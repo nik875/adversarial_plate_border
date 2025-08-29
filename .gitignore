@@ -1,0 +1,6 @@
+*.HEIC
+*.png
+*alpr_results.csv
+*.MOV
+*.json
+*.pkl
