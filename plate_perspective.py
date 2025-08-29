@@ -22,6 +22,7 @@ class LicensePlateDetector:
         self.alpr = None
         self.target_plate = "VRJ7774"
         self.crop_padding = 2
+        self.hole_border_finder_kernel = 4000
 
     def initialize_alpr(self):
         """Initialize ALPR models"""
@@ -339,7 +340,664 @@ class LicensePlateDetector:
                                 centered_image, (hole_center_x, hole_center_y), 3, (255, 255, 255), -1)
 
         print(f"🎯 Found {len(centered_components)} centered encircling components")
-        return centered_image
+        return centered_image, centered_components
+
+    def create_hole_border_only_image(self, gray_image, edges, centered_components_list):
+        """Create image showing only edge pixels that border the largest hole in each centered encircling component"""
+        # Find components
+        num_labels, labels_stats, stats, centroids = cv2.connectedComponentsWithStats(edges)
+
+        # Create output image
+        hole_border_image = np.zeros((gray_image.shape[0], gray_image.shape[1], 3), dtype=np.uint8)
+
+        hole_border_components = []
+
+        # Only process components that were identified as centered encircling components
+        for label in centered_components_list:
+            # Create mask for this component
+            component_mask = (labels_stats == label).astype(np.uint8) * 255
+
+            # Find contours in this component
+            contours, hierarchy = cv2.findContours(
+                component_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Find holes using contour hierarchy method
+            hole_masks = []
+            has_significant_holes = False
+
+            if hierarchy is not None:
+                largest_hole_mask = None
+                largest_hole_area = 0
+
+                for i in range(len(contours)):
+                    if hierarchy[0][i][2] != -1:  # Has child (hole)
+                        # Check if the hole is significant
+                        hole_idx = hierarchy[0][i][2]
+                        hole_area = cv2.contourArea(contours[hole_idx])
+                        outer_area = cv2.contourArea(contours[i])
+
+                        # Filter: hole should be at least 5% of outer contour area and minimum 20
+                        # pixels
+                        if hole_area > max(20, outer_area * 0.05):
+                            has_significant_holes = True
+                            # Check if this is the largest hole so far
+                            if hole_area > largest_hole_area:
+                                largest_hole_area = hole_area
+                                # Create mask for this hole
+                                temp_mask = np.zeros(gray_image.shape, dtype=np.uint8)
+                                cv2.fillPoly(temp_mask, [contours[hole_idx]], 255)
+                                largest_hole_mask = temp_mask
+
+                # Only keep the largest hole
+                if largest_hole_mask is not None:
+                    hole_masks = [largest_hole_mask]
+
+            # Alternative method: flood fill to detect enclosed regions
+            if not has_significant_holes:
+                # Create a slightly larger canvas for flood fill
+                h, w = component_mask.shape
+                flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+
+                # Copy component mask to center of flood mask
+                flood_mask[1:h + 1, 1:w + 1] = component_mask
+
+                # Flood fill from border
+                filled = flood_mask.copy()
+                cv2.floodFill(filled, None, (0, 0), 255)
+
+                # Extract the filled region (remove the padding)
+                filled_center = filled[1:h + 1, 1:w + 1]
+
+                # Find areas that weren't reached by flood fill (enclosed regions)
+                unreachable = cv2.bitwise_and(
+                    cv2.bitwise_not(filled_center),
+                    cv2.bitwise_not(component_mask)
+                )
+
+                # Check if there are significant unreachable areas
+                unreachable_area = cv2.countNonZero(unreachable)
+                if unreachable_area > 20:
+                    has_significant_holes = True
+                    # Find the largest unreachable region
+                    unreachable_contours, _ = cv2.findContours(
+                        unreachable, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    largest_hole_mask = None
+                    largest_hole_area = 0
+
+                    for contour in unreachable_contours:
+                        contour_area = cv2.contourArea(contour)
+                        if contour_area > max(20, largest_hole_area):
+                            # Create mask for this unreachable region
+                            temp_mask = np.zeros(gray_image.shape, dtype=np.uint8)
+                            cv2.fillPoly(temp_mask, [contour], 255)
+                            largest_hole_area = contour_area
+                            largest_hole_mask = temp_mask
+
+                    # Add the largest unreachable region to hole_masks
+                    if largest_hole_mask is not None:
+                        hole_masks = [largest_hole_mask]  # Replace with only the largest hole
+
+            # If this component has holes, find pixels that border only the largest hole
+            if has_significant_holes and hole_masks:
+                hole_border_components.append(label)
+
+                # Find the largest hole by area
+                largest_hole_mask = None
+                largest_hole_area = 0
+
+                for hole_mask in hole_masks:
+                    hole_area = cv2.countNonZero(hole_mask)
+                    if hole_area > largest_hole_area:
+                        largest_hole_area = hole_area
+                        largest_hole_mask = hole_mask
+
+                # Create border pixels only for the largest hole
+                hole_bordering_pixels = np.zeros(gray_image.shape, dtype=np.uint8)
+
+                if largest_hole_mask is not None:
+                    # Get the border using morphological gradient
+                    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                    hole_border = cv2.morphologyEx(largest_hole_mask, cv2.MORPH_GRADIENT, kernel)
+
+                    # Only keep pixels that are part of the original component
+                    component_mask_bool = (labels_stats == label).astype(np.uint8) * 255
+                    hole_bordering_pixels = cv2.bitwise_and(hole_border, component_mask_bool)
+
+                # Create vibrant color for this component's hole-bordering pixels
+                hue = (label * 137.5) % 360
+                saturation = 255  # Full saturation
+                value = 255      # Full brightness
+
+                # Convert HSV to BGR
+                hsv_color = np.uint8([[[hue / 2, saturation, value]]])
+                bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+
+                # Apply color only to hole-bordering pixels
+                hole_border_mask_bool = (hole_bordering_pixels > 0)
+                hole_border_image[hole_border_mask_bool] = bgr_color
+
+        print(f"🕳️ Found {len(hole_border_components)} centered components with largest hole borders")
+        return hole_border_image, hole_border_components
+
+    def create_biggest_component_hole_borders_image(
+            self, gray_image, edges, hole_border_components_list):
+        """Create image showing only the biggest component's largest hole borders"""
+        if not hole_border_components_list:
+            return np.zeros((gray_image.shape[0], gray_image.shape[1], 3), dtype=np.uint8)
+
+        # Find components
+        num_labels, labels_stats, stats, centroids = cv2.connectedComponentsWithStats(edges)
+
+        # Create output image
+        biggest_component_image = np.zeros(
+            (gray_image.shape[0], gray_image.shape[1], 3), dtype=np.uint8)
+
+        # Find the biggest component by area from the hole border components list
+        biggest_label = None
+        biggest_area = 0
+
+        for label in hole_border_components_list:
+            if label < len(stats):  # Make sure label is valid
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area > biggest_area:
+                    biggest_area = area
+                    biggest_label = label
+
+        if biggest_label is None:
+            print("🔍 No valid biggest component found")
+            return biggest_component_image
+
+        print(f"🏆 Biggest component: label {biggest_label} with area {biggest_area} pixels")
+
+        # Now recreate the hole border analysis for just this one component
+        component_mask = (labels_stats == biggest_label).astype(np.uint8) * 255
+
+        # Find contours in this component
+        contours, hierarchy = cv2.findContours(
+            component_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Find largest hole using contour hierarchy method
+        hole_masks = []
+        has_significant_holes = False
+
+        if hierarchy is not None:
+            largest_hole_mask = None
+            largest_hole_area = 0
+
+            for i in range(len(contours)):
+                if hierarchy[0][i][2] != -1:  # Has child (hole)
+                    # Check if the hole is significant
+                    hole_idx = hierarchy[0][i][2]
+                    hole_area = cv2.contourArea(contours[hole_idx])
+                    outer_area = cv2.contourArea(contours[i])
+
+                    # Filter: hole should be at least 5% of outer contour area and minimum 20 pixels
+                    if hole_area > max(20, outer_area * 0.05):
+                        has_significant_holes = True
+                        # Check if this is the largest hole so far
+                        if hole_area > largest_hole_area:
+                            largest_hole_area = hole_area
+                            # Create mask for this hole
+                            temp_mask = np.zeros(gray_image.shape, dtype=np.uint8)
+                            cv2.fillPoly(temp_mask, [contours[hole_idx]], 255)
+                            largest_hole_mask = temp_mask
+
+            # Only keep the largest hole
+            if largest_hole_mask is not None:
+                hole_masks = [largest_hole_mask]
+
+        # Alternative method: flood fill to detect enclosed regions
+        if not has_significant_holes:
+            # Create a slightly larger canvas for flood fill
+            h, w = component_mask.shape
+            flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+
+            # Copy component mask to center of flood mask
+            flood_mask[1:h + 1, 1:w + 1] = component_mask
+
+            # Flood fill from border
+            filled = flood_mask.copy()
+            cv2.floodFill(filled, None, (0, 0), 255)
+
+            # Extract the filled region (remove the padding)
+            filled_center = filled[1:h + 1, 1:w + 1]
+
+            # Find areas that weren't reached by flood fill (enclosed regions)
+            unreachable = cv2.bitwise_and(
+                cv2.bitwise_not(filled_center),
+                cv2.bitwise_not(component_mask)
+            )
+
+            # Check if there are significant unreachable areas
+            unreachable_area = cv2.countNonZero(unreachable)
+            if unreachable_area > 20:
+                has_significant_holes = True
+                # Find the largest unreachable region
+                unreachable_contours, _ = cv2.findContours(
+                    unreachable, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                largest_hole_mask = None
+                largest_hole_area = 0
+
+                for contour in unreachable_contours:
+                    contour_area = cv2.contourArea(contour)
+                    if contour_area > max(20, largest_hole_area):
+                        # Create mask for this unreachable region
+                        temp_mask = np.zeros(gray_image.shape, dtype=np.uint8)
+                        cv2.fillPoly(temp_mask, [contour], 255)
+                        largest_hole_area = contour_area
+                        largest_hole_mask = temp_mask
+
+                # Add the largest unreachable region to hole_masks
+                if largest_hole_mask is not None:
+                    hole_masks = [largest_hole_mask]  # Replace with only the largest hole
+
+        # Create border pixels only for the largest hole
+        if has_significant_holes and hole_masks:
+            hole_bordering_pixels = np.zeros(gray_image.shape, dtype=np.uint8)
+
+            largest_hole_mask = hole_masks[0]  # We only have one mask now (the largest)
+            if largest_hole_mask is not None:
+                # Get the border using morphological gradient
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                hole_border = cv2.morphologyEx(largest_hole_mask, cv2.MORPH_GRADIENT, kernel)
+
+                # Only keep pixels that are part of the original component
+                component_mask_bool = (labels_stats == biggest_label).astype(np.uint8) * 255
+                hole_bordering_pixels = cv2.bitwise_and(hole_border, component_mask_bool)
+
+                # Create vibrant color for this component's hole-bordering pixels
+                hue = (biggest_label * 137.5) % 360
+                saturation = 255  # Full saturation
+                value = 255      # Full brightness
+
+                # Convert HSV to BGR
+                hsv_color = np.uint8([[[hue / 2, saturation, value]]])
+                bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+
+                # Apply color only to hole-bordering pixels
+                hole_border_mask_bool = (hole_bordering_pixels > 0)
+                biggest_component_image[hole_border_mask_bool] = bgr_color
+
+        return biggest_component_image
+
+    def line_intersection(self, rho1, theta1, rho2, theta2):
+        """Calculate intersection point of two lines in polar form"""
+        a1, b1 = np.cos(theta1), np.sin(theta1)
+        a2, b2 = np.cos(theta2), np.sin(theta2)
+
+        det = a1 * b2 - a2 * b1
+        if abs(det) < 1e-10:  # Lines are parallel
+            return None
+
+        x = (rho1 * b2 - rho2 * b1) / det
+        y = (rho2 * a1 - rho1 * a2) / det
+
+        return (x, y)
+
+    def create_parallelogram_analysis_image(self, gray_image, biggest_component_image):
+        """Create image showing parallelogram detection with four lines and corners"""
+        # Convert the processed biggest component image to binary for Hough line detection
+        # The biggest_component_image is colored, so convert to grayscale first
+        if len(biggest_component_image.shape) == 3:
+            gray_biggest = cv2.cvtColor(biggest_component_image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_biggest = biggest_component_image
+
+        # Create binary edge image from the processed component
+        edge_img = (gray_biggest > 0).astype(np.uint8) * 255
+
+        # Detect lines using Hough transform - use same approach as original working code
+        lines = cv2.HoughLines(edge_img, 1, np.pi / 180, threshold=25)
+
+        # Create output image (start with original grayscale as background)
+        parallelogram_image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+        corners_in_crop = []
+        homography_matrix = None
+
+        if lines is not None and len(lines) >= 4:
+            print(f"Detected {len(lines)} lines for parallelogram analysis")
+
+            def select_parallelogram_lines(lines, angle_tolerance=5):
+                lines_data = []
+                # Extract and normalize angles for grouping
+                for i, line in enumerate(lines):
+                    rho, theta = line[0]
+                    # Normalize angle to [0, π) range
+                    angle_deg = np.degrees(theta) % 180
+                    lines_data.append((i, rho, theta, angle_deg))
+
+                # Group lines by similar angles
+                from collections import defaultdict
+                angle_groups = defaultdict(list)
+
+                for i, rho, theta, angle_deg in lines_data:
+                    # Find existing group or create new one
+                    assigned = False
+                    for group_angle in angle_groups.keys():
+                        if abs(angle_deg - group_angle) < angle_tolerance or abs(angle_deg -
+                                                                                 group_angle) > (180 - angle_tolerance):
+                            angle_groups[group_angle].append((i, rho, theta, angle_deg))
+                            assigned = True
+                            break
+                    if not assigned:
+                        angle_groups[angle_deg].append((i, rho, theta, angle_deg))
+
+                # Find the two largest groups
+                sorted_groups = sorted(angle_groups.items(), key=lambda x: len(x[1]), reverse=True)
+
+                if len(sorted_groups) < 2:
+                    print("Warning: Could not find two groups of parallel lines")
+                    return lines[:4] if len(lines) >= 4 else lines
+
+                # Select lines with MOST VOTES from each group
+                selected_lines = []
+                for group_angle, group in sorted_groups[:2]:
+                    if len(group) >= 2:
+                        # Sort by original index to preserve vote order (lower index = more votes)
+                        group_by_votes = sorted(group, key=lambda x: x[0])  # Sort by original index
+                        # Take the first two (highest vote count)
+                        selected_lines.append(lines[group_by_votes[0][0]])
+                        selected_lines.append(lines[group_by_votes[1][0]])
+                    else:
+                        selected_lines.append(lines[group[0][0]])
+
+                print(f"Selected {len(selected_lines)} lines for parallelogram (by vote count)")
+                return selected_lines
+
+            # Apply the same parallel correction as the original code
+            def make_truly_parallel(selected_lines):
+                if len(selected_lines) != 4:
+                    return selected_lines
+
+                lines_data = []
+                for line in selected_lines:
+                    rho, theta = line[0]
+                    angle_deg = np.degrees(theta) % 180
+                    lines_data.append([rho, theta, angle_deg])
+
+                # Group into two parallel pairs based on angle similarity
+                lines_data = np.array(lines_data)
+                angles = lines_data[:, 2]
+
+                # Find two main angle groups
+                angle_diffs = []
+                for i in range(len(angles)):
+                    for j in range(i + 1, len(angles)):
+                        diff = min(abs(angles[i] - angles[j]), 180 - abs(angles[i] - angles[j]))
+                        angle_diffs.append((diff, i, j))
+
+                # Sort by similarity and group
+                angle_diffs.sort()
+
+                # Find the best pairing that creates two groups of 2
+                used = set()
+                pairs = []
+                for diff, i, j in angle_diffs:
+                    if i not in used and j not in used and len(pairs) < 2:
+                        pairs.append([i, j])
+                        used.add(i)
+                        used.add(j)
+                        if len(used) == 4:
+                            break
+
+                # If we couldn't pair all 4, just take first 4
+                if len(pairs) != 2:
+                    pairs = [[0, 1], [2, 3]]
+
+                corrected_lines = []
+
+                for pair in pairs:
+                    i, j = pair
+                    # Get average angle for this parallel pair
+                    theta1, theta2 = lines_data[i, 1], lines_data[j, 1]
+
+                    # Handle angle wraparound at π
+                    if abs(theta1 - theta2) > np.pi / 2:
+                        if theta1 < theta2:
+                            theta1 += np.pi
+                        else:
+                            theta2 += np.pi
+
+                    avg_theta = (theta1 + theta2) / 2
+
+                    # Apply small equal and opposite corrections
+                    correction = 0.001  # Small angle correction in radians
+                    theta1_corrected = avg_theta + correction
+                    theta2_corrected = avg_theta - correction
+
+                    # Keep original rho values, update only theta
+                    corrected_lines.append([[lines_data[i, 0], theta1_corrected]])
+                    corrected_lines.append([[lines_data[j, 0], theta2_corrected]])
+
+                print(f"Applied parallel corrections to {len(corrected_lines)} lines")
+                return corrected_lines
+
+            # Select and correct lines using original algorithm
+            selected_lines = select_parallelogram_lines(lines)
+            corrected_lines = make_truly_parallel(selected_lines)
+
+            h, w = gray_image.shape
+
+            # Draw all detected lines in light blue (similar to original code's pink lines)
+            for line in lines:
+                rho, theta = line[0]
+                a = np.cos(theta)
+                b = np.sin(theta)
+
+                if abs(b) > abs(a):
+                    x1, x2 = 0, w - 1
+                    y1 = (rho - a * x1) / b
+                    y2 = (rho - a * x2) / b
+                else:
+                    y1, y2 = 0, h - 1
+                    x1 = (rho - b * y1) / a
+                    x2 = (rho - b * y2) / a
+
+                # Draw line (using image coordinates directly)
+                cv2.line(parallelogram_image, (int(x1), int(y1)),
+                         (int(x2), int(y2)), (255, 200, 100), 1)
+
+            # Draw corrected parallelogram lines in bright red
+            line_params = []
+            for line in corrected_lines:
+                rho, theta = line[0]
+                line_params.append((rho, theta))
+                a = np.cos(theta)
+                b = np.sin(theta)
+
+                if abs(b) > abs(a):
+                    x1, x2 = 0, w - 1
+                    y1 = (rho - a * x1) / b
+                    y2 = (rho - a * x2) / b
+                else:
+                    y1, y2 = 0, h - 1
+                    x1 = (rho - b * y1) / a
+                    x2 = (rho - b * y2) / a
+
+                # Draw line in red (using image coordinates directly)
+                cv2.line(parallelogram_image, (int(x1), int(y1)),
+                         (int(x2), int(y2)), (0, 0, 255), 3)
+
+            # Calculate intersections to find corners
+            corners = []
+            for i in range(4):
+                for j in range(i + 1, 4):
+                    rho1, theta1 = line_params[i]
+                    rho2, theta2 = line_params[j]
+
+                    intersection = self.line_intersection(rho1, theta1, rho2, theta2)
+                    if intersection is not None:
+                        x, y = intersection
+                        # Check if intersection is within reasonable bounds of the image
+                        if -w * 0.5 <= x <= w * 1.5 and -h * 0.5 <= y <= h * 1.5:
+                            corners.append((x, y))
+
+            # Remove duplicate corners (within 10 pixel tolerance)
+            unique_corners = []
+            for corner in corners:
+                is_duplicate = False
+                for existing in unique_corners:
+                    if abs(corner[0] - existing[0]) < 10 and abs(corner[1] - existing[1]) < 10:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_corners.append(corner)
+
+            # Take the 4 corners that form the most reasonable quadrilateral
+            if len(unique_corners) >= 4:
+                # Sort corners to find a reasonable quadrilateral
+                corners = unique_corners[:4]  # Take first 4 if more than 4
+
+                def order_corners_properly(corners):
+                    """Order corners in top-left, top-right, bottom-right, bottom-left sequence"""
+                    if len(corners) < 4:
+                        return corners
+
+                    # Calculate centroid
+                    cx = sum(c[0] for c in corners) / len(corners)
+                    cy = sum(c[1] for c in corners) / len(corners)
+
+                    # Calculate angle from centroid to each corner
+                    corners_with_angles = []
+                    for x, y in corners:
+                        angle = np.arctan2(y - cy, x - cx)
+                        corners_with_angles.append((x, y, angle))
+
+                    # Sort by angle (this gives us clockwise from rightward direction)
+                    corners_with_angles.sort(key=lambda item: item[2])
+
+                    # Extract just the coordinates
+                    sorted_corners = [(x, y) for x, y, angle in corners_with_angles]
+
+                    # Find which corner is closest to top-left (smallest x+y sum)
+                    distances_to_topleft = [(i, x + y) for i, (x, y) in enumerate(sorted_corners)]
+                    start_idx = min(distances_to_topleft, key=lambda item: item[1])[0]
+
+                    # Reorder to start from top-left and go clockwise
+                    reordered = sorted_corners[start_idx:] + sorted_corners[:start_idx]
+
+                    return reordered
+
+                corners_in_crop = order_corners_properly(unique_corners[:4])
+
+                # Draw corners with numbers
+                for i, (x, y) in enumerate(corners_in_crop):
+                    if 0 <= x < w and 0 <= y < h:  # Only draw if within image bounds
+                        cv2.circle(parallelogram_image, (int(x), int(y)), 6, (0, 255, 0), -1)
+                        cv2.putText(parallelogram_image, str(i + 1), (int(x) + 10, int(y) + 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                # Draw the parallelogram outline
+                valid_corners = [(x, y)
+                                 for x, y in corners_in_crop if 0 <= x < w and 0 <= y < h]
+                if len(valid_corners) >= 3:
+                    corner_points = np.array([[int(x), int(y)]
+                                             for x, y in valid_corners], dtype=np.int32)
+                    cv2.polylines(parallelogram_image, [corner_points], True, (255, 0, 255), 2)
+
+                # Calculate homography matrix
+                # Source: 2:1 width:height ratio rectangle (200 wide × 100 high)
+                src_points = np.float32([
+                    [0, 0],      # top-left
+                    [200, 0],    # top-right
+                    [200, 100],  # bottom-right
+                    [0, 100]     # bottom-left
+                ])
+
+                # Destination: detected parallelogram corners
+                dst_points = np.float32(corners_in_crop)
+
+                try:
+                    homography_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                    print(f"Found {len(corners_in_crop)} corners for parallelogram")
+                except cv2.error:
+                    print("Warning: Could not compute homography matrix - corners may be collinear")
+                    homography_matrix = None
+            else:
+                print("No valid corners found for parallelogram")
+
+        return parallelogram_image, corners_in_crop, homography_matrix
+
+    def create_perspective_corrected_image(
+            self, cropped_image, homography_matrix, target_panel_size):
+        """Create perspective-corrected image by applying inverse homography transformation"""
+        panel_height, panel_width = target_panel_size
+
+        if homography_matrix is None:
+            # Return a black square image with error message if no homography available
+            error_image = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+            cv2.putText(error_image, "No Homography", (10, panel_height // 2 - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1)
+            cv2.putText(error_image, "Matrix Found", (10, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1)
+            return error_image
+
+        try:
+            # Calculate inverse homography matrix
+            inverse_homography = np.linalg.inv(homography_matrix)
+
+            # Apply inverse perspective transformation to unwarp the image
+            # Output size: 2:1 width:height ratio (200x100) as defined in the original homography
+            plate_width, plate_height = 200, 100
+
+            # Warp the cropped image using the inverse transformation
+            corrected_plate = cv2.warpPerspective(
+                cropped_image,
+                inverse_homography,
+                (plate_width, plate_height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0)
+            )
+
+            # Create a square canvas of the same size as other panels
+            square_image = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+
+            # Calculate position to center the corrected plate in the square canvas
+            # Scale the plate to fit nicely in the square while maintaining aspect ratio
+            max_plate_size = min(panel_width * 0.8, panel_height *
+                                 0.8)  # Use 80% of available space
+
+            # Calculate scaling factor to fit plate in available space
+            scale_factor = min(max_plate_size / plate_width, max_plate_size / plate_height)
+
+            # Calculate new dimensions
+            scaled_width = int(plate_width * scale_factor)
+            scaled_height = int(plate_height * scale_factor)
+
+            # Resize the corrected plate
+            if scaled_width > 0 and scaled_height > 0:
+                scaled_plate = cv2.resize(corrected_plate, (scaled_width, scaled_height))
+
+                # Calculate position to center in square canvas
+                start_x = (panel_width - scaled_width) // 2
+                start_y = (panel_height - scaled_height) // 2
+
+                # Place the scaled plate in the center of the square canvas
+                square_image[start_y:start_y + scaled_height,
+                             start_x:start_x + scaled_width] = scaled_plate
+
+            print(
+                f"📐 Applied perspective correction: {cropped_image.shape[:2]} → {plate_height}x{plate_width} → scaled to {scaled_height}x{scaled_width} in {panel_height}x{panel_width} square")
+            return square_image
+
+        except np.linalg.LinAlgError:
+            # Homography matrix is singular (non-invertible)
+            error_image = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+            cv2.putText(error_image, "Singular Matrix", (10, panel_height // 2 - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1)
+            cv2.putText(error_image, "Cannot Invert", (10, panel_height // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1)
+            return error_image
+        except Exception as e:
+            # Any other error during transformation
+            error_image = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+            cv2.putText(error_image, "Transform Error", (10, panel_height // 2 - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1)
+            print(f"Error in perspective correction: {str(e)}")
+            raise  # Re-raise according to user's preference for failing loudly
 
     def create_cropped_edge_images(self, image_path, all_plates, target_plates, base_output_path):
         """Create cropped images with edge detection and connected components for all detected plates"""
@@ -394,42 +1052,49 @@ class LicensePlateDetector:
             # Apply Canny edge detection
             edges = cv2.Canny(blurred, 15, 50)
 
-            kernel_size = round(max(image_height, image_width) / 3000)
+            kernel_size = round(image_height * image_width / self.hole_border_finder_kernel ** 2)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             edges_thick = cv2.dilate(edges, kernel, iterations=2)
 
-            import pickle
-            with open("edges.pkl", "wb") as f:
-                pickle.dump(edges_thick, f)
-
-            # Create connected components analysis
+            # Create all analysis images
             components_image = self.create_connected_components_image(gray, edges_thick)
-
-            # Create encircling components analysis (only components that encircle areas)
             encircling_image = self.create_encircling_components_image(gray, edges_thick)
+            centered_image, centered_components_list = self.create_centered_encircling_components_image(
+                gray, edges_thick)
+            hole_border_image, hole_border_components_list = self.create_hole_border_only_image(
+                gray, edges_thick, centered_components_list)
+            biggest_component_image = self.create_biggest_component_hole_borders_image(
+                gray, edges_thick, hole_border_components_list)
 
-            # Create centered encircling components analysis
-            centered_image = self.create_centered_encircling_components_image(gray, edges_thick)
+            # Create parallelogram analysis image using the processed biggest component
+            parallelogram_image, corners_in_crop, homography_matrix = self.create_parallelogram_analysis_image(
+                gray, biggest_component_image)
 
             # Convert edges to 3-channel
             edges_colored = cv2.cvtColor(edges_thick, cv2.COLOR_GRAY2BGR)
 
-            # Create two-row composite image
-            # Row 1: original | edges | all components | encircling components
-            # Row 2: centered encircling (full width)
+            # Create nine-panel composite image
+            # Row 1: original | edges | all components
+            # Row 2: encircling components | centered encircling | hole borders only
+            # Row 3: biggest component | parallelogram analysis | perspective corrected
             panel_width = cropped.shape[1]
             panel_height = cropped.shape[0]
+
+            # NEW: Create perspective-corrected image using inverse homography (after
+            # panel dimensions are defined)
+            # Pass panel dimensions for square output
+            target_panel_size = (panel_height, panel_width)
+            perspective_corrected_image = self.create_perspective_corrected_image(
+                cropped, homography_matrix, target_panel_size)
             separator_width = 8
             row_separator_height = 40  # Space between rows for labels
 
-            # Row 1: 4 panels + 3 separators
-            row1_width = panel_width * 4 + separator_width * 3
-            # Row 2: 1 panel (centered)
-            row2_width = panel_width
+            # All rows now have 3 panels + 2 separators each
+            row_width = panel_width * 3 + separator_width * 2
 
-            # Composite dimensions
-            composite_width = max(row1_width, row2_width)
-            composite_height = panel_height * 2 + row_separator_height
+            # Composite dimensions (3 rows)
+            composite_width = row_width
+            composite_height = panel_height * 3 + row_separator_height * 2
             composite = np.zeros((composite_height, composite_width, 3), dtype=np.uint8)
 
             # === ROW 1 ===
@@ -452,20 +1117,54 @@ class LicensePlateDetector:
             panel3_start = sep2_start + separator_width
             composite[:panel_height, panel3_start:panel3_start + panel_width] = components_image
 
-            # Add separator 3
-            sep3_start = panel3_start + panel_width
-            composite[:panel_height, sep3_start:sep3_start + separator_width] = [255, 255, 255]
+            # === ROW 2 ===
+            row2_start_y = panel_height + row_separator_height
 
             # Place encircling components (panel 4)
-            panel4_start = sep3_start + separator_width
-            composite[:panel_height, panel4_start:panel4_start + panel_width] = encircling_image
+            composite[row2_start_y:row2_start_y + panel_height, :panel_width] = encircling_image
 
-            # === ROW 2 ===
-            # Center the panel in row 2
-            row2_start_y = panel_height + row_separator_height
-            row2_panel_x = (composite_width - panel_width) // 2  # Center horizontally
+            # Add separator 1 for row 2
+            composite[row2_start_y:row2_start_y +
+                      panel_height, sep1_start:sep1_start +
+                      separator_width] = [255, 255, 255]
+
+            # Place centered encircling components (panel 5)
             composite[row2_start_y:row2_start_y + panel_height,
-                      row2_panel_x:row2_panel_x + panel_width] = centered_image
+                      panel2_start:panel2_start + panel_width] = centered_image
+
+            # Add separator 2 for row 2
+            composite[row2_start_y:row2_start_y +
+                      panel_height, sep2_start:sep2_start +
+                      separator_width] = [255, 255, 255]
+
+            # Place hole border only (panel 6)
+            composite[row2_start_y:row2_start_y + panel_height,
+                      panel3_start:panel3_start + panel_width] = hole_border_image
+
+            # === ROW 3 ===
+            row3_start_y = panel_height * 2 + row_separator_height * 2
+
+            # Place biggest component (panel 7)
+            composite[row3_start_y:row3_start_y + panel_height,
+                      :panel_width] = biggest_component_image
+
+            # Add separator 1 for row 3
+            composite[row3_start_y:row3_start_y +
+                      panel_height, sep1_start:sep1_start +
+                      separator_width] = [255, 255, 255]
+
+            # Place parallelogram analysis (panel 8)
+            composite[row3_start_y:row3_start_y + panel_height,
+                      panel2_start:panel2_start + panel_width] = parallelogram_image
+
+            # Add separator 2 for row 3
+            composite[row3_start_y:row3_start_y +
+                      panel_height, sep2_start:sep2_start +
+                      separator_width] = [255, 255, 255]
+
+            # Place perspective corrected image (panel 9) - already sized correctly
+            composite[row3_start_y:row3_start_y + panel_height,
+                      panel3_start:panel3_start + panel_width] = perspective_corrected_image
 
             # Add text labels
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -479,22 +1178,25 @@ class LicensePlateDetector:
                         font, font_scale, color, thickness)
             cv2.putText(composite, "All Components", (panel3_start + 10, 20),
                         font, font_scale, color, thickness)
-            cv2.putText(
-                composite,
-                "Encircling Only",
-                (panel4_start + 10,
-                 20),
-                font,
-                font_scale,
-                color,
-                thickness)
 
-            # Row 2 label
-            cv2.putText(composite, "Centered Encircling (<10% from center)",
-                        (row2_panel_x + 10, row2_start_y + 20), font, font_scale, color, thickness)
+            # Row 2 labels
+            cv2.putText(composite, "Encircling Only", (10, row2_start_y + 20),
+                        font, font_scale, color, thickness)
+            cv2.putText(composite, "Centered Encircling", (panel2_start + 10, row2_start_y + 20),
+                        font, font_scale, color, thickness)
+            cv2.putText(composite, "Largest Hole Borders", (panel3_start + 10, row2_start_y + 20),
+                        font, font_scale, color, thickness)
 
-            # Add image center crosshair on row 2 for reference
-            img_center_x = row2_panel_x + panel_width // 2
+            # Row 3 labels
+            cv2.putText(composite, "Biggest Component", (10, row3_start_y + 20),
+                        font, font_scale, color, thickness)
+            cv2.putText(composite, "Parallelogram Analysis", (panel2_start + 10, row3_start_y + 20),
+                        font, font_scale, color, thickness)
+            cv2.putText(composite, "Perspective Corrected", (panel3_start + 10, row3_start_y + 20),
+                        font, font_scale, color, thickness)
+
+            # Add image center crosshair on centered encircling panel for reference
+            img_center_x = panel2_start + panel_width // 2
             img_center_y = row2_start_y + panel_height // 2
             cv2.drawMarker(composite, (img_center_x, img_center_y), (255, 255, 255),
                            cv2.MARKER_CROSS, 20, 2)
@@ -503,6 +1205,46 @@ class LicensePlateDetector:
             plate_info = f"{plate['text']} (conf: {plate['confidence']:.3f})"
             cv2.putText(composite, plate_info, (10, composite_height - 10),
                         font, font_scale, color, thickness)
+
+            # Output corner positions and homography matrix information
+            if corners_in_crop and homography_matrix is not None:
+                print(f"\n📐 PARALLELOGRAM ANALYSIS for {plate['text']}:")
+                print("=" * 50)
+
+                # Convert crop coordinates to original image coordinates
+                corners_in_original = []
+                for x_crop, y_crop in corners_in_crop:
+                    x_orig = x_crop + crop_x1
+                    y_orig = y_crop + crop_y1
+                    corners_in_original.append((x_orig, y_orig))
+
+                print("🎯 Corner positions in ORIGINAL image coordinates:")
+                for i, (x, y) in enumerate(corners_in_original):
+                    print(f"   Corner {i+1}: ({x:.1f}, {y:.1f})")
+
+                print("\n🎯 Corner positions in CROPPED image coordinates:")
+                for i, (x, y) in enumerate(corners_in_crop):
+                    print(f"   Corner {i+1}: ({x:.1f}, {y:.1f})")
+
+                print(f"\n📏 Homography Matrix (2:1 width:height rectangle → detected parallelogram):")
+                print("   Source: 2:1 width:height ratio rectangle [200×100]")
+                print("   Target: Detected parallelogram in cropped image")
+                for i, row in enumerate(homography_matrix):
+                    print(f"   [{row[0]:9.6f}, {row[1]:9.6f}, {row[2]:9.6f}]")
+
+                # Calculate parallelogram properties
+                corners_np = np.array(corners_in_crop)
+                # Side lengths
+                side1_len = np.linalg.norm(corners_np[1] - corners_np[0])
+                side2_len = np.linalg.norm(corners_np[2] - corners_np[1])
+                side3_len = np.linalg.norm(corners_np[3] - corners_np[2])
+                side4_len = np.linalg.norm(corners_np[0] - corners_np[3])
+
+                print(f"\n📊 Parallelogram Properties:")
+                print(
+                    f"   Side lengths: {side1_len:.1f}, {side2_len:.1f}, {side3_len:.1f}, {side4_len:.1f}")
+                print(
+                    f"   Aspect ratio: {max(side1_len, side3_len) / max(side2_len, side4_len):.2f}:1")
 
             # Generate output filename
             base_dir = os.path.dirname(base_output_path)
@@ -519,7 +1261,7 @@ class LicensePlateDetector:
 
             crop_path = os.path.join(base_dir, crop_filename)
 
-            # Save the three-panel composite image
+            # Save the nine-panel composite image
             cv2.imwrite(crop_path, composite)
             cropped_files.append(crop_path)
 
@@ -664,8 +1406,8 @@ class LicensePlateDetector:
         result_image.save(output_path, 'PNG', quality=95)
         print(f"✓ Saved main result: {output_path}")
 
-        # Create cropped analysis images (5-panel analysis)
-        print("🔍 Creating cropped images with comprehensive 5-panel analysis...")
+        # Create cropped analysis images (9-panel analysis)
+        print("🔍 Creating cropped images with comprehensive 9-panel analysis...")
         cropped_files = self.create_cropped_edge_images(
             image_path, all_plates, target_plates, output_path)
 
@@ -732,14 +1474,19 @@ def main():
     print("📱 Supports JPEG, PNG" + (", and HEIC" if HEIC_SUPPORT else ""))
     print("🎯 Specifically searches for license plate: VRJ7774")
     print("📦 Detects all plates and highlights the target plate in red")
-    print("✂️  Creates cropped images with 5-panel analysis:")
+    print("✂️  Creates cropped images with 9-panel analysis:")
     print("   Row 1:")
     print("     1️⃣ Original image")
     print("     2️⃣ Edge detection")
     print("     3️⃣ All connected components (different colors)")
-    print("     4️⃣ Encircling components only (components that form closed loops)")
     print("   Row 2:")
+    print("     4️⃣ Encircling components only (components that form closed loops)")
     print("     5️⃣ Centered encircling components (holes <10% from image center)")
+    print("     6️⃣ Largest hole borders only (from centered components, show only largest hole borders)")
+    print("   Row 3:")
+    print("     7️⃣ Biggest component only (largest component from panel 6)")
+    print("     8️⃣ Parallelogram analysis (4 lines + corners + homography)")
+    print("     9️⃣ Perspective corrected (inverse homography transformation to flat plane)")
     print()
 
     detector = LicensePlateDetector()
