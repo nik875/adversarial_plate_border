@@ -1,3 +1,5 @@
+import json
+import argparse
 import cv2
 import numpy as np
 from fast_alpr import ALPR
@@ -23,6 +25,8 @@ class LicensePlateDetector:
         self.target_plate = "VRJ7774"
         self.crop_padding = 2
         self.hole_border_finder_kernel = 4000
+        self.last_homography = None
+        self.last_corners = None
 
     def initialize_alpr(self):
         """Initialize ALPR models"""
@@ -222,8 +226,8 @@ class LicensePlateDetector:
         # Calculate image center and 10% threshold
         img_height, img_width = gray_image.shape
         img_center_x, img_center_y = img_width / 2, img_height / 2
-        threshold_x = img_width * 0.10  # 10% of width
-        threshold_y = img_height * 0.10  # 10% of height
+        threshold_x = img_width * 0.1  # 10% of width
+        threshold_y = img_height * 0.1  # 10% of height
 
         # Create output image
         centered_image = np.zeros((img_height, img_width, 3), dtype=np.uint8)
@@ -648,18 +652,58 @@ class LicensePlateDetector:
         # Create binary edge image from the processed component
         edge_img = (gray_biggest > 0).astype(np.uint8) * 255
 
+        # Create output image (start with original grayscale as background)
+        parallelogram_image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+        h, w = gray_image.shape
+
         # Detect lines using Hough transform - use same approach as original working code
         lines = cv2.HoughLines(edge_img, 1, np.pi / 180, threshold=25)
 
-        # Create output image (start with original grayscale as background)
-        parallelogram_image = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
+        def _normalize_rho_theta(rho, theta):
+            # canonicalize so we don’t get the (-ρ, θ+π) representation
+            if rho < 0:
+                rho = -rho
+                theta = (theta + np.pi) % np.pi
+            else:
+                theta = theta % np.pi
+            return float(rho), float(theta)
+
+        def _line_intersects_image(rho, theta, w, h, margin=2):
+            """
+            Returns True if the infinite Hesse-form line intersects the image rect.
+            We create a very long segment on the line, then clip it to the rectangle.
+            """
+            a, b = np.cos(theta), np.sin(theta)
+            x0, y0 = a * rho, b * rho           # a point on the line
+            vx, vy = -b, a                      # direction vector
+
+            # Very long segment endpoints
+            p1 = (int(round(x0 + 10000 * vx)), int(round(y0 + 10000 * vy)))
+            p2 = (int(round(x0 - 10000 * vx)), int(round(y0 - 10000 * vy)))
+
+            # Expand rect slightly to be tolerant to quantization
+            rect = (-margin, -margin, w + margin, h + margin)
+            ok, _, _ = cv2.clipLine(rect, p1, p2)
+            return bool(ok)
+
+        kept = []
+        for line in lines:
+            rho, theta = line[0]
+            rho, theta = _normalize_rho_theta(rho, theta)
+            if _line_intersects_image(rho, theta, w, h, margin=2):
+                kept.append(np.array([[rho, theta]], dtype=np.float32))
+
+        if kept:
+            lines = np.array(kept, dtype=np.float32)
+        lines = lines[:100]
+
         corners_in_crop = []
         homography_matrix = None
 
         if lines is not None and len(lines) >= 4:
             print(f"Detected {len(lines)} lines for parallelogram analysis")
 
-            def select_parallelogram_lines(lines, angle_tolerance=5):
+            def select_parallelogram_lines(lines, angle_tolerance=5, min_angle_sep=15):
                 lines_data = []
                 # Extract and normalize angles for grouping
                 for i, line in enumerate(lines):
@@ -673,7 +717,6 @@ class LicensePlateDetector:
                 angle_groups = defaultdict(list)
 
                 for i, rho, theta, angle_deg in lines_data:
-                    # Find existing group or create new one
                     assigned = False
                     for group_angle in angle_groups.keys():
                         if abs(angle_deg - group_angle) < angle_tolerance or abs(angle_deg -
@@ -691,19 +734,55 @@ class LicensePlateDetector:
                     print("Warning: Could not find two groups of parallel lines")
                     return lines[:4] if len(lines) >= 4 else lines
 
-                # Select lines with MOST VOTES from each group
+                # --- NEW: find first two groups with sufficient angular separation ---
+                chosen_groups = None
+                for i in range(len(sorted_groups)):
+                    for j in range(i + 1, len(sorted_groups)):
+                        angle1, group1 = sorted_groups[i]
+                        angle2, group2 = sorted_groups[j]
+                        sep = abs(angle1 - angle2)
+                        sep = min(sep, 180 - sep)  # wrap-around
+                        if sep >= min_angle_sep:
+                            chosen_groups = [(angle1, group1), (angle2, group2)]
+                            break
+                    if chosen_groups:
+                        break
+
+                if not chosen_groups:
+                    print(f"Warning: No angle groups found with separation >= {min_angle_sep}°")
+                    return lines[:4] if len(lines) >= 4 else lines
+
+                # Select best two lines from each group considering votes + distance
                 selected_lines = []
-                for group_angle, group in sorted_groups[:2]:
+                for group_angle, group in chosen_groups[:2]:
                     if len(group) >= 2:
-                        # Sort by original index to preserve vote order (lower index = more votes)
-                        group_by_votes = sorted(group, key=lambda x: x[0])  # Sort by original index
-                        # Take the first two (highest vote count)
-                        selected_lines.append(lines[group_by_votes[0][0]])
-                        selected_lines.append(lines[group_by_votes[1][0]])
+                        # Sort by original index = more votes first
+                        group_sorted = sorted(group, key=lambda x: x[0])
+
+                        # Evaluate all pairs for distance × vote score
+                        best_pair = None
+                        best_score = -1
+                        for a in range(len(group_sorted)):
+                            for b in range(a + 1, len(group_sorted)):
+                                i1, rho1, theta1, _ = group_sorted[a]
+                                i2, rho2, theta2, _ = group_sorted[b]
+
+                                # higher for lower indices
+                                vote_score = 1.0 / (1 + i1) + 1.0 / (1 + i2)
+                                distance = abs(rho1 - rho2)
+
+                                score = vote_score * (1 + distance)  # weight distance too
+                                if score > best_score:
+                                    best_score = score
+                                    best_pair = (i1, i2)
+
+                        if best_pair:
+                            selected_lines.append(lines[best_pair[0]])
+                            selected_lines.append(lines[best_pair[1]])
                     else:
                         selected_lines.append(lines[group[0][0]])
 
-                print(f"Selected {len(selected_lines)} lines for parallelogram (by vote count)")
+                print(f"Selected {len(selected_lines)} lines for parallelogram (votes + distance)")
                 return selected_lines
 
             # Apply the same parallel correction as the original code
@@ -911,6 +990,8 @@ class LicensePlateDetector:
 
                 try:
                     homography_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+                    self.last_homography = homography_matrix
+                    self.last_corners = [(float(i[0]), float(i[1])) for i in corners_in_crop]
                     print(f"Found {len(corners_in_crop)} corners for parallelogram")
                 except cv2.error:
                     print("Warning: Could not compute homography matrix - corners may be collinear")
@@ -1392,6 +1473,7 @@ class LicensePlateDetector:
                 print(f"   Target {i+1}: confidence = {plate['confidence']:.3f}")
         else:
             print(f"❌ Target plate '{self.target_plate}' not found")
+            return None
 
         # Draw bounding boxes
         result_image = self.draw_bounding_boxes(image, all_plates, target_plates)
@@ -1474,48 +1556,74 @@ def main():
     print("📱 Supports JPEG, PNG" + (", and HEIC" if HEIC_SUPPORT else ""))
     print("🎯 Specifically searches for license plate: VRJ7774")
     print("📦 Detects all plates and highlights the target plate in red")
-    print("✂️  Creates cropped images with 9-panel analysis:")
-    print("   Row 1:")
-    print("     1️⃣ Original image")
-    print("     2️⃣ Edge detection")
-    print("     3️⃣ All connected components (different colors)")
-    print("   Row 2:")
-    print("     4️⃣ Encircling components only (components that form closed loops)")
-    print("     5️⃣ Centered encircling components (holes <10% from image center)")
-    print("     6️⃣ Largest hole borders only (from centered components, show only largest hole borders)")
-    print("   Row 3:")
-    print("     7️⃣ Biggest component only (largest component from panel 6)")
-    print("     8️⃣ Parallelogram analysis (4 lines + corners + homography)")
-    print("     9️⃣ Perspective corrected (inverse homography transformation to flat plane)")
+    print("✂️  Creates cropped images with 9-panel analysis")
     print()
 
     detector = LicensePlateDetector()
 
-    # Option to change target plate
-    change_target = input(f"Current target plate: {detector.target_plate}\n"
-                          "Change target plate? (y/n) [n]: ").lower().strip()
+    # --- NEW: argparse CLI handling ---
+    parser = argparse.ArgumentParser(description="License Plate Detector")
+    parser.add_argument("--image", type=str, help="Path to image file")
+    parser.add_argument("--kernel", type=int, help="Hole border finder kernel size")
+    parser.add_argument("--homography_output", type=str,
+                        help="Output JSON file for homography matrix and corners")
+    args = parser.parse_args()
 
-    if change_target == 'y':
-        new_target = input("Enter new target plate number: ").strip().upper()
-        if new_target:
-            detector.target_plate = new_target
-            print(f"✓ Target plate changed to: {detector.target_plate}")
+    if args.kernel:
+        detector.hole_border_finder_kernel = args.kernel
 
-    # Option to change crop padding
-    change_padding = input(f"Current crop padding: {detector.crop_padding} pixels\n"
-                           "Change crop padding? (y/n) [n]: ").lower().strip()
+    if args.image:
+        # CLI mode
+        result = detector.process_image(args.image)
+        if result:
+            result_path, all_plates, target_plates, cropped_files = result
 
-    if change_padding == 'y':
-        try:
-            new_padding = int(input("Enter new padding in pixels [100]: ") or "100")
-            if new_padding >= 0:
-                detector.crop_padding = new_padding
-                print(f"✓ Crop padding changed to: {detector.crop_padding} pixels")
-        except ValueError:
-            print("Invalid padding value, keeping default (100)")
+            # If homography_output requested, dump info
+            if args.homography_output and cropped_files:
+                # Collect homography + corners info from last crop step
+                # Simplify: only use target plates (if any), else first plate
+                homography_data = []
+                for crop_file in cropped_files:
+                    # The analysis printed homography and corners already
+                    # We now store them in JSON
+                    entry = {
+                        "original_image": args.image,
+                        "analysis_image": crop_file,
+                        "corners": getattr(detector, "last_corners", []),
+                        "homography_matrix": getattr(detector, "last_homography", []).tolist()
+                        if getattr(detector, "last_homography", None) is not None else None
+                    }
+                    homography_data.append(entry)
 
-    # Process image
-    detector.select_and_process_image()
+                with open(args.homography_output, "w") as f:
+                    json.dump(homography_data, f, indent=2)
+                print(f"💾 Homography data written to {args.homography_output}")
+
+    else:
+        # Interactive fallback mode
+        # Option to change target plate
+        change_target = input(f"Current target plate: {detector.target_plate}\n"
+                              "Change target plate? (y/n) [n]: ").lower().strip()
+        if change_target == 'y':
+            new_target = input("Enter new target plate number: ").strip().upper()
+            if new_target:
+                detector.target_plate = new_target
+                print(f"✓ Target plate changed to: {detector.target_plate}")
+
+        # Option to change crop padding
+        change_padding = input(f"Current crop padding: {detector.crop_padding} pixels\n"
+                               "Change crop padding? (y/n) [n]: ").lower().strip()
+        if change_padding == 'y':
+            try:
+                new_padding = int(input("Enter new padding in pixels [100]: ") or "100")
+                if new_padding >= 0:
+                    detector.crop_padding = new_padding
+                    print(f"✓ Crop padding changed to: {detector.crop_padding} pixels")
+            except ValueError:
+                print("Invalid padding value, keeping default (100)")
+
+        # Process image interactively
+        detector.select_and_process_image()
 
 
 if __name__ == "__main__":
