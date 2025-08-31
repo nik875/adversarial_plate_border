@@ -239,7 +239,7 @@ class CornerPicker:
 # --------------------- Batch Runner ---------------------
 
 def list_images(root_dir):
-    exts = (".heic", ".heif")
+    exts = (".heic", ".heif", ".png")
     return [os.path.join(root_dir, n)
             for n in sorted(os.listdir(root_dir)) if n.lower().endswith(exts)]
 
