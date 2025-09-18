@@ -1,51 +1,64 @@
 #!/usr/bin/env python3
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-import kornia
-import kornia.geometry as K
-from PIL import Image, ImageDraw, ImageFont
-import torchvision.transforms as T
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import onnx
-import onnx2torch
-from open_image_models import LicensePlateDetector
+import os
 from typing import Tuple, List, Optional
 import logging
 import warnings
 import argparse
+from pathlib import Path
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch import optim
+import numpy as np
+from tqdm import tqdm
+import kornia
+import kornia.geometry as K
+import torchvision.transforms as T
+import matplotlib.pyplot as plt
+from matplotlib import patches
+import onnx
+import onnx2torch
+from open_image_models import LicensePlateDetector
+from dataset import create_dataloaders
 warnings.filterwarnings("ignore")
+
+
+PATCH_WIDTH = 256
+PATCH_HEIGHT = 128
 
 
 class AdversarialPatchTrainer:
     def __init__(self,
                  csv_path: str,
-                 patch_width: int = 64,
-                 patch_height: int = 32,
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-
-        self.device = torch.device(device)
-        self.patch_width = patch_width
-        self.patch_height = patch_height
-
-        # Load dataset
-        self.df = pd.read_csv(csv_path)
-        print(f"Loaded {len(self.df)} images")
-
-        # Initialize adversarial patch with Xavier initialization
-        self.patch = nn.Parameter(
-            torch.randn(3, patch_height, patch_width, device=self.device) * 0.1)
-
-        # Load YOLO model
-        self.load_yolo_model()
+                 device: str = None,
+                 grad_accumulate: int = None):
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
+
+        self.grad_accumulate = grad_accumulate
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+            elif torch.backends.mps.is_available():
+                self.device = 'mps'
+            else:
+                self.device = 'cpu'
+        else:
+            self.device = device
+        self.patch_width = PATCH_WIDTH
+        self.patch_height = PATCH_HEIGHT
+
+        self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
+                                                                preload=False, batch_size=1,
+                                                                n_jobs=1)
+
+        # Initialize adversarial patch with Xavier initialization
+        self.patch = nn.Parameter(
+            torch.randn(3, self.patch_height, self.patch_width, device=self.device) * 0.1)
+
+        # Load YOLO model
+        self.load_yolo_model()
 
         # Track statistics
         self.epoch_stats = []
@@ -53,11 +66,14 @@ class AdversarialPatchTrainer:
     def load_yolo_model(self):
         """Load and convert YOLO model to PyTorch"""
         print("Loading YOLO model...")
-        detector = LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+        LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
 
         # Get ONNX model path
-        model_cache_dir = Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
+        model_cache_dir = \
+            Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
         onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
+        ocr_path = \
+            Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
         if not onnx_path.exists():
             raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
@@ -67,185 +83,188 @@ class AdversarialPatchTrainer:
         self.model.to(self.device)
         self.model.eval()
 
+        ocr_model = onnx.load(str(ocr_path))
+        self.ocr_input_shape = (64, 128, 3)
+        alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
+        self.ocr_target = self.text_to_target_tensor('VRJ7774', 9, alphabet)
+        self.ocr = onnx2torch.convert(ocr_model).to(self.device)
+        self.ocr_loss = self.focal_cce_loss(len(alphabet))
+        self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
+        self.ocr.eval()
+
         # Disable gradients for model parameters to save memory
         for param in self.model.parameters():
             param.requires_grad = False
 
-    def load_image(self, image_path: str) -> torch.Tensor:
-        """Load and preprocess image"""
-        if not Path(image_path).exists():
-            raise FileNotFoundError(f"Image not found: {image_path}")
+    def text_to_target_tensor(self, plate_text: str, max_slots: int, alphabet: str):
+        """Convert 'ABC123' -> one-hot tensor [batch, seq_len, vocab_size]"""
+        # Pad with '_' to max_slots
+        padded = (plate_text + '_' * max_slots)[:max_slots]
 
-        image = Image.open(image_path).convert('RGB')
-        image = image.resize((384, 384))
-        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-        return image_tensor
+        # Convert to indices
+        indices = [alphabet.index(char) for char in padded]
 
-    def extract_homography_matrix(self, row) -> torch.Tensor:
-        """Extract homography matrix from CSV row"""
-        H = np.array([
-            [row['H00'], row['H01'], row['H02']],
-            [row['H10'], row['H11'], row['H12']],
-            [row['H20'], row['H21'], row['H22']]
-        ], dtype=np.float32)
+        # One-hot encode
+        target = torch.zeros(1, max_slots, len(alphabet))
+        for i, idx in enumerate(indices):
+            target[0, i, idx] = 1.0
 
-        if np.any(np.isnan(H)) or np.any(np.isinf(H)):
-            raise ValueError("Invalid homography matrix")
+        return target.to(self.device)
 
-        return torch.from_numpy(H).unsqueeze(0).to(self.device)
-
-    def get_license_plate_corners(self, row) -> torch.Tensor:
-        """Get license plate corner coordinates"""
-        corners = torch.tensor([
-            [row['p1_x'], row['p1_y']],
-            [row['p2_x'], row['p2_y']],
-            [row['p3_x'], row['p3_y']],
-            [row['p4_x'], row['p4_y']]
-        ], dtype=torch.float32, device=self.device).unsqueeze(0)
-
-        if torch.any(torch.isnan(corners)) or torch.any(corners < 0) or torch.any(corners > 384):
-            raise ValueError("Invalid corner coordinates")
-
-        return corners
-
-    def apply_patch_to_image(self, image: torch.Tensor, homography: torch.Tensor,
-                             corners: torch.Tensor, border_scale: float = 1.4) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply adversarial patch as a border around the license plate using homography transformation"""
+    def apply_patch_to_image(self, image: torch.Tensor,
+                             corners: torch.Tensor,
+                             border_scale: float = 1.4) \
+            -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply adversarial patch as border around license plate using homography"""
         batch_size = image.shape[0]
 
-        try:
-            # Normalize patch to [0, 1] range
-            patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
+        # Extract image dimensions dynamically
+        image_height, image_width = image.shape[2], image.shape[3]
+        # FIXED: kornia produces output with dimensions swapped, so we need to swap them back
+        # NOTE: This produces output matching input spatial dims
+        dsize = (image_height, image_width)
 
-            # Get the 4 corners of the license plate
-            plate_corners = corners[0]  # [4, 2]
+        # Normalize patch to [0, 1] range
+        patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
 
-            # Calculate center and create larger border quad
-            center_x = plate_corners[:, 0].mean()
-            center_y = plate_corners[:, 1].mean()
-            center = torch.tensor([center_x, center_y], device=self.device)
+        # Get the 4 corners of the license plate
+        plate_corners = corners[0]  # [4, 2]
 
-            border_corners = center.unsqueeze(
-                0) + (plate_corners - center.unsqueeze(0)) * border_scale
-            border_corners = border_corners.unsqueeze(0)  # [1, 4, 2]
+        # Calculate center and create larger border quad
+        center_x = plate_corners[:, 0].mean()
+        center_y = plate_corners[:, 1].mean()
+        center = torch.tensor([center_x, center_y], device=self.device)
 
-            # Create patch corner coordinates in patch space
-            patch_h, patch_w = self.patch_height, self.patch_width
-            src_corners = torch.tensor([
-                [0, 0], [patch_w, 0], [patch_w, patch_h], [0, patch_h]
-            ], dtype=torch.float32, device=self.device).unsqueeze(0)
+        border_corners = center.unsqueeze(
+            0) + (plate_corners - center.unsqueeze(0)) * border_scale
+        border_corners = border_corners.unsqueeze(0)  # [1, 4, 2]
 
-            # Compute perspective transformation matrices
-            M_border = K.get_perspective_transform(src_corners, border_corners)
-            M_plate = K.get_perspective_transform(src_corners, corners)
+        # Create patch corner coordinates in patch space
+        patch_h, patch_w = self.patch_height, self.patch_width
+        src_corners = torch.tensor([
+            [0, 0], [patch_w, 0], [patch_w, patch_h], [0, patch_h]
+        ], dtype=torch.float32, device=self.device).unsqueeze(0)
 
-            # Create and warp patch
-            patch_batch = patch_normalized.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-            warped_patch = K.warp_perspective(
-                patch_batch, M_border, dsize=(384, 384),
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )
+        # Compute perspective transformation matrices
+        M_border = K.get_perspective_transform(src_corners, border_corners)
+        M_plate = K.get_perspective_transform(src_corners, corners)
 
-            # Create masks
-            patch_mask = torch.ones(batch_size, 1, self.patch_height, self.patch_width,
-                                    dtype=torch.float32, device=self.device)
+        # Create and warp patch using dynamic image size
+        patch_batch = patch_normalized.unsqueeze(0).repeat(batch_size, 1, 1, 1)
 
-            warped_border_mask = K.warp_perspective(
-                patch_mask, M_border, dsize=(384, 384),
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )
+        warped_patch = K.warp_perspective(
+            patch_batch, M_border, dsize=dsize,  # Dynamic size
+            mode='bilinear', padding_mode='zeros', align_corners=True
+        )
 
-            warped_plate_mask = K.warp_perspective(
-                patch_mask, M_plate, dsize=(384, 384),
-                mode='bilinear', padding_mode='zeros', align_corners=True
-            )
+        # Create masks using dynamic image size
+        patch_mask = torch.ones(batch_size, 1, self.patch_height, self.patch_width,
+                                dtype=torch.float32, device=self.device)
 
-            # Final mask: border area minus license plate area
-            final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1)
-            final_mask = final_mask.expand(-1, 3, -1, -1)
+        warped_border_mask = K.warp_perspective(
+            patch_mask, M_border, dsize=dsize,  # Dynamic size
+            mode='bilinear', padding_mode='zeros', align_corners=True
+        )
 
-            # Apply patch with cutout
-            result_image = image * (1 - final_mask) + warped_patch * final_mask
-            result_image = torch.clamp(result_image, 0, 1)
+        warped_plate_mask = K.warp_perspective(
+            patch_mask, M_plate, dsize=dsize,  # Dynamic size
+            mode='bilinear', padding_mode='zeros', align_corners=True
+        )
 
-            return result_image, final_mask
+        # Final mask: border area minus license plate area
+        final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1)
+        final_mask = final_mask.expand(-1, 3, -1, -1)
 
-        except Exception as e:
-            print(f"Warning: Patch application failed: {e}")
-            return image, None
+        # Validate all tensors have matching spatial dimensions
+        if image.shape[2:] != final_mask.shape[2:]:
+            raise RuntimeError(
+                f"Image spatial dims {image.shape[2:]} != mask spatial dims {final_mask.shape[2:]}")
+        if image.shape[2:] != warped_patch.shape[2:]:
+            raise RuntimeError(
+                f"Image spatial dims {image.shape[2:]} != warped patch spatial dims {warped_patch.shape[2:]}")
 
-    def compute_detection_loss_full_image(self, model_output, ground_truth_box: torch.Tensor,
-                                          target_confidence: float = 0.1) -> torch.Tensor:
-        """Compute loss for full image detection"""
-        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        num_matched_detections = 0
+        # Apply patch with cutout
+        result_image = image * (1 - final_mask) + warped_patch * final_mask
+        result_image = torch.clamp(result_image, 0, 1)
 
-        if isinstance(model_output, (list, tuple)):
-            outputs = model_output
-        else:
-            outputs = [model_output]
+        return result_image, final_mask
 
-        for output in outputs:
-            if output is None or output.numel() == 0:
-                continue
+    def focal_cce_loss(
+        self,
+        vocabulary_size: int,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        label_smoothing: float = 0.01,
+    ):
+        """
+        Categorical focal cross-entropy loss - exact PyTorch replica of Keras version.
+        """
+        def cce(y_true, y_pred):
+            """
+            Computes the focal categorical cross-entropy loss.
 
-            # End-to-end YOLO format: [num_detections, 7]
-            if output.dim() == 2 and output.shape[-1] >= 7:
-                pred_boxes = output[:, 1:5]  # x1, y1, x2, y2
-                confidences = output[:, 6]   # confidence
+            Args:
+                y_true: One-hot encoded ground truth [batch, seq_len, vocab_size]
+                y_pred: Model predictions (logits or probabilities) [batch, seq_len, vocab_size]
+            """
+            # Exact replica: flatten both inputs to (-1, vocabulary_size)
+            y_true = y_true.reshape(-1, vocabulary_size)
+            y_pred = y_pred.reshape(-1, vocabulary_size)
 
-                if pred_boxes.shape[0] > 0:
-                    ious = self.compute_box_iou(pred_boxes, ground_truth_box.unsqueeze(0))
-                    ious = ious.squeeze(-1)
+            # Ensure y_pred are probabilities (Keras uses from_logits=False)
+            if y_pred.max() > 1.0 or y_pred.min() < 0.0:
+                y_pred = F.softmax(y_pred, dim=-1)
 
-                    best_match_idx = ious.argmax()
-                    best_iou = ious[best_match_idx]
+            # Apply label smoothing to y_true (if specified)
+            if label_smoothing > 0.0:
+                y_true = y_true * (1.0 - label_smoothing) + label_smoothing / vocabulary_size
 
-                    # Only apply loss if IoU > threshold
-                    if best_iou > 0.1:
-                        matched_confidence = confidences[best_match_idx]
-                        detection_loss = matched_confidence
-                        total_loss = total_loss + detection_loss
-                        num_matched_detections += 1
+            # Compute focal loss
+            # p_t is the probability of the true class
+            p_t = torch.sum(y_true * y_pred, dim=-1)  # [batch*seq]
 
-        # Return average loss or small default if no matches
-        if num_matched_detections > 0:
-            total_loss = total_loss / num_matched_detections
-        else:
-            total_loss = torch.tensor(0.001, device=self.device, requires_grad=True)
+            # Focal weight: (1 - p_t)^gamma
+            focal_weight = (1.0 - p_t) ** gamma
 
-        return total_loss
+            # Cross entropy: -log(p_t)
+            ce_loss = -torch.log(p_t + 1e-8)  # Small epsilon to prevent log(0)
 
-    def evaluate_detection_performance_full_image(
-            self, model_output, ground_truth_box: torch.Tensor) -> float:
-        """Evaluate detection performance for full image"""
-        max_matched_score = 0.0
+            # Combine: focal_loss = alpha * focal_weight * ce_loss
+            focal_loss = alpha * focal_weight * ce_loss
 
-        if isinstance(model_output, (list, tuple)):
-            outputs = model_output
-        else:
-            outputs = [model_output]
+            # Return mean (exact replica behavior)
+            return torch.mean(focal_loss)
 
-        for output in outputs:
-            if output is not None and output.dim() == 2 and output.shape[-1] >= 7:
-                pred_boxes = output[:, 1:5]
-                confidences = output[:, 6]
+        return cce
 
-                if pred_boxes.shape[0] > 0:
-                    ious = self.compute_box_iou(pred_boxes, ground_truth_box.unsqueeze(0))
-                    ious = ious.squeeze(-1)
+    def invert_bbox(self, corners, transform):
+        """Invert the given transformation to bring the corners back to original image"""
+        r, dw, dh = transform
+        # Undo operations in REVERSE order
+        corners = corners.clone()  # Make a copy to avoid view issues
+        corners[::2] = corners[::2] - dw
+        corners[1::2] = corners[1::2] - dh
+        corners = corners / r
+        return corners
 
-                    best_match_idx = ious.argmax()
-                    best_iou = ious[best_match_idx]
+    def bbox_to_corners(self, bbox, device=None):
+        x1, y1, x2, y2 = bbox
+        corners = torch.tensor([[
+            [x1, y1],  # top-left
+            [x2, y1],  # top-right
+            [x2, y2],  # bottom-right
+            [x1, y2]   # bottom-left
+        ]], device=device or self.device)  # [1, 4, 2]
+        return corners
 
-                    if best_iou > 0.1:
-                        matched_score = confidences[best_match_idx].item()
-                        max_matched_score = max(max_matched_score, matched_score)
+    def corners_to_bbox(self, corners):
+        min_x = torch.min(corners[:, 0])
+        max_x = torch.max(corners[:, 0])
+        min_y = torch.min(corners[:, 1])
+        max_y = torch.max(corners[:, 1])
+        return torch.stack([min_x, min_y, max_x, max_y])
 
-        return max_matched_score
-
-    def compute_box_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-        """Compute IoU between two sets of boxes"""
+    def boxes_IoU(self, boxes1, boxes2):
         area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
         area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
 
@@ -263,187 +282,214 @@ class AdversarialPatchTrainer:
         inter_height = torch.clamp(inter_y2 - inter_y1, min=0)
         inter_area = inter_width * inter_height
 
-        # Union area and IoU
-        union_area = area1.unsqueeze(1) + area2.unsqueeze(0) - inter_area
-        iou = inter_area / (union_area + 1e-8)
-        return iou
+        # Union area = area1 + area2 - intersection_area
+        union_area = area1 + area2 - inter_area
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int,
-                    debug_first_image=False) -> Tuple[float, float, int]:
-        """Train for one epoch"""
-        total_loss = 0.0
-        successful_images = 0
-        detection_scores = []
+        # Intersection area / ground truth area
+        return inter_area / (union_area + 1e-8)
 
-        # Shuffle dataset
-        shuffled_df = self.df.sample(frac=1, random_state=epoch).reset_index(drop=True)
-        train_size = int(0.8 * len(shuffled_df))
-        train_df = shuffled_df[:train_size]
+    def partial_loss(self, batch, use_ocr_baseline=True):
+        # Load original image (no patch)
+        prep_image = batch['prep_image'].to(self.device)
+        corners = batch['new_corners'].to(self.device)
+        ground_truth = self.corners_to_bbox(corners)
 
-        desc = f"Epoch {epoch+1} - Training"
-        with tqdm(range(len(train_df)), desc=desc, leave=False) as pbar:
-            for idx in pbar:
-                row = train_df.iloc[idx]
+        # Run YOLO detection on full patched image
+        model_output = self.model(prep_image.unsqueeze(0))
 
-                try:
-                    # Load and preprocess image
-                    image = self.load_image(row['processed_filename'])
-                    homography = self.extract_homography_matrix(row)
-                    corners = self.get_license_plate_corners(row)
+        best_detection = None
+        det_loss = 0.0
 
-                    # Apply adversarial patch to full image
-                    patched_image, patch_mask = self.apply_patch_to_image(
-                        image, homography, corners)
-                    if patch_mask is None:
-                        continue
+        for detection in model_output:
 
-                    # Create ground truth box from corners
-                    x_coords = corners[0, :, 0]
-                    y_coords = corners[0, :, 1]
-                    ground_truth_box = torch.tensor([
-                        x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()
-                    ], device=self.device)
+            pred_box = detection[1:5]
+            conf = detection[6]
+            IoU = self.boxes_IoU(pred_box.unsqueeze(0), ground_truth.unsqueeze(0))
+            this_det_loss = IoU * conf
 
-                    # Run YOLO detection on full patched image
-                    detection_output = self.model(patched_image)
+            if this_det_loss > det_loss:
+                det_loss = this_det_loss
+                best_detection = detection
 
-                    # DEBUG PRINTS FOR FIRST IMAGE
-                    if debug_first_image and idx == 0:
-                        print(f"\n{'='*80}")
-                        print(f"DEBUG: FIRST IMAGE OF EPOCH {epoch+1}")
-                        print(f"{'='*80}")
-                        print(f"Image: {row['processed_filename']}")
-                        print(f"Ground truth box: {ground_truth_box}")
-                        print(f"Processing full 384x384 image (no ROI extraction)")
+        ocr_loss = 0.0
+        if best_detection is not None:
+            pred_box = best_detection[1:5]
+            orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
+            corners_box = self.bbox_to_corners(orig_projection, device='cpu')
 
-                        # Print raw model output structure
-                        print(
-                            f"\nModel output type: {type(detection_output)} (length: {len(detection_output)})")
-                        for i, output in enumerate(detection_output):
-                            print(f"  Output[{i}] shape: {output.shape}")
-                            print(f"  Output[{i}] dtype: {output.dtype}")
-                            print(f"  Output[{i}] device: {output.device}")
+            # Use crop_and_resize instead
+            cropped_plate = kornia.geometry.crop_and_resize(
+                batch['orig_image'].unsqueeze(0),                           # [1, C, H, W]
+                corners_box,                     # [1, 4, 2] - corner coordinates
+                self.ocr_input_shape[:2],       # (H, W) tuple
+                mode='bilinear',
+                align_corners=True
+            ).to(self.device)  # Only move small image to gpu
 
-                            # Print full tensor values
-                            print(f"  Output[{i}] full tensor:")
-                            print(f"    {output}")
+            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255  # NHWC
+            ocr_output = self.ocr(ocr_input)
+            ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
+            if use_ocr_baseline:
+                if not hasattr(self, 'ocr_baseline'):
+                    raise ValueError('Must call calculate_baseline_loss before using!')
+                ocr_loss = self.ocr_baseline / ocr_loss
 
-                            # Parse and explain the values
-                            print(
-                                f"\n  PARSING Output[{i}] (format: [num_detections, 7]):")
-                            print(f"    Tensor columns explanation:")
-                            print(
-                                f"      Column 0: ? (value {output[0]})")
-                            print(f"      Columns 1-4: Bounding box [x1, y1, x2, y2]")
-                            print(f"      Column 5: Class ID")
-                            print(f"      Column 6: Confidence score")
+        return det_loss, ocr_loss
 
-                            print(f"\n    Detection {i}:")
-                            print(f"      Raw values: {output}")
-                            print(
-                                f"      Bounding box: [{output[1]:.2f}, {output[2]:.2f}, {output[3]:.2f}, {output[4]:.2f}]")
-                            print(f"      Class ID: {output[5]:.1f}")
-                            print(f"      Confidence: {output[6]:.6f}")
+    def calculate_baseline_loss(self) -> float:
+        """
+        Calculate baseline OCR loss across entire dataset using ground truth boxes.
 
-                            # Calculate IoU with ground truth
-                            pred_box = output[1:5]
-                            iou = self.compute_box_iou(
-                                pred_box.unsqueeze(0), ground_truth_box.unsqueeze(0))
-                            print(
-                                f"      IoU with ground truth: {iou.item():.6f}")
-                            print(
-                                f"      Will be used in loss? {'YES' if iou.item() > 0.1 else 'NO'} (threshold: 0.1)")
+        Returns:
+            Average OCR loss across all images and plates
+        """
+        total_ocr_loss = 0.0
+        total_det_loss = 0.0
+        total_plates = 0
 
-                        print(f"{'='*80}")
-                        print(f"END DEBUG FOR FIRST IMAGE")
-                        print(f"{'='*80}\n")
-
-                    # Compute loss and update statistics
-                    loss = self.compute_detection_loss_full_image(
-                        detection_output, ground_truth_box)
-                    loss.backward()
-
-                    total_loss += loss.item()
-                    successful_images += 1
-
-                    detection_score = self.evaluate_detection_performance_full_image(
-                        detection_output, ground_truth_box)
-                    detection_scores.append(detection_score)
+        desc = "Calculating baseline OCR loss"
+        with tqdm(self.train_loader, desc=desc, leave=False) as pbar:
+            with torch.no_grad():
+                for batch in pbar:
+                    batch = {k: v[0] for k, v in batch.items()}  # Remove batch dim
+                    det_loss, ocr_loss = self.partial_loss(batch, use_ocr_baseline=False)
+                    total_det_loss += det_loss
+                    total_ocr_loss += ocr_loss
+                    total_plates += 1
 
                     # Update progress bar
-                    if successful_images > 0:
-                        avg_loss = total_loss / successful_images
-                        avg_detection = np.mean(detection_scores)
+                    avg_ocr = total_ocr_loss / total_plates
+                    avg_det = total_det_loss / total_plates
+                    pbar.set_postfix({
+                        'Avg_Detection_Loss': f'{avg_det.item():.4f}',
+                        'Avg_OCR_Loss': f'{avg_ocr.item():.4f}'
+                    })
 
-                        pbar.set_postfix({
-                            'Loss': f'{avg_loss:.4f}',
-                            'Det': f'{avg_detection:.3f}',
-                            'Success': f'{successful_images}/{idx+1}',
-                            'Patch_Std': f'{self.patch.std().item():.3f}'
-                        })
+        return total_det_loss / total_plates, total_ocr_loss / total_plates
 
-                except Exception as e:
-                    # Fail loudly with full error details
-                    print(f"\nFATAL ERROR processing {row.get('processed_filename', 'unknown')}:")
-                    print(f"Error type: {type(e).__name__}")
-                    print(f"Error message: {str(e)}")
-                    print(f"Row data: {row.to_dict()}")
-                    raise e
+    def compute_loss_full_image(self, batch: dict, use_ocr_baseline=True) -> torch.Tensor:
+        """Compute loss for full image detection"""
 
-        # Apply accumulated gradients
-        if successful_images > 0:
-            torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+        batch = {k: v[0] for k, v in batch.items()}  # Remove batch dim
 
-        avg_loss = total_loss / successful_images if successful_images > 0 else float('inf')
-        avg_detection_score = np.mean(detection_scores) if detection_scores else 1.0
+        # Apply adversarial patch to YOLO input
+        patched_image, _ = self.apply_patch_to_image(
+            batch['prep_image'].to(self.device).unsqueeze(0),
+            batch['new_corners'].to(self.device).unsqueeze(0)
+        )
+        # Overwrite batch's image with patched version
+        batch['prep_image'] = patched_image.squeeze()
 
-        return avg_loss, avg_detection_score, successful_images
+        # Apply adversarial patch to full original image
+        patched_image, _ = self.apply_patch_to_image(
+            batch['orig_image'].to(self.device).unsqueeze(0),
+            batch['orig_corners'].to(self.device).unsqueeze(0)
+        )
+        # Overwrite batch's image with patched version
+        batch['orig_image'] = patched_image.squeeze()
 
-    def validate(self, epoch: int) -> Tuple[float, int]:
+        det_loss, ocr_loss = self.partial_loss(batch, use_ocr_baseline=use_ocr_baseline)
+        return (det_loss + ocr_loss) / 2
+
+    def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
+        """Train for one epoch with gradient accumulation"""
+        total_loss = 0.0
+        accumulation_loss = 0.0
+        step_count = 0
+
+        # Determine update frequency
+        update_every = len(
+            self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
+        effective_batch_size = update_every
+
+        desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
+        with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
+                  total=len(self.train_loader)) as pbar:
+
+            for idx, batch in pbar:
+                # Compute loss and scale by accumulation steps
+                loss = self.compute_loss_full_image(batch)
+                scaled_loss = loss / effective_batch_size
+
+                # Backward pass (accumulate gradients)
+                scaled_loss.backward()
+
+                # Track losses
+                accumulation_loss += loss.item()
+                step_count += 1
+
+                # Update model every update_every steps (or at the very end if None)
+                if step_count % update_every == 0:
+                    # Apply accumulated gradients
+                    torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # Add accumulated loss to total
+                    total_loss += accumulation_loss
+
+                    # Memory cleanup after update
+                    del loss, scaled_loss
+                    if self.device == 'cuda':
+                        torch.cuda.empty_cache()
+                    elif self.device == 'mps':
+                        torch.mps.empty_cache()
+
+                    # Reset accumulation tracking
+                    accumulation_loss = 0.0
+
+                    # Update progress bar
+                    if self.grad_accumulate is None:
+                        # Single update at end - show total progress
+                        pbar.set_postfix(
+                            {'Loss': f"{total_loss / len(self.train_loader):.4f}", 'Mode': 'End-Update'})
+                    else:
+                        # Regular accumulation updates
+                        effective_batches_processed = step_count // self.grad_accumulate
+                        avg_loss = total_loss / \
+                            (effective_batches_processed *
+                             self.grad_accumulate) if effective_batches_processed > 0 else 0
+                        pbar.set_postfix({'Loss': f"{avg_loss:.4f}",
+                                         'Updates': effective_batches_processed})
+                else:
+                    # Just cleanup current tensors, keep gradients
+                    del loss, scaled_loss
+
+                    # Show accumulation progress
+                    pbar.set_postfix({
+                        'AccumLoss': f"{accumulation_loss / step_count:.4f}",
+                        'Progress': f"{step_count % update_every}/{update_every}"
+                    })
+
+            # Handle remaining accumulated gradients (should only happen with regular
+            # grad_accumulate, not None)
+            if step_count % update_every != 0 and self.grad_accumulate is not None:
+                torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                # Add remaining accumulated loss
+                total_loss += accumulation_loss
+
+                # Final memory cleanup
+                if self.device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif self.device == 'mps':
+                    torch.mps.empty_cache()
+
+        # Return average loss per batch
+        return total_loss / len(self.train_loader)
+
+    def validate(self) -> Tuple[float, int]:
         """Validation pass on held-out data"""
-        detection_scores = []
-        successful_validations = 0
-
-        shuffled_df = self.df.sample(frac=1, random_state=epoch).reset_index(drop=True)
-        train_size = int(0.8 * len(shuffled_df))
-        val_df = shuffled_df[train_size:]
+        losses = []
 
         with torch.no_grad():
-            for idx in range(min(30, len(val_df))):
-                row = val_df.iloc[idx]
+            for batch in self.val_loader:
+                loss = self.compute_loss_full_image(batch)
+                losses.append(loss.detach().cpu().item())
 
-                try:
-                    image = self.load_image(row['processed_filename'])
-                    homography = self.extract_homography_matrix(row)
-                    corners = self.get_license_plate_corners(row)
-
-                    # Apply adversarial patch to full image
-                    patched_image, patch_mask = self.apply_patch_to_image(
-                        image, homography, corners)
-                    if patch_mask is None:
-                        continue
-
-                    # Create ground truth box from corners
-                    x_coords = corners[0, :, 0]
-                    y_coords = corners[0, :, 1]
-                    ground_truth_box = torch.tensor([
-                        x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()
-                    ], device=self.device)
-
-                    # Run YOLO detection on full patched image
-                    detection_output = self.model(patched_image)
-                    detection_score = self.evaluate_detection_performance_full_image(
-                        detection_output, ground_truth_box)
-                    detection_scores.append(detection_score)
-                    successful_validations += 1
-
-                except Exception:
-                    continue
-
-        avg_val_score = np.mean(detection_scores) if detection_scores else 1.0
-        return avg_val_score, successful_validations
+        return np.mean(losses)
 
     def save_patch(self, epoch: int, save_dir: str = "patches"):
         """Save current patch state"""
@@ -471,27 +517,24 @@ class AdversarialPatchTrainer:
             optimizer, mode='min', patience=5, factor=0.5
         )
 
-        history = {
-            'loss': [], 'detection_score': [], 'val_score': [],
-            'learning_rate': [], 'successful_images': []
-        }
+        history = {'loss': [], 'val_score': [], 'learning_rate': []}
 
         best_loss = float('inf')
         patience_counter = 0
 
-        print(f"\nStarting adversarial patch training")
-        print(f"   Dataset: {len(self.df)} images")
+        print("\nStarting adversarial patch training")
+        print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
         print(f"   Initial LR: {learning_rate}")
-        print(f"   Processing: Full 384x384 images only")
+        print("   Processing: Full 384x384 images only")
         print("-" * 60)
 
         for epoch in range(num_epochs):
             # Training and validation
-            train_loss, train_detection_score, successful_imgs = self.train_epoch(optimizer, epoch)
-            val_detection_score, val_imgs = self.validate(epoch)
+            train_loss = self.train_epoch(optimizer, epoch)
+            val_detection_score = self.validate()
 
             # Learning rate scheduling
             scheduler.step(train_loss)
@@ -499,10 +542,8 @@ class AdversarialPatchTrainer:
 
             # Record history
             history['loss'].append(train_loss)
-            history['detection_score'].append(train_detection_score)
             history['val_score'].append(val_detection_score)
             history['learning_rate'].append(current_lr)
-            history['successful_images'].append(successful_imgs)
 
             # Calculate detection reduction
             initial_detection = history['val_score'][0] if len(history['val_score']) > 0 else 1.0
@@ -511,11 +552,9 @@ class AdversarialPatchTrainer:
             # Print epoch summary
             print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                   f"Loss: {train_loss:.4f} | "
-                  f"Train Det: {train_detection_score:.3f} | "
                   f"Val Det: {val_detection_score:.3f} | "
                   f"Reduction: {detection_reduction:+.1f}% | "
-                  f"LR: {current_lr:.2e} | "
-                  f"Success: {successful_imgs}/{int(0.8*len(self.df))}")
+                  f"LR: {current_lr:.2e} | ")
 
             # Save best model
             if val_detection_score < best_loss:
@@ -542,7 +581,7 @@ class AdversarialPatchTrainer:
                     print("   Converged: Loss stabilized")
                     break
 
-        print(f"\nTraining completed!")
+        print("\nTraining completed!")
         print(f"   Best loss: {best_loss:.4f}")
         final_reduction = (1 - history['val_score'][-1] / history['val_score'][0]) * 100
         print(f"   Detection reduction: {final_reduction:.1f}%")
@@ -550,77 +589,99 @@ class AdversarialPatchTrainer:
         return history
 
 
+# Add this new function for loading patches:
+def load_patch_from_file(patch_file: str, target_height: int, target_width: int, device):
+    """Load and prepare a patch from an image file"""
+    from PIL import Image
+    import torchvision.transforms as transforms
+
+    if not os.path.exists(patch_file):
+        raise FileNotFoundError(f"Patch file not found: {patch_file}")
+
+    try:
+        # Load image
+        patch_img = Image.open(patch_file).convert('RGB')
+        print(f"Loaded patch image: {patch_img.size}")
+
+        # Resize to target dimensions
+        transform = transforms.Compose([
+            transforms.Resize((target_height, target_width)),
+            transforms.ToTensor()
+        ])
+
+        patch_tensor = transform(patch_img).to(device)
+
+        # Ensure values are in [0, 1] range
+        patch_tensor = torch.clamp(patch_tensor, 0, 1)
+
+        print(f"Patch tensor shape: {patch_tensor.shape}")
+        print(f"Patch value range: [{patch_tensor.min():.3f}, {patch_tensor.max():.3f}]")
+
+        return patch_tensor
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to load patch from {patch_file}: {str(e)}")
+
+
 def test_detection_visualization(csv_path: str, output_path: str = "test_detection.png"):
-    """Test mode: visualize YOLO detections on a single image without patch"""
+    """Test mode: visualize YOLO detections on a single image without patch using dataloader"""
     print("Running test mode - visualizing detections on sample image...")
 
-    df = pd.read_csv(csv_path)
-    if len(df) == 0:
-        raise ValueError("No images found in dataset")
+    trainer = AdversarialPatchTrainer(csv_path)
 
-    row = df.iloc[0]
-    print(f"Testing on: {row['processed_filename']}")
+    # Use the existing dataloader system - get first batch
+    batch = next(iter(trainer.train_loader))
+    batch = {k: v[0] for k, v in batch.items()}  # Remove batch dim like in training
 
-    trainer = AdversarialPatchTrainer(csv_path, patch_width=64, patch_height=32)
+    print(f"Testing on image from dataloader batch")
 
-    # Load and process the test image
-    image = trainer.load_image(row['processed_filename'])
-    corners = trainer.get_license_plate_corners(row)
+    # Get the preprocessed image and corners from dataloader
+    prep_image = batch['prep_image'].to(trainer.device)
+    corners = batch['new_corners'].to(trainer.device)
+    ground_truth = trainer.corners_to_bbox(corners)  # Use same format as partial_loss
 
-    # Run YOLO detection on full image
+    # Run YOLO detection on full image using existing method
     with torch.no_grad():
-        detection_output = trainer.model(image)
-
-    # Create ground truth box
-    x_coords = corners[0, :, 0]
-    y_coords = corners[0, :, 1]
-    ground_truth_box = torch.tensor([
-        x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()
-    ], device=trainer.device)
+        model_output = trainer.model(prep_image.unsqueeze(0))
 
     print(f"\nDetection Results:")
-    print(f"Ground truth box: {ground_truth_box}")
+    print(f"Ground truth box: {ground_truth}")
 
-    # Parse YOLO output
-    if isinstance(detection_output, (list, tuple)):
-        outputs = detection_output
-    else:
-        outputs = [detection_output]
-
+    # Parse detections and calculate IoUs like in partial_loss
     all_detections = []
-    for i, output in enumerate(outputs):
-        if output is not None and output.dim() == 2 and output.shape[0] > 0:
-            pred_boxes = output[:, 1:5]
-            confidences = output[:, 6]
-            class_ids = output[:, 5]
+    for detection in model_output:
+        pred_box = detection[1:5]
+        conf = detection[6]
+        class_id = detection[5]
+        IoU = trainer.boxes_IoU(pred_box.unsqueeze(0), ground_truth.unsqueeze(0)).squeeze()
 
-            ious = trainer.compute_box_iou(pred_boxes, ground_truth_box.unsqueeze(0)).squeeze(-1)
+        # Convert back to original image coordinates if needed
+        orig_projection = trainer.invert_bbox(pred_box.to('cpu'), batch['transform'])
 
-            print(f"\nOutput {i}:")
-            for j in range(len(pred_boxes)):
-                print(f"  Detection {j}: Box={pred_boxes[j]}, Conf={confidences[j]:.4f}, "
-                      f"Class={class_ids[j]:.0f}, IoU={ious[j]:.4f}")
+        print(f"  Detection: Box={pred_box}, Conf={conf:.4f}, Class={class_id:.0f}, IoU={IoU:.4f}")
 
-                all_detections.append({
-                    'box': pred_boxes[j].cpu().numpy(),
-                    'confidence': confidences[j].item(),
-                    'class_id': int(class_ids[j].item()),
-                    'iou': ious[j].item()
-                })
+        all_detections.append({
+            'box': pred_box.cpu().numpy(),
+            'orig_box': orig_projection.numpy(),
+            'confidence': conf.item(),
+            'class_id': int(class_id.item()),
+            'iou': IoU.item()
+        })
 
     # Create visualization
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
 
-    # Original image with ground truth
-    original_img = image[0].permute(1, 2, 0).cpu().numpy()
-    ax1.imshow(original_img)
-    ax1.set_title('Full Image with Ground Truth & Detections')
+    # Original preprocessed image with detections
+    prep_img = prep_image.permute(1, 2, 0).detach().cpu().numpy()
+    ax1.imshow(prep_img)
+    ax1.set_title('Preprocessed Image (384x384) with Detections')
 
     # Draw ground truth box
+    ground_truth = ground_truth.detach().cpu().numpy()
     gt_rect = patches.Rectangle(
-        (ground_truth_box[0], ground_truth_box[1]),
-        ground_truth_box[2] - ground_truth_box[0],
-        ground_truth_box[3] - ground_truth_box[1],
+        (ground_truth[0], ground_truth[1]),
+        ground_truth[2] - ground_truth[0],
+        ground_truth[3] - ground_truth[1],
         linewidth=3, edgecolor='green', facecolor='none', label='Ground Truth'
     )
     ax1.add_patch(gt_rect)
@@ -647,13 +708,13 @@ def test_detection_visualization(csv_path: str, output_path: str = "test_detecti
     ax2.axis('off')
     ax2.set_title('Detection Analysis', pad=20)
 
-    analysis_text = f"Dataset: {len(df)} images\n"
-    analysis_text += f"Test image: {Path(row['processed_filename']).name}\n"
-    analysis_text += f"Image size: 384x384 (full image processing)\n\n"
+    analysis_text = f"Using new dataloader system\n"
+    analysis_text += f"Dataset: {len(trainer.train_loader) + len(trainer.val_loader)} batches\n"
+    analysis_text += f"Image size: 384x384 (preprocessed)\n\n"
 
     analysis_text += f"Ground Truth Box:\n"
-    analysis_text += f"  [{ground_truth_box[0]:.1f}, {ground_truth_box[1]:.1f}, "
-    analysis_text += f"{ground_truth_box[2]:.1f}, {ground_truth_box[3]:.1f}]\n\n"
+    analysis_text += f"  Top-left: [{ground_truth[0]:.1f}, {ground_truth[1]:.1f}]\n"
+    analysis_text += f"  Bottom-right: [{ground_truth[2]:.1f}, {ground_truth[3]:.1f}]\n\n"
 
     analysis_text += f"YOLO Detections: {len(all_detections)}\n"
     for i, det in enumerate(all_detections):
@@ -690,220 +751,770 @@ def test_detection_visualization(csv_path: str, output_path: str = "test_detecti
         print(f"Best IoU: {best_iou:.4f}")
 
 
-def debug_patch_application(csv_path: str, output_path: str = "debug_patch.png"):
-    """Debug mode: Apply a blank white patch and visualize the result"""
-    print("Running debug patch mode - applying blank white patch...")
+def debug_patch_application(csv_path: str, patch_file: str = None,
+                            output_path: str = "debug_patch.png"):
+    """Debug mode: apply patch and visualize impact on detection"""
+    print("Running debug patch mode...")
 
-    df = pd.read_csv(csv_path)
-    if len(df) == 0:
-        raise ValueError("No images found in dataset")
+    # Initialize trainer
+    trainer = AdversarialPatchTrainer(csv_path)
 
-    row = df.iloc[0]
-    print(f"Testing on: {row['processed_filename']}")
+    # Get random batch from dataloader
+    import random
+    batch = next(iter(trainer.train_loader))
+    batch = {k: v[0] for k, v in batch.items()}  # Remove batch dim like in training
 
-    trainer = AdversarialPatchTrainer(csv_path, patch_width=64, patch_height=32)
+    print(f"Selected random image from {len(trainer.train_loader)} available batches")
 
-    # Create blank white patch
-    white_patch = torch.ones(3, trainer.patch_height, trainer.patch_width, device=trainer.device)
-    original_patch = trainer.patch.clone()
-    trainer.patch.data = white_patch
+    # Get image and ground truth
+    prep_image = batch['prep_image'].to(trainer.device)
+    corners = batch['new_corners'].to(trainer.device)
+    ground_truth = trainer.corners_to_bbox(corners)
 
-    # Load and process the test image
-    image = trainer.load_image(row['processed_filename'])
-    corners = trainer.get_license_plate_corners(row)
-    homography = trainer.extract_homography_matrix(row)
+    print(f"Image shape: {prep_image.shape}")
+    print(f"Ground truth box: {ground_truth}")
 
-    # Apply white patch to full image
-    patched_image, patch_mask = trainer.apply_patch_to_image(image, homography, corners)
-
-    # Create ground truth box
-    x_coords = corners[0, :, 0]
-    y_coords = corners[0, :, 1]
-    ground_truth_box = torch.tensor([
-        x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()
-    ], device=trainer.device)
-
-    # Run YOLO on both original and patched full images
+    # Run detection on original image
+    print("Running detection on original image...")
     with torch.no_grad():
-        original_output = trainer.model(image)
-        patched_output = trainer.model(patched_image)
+        original_output = trainer.model(prep_image.unsqueeze(0))
 
-    # Parse outputs
-    def parse_yolo_output(output, gt_box):
-        if isinstance(output, (list, tuple)):
-            outputs = output
-        else:
-            outputs = [output]
+    # Parse original detections using same logic as partial_loss
+    original_detections = []
+    best_original_iou = 0.0
+    best_original_conf = 0.0
+    best_original_detection = None
 
-        all_dets = []
-        for out in outputs:
-            if out is not None and out.dim() == 2 and out.shape[0] > 0:
-                pred_boxes = out[:, 1:5]
-                confidences = out[:, 6]
-                class_ids = out[:, 5]
-                ious = trainer.compute_box_iou(pred_boxes, gt_box.unsqueeze(0)).squeeze(-1)
+    for detection in original_output:
+        pred_box = detection[1:5]
+        conf = detection[6]
+        class_id = detection[5]
+        iou = trainer.boxes_IoU(pred_box.unsqueeze(0), ground_truth.unsqueeze(0)).squeeze()
 
-                for j in range(len(pred_boxes)):
-                    all_dets.append({
-                        'box': pred_boxes[j].cpu().numpy(),
-                        'confidence': confidences[j].item(),
-                        'class_id': int(class_ids[j].item()),
-                        'iou': ious[j].item()
-                    })
-        return all_dets
+        det_info = {
+            'box': pred_box.cpu().numpy(),
+            'confidence': conf.item(),
+            'class_id': int(class_id.item()),
+            'iou': iou.item()
+        }
+        original_detections.append(det_info)
 
-    original_dets = parse_yolo_output(original_output, ground_truth_box)
-    patched_dets = parse_yolo_output(patched_output, ground_truth_box)
+        if iou.item() > best_original_iou:
+            best_original_iou = iou.item()
+            best_original_detection = det_info
+        if conf.item() > best_original_conf:
+            best_original_conf = conf.item()
 
-    # Find best matches
-    best_original = max(original_dets, key=lambda x: x['iou']) if original_dets else None
-    best_patched = max(patched_dets, key=lambda x: x['iou']) if patched_dets else None
+    print(f"Original detections found: {len(original_detections)}")
 
-    print(f"\nOriginal full image:")
-    print(
-        f"  Best detection: Conf={best_original['confidence']:.4f}, IoU={best_original['iou']:.4f}" if best_original else "  No detections")
+    # Load or create patch
+    if patch_file:
+        print(f"Loading patch from: {patch_file}")
+        patch_tensor = load_patch_from_file(patch_file, PATCH_HEIGHT, PATCH_WIDTH, trainer.device)
+        # Convert to parameter format that matches trainer.patch (inverse of tanh normalization)
+        # patch = tanh^(-1)((patch_tensor * 2) - 1) but clamp to avoid inf
+        patch = torch.arctanh(torch.clamp(patch_tensor * 2 - 1, -0.99, 0.99))
+    else:
+        print("Using default white patch")
+        # Create white patch (arctanh(0.99) ≈ 2.6, so this will give white after tanh normalization)
+        patch = torch.full((3, PATCH_HEIGHT, PATCH_WIDTH), 2.6, device=trainer.device)
 
-    print(f"\nWith white patch on full image:")
-    print(
-        f"  Best detection: Conf={best_patched['confidence']:.4f}, IoU={best_patched['iou']:.4f}" if best_patched else "  No detections")
+    # Temporarily replace trainer's patch for visualization
+    original_patch = trainer.patch.data.clone()
+    trainer.patch.data = patch
 
-    # Create visualization
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+    # Apply patch using trainer's method
+    print("Applying patch to image...")
+    patched_image, patch_mask = trainer.apply_patch_to_image(
+        prep_image.unsqueeze(0), corners.unsqueeze(0))
 
-    # Original image
-    orig_img = image[0].permute(1, 2, 0).cpu().numpy()
+    if patched_image is None:
+        raise RuntimeError("apply_patch_to_image returned None")
+    if patch_mask is None:
+        print("Warning: No patch mask generated (patch application may have failed)")
+
+    patched_image = patched_image.squeeze(0)
+
+    # Run detection on patched image
+    print("Running detection on patched image...")
+    with torch.no_grad():
+        patched_output = trainer.model(patched_image.unsqueeze(0))
+
+    # Parse patched detections
+    patched_detections = []
+    best_patched_iou = 0.0
+    best_patched_conf = 0.0
+    best_patched_detection = None
+
+    for detection in patched_output:
+        pred_box = detection[1:5]
+        conf = detection[6]
+        class_id = detection[5]
+        iou = trainer.boxes_IoU(pred_box.unsqueeze(0), ground_truth.unsqueeze(0)).squeeze()
+
+        det_info = {
+            'box': pred_box.cpu().numpy(),
+            'confidence': conf.item(),
+            'class_id': int(class_id.item()),
+            'iou': iou.item()
+        }
+        patched_detections.append(det_info)
+
+        if iou.item() > best_patched_iou:
+            best_patched_iou = iou.item()
+            best_patched_detection = det_info
+        if conf.item() > best_patched_conf:
+            best_patched_conf = conf.item()
+
+    print(f"Patched detections found: {len(patched_detections)}")
+
+    # Restore original patch
+    trainer.patch.data = original_patch
+
+    # Calculate impact metrics
+    iou_reduction = ((best_original_iou - best_patched_iou) /
+                     best_original_iou * 100) if best_original_iou > 0 else 0
+    conf_reduction = ((best_original_conf - best_patched_conf) /
+                      best_original_conf * 100) if best_original_conf > 0 else 0
+    detection_count_change = len(patched_detections) - len(original_detections)
+
+    print(f"\nPatch Impact Results:")
+    print(f"Original - Best IoU: {best_original_iou:.4f}, Best Conf: {best_original_conf:.4f}")
+    print(f"Patched  - Best IoU: {best_patched_iou:.4f}, Best Conf: {best_patched_conf:.4f}")
+    print(f"Reduction - IoU: {iou_reduction:.1f}%, Confidence: {conf_reduction:.1f}%")
+    print(f"Detection count change: {detection_count_change:+d}")
+
+    # Create comprehensive visualization with 4x4 layout
+    fig = plt.figure(figsize=(28, 20))
+
+    # Row 1: Image comparisons
+    # Original image with detections
+    ax1 = plt.subplot(4, 4, 1)
+    orig_img = prep_image.permute(1, 2, 0).detach().cpu().numpy()
     ax1.imshow(orig_img)
-    ax1.set_title('Original Full Image')
+    ax1.set_title(f'Original Image\n({len(original_detections)} detections)')
 
     # Draw ground truth
-    gt_rect = patches.Rectangle(
-        (ground_truth_box[0], ground_truth_box[1]),
-        ground_truth_box[2] - ground_truth_box[0],
-        ground_truth_box[3] - ground_truth_box[1],
-        linewidth=3, edgecolor='green', facecolor='none', label='Ground Truth'
-    )
+    gt = ground_truth.detach().cpu().numpy()
+    gt_rect = patches.Rectangle((gt[0], gt[1]), gt[2] - gt[0], gt[3] - gt[1],
+                                linewidth=3, edgecolor='green', facecolor='none', label='Ground Truth')
     ax1.add_patch(gt_rect)
 
-    # Draw best original detection
-    if best_original and best_original['iou'] > 0.1:
-        box = best_original['box']
-        orig_rect = patches.Rectangle(
-            (box[0], box[1]), box[2] - box[0], box[3] - box[1],
-            linewidth=2, edgecolor='blue', facecolor='none',
-            label=f'YOLO: {best_original["confidence"]:.3f}'
-        )
-        ax1.add_patch(orig_rect)
-    ax1.legend()
+    # Draw original detections (top 5)
+    colors = ['red', 'orange', 'purple', 'brown', 'pink']
+    for i, det in enumerate(original_detections[:5]):
+        box = det['box']
+        color = colors[i % len(colors)]
+        rect = patches.Rectangle((box[0], box[1]), box[2] - box[0], box[3] - box[1],
+                                 linewidth=2, edgecolor=color, facecolor='none', alpha=0.8)
+        ax1.add_patch(rect)
+        ax1.text(box[0], box[1] - 5, f'{det["confidence"]:.3f}',
+                 color=color, fontsize=8, weight='bold',
+                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
 
-    # Patched image
-    patched_img = patched_image[0].permute(1, 2, 0).detach().cpu().numpy()
+    if best_original_detection:
+        ax1.text(0.02, 0.98, f'Best: IoU={best_original_detection["iou"]:.3f}',
+                 transform=ax1.transAxes, fontsize=10, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+    ax1.legend(loc='upper right')
+
+    # Patched image with detections
+    ax2 = plt.subplot(4, 4, 2)
+    patched_img = patched_image.permute(1, 2, 0).detach().cpu().numpy()
     ax2.imshow(patched_img)
-    ax2.set_title('Full Image With White Patch')
+    ax2.set_title(f'Patched Image with Detections\n({len(patched_detections)} detections)')
 
     # Draw ground truth
-    gt_rect2 = patches.Rectangle(
-        (ground_truth_box[0], ground_truth_box[1]),
-        ground_truth_box[2] - ground_truth_box[0],
-        ground_truth_box[3] - ground_truth_box[1],
-        linewidth=3, edgecolor='green', facecolor='none', label='Ground Truth'
-    )
+    gt_rect2 = patches.Rectangle((gt[0], gt[1]), gt[2] - gt[0], gt[3] - gt[1],
+                                 linewidth=3, edgecolor='green', facecolor='none', label='Ground Truth')
     ax2.add_patch(gt_rect2)
 
-    # Draw best patched detection
-    if best_patched and best_patched['iou'] > 0.1:
-        box = best_patched['box']
-        patch_rect = patches.Rectangle(
-            (box[0], box[1]), box[2] - box[0], box[3] - box[1],
-            linewidth=2, edgecolor='red', facecolor='none',
-            label=f'YOLO: {best_patched["confidence"]:.3f}'
-        )
-        ax2.add_patch(patch_rect)
-    ax2.legend()
+    # Draw patched detections (top 5)
+    for i, det in enumerate(patched_detections[:5]):
+        box = det['box']
+        color = colors[i % len(colors)]
+        rect = patches.Rectangle((box[0], box[1]), box[2] - box[0], box[3] - box[1],
+                                 linewidth=2, edgecolor=color, facecolor='none', alpha=0.8)
+        ax2.add_patch(rect)
+        ax2.text(box[0], box[1] - 5, f'{det["confidence"]:.3f}',
+                 color=color, fontsize=8, weight='bold',
+                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
 
-    # Show patch mask
-    if patch_mask is not None:
-        mask_img = patch_mask[0, 0].cpu().numpy()
-        ax3.imshow(mask_img, cmap='gray')
-        ax3.set_title('Patch Mask (White = Patch Area)')
-    else:
-        ax3.text(
-            0.5,
-            0.5,
-            'Patch application failed',
-            ha='center',
-            va='center',
-            transform=ax3.transAxes)
-        ax3.set_title('Patch Mask - FAILED')
+    if best_patched_detection:
+        ax2.text(0.02, 0.98, f'Best: IoU={best_patched_detection["iou"]:.3f}',
+                 transform=ax2.transAxes, fontsize=10, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.8))
+    ax2.legend(loc='upper right')
 
-    # Analysis
+    # NEW: Clean patched image without detection overlays
+    ax3 = plt.subplot(4, 4, 3)
+    ax3.imshow(patched_img)
+    ax3.set_title('Clean Patched Image\n(no detection overlays)')
+    ax3.axis('off')
+
+    # Patch visualization
+    ax4 = plt.subplot(4, 4, 4)
+    patch_display = torch.tanh(patch) * 0.5 + 0.5  # Convert back to [0,1] for display
+    patch_img = patch_display.detach().cpu().permute(1, 2, 0).numpy()
+    ax4.imshow(patch_img)
+    ax4.set_title(f'Applied Patch\n({PATCH_WIDTH}×{PATCH_HEIGHT})')
     ax4.axis('off')
-    ax4.set_title('Debug Analysis', pad=20)
 
-    analysis_text = f"White Patch Debug Results\n\n"
-    analysis_text += f"Image: {Path(row['processed_filename']).name}\n"
-    analysis_text += f"Processing: Full 384x384 images\n"
-    analysis_text += f"Ground truth: [{ground_truth_box[0]:.1f}, {ground_truth_box[1]:.1f}, "
-    analysis_text += f"{ground_truth_box[2]:.1f}, {ground_truth_box[3]:.1f}]\n\n"
-
-    analysis_text += f"ORIGINAL FULL IMAGE:\n"
-    analysis_text += f"  Detections: {len(original_dets)}\n"
-    if best_original:
-        analysis_text += f"  Best: Conf={best_original['confidence']:.4f}, IoU={best_original['iou']:.4f}\n"
+    # Row 2: Analysis visualizations
+    # Patch mask visualization
+    ax5 = plt.subplot(4, 4, 5)
+    if patch_mask is not None:
+        mask_display = patch_mask[0, 0].detach().cpu().numpy()  # First channel of first batch
+        ax5.imshow(mask_display, cmap='hot', alpha=0.8)
+        ax5.set_title('Patch Application Mask')
     else:
-        analysis_text += f"  Best: None found\n"
+        ax5.text(0.5, 0.5, 'No mask available\n(patch application failed)',
+                 ha='center', va='center', transform=ax5.transAxes,
+                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
+        ax5.set_title('Patch Application Mask')
+    ax5.axis('off')
 
-    analysis_text += f"\nWITH WHITE PATCH ON FULL IMAGE:\n"
-    analysis_text += f"  Detections: {len(patched_dets)}\n"
-    if best_patched:
-        analysis_text += f"  Best: Conf={best_patched['confidence']:.4f}, IoU={best_patched['iou']:.4f}\n"
+    # Side-by-side difference
+    ax6 = plt.subplot(4, 4, 6)
+    diff_img = np.abs(patched_img - orig_img)
+    ax6.imshow(diff_img)
+    ax6.set_title('Absolute Difference\n(Patched - Original)')
+    ax6.axis('off')
+
+    # IoU comparison chart
+    ax7 = plt.subplot(4, 4, 7)
+    if original_detections and patched_detections:
+        orig_ious = [det['iou'] for det in original_detections]
+        patch_ious = [det['iou'] for det in patched_detections]
+
+        ax7.hist(orig_ious, bins=10, alpha=0.7, label='Original', color='red', density=True)
+        ax7.hist(patch_ious, bins=10, alpha=0.7, label='Patched', color='blue', density=True)
+        ax7.set_xlabel('IoU')
+        ax7.set_ylabel('Density')
+        ax7.set_title('IoU Distribution')
+        ax7.legend()
+        ax7.grid(True, alpha=0.3)
     else:
-        analysis_text += f"  Best: None found\n"
+        ax7.text(0.5, 0.5, 'No detections\nfor comparison', ha='center', va='center')
+        ax7.set_title('IoU Distribution')
 
-    if best_original and best_patched:
-        conf_change = best_patched['confidence'] - best_original['confidence']
-        analysis_text += f"\nCONFIDENCE CHANGE: {conf_change:+.4f}\n"
-        if abs(conf_change) < 0.01:
-            analysis_text += f"  Status: MINIMAL IMPACT\n"
-        elif conf_change < -0.05:
-            analysis_text += f"  Status: PATCH WORKING\n"
-        else:
-            analysis_text += f"  Status: UNEXPECTED CHANGE\n"
+    # Confidence comparison chart
+    ax8 = plt.subplot(4, 4, 8)
+    if original_detections and patched_detections:
+        orig_confs = [det['confidence'] for det in original_detections]
+        patch_confs = [det['confidence'] for det in patched_detections]
 
-    analysis_text += f"\nPatch application: {'SUCCESS' if patch_mask is not None else 'FAILED'}\n"
+        ax8.hist(orig_confs, bins=10, alpha=0.7, label='Original', color='red', density=True)
+        ax8.hist(patch_confs, bins=10, alpha=0.7, label='Patched', color='blue', density=True)
+        ax8.set_xlabel('Confidence')
+        ax8.set_ylabel('Density')
+        ax8.set_title('Confidence Distribution')
+        ax8.legend()
+        ax8.grid(True, alpha=0.3)
+    else:
+        ax8.text(0.5, 0.5, 'No detections\nfor comparison', ha='center', va='center')
+        ax8.set_title('Confidence Distribution')
 
-    ax4.text(0.05, 0.95, analysis_text, transform=ax4.transAxes, fontsize=11,
-             verticalalignment='top', fontfamily='monospace',
-             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    # Row 3: Metrics
+    # Metrics comparison bar chart
+    ax9 = plt.subplot(4, 4, 9)
+    metrics = ['Best IoU', 'Best Conf', '# Detections']
+    original_values = [best_original_iou, best_original_conf, len(original_detections)]
+    patched_values = [best_patched_iou, best_patched_conf, len(patched_detections)]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    bars1 = ax9.bar(x - width / 2, original_values, width, label='Original', color='red', alpha=0.7)
+    bars2 = ax9.bar(x + width / 2, patched_values, width, label='Patched', color='blue', alpha=0.7)
+
+    ax9.set_ylabel('Score')
+    ax9.set_title('Metrics Comparison')
+    ax9.set_xticks(x)
+    ax9.set_xticklabels(metrics, rotation=45)
+    ax9.legend()
+    ax9.grid(True, alpha=0.3)
+
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax9.text(bar.get_x() + bar.get_width() / 2., height + 0.01,
+                     f'{height:.3f}' if height < 10 else f'{int(height)}',
+                     ha='center', va='bottom', fontsize=8)
+
+    # Row 4: Detailed analysis text panel (spanning bottom row)
+    ax10 = plt.subplot(4, 4, (13, 16))  # Span entire bottom row
+    ax10.axis('off')
+    ax10.set_title('Detailed Impact Analysis', pad=20, fontsize=14, weight='bold')
+
+    analysis_text = f"PATCH EFFECTIVENESS ANALYSIS\n{'='*50}\n\n"
+
+    # Basic stats
+    analysis_text += f"Dataset Info:\n"
+    analysis_text += f"  • Total batches available: {len(trainer.train_loader)}\n"
+    analysis_text += f"  • Image resolution: 384×384\n"
+    analysis_text += f"  • Patch size: {PATCH_WIDTH}×{PATCH_HEIGHT}\n\n"
+
+    # Detection counts
+    analysis_text += f"Detection Counts:\n"
+    analysis_text += f"  • Original: {len(original_detections)} detections\n"
+    analysis_text += f"  • Patched:  {len(patched_detections)} detections\n"
+    analysis_text += f"  • Change:   {detection_count_change:+d} detections\n\n"
+
+    # Best detection metrics
+    analysis_text += f"Best Detection Metrics:\n"
+    analysis_text += f"  • Original IoU:  {best_original_iou:.4f}\n"
+    analysis_text += f"  • Patched IoU:   {best_patched_iou:.4f}\n"
+    analysis_text += f"  • IoU Reduction: {iou_reduction:.1f}%\n\n"
+
+    analysis_text += f"  • Original Conf: {best_original_conf:.4f}\n"
+    analysis_text += f"  • Patched Conf:  {best_patched_conf:.4f}\n"
+    analysis_text += f"  • Conf Reduction: {conf_reduction:.1f}%\n\n"
+
+    # Effectiveness assessment
+    analysis_text += f"Effectiveness Assessment:\n"
+    if iou_reduction > 30 or conf_reduction > 30:
+        status = "🔴 HIGHLY EFFECTIVE"
+        analysis_text += f"  Status: {status}\n"
+        analysis_text += f"  • Significant detection degradation achieved\n"
+        analysis_text += f"  • Patch successfully disrupts model performance\n"
+    elif iou_reduction > 10 or conf_reduction > 10:
+        status = "🟡 MODERATELY EFFECTIVE"
+        analysis_text += f"  Status: {status}\n"
+        analysis_text += f"  • Moderate detection impact observed\n"
+        analysis_text += f"  • Patch shows some adversarial effect\n"
+    elif iou_reduction > 0 or conf_reduction > 0:
+        status = "🟢 MINIMALLY EFFECTIVE"
+        analysis_text += f"  Status: {status}\n"
+        analysis_text += f"  • Minor detection changes detected\n"
+        analysis_text += f"  • Patch has limited adversarial impact\n"
+    else:
+        status = "⚫ INEFFECTIVE"
+        analysis_text += f"  Status: {status}\n"
+        analysis_text += f"  • No meaningful detection degradation\n"
+        analysis_text += f"  • Patch fails to achieve adversarial effect\n"
+
+    # Additional insights
+    if len(original_detections) == 0:
+        analysis_text += f"\n⚠️  WARNING: No detections on original image!\n"
+        analysis_text += f"   This may indicate issues with the model or ground truth.\n"
+    elif len(patched_detections) == 0 and len(original_detections) > 0:
+        analysis_text += f"\n✅ COMPLETE SUPPRESSION ACHIEVED!\n"
+        analysis_text += f"   Patch completely eliminates all detections.\n"
+
+    if patch_mask is None:
+        analysis_text += f"\n⚠️  WARNING: Patch application failed!\n"
+        analysis_text += f"   No valid mask generated. Check patch placement logic.\n"
+
+    ax10.text(0.02, 0.98, analysis_text, transform=ax10.transAxes, fontsize=10,
+              verticalalignment='top', fontfamily='monospace',
+              bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.9))
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Restore original patch
-    trainer.patch.data = original_patch
-
     print(f"\nDebug visualization saved to: {output_path}")
-    if best_original and best_patched:
-        print(f"Confidence change: {best_original['confidence']:.4f} -> {best_patched['confidence']:.4f} "
-              f"({best_patched['confidence'] - best_original['confidence']:+.4f})")
+    print(f"Patch effectiveness: {status}")
+
+    # Return metrics for programmatic use
+    return {
+        'original_detections': len(original_detections),
+        'patched_detections': len(patched_detections),
+        'best_original_iou': best_original_iou,
+        'best_patched_iou': best_patched_iou,
+        'best_original_conf': best_original_conf,
+        'best_patched_conf': best_patched_conf,
+        'iou_reduction_percent': iou_reduction,
+        'conf_reduction_percent': conf_reduction,
+        'detection_count_change': detection_count_change,
+        'effectiveness_status': status
+    }
+
+
+def debug_ocr_accuracy(csv_path: str, patch_file: str = None,
+                       output_path: str = "debug_ocr.png"):
+    """
+    Enhanced OCR test: compare OCR results with and without patch showing crops and losses.
+    """
+    print("Testing OCR accuracy with/without patch...")
+
+    # Initialize trainer
+    trainer = AdversarialPatchTrainer(csv_path)
+    alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
+
+    # Load patch if provided, otherwise use trainer's current patch
+    if patch_file:
+        print(f"Loading patch from: {patch_file}")
+        patch_tensor = load_patch_from_file(patch_file, PATCH_HEIGHT, PATCH_WIDTH, trainer.device)
+        patch = torch.arctanh(torch.clamp(patch_tensor * 2 - 1, -0.99, 0.99))
+        trainer.patch.data = patch
+
+    # Get first batch (already shuffled)
+    batch = next(iter(trainer.train_loader))
+    batch = {k: v[0] for k, v in batch.items()}  # Remove batch dim
+
+    print("Processing sample image...")
+
+    def logits_to_text(logits, alphabet_str):
+        """Convert OCR logits to text"""
+        probs = torch.softmax(logits, dim=-1)
+        pred_chars = torch.argmax(probs, dim=-1).squeeze(0)
+        text = ""
+        for char_idx in pred_chars:
+            char_idx = char_idx.item()
+            if char_idx < len(alphabet_str) and alphabet_str[char_idx] != '_':
+                text += alphabet_str[char_idx]
+        return text.strip()
+
+    def run_ocr_pipeline(use_patch=False):
+        """Run detection + OCR pipeline, return all intermediate results"""
+        batch_copy = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
+
+        if use_patch:
+            # Apply patch
+            patched_image, _ = trainer.apply_patch_to_image(
+                batch_copy['prep_image'].to(trainer.device).unsqueeze(0),
+                batch_copy['new_corners'].to(trainer.device).unsqueeze(0)
+            )
+            if patched_image is not None:
+                batch_copy['prep_image'] = patched_image.squeeze(0)
+            # Apply patch
+            patched_image, _ = trainer.apply_patch_to_image(
+                batch_copy['orig_image'].to(trainer.device).unsqueeze(0),
+                batch_copy['orig_corners'].to(trainer.device).unsqueeze(0)
+            )
+            if patched_image is not None:
+                batch_copy['orig_image'] = patched_image.squeeze(0)
+
+        # YOLO detection
+        prep_image = batch_copy['prep_image'].to(trainer.device)
+        model_output = trainer.model(prep_image.unsqueeze(0))
+
+        # Find best detection
+        corners = batch_copy['new_corners'].to(trainer.device)
+        ground_truth = trainer.corners_to_bbox(corners)
+
+        best_detection = None
+        best_iou = 0.0
+
+        for detection in model_output:
+            pred_box = detection[1:5]
+            iou = trainer.boxes_IoU(pred_box.unsqueeze(0), ground_truth.unsqueeze(0)).squeeze()
+            if iou > best_iou:
+                best_iou = iou.item()
+                best_detection = detection
+
+        if best_detection is None:
+            return {
+                'text': None,
+                'conf': 0.0,
+                'iou': 0.0,
+                'ocr_loss': float('inf'),
+                'image': batch_copy['prep_image'],
+                'cropped_plate': None,
+                'ocr_logits': None,
+                'detection_box': None
+            }
+
+        # Transform detection back to original coordinates
+        pred_box = best_detection[1:5]
+        conf = best_detection[6].item()
+        orig_projection = trainer.invert_bbox(pred_box.to('cpu'), batch_copy['transform'])
+        corners_box = trainer.bbox_to_corners(orig_projection, device='cpu')
+
+        # Crop and resize for OCR
+        cropped_plate = kornia.geometry.crop_and_resize(
+            batch_copy['orig_image'].unsqueeze(0),
+            corners_box,
+            trainer.ocr_input_shape[:2],
+            mode='bilinear',
+            align_corners=True
+        ).to(trainer.device)
+
+        # Run OCR
+        ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255  # NHWC format
+        with torch.no_grad():
+            ocr_logits = trainer.ocr(ocr_input)
+
+        # Calculate OCR loss
+        ocr_loss = trainer.ocr_loss(trainer.ocr_target, ocr_logits).item()
+
+        # Convert logits to text
+        ocr_text = logits_to_text(ocr_logits, alphabet)
+
+        return {
+            'text': ocr_text,
+            'conf': conf,
+            'iou': best_iou,
+            'ocr_loss': ocr_loss,
+            'image': batch_copy['prep_image'],
+            'cropped_plate': cropped_plate.squeeze(0),  # Remove batch dim
+            'ocr_logits': ocr_logits,
+            'detection_box': pred_box
+        }
+
+    # Test without patch
+    try:
+        results_no_patch = run_ocr_pipeline(use_patch=False)
+        print(
+            f"Without patch - Text: '{results_no_patch['text']}', Loss: {results_no_patch['ocr_loss']:.4f}")
+    except Exception as e:
+        print(f"Error without patch: {e}")
+        raise
+
+    # Test with patch
+    try:
+        results_with_patch = run_ocr_pipeline(use_patch=True)
+        print(
+            f"With patch - Text: '{results_with_patch['text']}', Loss: {results_with_patch['ocr_loss']:.4f}")
+    except Exception as e:
+        print(f"Error with patch: {e}")
+        raise
+
+    # Create enhanced visualization with 3x3 grid
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+
+    # Row 1: Full images
+    # Original image
+    orig_img = results_no_patch['image'].permute(1, 2, 0).detach().cpu().numpy()
+    axes[0, 0].imshow(orig_img)
+    axes[0, 0].set_title(f'Without Patch\nOCR: "{results_no_patch["text"] or "NONE"}"')
+    axes[0, 0].axis('off')
+
+    # Patched image
+    patched_img = results_with_patch['image'].permute(1, 2, 0).detach().cpu().numpy()
+    axes[0, 1].imshow(patched_img)
+    axes[0, 1].set_title(f'With Patch\nOCR: "{results_with_patch["text"] or "NONE"}"')
+    axes[0, 1].axis('off')
+
+    # Patch visualization
+    if hasattr(trainer, 'patch'):
+        patch_display = torch.tanh(trainer.patch) * 0.5 + 0.5
+        patch_img = patch_display.detach().cpu().permute(1, 2, 0).numpy()
+        axes[0, 2].imshow(patch_img)
+        axes[0, 2].set_title(f'Applied Patch\n({PATCH_WIDTH}×{PATCH_HEIGHT})')
+    else:
+        axes[0, 2].text(0.5, 0.5, 'No patch', ha='center', va='center')
+        axes[0, 2].set_title('Patch')
+    axes[0, 2].axis('off')
+
+    # Row 2: Cropped plates fed to OCR
+    if results_no_patch['cropped_plate'] is not None:
+        crop_no_patch = results_no_patch['cropped_plate'].permute(1, 2, 0).detach().cpu().numpy()
+        axes[1, 0].imshow(crop_no_patch)
+        axes[1, 0].set_title(
+            f'OCR Input (No Patch)\nSize: {crop_no_patch.shape[:2]}\nLoss: {results_no_patch["ocr_loss"]:.4f}')
+    else:
+        axes[1, 0].text(0.5, 0.5, 'No detection\nfound', ha='center', va='center')
+        axes[1, 0].set_title('OCR Input (No Patch)\nLoss: ∞')
+    axes[1, 0].axis('off')
+
+    if results_with_patch['cropped_plate'] is not None:
+        crop_with_patch = results_with_patch['cropped_plate'].permute(
+            1, 2, 0).detach().cpu().numpy()
+        axes[1, 1].imshow(crop_with_patch)
+        axes[1, 1].set_title(
+            f'OCR Input (With Patch)\nSize: {crop_with_patch.shape[:2]}\nLoss: {results_with_patch["ocr_loss"]:.4f}')
+    else:
+        axes[1, 1].text(0.5, 0.5, 'No detection\nfound', ha='center', va='center')
+        axes[1, 1].set_title('OCR Input (With Patch)\nLoss: ∞')
+    axes[1, 1].axis('off')
+
+    # Side-by-side crop comparison (if both available)
+    if (results_no_patch['cropped_plate'] is not None and
+            results_with_patch['cropped_plate'] is not None):
+
+        # Compute difference
+        crop_diff = np.abs(crop_with_patch - crop_no_patch)
+        axes[1, 2].imshow(crop_diff)
+        axes[1, 2].set_title('OCR Input Difference\n|With Patch - No Patch|')
+    else:
+        axes[1, 2].text(0.5, 0.5, 'Cannot compare\ncrops', ha='center', va='center')
+        axes[1, 2].set_title('OCR Input Difference')
+    axes[1, 2].axis('off')
+
+    # Row 3: Analysis and metrics
+    # Loss comparison chart
+    axes[2, 0].axis('off')
+
+    if (results_no_patch['ocr_loss'] < float('inf') and
+            results_with_patch['ocr_loss'] < float('inf')):
+
+        losses = [results_no_patch['ocr_loss'], results_with_patch['ocr_loss']]
+        labels = ['No Patch', 'With Patch']
+        colors = ['blue', 'red']
+
+        bars = axes[2, 0].bar(labels, losses, color=colors, alpha=0.7)
+        axes[2, 0].set_ylabel('OCR Loss')
+        axes[2, 0].set_title('OCR Loss Comparison')
+        axes[2, 0].grid(True, alpha=0.3)
+
+        # Add value labels on bars
+        for bar, loss in zip(bars, losses):
+            height = bar.get_height()
+            axes[2, 0].text(bar.get_x() + bar.get_width() / 2., height + height * 0.01,
+                            f'{loss:.4f}', ha='center', va='bottom', fontsize=10)
+    else:
+        axes[2, 0].text(0.5, 0.5, 'No valid losses\nto compare', ha='center', va='center')
+        axes[2, 0].set_title('OCR Loss Comparison')
+
+    # Detection metrics comparison
+    axes[2, 1].axis('off')
+
+    metrics = ['IoU', 'Confidence']
+    no_patch_vals = [results_no_patch['iou'], results_no_patch['conf']]
+    with_patch_vals = [results_with_patch['iou'], results_with_patch['conf']]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    bars1 = axes[2, 1].bar(x - width / 2, no_patch_vals, width,
+                           label='No Patch', color='blue', alpha=0.7)
+    bars2 = axes[2, 1].bar(x + width / 2, with_patch_vals, width,
+                           label='With Patch', color='red', alpha=0.7)
+
+    axes[2, 1].set_ylabel('Score')
+    axes[2, 1].set_title('Detection Metrics')
+    axes[2, 1].set_xticks(x)
+    axes[2, 1].set_xticklabels(metrics)
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+
+    # Add value labels
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            axes[2, 1].text(bar.get_x() + bar.get_width() / 2., height + 0.01,
+                            f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+
+    # Detailed results summary
+    axes[2, 2].axis('off')
+    axes[2, 2].set_title('Detailed Analysis', pad=20, fontsize=12, weight='bold')
+
+    # Calculate changes
+    loss_change = results_with_patch['ocr_loss'] - results_no_patch['ocr_loss']
+    conf_change = results_with_patch['conf'] - results_no_patch['conf']
+    iou_change = results_with_patch['iou'] - results_no_patch['iou']
+
+    # Determine status
+    if results_no_patch['text'] and results_with_patch['text']:
+        if results_no_patch['text'] == results_with_patch['text']:
+            if loss_change > 0:
+                status = "TEXT SAME, LOSS INCREASED"
+                color = 'orange'
+            else:
+                status = "NO CHANGE"
+                color = 'green'
+        else:
+            status = "TEXT CHANGED"
+            color = 'red'
+    elif results_no_patch['text'] and not results_with_patch['text']:
+        status = "DETECTION SUPPRESSED"
+        color = 'darkred'
+    elif not results_no_patch['text'] and results_with_patch['text']:
+        status = "DETECTION ENABLED"
+        color = 'blue'
+    else:
+        status = "NO DETECTIONS"
+        color = 'gray'
+
+    results_text = f"OCR ANALYSIS RESULTS\n{'='*20}\n\n"
+    results_text += f"Without Patch:\n"
+    results_text += f"  Text: '{results_no_patch['text'] or 'NONE'}'\n"
+    results_text += f"  Loss: {results_no_patch['ocr_loss']:.4f}\n"
+    results_text += f"  IoU:  {results_no_patch['iou']:.3f}\n"
+    results_text += f"  Conf: {results_no_patch['conf']:.3f}\n\n"
+
+    results_text += f"With Patch:\n"
+    results_text += f"  Text: '{results_with_patch['text'] or 'NONE'}'\n"
+    results_text += f"  Loss: {results_with_patch['ocr_loss']:.4f}\n"
+    results_text += f"  IoU:  {results_with_patch['iou']:.3f}\n"
+    results_text += f"  Conf: {results_with_patch['conf']:.3f}\n\n"
+
+    results_text += f"Changes:\n"
+    if results_with_patch['ocr_loss'] < float(
+            'inf') and results_no_patch['ocr_loss'] < float('inf'):
+        results_text += f"  Loss:  {loss_change:+.4f}\n"
+    else:
+        results_text += f"  Loss:  N/A\n"
+    results_text += f"  IoU:   {iou_change:+.3f}\n"
+    results_text += f"  Conf:  {conf_change:+.3f}\n\n"
+
+    results_text += f"Status: {status}\n"
+
+    # Add target info
+    results_text += f"\nTarget: 'VRJ7774'\n"
+
+    # Loss interpretation
+    if loss_change > 0.5:
+        results_text += f"OCR Impact: HIGH\n"
+    elif loss_change > 0.1:
+        results_text += f"OCR Impact: MODERATE\n"
+    elif loss_change > 0.0:
+        results_text += f"OCR Impact: LOW\n"
+    else:
+        results_text += f"OCR Impact: MINIMAL\n"
+
+    axes[2, 2].text(0.05, 0.95, results_text, transform=axes[2, 2].transAxes, fontsize=9,
+                    verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor=color, alpha=0.2))
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Print results
+    print(f"\nEnhanced OCR Results:")
+    print(
+        f"  Without patch: '{results_no_patch['text'] or 'NO DETECTION'}' (loss: {results_no_patch['ocr_loss']:.4f})")
+    print(
+        f"  With patch:    '{results_with_patch['text'] or 'NO DETECTION'}' (loss: {results_with_patch['ocr_loss']:.4f})")
+    print(f"  Status: {status}")
+    print(f"  Loss change: {loss_change:+.4f}")
+    print(f"  Visualization saved: {output_path}")
+
+    return {
+        'without_patch': {
+            'text': results_no_patch['text'],
+            'loss': results_no_patch['ocr_loss'],
+            'conf': results_no_patch['conf'],
+            'iou': results_no_patch['iou']
+        },
+        'with_patch': {
+            'text': results_with_patch['text'],
+            'loss': results_with_patch['ocr_loss'],
+            'conf': results_with_patch['conf'],
+            'iou': results_with_patch['iou']
+        },
+        'changes': {
+            'loss': loss_change,
+            'conf': conf_change,
+            'iou': iou_change
+        },
+        'status': status
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description='Adversarial Patch Training')
     parser.add_argument('--test', action='store_true',
                         help='Test mode: visualize detections on single image without patch')
-    parser.add_argument('--debug-patch', action='store_true',
-                        help='Debug mode: apply blank white patch and visualize impact')
+    parser.add_argument('--debug-patch', nargs='?', const=True, default=False,
+                        help='Debug mode: apply patch and visualize impact. '
+                        'Optionally specify patch file path (default: white patch)')
     parser.add_argument('--output', default='test_detection.png',
                         help='Output path for test/debug visualization')
+    parser.add_argument('--debug-ocr', nargs='?', const=True, default=False,
+                        help='Optionally specify a patch file')
     args = parser.parse_args()
 
     # Configuration
     CSV_PATH = "preproc_labels.csv"
-    PATCH_WIDTH = 64
-    PATCH_HEIGHT = 32
     NUM_EPOCHS = 100
     LEARNING_RATE = 0.1
+    trainer = AdversarialPatchTrainer(CSV_PATH, device='cpu', grad_accumulate=1)
 
     if args.test:
         try:
@@ -915,61 +1526,57 @@ def main():
 
     if args.debug_patch:
         try:
-            debug_patch_application(CSV_PATH, args.output)
+            patch_file = args.debug_patch if isinstance(args.debug_patch, str) else None
+            debug_patch_application(CSV_PATH, patch_file, args.output)
         except Exception as e:
             print(f"Debug patch failed: {e}")
             raise
         return
 
+    if args.debug_ocr:
+        try:
+            patch_file = args.debug_ocr if isinstance(args.debug_ocr, str) else None
+            results = debug_ocr_accuracy(CSV_PATH, patch_file, args.output)
+        except Exception as e:
+            print(f"OCR debug failed: {e}")
+            raise
+        return
+
     # Normal training mode
     try:
-        trainer = AdversarialPatchTrainer(
-            csv_path=CSV_PATH,
-            patch_width=PATCH_WIDTH,
-            patch_height=PATCH_HEIGHT
-        )
-
         history = trainer.train(
             num_epochs=NUM_EPOCHS,
             learning_rate=LEARNING_RATE,
-            save_interval=10,
-            early_stop_patience=15
+            save_interval=1,
+            early_stop_patience=20
         )
 
         # Plot training results
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 10))
 
         # Loss curve
         ax1.plot(history['loss'], 'b-', label='Training Loss')
-        ax1.set_title('Training Loss Over Time')
+        ax1.plot(history['val_score'], 'r-', label='Validation Loss')
+        ax1.set_title('Loss Over Time')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Loss')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        # Detection scores
-        ax2.plot(history['detection_score'], 'r-', label='Train Detection', alpha=0.7)
-        ax2.plot(history['val_score'], 'g-', label='Val Detection', linewidth=2)
-        ax2.set_title('Detection Scores (Lower = Better Attack)')
+        # Learning rate
+        ax2.semilogy(history['learning_rate'], 'purple', label='Learning Rate')
+        ax2.set_title('Learning Rate Schedule')
         ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Detection Score')
+        ax2.set_ylabel('Learning Rate (log scale)')
         ax2.grid(True, alpha=0.3)
         ax2.legend()
-
-        # Learning rate
-        ax3.semilogy(history['learning_rate'], 'purple', label='Learning Rate')
-        ax3.set_title('Learning Rate Schedule')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Learning Rate (log scale)')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
 
         # Final adversarial patch
         final_patch = torch.tanh(trainer.patch) * 0.5 + 0.5
         final_patch_np = final_patch.detach().cpu().permute(1, 2, 0).numpy()
-        ax4.imshow(final_patch_np)
-        ax4.set_title(f'Final Adversarial Patch ({PATCH_WIDTH}×{PATCH_HEIGHT})')
-        ax4.axis('off')
+        ax3.imshow(final_patch_np)
+        ax3.set_title(f'Final Adversarial Patch ({PATCH_WIDTH}×{PATCH_HEIGHT})')
+        ax3.axis('off')
 
         plt.tight_layout()
         plt.savefig('adversarial_training_results.png', dpi=300, bbox_inches='tight')
