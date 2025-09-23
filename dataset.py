@@ -8,14 +8,39 @@ from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 import pillow_heif
+import getpass
 
 
 # Register HEIF opener with Pillow
 pillow_heif.register_heif_opener()
 
 
+def transform_path_for_user(filepath):
+    """Transform file paths based on current user"""
+    current_user = getpass.getuser()
+
+    if current_user == "ubuntu":
+        # Strip the old base path and replace with new one
+        old_base = "/Users/NikhilKalidasu/Documents/Adversarial Plate"
+        new_base = "/home/ubuntu/dataset/adversarial_plate_border"
+
+        if filepath.startswith(old_base):
+            relative_path = filepath[len(old_base):].lstrip('/')
+            transformed_path = os.path.join(new_base, relative_path)
+            return transformed_path
+        else:
+            # If path doesn't start with old_base, assume it's already relative to new_base
+            return os.path.join(new_base, filepath.lstrip('/'))
+
+    # For non-ubuntu users, return path as-is
+    return filepath
+
+
 def load_image(filepath):
     """Load image with support for HEIC files"""
+    # Transform path based on current user
+    filepath = transform_path_for_user(filepath)
+
     file_ext = os.path.splitext(filepath)[1].lower()
 
     if file_ext in ['.heic', '.heif']:
