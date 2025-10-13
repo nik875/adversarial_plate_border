@@ -22,7 +22,7 @@ def transform_path_for_user(filepath):
     if current_user == "ubuntu":
         # Strip the old base path and replace with new one
         old_base = "/Users/NikhilKalidasu/Documents/Adversarial Plate"
-        new_base = "/home/ubuntu/"
+        new_base = "/home/ubuntu/adversarial_plate_border"
 
         if filepath.startswith(old_base):
             relative_path = filepath[len(old_base):].lstrip('/')
