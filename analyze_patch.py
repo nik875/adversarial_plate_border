@@ -24,13 +24,15 @@ warnings.filterwarnings("ignore")
 class PatchEvaluator:
     """Evaluate adversarial patches against the original ALPR detection model"""
 
-    def __init__(self, csv_path: str, patch_file: str, device: str = None):
+    def __init__(self, csv_path: str, patch_file: str, device: str = None,
+                 impersonating_plate: str = None):
         """Initialize the patch evaluator
 
         Args:
             csv_path: Path to CSV file with image data
             patch_file: Path to patch image file
             device: Device to use for computation
+            impersonating_plate: Target license plate number to track impersonation attempts
         """
         # Set device
         if device is None:
@@ -44,6 +46,11 @@ class PatchEvaluator:
             self.device = device
 
         print(f"Using device: {self.device}")
+
+        # Store impersonating plate number
+        self.impersonating_plate = impersonating_plate
+        if self.impersonating_plate is not None:
+            print(f"Tracking impersonation attempts for plate: '{self.impersonating_plate}'")
 
         # Load dataset
         self.df = pd.read_csv(csv_path)
@@ -468,27 +475,37 @@ class PatchEvaluator:
         ax3.set_title('Distribution of Best IoU Scores')
         ax3.legend()
 
-        # 4. OCR Accuracy Pie Chart - NEW
+        # 4. OCR Accuracy Pie Chart - MODIFIED to include impersonating detection
         ax4 = plt.subplot(3, 4, 4)
 
-        # Categorize by OCR accuracy
+        # Categorize by OCR accuracy (including impersonating plate if specified)
         def categorize_ocr_result(row):
             if row['best_iou'] == 0:
                 return 'Eliminated'
             elif row['detection_text'] == 'VRJ7774':
                 return 'Correct Read'
+            elif self.impersonating_plate is not None and row['detection_text'] == self.impersonating_plate:
+                return 'Impersonating Read'
             elif row['detection_text'] != '' and row['detection_text'] != 'VRJ7774':
-                return 'Incorrect Read'
+                # Only count as incorrect if it's not the impersonating plate (already
+                # handled above)
+                if self.impersonating_plate is None or row['detection_text'] != self.impersonating_plate:
+                    return 'Incorrect Read'
+                else:
+                    # This shouldn't happen due to logic above, but fail loudly if it does
+                    raise ValueError(f"Unexpected OCR categorization state for row with detection_text='{row['detection_text']}' "
+                                     f"and impersonating_plate='{self.impersonating_plate}'")
             else:
                 return 'Detection No OCR'  # Detected but no text extracted
 
         valid_results['ocr_category'] = valid_results.apply(categorize_ocr_result, axis=1)
         ocr_counts = valid_results['ocr_category'].value_counts()
 
-        # Colors for pie chart
+        # Colors for pie chart (including new impersonating category)
         ocr_colors = {
             'Eliminated': '#d62728',        # Red - best outcome for adversarial patch
             'Incorrect Read': '#ff7f0e',    # Orange - partial success
+            'Impersonating Read': '#9467bd',  # Purple - successful impersonation
             'Detection No OCR': '#ffbb78',  # Light orange - detection but OCR failed
             'Correct Read': '#2ca02c'       # Green - patch failed, system worked correctly
         }
@@ -497,7 +514,13 @@ class PatchEvaluator:
 
         wedges, texts, autotexts = ax4.pie(ocr_counts.values, labels=ocr_counts.index,
                                            autopct='%1.1f%%', colors=colors_list, startangle=90)
-        ax4.set_title('OCR Accuracy After Patch Application\n(Target: VRJ7774)')
+
+        # Create title based on whether impersonating is enabled
+        title_text = 'OCR Accuracy After Patch Application\n(Target: VRJ7774'
+        if self.impersonating_plate is not None:
+            title_text += f', Impersonating: {self.impersonating_plate}'
+        title_text += ')'
+        ax4.set_title(title_text)
 
         # Make percentage text more readable
         for autotext in autotexts:
@@ -582,11 +605,22 @@ class PatchEvaluator:
         detections_eliminated = (valid_results['best_iou'] == 0).sum()
         strong_reduction = (valid_results['confidence_change'] < -0.1).sum()
 
-        # OCR-specific stats
+        # OCR-specific stats (including impersonating if specified)
         correct_reads = (valid_results['detection_text'] == 'VRJ7774').sum()
         incorrect_reads = ((valid_results['detection_text'] != 'VRJ7774') &
                            (valid_results['detection_text'] != '') &
                            (valid_results['best_iou'] > 0)).sum()
+
+        # Calculate impersonating reads if specified
+        impersonating_reads = 0
+        if self.impersonating_plate is not None:
+            impersonating_reads = (
+                valid_results['detection_text'] == self.impersonating_plate).sum()
+            # Subtract impersonating reads from incorrect reads since they're now separate
+            incorrect_reads = ((valid_results['detection_text'] != 'VRJ7774') &
+                               (valid_results['detection_text'] != self.impersonating_plate) &
+                               (valid_results['detection_text'] != '') &
+                               (valid_results['best_iou'] > 0)).sum()
 
         summary_text = f"""Patch Evaluation Summary
 
@@ -602,11 +636,16 @@ Strong Reduction (>0.1): {strong_reduction} ({strong_reduction/total_images*100:
 
 OCR ACCURACY ANALYSIS:
 Eliminated Detection: {detections_eliminated} ({detections_eliminated/total_images*100:.1f}%)
-Correct Read "VRJ7774": {correct_reads} ({correct_reads/total_images*100:.1f}%)
-Incorrect OCR Reading: {incorrect_reads} ({incorrect_reads/total_images*100:.1f}%)
+Correct Read "VRJ7774": {correct_reads} ({correct_reads/total_images*100:.1f}%)"""
 
-Patch Success Rate: {((detections_eliminated + incorrect_reads)/total_images*100):.1f}%
-"""
+        if self.impersonating_plate is not None:
+            summary_text += f"""
+Impersonating Read "{self.impersonating_plate}": {impersonating_reads} ({impersonating_reads/total_images*100:.1f}%)"""
+
+        summary_text += f"""
+Other Incorrect OCR: {incorrect_reads} ({incorrect_reads/total_images*100:.1f}%)
+
+Patch Success Rate: {((detections_eliminated + incorrect_reads + impersonating_reads)/total_images*100):.1f}%"""
 
         ax11.text(0.05, 0.95, summary_text, transform=ax11.transAxes, fontsize=11,
                   verticalalignment='top', fontfamily='monospace',
@@ -616,38 +655,60 @@ Patch Success Rate: {((detections_eliminated + incorrect_reads)/total_images*100
         ax12 = plt.subplot(3, 4, 12)
         ax12.axis('off')
 
-        # Show some examples of incorrect readings
-        incorrect_examples = valid_results[
-            (valid_results['detection_text'] != 'VRJ7774') &
-            (valid_results['detection_text'] != '') &
-            (valid_results['best_iou'] > 0)
-        ]['detection_text'].value_counts().head(8)
+        # Show some examples of incorrect readings (excluding impersonating if specified)
+        filter_condition = ((valid_results['detection_text'] != 'VRJ7774') &
+                            (valid_results['detection_text'] != '') &
+                            (valid_results['best_iou'] > 0))
+
+        if self.impersonating_plate is not None:
+            filter_condition = filter_condition & (
+                valid_results['detection_text'] != self.impersonating_plate)
+
+        incorrect_examples = valid_results[filter_condition]['detection_text'].value_counts().head(
+            8)
 
         ocr_detail_text = f"""OCR Reading Details
 
-TARGET PLATE: "VRJ7774"
+TARGET PLATE: "VRJ7774\""""
 
-Most Common Misreadings:"""
+        if self.impersonating_plate is not None:
+            ocr_detail_text += f"""
+IMPERSONATING: "{self.impersonating_plate}\""""
+
+        ocr_detail_text += f"""
+
+Most Common Other Misreadings:"""
 
         if len(incorrect_examples) > 0:
             for text, count in incorrect_examples.items():
                 ocr_detail_text += f"\n  '{text}': {count} times"
         else:
-            ocr_detail_text += f"\n  No misreadings found!"
+            ocr_detail_text += f"\n  No other misreadings found!"
 
         ocr_detail_text += f"""
 
 Detection Categories:
 • RED (Eliminated): Complete detection failure
-• ORANGE (Incorrect): Wrong plate number read
+• GREEN (Correct): Patch failed, correct read"""
+
+        if self.impersonating_plate is not None:
+            ocr_detail_text += f"""
+• PURPLE (Impersonating): Successfully read as "{self.impersonating_plate}\""""
+
+        ocr_detail_text += f"""
+• ORANGE (Other Incorrect): Wrong plate number
 • LIGHT ORANGE: Detection but no OCR text
-• GREEN (Correct): Patch failed, correct read
 
 Patch Effectiveness:
-• Total Disruption: {((detections_eliminated + incorrect_reads)/total_images*100):.1f}%
-• Elimination Only: {(detections_eliminated/total_images*100):.1f}%
-• Misreading Only: {(incorrect_reads/total_images*100):.1f}%
-"""
+• Total Disruption: {((detections_eliminated + incorrect_reads + impersonating_reads)/total_images*100):.1f}%
+• Elimination Only: {(detections_eliminated/total_images*100):.1f}%"""
+
+        if self.impersonating_plate is not None:
+            ocr_detail_text += f"""
+• Impersonation Success: {(impersonating_reads/total_images*100):.1f}%"""
+
+        ocr_detail_text += f"""
+• Other Misreading: {(incorrect_reads/total_images*100):.1f}%"""
 
         ax12.text(0.05, 0.95, ocr_detail_text, transform=ax12.transAxes, fontsize=10,
                   verticalalignment='top', fontfamily='monospace',
@@ -814,9 +875,16 @@ Patch Effectiveness:
 
                     # Add detection text if available
                     if row['detection_text']:
+                        # Color-code the text based on what was detected
+                        text_color = 'red'
+                        if row['detection_text'] == 'VRJ7774':
+                            text_color = 'green'  # Correct read
+                        elif self.impersonating_plate is not None and row['detection_text'] == self.impersonating_plate:
+                            text_color = 'purple'  # Successful impersonation
+
                         ax.text(det_bbox[0], det_bbox[1] - 10,
                                 f'"{row["detection_text"]}"',
-                                color='red', fontsize=8, weight='bold',
+                                color=text_color, fontsize=8, weight='bold',
                                 bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
                 elif row['best_iou'] == 0:
                     # Add "NO DETECTION" text
@@ -888,6 +956,8 @@ def main():
                         help='Output directory for results and visualizations')
     parser.add_argument('--device', choices=['cpu', 'cuda', 'mps'], default=None,
                         help='Device to use for computation')
+    parser.add_argument('--impersonating', type=str, default=None,
+                        help='License plate number to track for impersonation attempts (e.g., "ABC123")')
     args = parser.parse_args()
 
     try:
@@ -895,12 +965,15 @@ def main():
         print(f"CSV file: {args.csv}")
         print(f"Patch file: {args.patch}")
         print(f"Output directory: {args.output}")
+        if args.impersonating:
+            print(f"Tracking impersonation attempts for: {args.impersonating}")
 
         # Initialize evaluator
         evaluator = PatchEvaluator(
             csv_path=args.csv,
             patch_file=args.patch,
-            device=args.device
+            device=args.device,
+            impersonating_plate=args.impersonating
         )
 
         # Run evaluation
@@ -924,6 +997,12 @@ def main():
             print(f"- Average confidence change: {avg_change:.4f}")
             print(
                 f"- Detections eliminated: {eliminated}/{len(valid_results)} ({eliminated/len(valid_results)*100:.1f}%)")
+
+            # Add impersonation summary if enabled
+            if args.impersonating:
+                impersonating_count = (valid_results['detection_text'] == args.impersonating).sum()
+                print(
+                    f"- Successful impersonations as '{args.impersonating}': {impersonating_count}/{len(valid_results)} ({impersonating_count/len(valid_results)*100:.1f}%)")
 
     except Exception as e:
         print(f"\nFATAL ERROR: {type(e).__name__}: {str(e)}")

@@ -23,8 +23,8 @@ from dataset import create_dataloaders
 warnings.filterwarnings("ignore")
 
 
-PATCH_WIDTH = 256
-PATCH_HEIGHT = 128
+PATCH_WIDTH = 1024
+PATCH_HEIGHT = 512
 
 
 class AdversarialPatchTrainer:
@@ -33,7 +33,9 @@ class AdversarialPatchTrainer:
                  device: str = None,
                  grad_accumulate: int = None,
                  match_detection: bool = False,
-                 impersonation_target: str = None):
+                 impersonation_target: str = None,
+                 training=False):
+        self.training = training
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -160,6 +162,10 @@ class AdversarialPatchTrainer:
 
         # Normalize patch to [0, 1] range
         patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
+
+        if self.training:
+            darkening_factor = torch.rand(1, device=self.device) * 0.5
+            patch_normalized = patch_normalized * (1.0 - darkening_factor)
 
         # Get the 4 corners of the license plate
         plate_corners = corners[0]  # [4, 2]
@@ -1718,7 +1724,7 @@ def main():
 
     # Normal training mode
     try:
-        trainer = AdversarialPatchTrainer(CSV_PATH, **trainer_kwargs)
+        trainer = AdversarialPatchTrainer(CSV_PATH, training=True, **trainer_kwargs)
 
         history = trainer.train(
             num_epochs=NUM_EPOCHS,
