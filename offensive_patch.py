@@ -23,8 +23,8 @@ from dataset import create_dataloaders
 warnings.filterwarnings("ignore")
 
 
-PATCH_WIDTH = 1024
-PATCH_HEIGHT = 512
+PATCH_WIDTH = 512
+PATCH_HEIGHT = 256
 
 
 class AdversarialPatchTrainer:
@@ -34,8 +34,10 @@ class AdversarialPatchTrainer:
                  grad_accumulate: int = None,
                  match_detection: bool = False,
                  impersonation_target: str = None,
+                 print_blur=0.5,
                  training=False):
         self.training = training
+        self.print_blur = print_blur
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -162,6 +164,14 @@ class AdversarialPatchTrainer:
 
         # Normalize patch to [0, 1] range
         patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
+
+        # Very light Gaussian blur (closer to real printer physics)
+        if self.print_blur > 0:
+            patch_normalized = kornia.filters.gaussian_blur2d(
+                patch_normalized.unsqueeze(0),
+                kernel_size=(3, 3),
+                sigma=(self.print_blur, self.print_blur)  # Small blur at 1 px radius, before warping
+            ).squeeze(0)
 
         if self.training:
             darkening_factor = torch.rand(1, device=self.device) * 0.5
@@ -1691,7 +1701,7 @@ def main():
     # Common trainer kwargs
     trainer_kwargs = {
         'device': 'cpu',
-        'grad_accumulate': 1,
+        'grad_accumulate': None,
         'match_detection': args.match_detection,
         'impersonation_target': args.impersonation_target
     }
