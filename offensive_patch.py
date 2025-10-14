@@ -23,8 +23,8 @@ from dataset import create_dataloaders
 warnings.filterwarnings("ignore")
 
 
-PATCH_WIDTH = 512
-PATCH_HEIGHT = 256
+PATCH_WIDTH = 256
+PATCH_HEIGHT = 128
 
 
 class AdversarialPatchTrainer:
@@ -34,7 +34,7 @@ class AdversarialPatchTrainer:
                  grad_accumulate: int = None,
                  match_detection: bool = False,
                  impersonation_target: str = None,
-                 print_blur=0.5,
+                 print_blur=0,  # Disabled print blur
                  training=False):
         self.training = training
         self.print_blur = print_blur
@@ -165,7 +165,7 @@ class AdversarialPatchTrainer:
         # Normalize patch to [0, 1] range
         patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
 
-        # Very light Gaussian blur (closer to real printer physics)
+        # Very light Gaussian blur
         if self.print_blur > 0:
             patch_normalized = kornia.filters.gaussian_blur2d(
                 patch_normalized.unsqueeze(0),
@@ -174,7 +174,7 @@ class AdversarialPatchTrainer:
             ).squeeze(0)
 
         if self.training:
-            darkening_factor = torch.rand(1, device=self.device) * 0.5
+            darkening_factor = torch.rand(1, device=self.device) * 0.2
             patch_normalized = patch_normalized * (1.0 - darkening_factor)
 
         # Get the 4 corners of the license plate
@@ -1701,7 +1701,7 @@ def main():
     # Common trainer kwargs
     trainer_kwargs = {
         'device': 'cpu',
-        'grad_accumulate': None,
+        'grad_accumulate': 64,
         'match_detection': args.match_detection,
         'impersonation_target': args.impersonation_target
     }

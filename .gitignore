@@ -5,3 +5,4 @@
 *.json
 *.pkl
 preprocessed_images
+__pycache__
