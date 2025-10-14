@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch
+torchvision
+matplotlib
+pandas
+tqdm
+scipy
+scikit-learn
+kornia
+fast-alpr
+open_image_models[onnx]
+onnx2torch
+pillow_heif
