@@ -1,0 +1,1077 @@
+time_of_day,condition,x,y,filename,any_plate_detected,detected_plate_text,detected_plate_confidence,is_correct_plate
+dark flash,impersonation,10,15,x_+10_y_15.heic,True,VRJ7774,0.999988853931427,True
+dark flash,impersonation,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999886751174927,True
+dark flash,impersonation,5,15,x_+05_y_15.heic,True,VRJ7774,0.9986588358879089,True
+dark flash,impersonation,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999666213989258,True
+dark flash,impersonation,-20,15,x_-20_y_15.heic,False,,,False
+dark flash,impersonation,0,15,x_+00_y_15.heic,True,VRJ7774,0.9999676942825317,True
+dark flash,impersonation,-15,15,x_-15_y_15.heic,True,VRJ7774,0.999640703201294,True
+dark flash,impersonation,15,15,x_+15_y_15.heic,True,VRJ7774,0.9535011649131775,True
+dark flash,impersonation,20,15,x_+20_y_15.heic,True,VRJ7774,0.9995761513710022,True
+dark flash,impersonation,-10,25,x_-10_y_25.heic,True,VRJ7274,0.9893239140510559,False
+dark flash,impersonation,5,25,x_+05_y_25.heic,True,VRJ7774,0.999853253364563,True
+dark flash,impersonation,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9997723698616028,True
+dark flash,impersonation,10,25,x_+10_y_25.heic,True,VRJ7774,0.9999805092811584,True
+dark flash,impersonation,20,25,x_+20_y_25.heic,False,,,False
+dark flash,impersonation,15,25,x_+15_y_25.heic,False,,,False
+dark flash,impersonation,-15,25,x_-15_y_25.heic,False,,,False
+dark flash,impersonation,0,25,x_+00_y_25.heic,True,VRJ7774,0.9998841881752014,True
+dark flash,impersonation,-20,25,x_-20_y_25.heic,False,,,False
+dark flash,impersonation,20,40,x_+20_y_40.heic,False,,,False
+dark flash,impersonation,15,40,x_+15_y_40.heic,False,,,False
+dark flash,impersonation,-15,40,x_-15_y_40.heic,False,,,False
+dark flash,impersonation,-20,40,x_-20_y_40.heic,False,,,False
+dark flash,impersonation,0,40,x_+00_y_40.heic,True,VRJ7774,0.9889763593673706,True
+dark flash,impersonation,-10,40,x_-10_y_40.heic,False,,,False
+dark flash,impersonation,5,40,x_+05_y_40.heic,False,,,False
+dark flash,impersonation,-5,40,x_-05_y_40.heic,False,,,False
+dark flash,impersonation,10,40,x_+10_y_40.heic,False,,,False
+dark flash,impersonation,-15,30,x_-15_y_30.heic,False,,,False
+dark flash,impersonation,-20,30,x_-20_y_30.heic,False,,,False
+dark flash,impersonation,0,30,x_+00_y_30.heic,True,VRJ7774,0.999884307384491,True
+dark flash,impersonation,20,30,x_+20_y_30.heic,False,,,False
+dark flash,impersonation,15,30,x_+15_y_30.heic,True,VRJ7774,0.9629451036453247,True
+dark flash,impersonation,-5,30,x_-05_y_30.heic,False,,,False
+dark flash,impersonation,10,30,x_+10_y_30.heic,False,,,False
+dark flash,impersonation,-10,30,x_-10_y_30.heic,True,VRJ7774,0.9987779259681702,True
+dark flash,impersonation,5,30,x_+05_y_30.heic,True,VRJ7774,0.9974852800369263,True
+dark flash,impersonation,-10,45,x_-10_y_45.heic,False,,,False
+dark flash,impersonation,5,45,x_+05_y_45.heic,False,,,False
+dark flash,impersonation,-5,45,x_-05_y_45.heic,False,,,False
+dark flash,impersonation,10,45,x_+10_y_45.heic,False,,,False
+dark flash,impersonation,20,45,x_+20_y_45.heic,False,,,False
+dark flash,impersonation,15,45,x_+15_y_45.heic,False,,,False
+dark flash,impersonation,-15,45,x_-15_y_45.heic,False,,,False
+dark flash,impersonation,-20,45,x_-20_y_45.heic,False,,,False
+dark flash,impersonation,0,45,x_+00_y_45.heic,False,,,False
+dark flash,impersonation,20,20,x_+20_y_20.heic,False,,,False
+dark flash,impersonation,15,20,x_+15_y_20.heic,True,VRJ7774,0.99998539686203,True
+dark flash,impersonation,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9999805092811584,True
+dark flash,impersonation,0,20,x_+00_y_20.heic,True,VRJ7774,0.9995734095573425,True
+dark flash,impersonation,-20,20,x_-20_y_20.heic,False,,,False
+dark flash,impersonation,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9999839067459106,True
+dark flash,impersonation,5,20,x_+05_y_20.heic,True,VRJ7774,0.9998798370361328,True
+dark flash,impersonation,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9866631627082825,True
+dark flash,impersonation,10,20,x_+10_y_20.heic,True,VRJ7774,0.9996855854988098,True
+dark flash,impersonation,-20,10,x_-20_y_10.heic,False,,,False
+dark flash,impersonation,0,10,x_+00_y_10.heic,True,VRJ7774,0.9999066591262817,True
+dark flash,impersonation,-15,10,x_-15_y_10.heic,False,,,False
+dark flash,impersonation,15,10,x_+15_y_10.heic,True,VRJ7774,0.9999687671661377,True
+dark flash,impersonation,20,10,x_+20_y_10.heic,False,,,False
+dark flash,impersonation,10,10,x_+10_y_10.heic,True,VRJ7774,0.9994686841964722,True
+dark flash,impersonation,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9894320964813232,True
+dark flash,impersonation,5,10,x_+05_y_10.heic,True,VRJ7774,0.9890320897102356,True
+dark flash,impersonation,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9999419450759888,True
+dark flash,impersonation,-5,35,x_-05_y_35.heic,False,,,False
+dark flash,impersonation,10,35,x_+10_y_35.heic,False,,,False
+dark flash,impersonation,-10,35,x_-10_y_35.heic,True,VRJ7774,0.9943616390228271,True
+dark flash,impersonation,5,35,x_+05_y_35.heic,False,,,False
+dark flash,impersonation,-15,35,x_-15_y_35.heic,False,,,False
+dark flash,impersonation,-20,35,x_-20_y_35.heic,False,,,False
+dark flash,impersonation,0,35,x_+00_y_35.heic,False,,,False
+dark flash,impersonation,20,35,x_+20_y_35.heic,False,,,False
+dark flash,impersonation,15,35,x_+15_y_35.heic,False,,,False
+dark flash,impersonation,-15,50,x_-15_y_50.heic,False,,,False
+dark flash,impersonation,0,50,x_+00_y_50.heic,False,,,False
+dark flash,impersonation,-20,50,x_-20_y_50.heic,False,,,False
+dark flash,impersonation,20,50,x_+20_y_50.heic,False,,,False
+dark flash,impersonation,15,50,x_+15_y_50.heic,False,,,False
+dark flash,impersonation,-5,50,x_-05_y_50.heic,False,,,False
+dark flash,impersonation,10,50,x_+10_y_50.heic,False,,,False
+dark flash,impersonation,-10,50,x_-10_y_50.heic,False,,,False
+dark flash,impersonation,5,50,x_+05_y_50.heic,False,,,False
+dark flash,impersonation,5,5,x_+05_y_05.heic,True,VRJ7774,0.9532394409179688,True
+dark flash,impersonation,-10,5,x_-10_y_05.heic,True,VRJ7774,0.8673126697540283,True
+dark flash,impersonation,10,5,x_+10_y_05.heic,True,VRJ7774,0.9944220781326294,True
+dark flash,impersonation,-5,5,x_-05_y_05.heic,True,2RJ777A,0.6302425861358643,False
+dark flash,impersonation,15,5,x_+15_y_05.heic,True,VRJ7774,0.9992878437042236,True
+dark flash,impersonation,20,5,x_+20_y_05.heic,False,,,False
+dark flash,impersonation,0,5,x_+00_y_05.heic,True,VRJ7774,0.9941914677619934,True
+dark flash,impersonation,-20,5,x_-20_y_05.heic,False,,,False
+dark flash,impersonation,-15,5,x_-15_y_05.heic,False,,,False
+dark flash,disruption,10,15,x_+10_y_15.heic,True,VRJ7774,0.999366044998169,True
+dark flash,disruption,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999783635139465,True
+dark flash,disruption,5,15,x_+05_y_15.heic,True,VRJ7774,0.9998912811279297,True
+dark flash,disruption,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999964833259583,True
+dark flash,disruption,-20,15,x_-20_y_15.heic,False,,,False
+dark flash,disruption,0,15,x_+00_y_15.heic,True,VRJ7774,0.9997476935386658,True
+dark flash,disruption,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9999938607215881,True
+dark flash,disruption,15,15,x_+15_y_15.heic,True,VRJ7774,0.9999306797981262,True
+dark flash,disruption,20,15,x_+20_y_15.heic,True,VRJ7774,0.9992361068725586,True
+dark flash,disruption,-10,25,x_-10_y_25.heic,True,VRJ7774,0.9996955394744873,True
+dark flash,disruption,5,25,x_+05_y_25.heic,True,VRJ7774,0.9991201758384705,True
+dark flash,disruption,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9989395141601562,True
+dark flash,disruption,10,25,x_+10_y_25.heic,True,VRJ7774,0.99984210729599,True
+dark flash,disruption,20,25,x_+20_y_25.heic,False,,,False
+dark flash,disruption,15,25,x_+15_y_25.heic,False,,,False
+dark flash,disruption,-15,25,x_-15_y_25.heic,False,,,False
+dark flash,disruption,0,25,x_+00_y_25.heic,False,,,False
+dark flash,disruption,20,40,x_+20_y_40.heic,False,,,False
+dark flash,disruption,15,40,x_+15_y_40.heic,False,,,False
+dark flash,disruption,-15,40,x_-15_y_40.heic,False,,,False
+dark flash,disruption,-20,40,x_-20_y_40.heic,False,,,False
+dark flash,disruption,0,40,x_+00_y_40.heic,False,,,False
+dark flash,disruption,-10,40,x_-10_y_40.heic,False,,,False
+dark flash,disruption,5,40,x_+05_y_40.heic,False,,,False
+dark flash,disruption,-5,40,x_-05_y_40.heic,False,,,False
+dark flash,disruption,10,40,x_+10_y_40.heic,False,,,False
+dark flash,disruption,-15,30,x_-15_y_30.heic,False,,,False
+dark flash,disruption,0,30,x_+00_y_30.heic,True,VRJ7774,0.9942919611930847,True
+dark flash,disruption,20,30,x_+20_y_30.heic,False,,,False
+dark flash,disruption,15,30,x_+15_y_30.heic,False,,,False
+dark flash,disruption,-5,30,x_-05_y_30.heic,True,VRJ7774,0.9939670562744141,True
+dark flash,disruption,10,30,x_+10_y_30.heic,True,VRJ7774,0.9999480843544006,True
+dark flash,disruption,-10,30,x_-10_y_30.heic,True,VPJ7774,0.9081419706344604,False
+dark flash,disruption,5,30,x_+05_y_30.heic,True,NRJ7074,0.9000587463378906,False
+dark flash,disruption,-10,45,x_-10_y_45.heic,False,,,False
+dark flash,disruption,5,45,x_+05_y_45.heic,False,,,False
+dark flash,disruption,-5,45,x_-05_y_45.heic,False,,,False
+dark flash,disruption,10,45,x_+10_y_45.heic,False,,,False
+dark flash,disruption,20,45,x_+20_y_45.heic,False,,,False
+dark flash,disruption,15,45,x_+15_y_45.heic,False,,,False
+dark flash,disruption,-15,45,x_-15_y_45.heic,False,,,False
+dark flash,disruption,-20,45,x_-20_y_45.heic,False,,,False
+dark flash,disruption,0,45,x_+00_y_45.heic,False,,,False
+dark flash,disruption,20,20,x_+20_y_20.heic,True,VRJ7774,0.9988933205604553,True
+dark flash,disruption,15,20,x_+15_y_20.heic,False,,,False
+dark flash,disruption,-15,20,x_-15_y_20.heic,False,,,False
+dark flash,disruption,0,20,x_+00_y_20.heic,True,VRJ7774,0.9999670386314392,True
+dark flash,disruption,-20,20,x_-20_y_20.heic,False,,,False
+dark flash,disruption,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9993042349815369,True
+dark flash,disruption,5,20,x_+05_y_20.heic,True,VRJ7774,0.9999850392341614,True
+dark flash,disruption,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9999942779541016,True
+dark flash,disruption,10,20,x_+10_y_20.heic,True,VRJ7774,0.9997528791427612,True
+dark flash,disruption,-20,10,x_-20_y_10.heic,False,,,False
+dark flash,disruption,0,10,x_+00_y_10.heic,True,VRJ7774,0.9774070382118225,True
+dark flash,disruption,-15,10,x_-15_y_10.heic,False,,,False
+dark flash,disruption,15,10,x_+15_y_10.heic,True,TH771L,0.496038019657135,False
+dark flash,disruption,20,10,x_+20_y_10.heic,True,VRJ7774,0.9783658981323242,True
+dark flash,disruption,10,10,x_+10_y_10.heic,True,VRJ1774,0.9722802639007568,False
+dark flash,disruption,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9908764958381653,True
+dark flash,disruption,5,10,x_+05_y_10.heic,True,VRJ7774,0.9910448789596558,True
+dark flash,disruption,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9956625699996948,True
+dark flash,disruption,-5,35,x_-05_y_35.heic,False,,,False
+dark flash,disruption,10,35,x_+10_y_35.heic,True,VRJ7774,0.9985983371734619,True
+dark flash,disruption,-10,35,x_-10_y_35.heic,True,VRJ7774,0.9992921352386475,True
+dark flash,disruption,5,35,x_+05_y_35.heic,True,VRJ7174,0.9727913737297058,False
+dark flash,disruption,-15,35,x_-15_y_35.heic,False,,,False
+dark flash,disruption,-20,35,x_-20_y_35.heic,False,,,False
+dark flash,disruption,0,35,x_+00_y_35.heic,False,,,False
+dark flash,disruption,20,35,x_+20_y_35.heic,False,,,False
+dark flash,disruption,15,35,x_+15_y_35.heic,False,,,False
+dark flash,disruption,-15,50,x_-15_y_50.heic,False,,,False
+dark flash,disruption,0,50,x_+00_y_50.heic,False,,,False
+dark flash,disruption,-20,50,x_-20_y_50.heic,False,,,False
+dark flash,disruption,20,50,x_+20_y_50.heic,False,,,False
+dark flash,disruption,15,50,x_+15_y_50.heic,False,,,False
+dark flash,disruption,-5,50,x_-05_y_50.heic,False,,,False
+dark flash,disruption,10,50,x_+10_y_50.heic,False,,,False
+dark flash,disruption,-10,50,x_-10_y_50.heic,False,,,False
+dark flash,disruption,5,50,x_+05_y_50.heic,False,,,False
+dark flash,disruption,5,5,x_+05_y_05.heic,True,VRJ77744,0.9322782158851624,False
+dark flash,disruption,-10,5,x_-10_y_05.heic,True,VYT7777,0.6109436750411987,False
+dark flash,disruption,10,5,x_+10_y_05.heic,True,VRJ7774,0.9980661869049072,True
+dark flash,disruption,-5,5,x_-05_y_05.heic,True,VRJ777A,0.9665126800537109,False
+dark flash,disruption,15,5,x_+15_y_05.heic,True,VRJ7774,0.9998471736907959,True
+dark flash,disruption,20,5,x_+20_y_05.heic,False,,,False
+dark flash,disruption,0,5,x_+00_y_05.heic,True,VRJ7774,0.99648118019104,True
+dark flash,disruption,-20,5,x_-20_y_05.heic,False,,,False
+dark flash,disruption,-15,5,x_-15_y_05.heic,False,,,False
+dark flash,control,10,15,x_+10_y_15.heic,True,VRJ7774,0.9999644160270691,True
+dark flash,control,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999644160270691,True
+dark flash,control,5,15,x_+05_y_15.heic,True,VRJ7774,0.9995386600494385,True
+dark flash,control,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9998023509979248,True
+dark flash,control,-20,15,x_-20_y_15.heic,False,,,False
+dark flash,control,0,15,x_+00_y_15.heic,True,VRJ7774,0.9999930262565613,True
+dark flash,control,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9999462962150574,True
+dark flash,control,15,15,x_+15_y_15.heic,True,VRJ7774,0.9998754858970642,True
+dark flash,control,20,15,x_+20_y_15.heic,True,VRJ7774,0.9999659657478333,True
+dark flash,control,-10,25,x_-10_y_25.heic,True,1RJH774,0.5931389927864075,False
+dark flash,control,5,25,x_+05_y_25.heic,True,VRJ7774,0.9992512464523315,True
+dark flash,control,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9945093989372253,True
+dark flash,control,10,25,x_+10_y_25.heic,True,VRJ7774,0.9997132420539856,True
+dark flash,control,20,25,x_+20_y_25.heic,False,,,False
+dark flash,control,15,25,x_+15_y_25.heic,False,,,False
+dark flash,control,-15,25,x_-15_y_25.heic,False,,,False
+dark flash,control,0,25,x_+00_y_25.heic,True,VRJ7774,0.9996744990348816,True
+dark flash,control,-20,25,x_-20_y_25.heic,False,,,False
+dark flash,control,20,40,x_+20_y_40.heic,False,,,False
+dark flash,control,15,40,x_+15_y_40.heic,False,,,False
+dark flash,control,-15,40,x_-15_y_40.heic,False,,,False
+dark flash,control,-20,40,x_-20_y_40.heic,False,,,False
+dark flash,control,0,40,x_+00_y_40.heic,False,,,False
+dark flash,control,-10,40,x_-10_y_40.heic,False,,,False
+dark flash,control,5,40,x_+05_y_40.heic,False,,,False
+dark flash,control,-5,40,x_-05_y_40.heic,False,,,False
+dark flash,control,10,40,x_+10_y_40.heic,True,VVZ7777,0.8021349906921387,False
+dark flash,control,-15,30,x_-15_y_30.heic,False,,,False
+dark flash,control,-20,30,x_-20_y_30.heic,False,,,False
+dark flash,control,0,30,x_+00_y_30.heic,False,,,False
+dark flash,control,20,30,x_+20_y_30.heic,False,,,False
+dark flash,control,15,30,x_+15_y_30.heic,True,VRJ7774,0.9998142719268799,True
+dark flash,control,-5,30,x_-05_y_30.heic,True,VRJ7774,0.9997603893280029,True
+dark flash,control,10,30,x_+10_y_30.heic,True,VKJ7774,0.8984770178794861,False
+dark flash,control,-10,30,x_-10_y_30.heic,True,PP7776,0.590495228767395,False
+dark flash,control,5,30,x_+05_y_30.heic,True,VRJ7774,0.9946410059928894,True
+dark flash,control,-10,45,x_-10_y_45.heic,False,,,False
+dark flash,control,5,45,x_+05_y_45.heic,False,,,False
+dark flash,control,-5,45,x_-05_y_45.heic,False,,,False
+dark flash,control,10,45,x_+10_y_45.heic,False,,,False
+dark flash,control,20,45,x_+20_y_45.heic,False,,,False
+dark flash,control,15,45,x_+15_y_45.heic,False,,,False
+dark flash,control,-15,45,x_-15_y_45.heic,False,,,False
+dark flash,control,-20,45,x_-20_y_45.heic,False,,,False
+dark flash,control,0,45,x_+00_y_45.heic,False,,,False
+dark flash,control,20,20,x_+20_y_20.heic,False,,,False
+dark flash,control,15,20,x_+15_y_20.heic,True,VRJ7774,0.9997257590293884,True
+dark flash,control,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9998800754547119,True
+dark flash,control,0,20,x_+00_y_20.heic,True,VRJ7774,0.9999242424964905,True
+dark flash,control,-20,20,x_-20_y_20.heic,False,,,False
+dark flash,control,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9999798536300659,True
+dark flash,control,5,20,x_+05_y_20.heic,True,VRJ7774,0.9869940876960754,True
+dark flash,control,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9999932050704956,True
+dark flash,control,10,20,x_+10_y_20.heic,True,VRJ7774,0.9999456405639648,True
+dark flash,control,-20,10,x_-20_y_10.heic,False,,,False
+dark flash,control,0,10,x_+00_y_10.heic,True,VBJ7774,0.8963496088981628,False
+dark flash,control,-15,10,x_-15_y_10.heic,False,,,False
+dark flash,control,15,10,x_+15_y_10.heic,True,VRJ7774,0.9998619556427002,True
+dark flash,control,20,10,x_+20_y_10.heic,False,,,False
+dark flash,control,10,10,x_+10_y_10.heic,True,VRJ7774,0.9998989105224609,True
+dark flash,control,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9999127984046936,True
+dark flash,control,5,10,x_+05_y_10.heic,True,VRJ7774,0.9999881386756897,True
+dark flash,control,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9925068616867065,True
+dark flash,control,-5,35,x_-05_y_35.heic,False,,,False
+dark flash,control,10,35,x_+10_y_35.heic,True,VRJ7774,0.9259019494056702,True
+dark flash,control,-10,35,x_-10_y_35.heic,False,,,False
+dark flash,control,5,35,x_+05_y_35.heic,False,,,False
+dark flash,control,-15,35,x_-15_y_35.heic,False,,,False
+dark flash,control,-20,35,x_-20_y_35.heic,False,,,False
+dark flash,control,0,35,x_+00_y_35.heic,False,,,False
+dark flash,control,20,35,x_+20_y_35.heic,False,,,False
+dark flash,control,15,35,x_+15_y_35.heic,False,,,False
+dark flash,control,-15,50,x_-15_y_50.heic,False,,,False
+dark flash,control,0,50,x_+00_y_50.heic,False,,,False
+dark flash,control,-20,50,x_-20_y_50.heic,False,,,False
+dark flash,control,20,50,x_+20_y_50.heic,False,,,False
+dark flash,control,15,50,x_+15_y_50.heic,False,,,False
+dark flash,control,-5,50,x_-05_y_50.heic,False,,,False
+dark flash,control,10,50,x_+10_y_50.heic,False,,,False
+dark flash,control,-10,50,x_-10_y_50.heic,False,,,False
+dark flash,control,5,50,x_+05_y_50.heic,False,,,False
+dark flash,control,5,5,x_+05_y_05.heic,True,VRJ7774,0.9999381303787231,True
+dark flash,control,-10,5,x_-10_y_05.heic,True,VRJ7774,0.999934196472168,True
+dark flash,control,10,5,x_+10_y_05.heic,True,VRJ7774,0.9999754428863525,True
+dark flash,control,-5,5,x_-05_y_05.heic,True,VRJ7174,0.9662546515464783,False
+dark flash,control,15,5,x_+15_y_05.heic,True,VRJ7774,0.9999277591705322,True
+dark flash,control,20,5,x_+20_y_05.heic,False,,,False
+dark flash,control,0,5,x_+00_y_05.heic,True,VRJ7774,0.9999939799308777,True
+dark flash,control,-20,5,x_-20_y_05.heic,False,,,False
+dark flash,control,-15,5,x_-15_y_05.heic,False,,,False
+dusk,impersonation,10,15,x_+10_y_15.heic,True,VRE7774,0.7082680463790894,False
+dusk,impersonation,-5,15,x_-05_y_15.heic,True,SHTJ777,0.5920911431312561,False
+dusk,impersonation,5,15,x_+05_y_15.heic,True,VRRJ77,0.5317543148994446,False
+dusk,impersonation,-10,15,x_-10_y_15.heic,True,YRJ777,0.8619372248649597,False
+dusk,impersonation,-20,15,x_-20_y_15.heic,False,,,False
+dusk,impersonation,0,15,x_+00_y_15.heic,True,VRJ7774,0.8793066143989563,True
+dusk,impersonation,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9256060719490051,True
+dusk,impersonation,15,15,x_+15_y_15.heic,True,AHJ711,0.44145071506500244,False
+dusk,impersonation,20,15,x_+20_y_15.heic,False,,,False
+dusk,impersonation,-10,25,x_-10_y_25.heic,True,SHVR777,0.5313373804092407,False
+dusk,impersonation,5,25,x_+05_y_25.heic,True,SNRJ777,0.6425034999847412,False
+dusk,impersonation,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9020649790763855,True
+dusk,impersonation,10,25,x_+10_y_25.heic,True,VRJ7774,0.9954076409339905,True
+dusk,impersonation,20,25,x_+20_y_25.heic,False,,,False
+dusk,impersonation,15,25,x_+15_y_25.heic,True,VRRJ774,0.8365885019302368,False
+dusk,impersonation,-15,25,x_-15_y_25.heic,False,,,False
+dusk,impersonation,0,25,x_+00_y_25.heic,True,3HVR77,0.5029719471931458,False
+dusk,impersonation,-20,25,x_-20_y_25.heic,False,,,False
+dusk,impersonation,20,40,x_+20_y_40.heic,False,,,False
+dusk,impersonation,15,40,x_+15_y_40.heic,False,,,False
+dusk,impersonation,-15,40,x_-15_y_40.heic,False,,,False
+dusk,impersonation,-20,40,x_-20_y_40.heic,False,,,False
+dusk,impersonation,0,40,x_+00_y_40.heic,False,,,False
+dusk,impersonation,-10,40,x_-10_y_40.heic,False,,,False
+dusk,impersonation,5,40,x_+05_y_40.heic,False,,,False
+dusk,impersonation,-5,40,x_-05_y_40.heic,False,,,False
+dusk,impersonation,10,40,x_+10_y_40.heic,False,,,False
+dusk,impersonation,-15,30,x_-15_y_30.heic,False,,,False
+dusk,impersonation,-20,30,x_-20_y_30.heic,False,,,False
+dusk,impersonation,0,30,x_+00_y_30.heic,False,,,False
+dusk,impersonation,20,30,x_+20_y_30.heic,False,,,False
+dusk,impersonation,15,30,x_+15_y_30.heic,False,,,False
+dusk,impersonation,-5,30,x_-05_y_30.heic,False,,,False
+dusk,impersonation,10,30,x_+10_y_30.heic,False,,,False
+dusk,impersonation,-10,30,x_-10_y_30.heic,True,VRJ7774,0.8025037050247192,True
+dusk,impersonation,5,30,x_+05_y_30.heic,True,5AKJ17774,0.5521602630615234,False
+dusk,impersonation,-10,45,x_-10_y_45.heic,False,,,False
+dusk,impersonation,5,45,x_+05_y_45.heic,False,,,False
+dusk,impersonation,-5,45,x_-05_y_45.heic,False,,,False
+dusk,impersonation,10,45,x_+10_y_45.heic,False,,,False
+dusk,impersonation,20,45,x_+20_y_45.heic,False,,,False
+dusk,impersonation,15,45,x_+15_y_45.heic,False,,,False
+dusk,impersonation,-15,45,x_-15_y_45.heic,False,,,False
+dusk,impersonation,-20,45,x_-20_y_45.heic,False,,,False
+dusk,impersonation,0,45,x_+00_y_45.heic,False,,,False
+dusk,impersonation,20,20,x_+20_y_20.heic,False,,,False
+dusk,impersonation,15,20,x_+15_y_20.heic,True,VRJ777,0.88685542345047,False
+dusk,impersonation,-15,20,x_-15_y_20.heic,True,SRJ777,0.640682578086853,False
+dusk,impersonation,0,20,x_+00_y_20.heic,True,VRJ7774,0.9992281794548035,True
+dusk,impersonation,-20,20,x_-20_y_20.heic,False,,,False
+dusk,impersonation,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9991579055786133,True
+dusk,impersonation,5,20,x_+05_y_20.heic,True,VRJ7774,0.9848019480705261,True
+dusk,impersonation,-5,20,x_-05_y_20.heic,True,VMW7774,0.5962272882461548,False
+dusk,impersonation,10,20,x_+10_y_20.heic,True,V1J7774,0.7038823366165161,False
+dusk,impersonation,-20,10,x_-20_y_10.heic,False,,,False
+dusk,impersonation,0,10,x_+00_y_10.heic,True,V47J,0.614344596862793,False
+dusk,impersonation,-15,10,x_-15_y_10.heic,True,PNJ777,0.6328146457672119,False
+dusk,impersonation,15,10,x_+15_y_10.heic,True,NRJ7774,0.6825021505355835,False
+dusk,impersonation,20,10,x_+20_y_10.heic,True,HVJ777,0.540973961353302,False
+dusk,impersonation,10,10,x_+10_y_10.heic,True,VR7774,0.8795540928840637,False
+dusk,impersonation,-5,10,x_-05_y_10.heic,True,5H7J777,0.5261510014533997,False
+dusk,impersonation,5,10,x_+05_y_10.heic,True,VNJJ77,0.635260820388794,False
+dusk,impersonation,-10,10,x_-10_y_10.heic,True,55D41177,0.4617956578731537,False
+dusk,impersonation,-5,35,x_-05_y_35.heic,False,,,False
+dusk,impersonation,10,35,x_+10_y_35.heic,False,,,False
+dusk,impersonation,-10,35,x_-10_y_35.heic,False,,,False
+dusk,impersonation,5,35,x_+05_y_35.heic,False,,,False
+dusk,impersonation,-15,35,x_-15_y_35.heic,False,,,False
+dusk,impersonation,-20,35,x_-20_y_35.heic,False,,,False
+dusk,impersonation,0,35,x_+00_y_35.heic,False,,,False
+dusk,impersonation,20,35,x_+20_y_35.heic,False,,,False
+dusk,impersonation,15,35,x_+15_y_35.heic,False,,,False
+dusk,impersonation,-15,50,x_-15_y_50.heic,False,,,False
+dusk,impersonation,0,50,x_+00_y_50.heic,False,,,False
+dusk,impersonation,-20,50,x_-20_y_50.heic,False,,,False
+dusk,impersonation,20,50,x_+20_y_50.heic,False,,,False
+dusk,impersonation,15,50,x_+15_y_50.heic,False,,,False
+dusk,impersonation,-5,50,x_-05_y_50.heic,False,,,False
+dusk,impersonation,10,50,x_+10_y_50.heic,False,,,False
+dusk,impersonation,-10,50,x_-10_y_50.heic,False,,,False
+dusk,impersonation,5,50,x_+05_y_50.heic,False,,,False
+dusk,impersonation,5,5,x_+05_y_05.heic,True,SHS97,0.38247546553611755,False
+dusk,impersonation,-10,5,x_-10_y_05.heic,True,VJ7777,0.6939365863800049,False
+dusk,impersonation,10,5,x_+10_y_05.heic,True,SVJJ77,0.5018205642700195,False
+dusk,impersonation,-5,5,x_-05_y_05.heic,True,35JJ774,0.47077739238739014,False
+dusk,impersonation,15,5,x_+15_y_05.heic,True,RRJ777,0.6393991708755493,False
+dusk,impersonation,20,5,x_+20_y_05.heic,False,,,False
+dusk,impersonation,0,5,x_+00_y_05.heic,True,587J77,0.4578653872013092,False
+dusk,impersonation,-20,5,x_-20_y_05.heic,False,,,False
+dusk,impersonation,-15,5,x_-15_y_05.heic,False,,,False
+dusk,disruption,10,15,x_+10_y_15.heic,True,VJJ7744,0.9397246241569519,False
+dusk,disruption,-5,15,x_-05_y_15.heic,True,VJJ7744,0.9900152683258057,False
+dusk,disruption,5,15,x_+05_y_15.heic,True,VRI4744,0.8231648802757263,False
+dusk,disruption,-10,15,x_-10_y_15.heic,True,VJJ7744,0.9394255876541138,False
+dusk,disruption,-20,15,x_-20_y_15.heic,False,,,False
+dusk,disruption,0,15,x_+00_y_15.heic,True,VJJ7744,0.9636086225509644,False
+dusk,disruption,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9966471195220947,True
+dusk,disruption,15,15,x_+15_y_15.heic,True,VJ77744,0.9355471134185791,False
+dusk,disruption,20,15,x_+20_y_15.heic,True,VRJ7774,0.9945445656776428,True
+dusk,disruption,-10,25,x_-10_y_25.heic,False,,,False
+dusk,disruption,5,25,x_+05_y_25.heic,True,VRJ7774,0.995550811290741,True
+dusk,disruption,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9792665839195251,True
+dusk,disruption,10,25,x_+10_y_25.heic,True,VJJ7744,0.9937583208084106,False
+dusk,disruption,20,25,x_+20_y_25.heic,False,,,False
+dusk,disruption,15,25,x_+15_y_25.heic,False,,,False
+dusk,disruption,-15,25,x_-15_y_25.heic,True,VRJ7774,0.9922452569007874,True
+dusk,disruption,0,25,x_+00_y_25.heic,True,VRJ7774,0.9976592659950256,True
+dusk,disruption,-20,25,x_-20_y_25.heic,False,,,False
+dusk,disruption,20,40,x_+20_y_40.heic,False,,,False
+dusk,disruption,15,40,x_+15_y_40.heic,False,,,False
+dusk,disruption,-15,40,x_-15_y_40.heic,False,,,False
+dusk,disruption,-20,40,x_-20_y_40.heic,False,,,False
+dusk,disruption,0,40,x_+00_y_40.heic,False,,,False
+dusk,disruption,-10,40,x_-10_y_40.heic,False,,,False
+dusk,disruption,5,40,x_+05_y_40.heic,False,,,False
+dusk,disruption,-5,40,x_-05_y_40.heic,False,,,False
+dusk,disruption,10,40,x_+10_y_40.heic,False,,,False
+dusk,disruption,-15,30,x_-15_y_30.heic,False,,,False
+dusk,disruption,-20,30,x_-20_y_30.heic,False,,,False
+dusk,disruption,0,30,x_+00_y_30.heic,True,VRJ7744,0.9091091156005859,False
+dusk,disruption,20,30,x_+20_y_30.heic,False,,,False
+dusk,disruption,15,30,x_+15_y_30.heic,False,,,False
+dusk,disruption,-5,30,x_-05_y_30.heic,True,VRJ7774,0.9946406483650208,True
+dusk,disruption,10,30,x_+10_y_30.heic,False,,,False
+dusk,disruption,-10,30,x_-10_y_30.heic,True,VRJ7774,0.9952476024627686,True
+dusk,disruption,5,30,x_+05_y_30.heic,True,VRJ7774,0.9902235865592957,True
+dusk,disruption,-10,45,x_-10_y_45.heic,False,,,False
+dusk,disruption,5,45,x_+05_y_45.heic,False,,,False
+dusk,disruption,-5,45,x_-05_y_45.heic,False,,,False
+dusk,disruption,10,45,x_+10_y_45.heic,False,,,False
+dusk,disruption,20,45,x_+20_y_45.heic,False,,,False
+dusk,disruption,15,45,x_+15_y_45.heic,False,,,False
+dusk,disruption,-15,45,x_-15_y_45.heic,False,,,False
+dusk,disruption,-20,45,x_-20_y_45.heic,False,,,False
+dusk,disruption,0,45,x_+00_y_45.heic,False,,,False
+dusk,disruption,20,20,x_+20_y_20.heic,True,VRJ7774,0.9981014728546143,True
+dusk,disruption,15,20,x_+15_y_20.heic,True,VJJ7744,0.9400968551635742,False
+dusk,disruption,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9787416458129883,True
+dusk,disruption,0,20,x_+00_y_20.heic,True,VRJ7744,0.999038577079773,False
+dusk,disruption,-20,20,x_-20_y_20.heic,True,VJ7774,0.9403764009475708,False
+dusk,disruption,-10,20,x_-10_y_20.heic,True,VJJ7744,0.9903503060340881,False
+dusk,disruption,5,20,x_+05_y_20.heic,True,VJJ7744,0.9498324990272522,False
+dusk,disruption,-5,20,x_-05_y_20.heic,True,VJJ7744,0.9966234564781189,False
+dusk,disruption,10,20,x_+10_y_20.heic,True,VJJ7744,0.9907255172729492,False
+dusk,disruption,-20,10,x_-20_y_10.heic,False,,,False
+dusk,disruption,0,10,x_+00_y_10.heic,True,VJ77744,0.9457641243934631,False
+dusk,disruption,-15,10,x_-15_y_10.heic,True,VJJ7774,0.9281313419342041,False
+dusk,disruption,15,10,x_+15_y_10.heic,True,VRJ7774,0.884816586971283,True
+dusk,disruption,20,10,x_+20_y_10.heic,True,VJ7774,0.8101604580879211,False
+dusk,disruption,10,10,x_+10_y_10.heic,True,VRJ7774,0.9618234634399414,True
+dusk,disruption,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9640892744064331,True
+dusk,disruption,5,10,x_+05_y_10.heic,True,VJJ7744,0.9762676954269409,False
+dusk,disruption,-10,10,x_-10_y_10.heic,True,VRJ7744,0.9658783674240112,False
+dusk,disruption,-5,35,x_-05_y_35.heic,False,,,False
+dusk,disruption,10,35,x_+10_y_35.heic,True,VRJ7744,0.9840361475944519,False
+dusk,disruption,-10,35,x_-10_y_35.heic,False,,,False
+dusk,disruption,5,35,x_+05_y_35.heic,False,,,False
+dusk,disruption,-15,35,x_-15_y_35.heic,True,VRJ7774,0.972320020198822,True
+dusk,disruption,-20,35,x_-20_y_35.heic,False,,,False
+dusk,disruption,0,35,x_+00_y_35.heic,False,,,False
+dusk,disruption,20,35,x_+20_y_35.heic,False,,,False
+dusk,disruption,15,35,x_+15_y_35.heic,False,,,False
+dusk,disruption,-15,50,x_-15_y_50.heic,False,,,False
+dusk,disruption,0,50,x_+00_y_50.heic,False,,,False
+dusk,disruption,-20,50,x_-20_y_50.heic,False,,,False
+dusk,disruption,20,50,x_+20_y_50.heic,False,,,False
+dusk,disruption,15,50,x_+15_y_50.heic,False,,,False
+dusk,disruption,-5,50,x_-05_y_50.heic,False,,,False
+dusk,disruption,10,50,x_+10_y_50.heic,False,,,False
+dusk,disruption,-10,50,x_-10_y_50.heic,False,,,False
+dusk,disruption,5,50,x_+05_y_50.heic,False,,,False
+dusk,disruption,5,5,x_+05_y_05.heic,True,VJJ7744,0.9067904353141785,False
+dusk,disruption,-10,5,x_-10_y_05.heic,True,VJJ7774,0.9372861385345459,False
+dusk,disruption,10,5,x_+10_y_05.heic,True,VRJ7774,0.9685108661651611,True
+dusk,disruption,-5,5,x_-05_y_05.heic,True,VRJ1744,0.8761420249938965,False
+dusk,disruption,15,5,x_+15_y_05.heic,True,RJ77774,0.7120845317840576,False
+dusk,disruption,20,5,x_+20_y_05.heic,True,DAITAA,0.4287731945514679,False
+dusk,disruption,0,5,x_+00_y_05.heic,True,VJ77744,0.9369654059410095,False
+dusk,disruption,-20,5,x_-20_y_05.heic,False,,,False
+dusk,disruption,-15,5,x_-15_y_05.heic,False,,,False
+dusk,control,10,15,x_+10_y_15.heic,True,VRJ7774,0.9999182224273682,True
+dusk,control,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999932050704956,True
+dusk,control,5,15,x_+05_y_15.heic,True,VRJ7774,0.9999792575836182,True
+dusk,control,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999266862869263,True
+dusk,control,-20,15,x_-20_y_15.heic,False,,,False
+dusk,control,0,15,x_+00_y_15.heic,True,VRJ7774,0.999955415725708,True
+dusk,control,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9999924898147583,True
+dusk,control,15,15,x_+15_y_15.heic,True,VRJ7774,0.999950110912323,True
+dusk,control,20,15,x_+20_y_15.heic,False,,,False
+dusk,control,-10,25,x_-10_y_25.heic,False,,,False
+dusk,control,5,25,x_+05_y_25.heic,True,VRJ7774,0.9997425079345703,True
+dusk,control,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9999921321868896,True
+dusk,control,10,25,x_+10_y_25.heic,True,VRJ7774,0.9996024370193481,True
+dusk,control,20,25,x_+20_y_25.heic,False,,,False
+dusk,control,15,25,x_+15_y_25.heic,False,,,False
+dusk,control,-15,25,x_-15_y_25.heic,False,,,False
+dusk,control,0,25,x_+00_y_25.heic,True,VRJ7774,0.9999828338623047,True
+dusk,control,-20,25,x_-20_y_25.heic,False,,,False
+dusk,control,20,40,x_+20_y_40.heic,False,,,False
+dusk,control,15,40,x_+15_y_40.heic,False,,,False
+dusk,control,-15,40,x_-15_y_40.heic,False,,,False
+dusk,control,-20,40,x_-20_y_40.heic,False,,,False
+dusk,control,0,40,x_+00_y_40.heic,False,,,False
+dusk,control,-10,40,x_-10_y_40.heic,False,,,False
+dusk,control,5,40,x_+05_y_40.heic,False,,,False
+dusk,control,-5,40,x_-05_y_40.heic,False,,,False
+dusk,control,10,40,x_+10_y_40.heic,False,,,False
+dusk,control,-15,30,x_-15_y_30.heic,False,,,False
+dusk,control,-20,30,x_-20_y_30.heic,False,,,False
+dusk,control,0,30,x_+00_y_30.heic,False,,,False
+dusk,control,20,30,x_+20_y_30.heic,False,,,False
+dusk,control,15,30,x_+15_y_30.heic,False,,,False
+dusk,control,-5,30,x_-05_y_30.heic,False,,,False
+dusk,control,10,30,x_+10_y_30.heic,False,,,False
+dusk,control,-10,30,x_-10_y_30.heic,False,,,False
+dusk,control,5,30,x_+05_y_30.heic,False,,,False
+dusk,control,-10,45,x_-10_y_45.heic,False,,,False
+dusk,control,5,45,x_+05_y_45.heic,False,,,False
+dusk,control,-5,45,x_-05_y_45.heic,False,,,False
+dusk,control,10,45,x_+10_y_45.heic,False,,,False
+dusk,control,20,45,x_+20_y_45.heic,False,,,False
+dusk,control,15,45,x_+15_y_45.heic,False,,,False
+dusk,control,-15,45,x_-15_y_45.heic,False,,,False
+dusk,control,0,45,x_+00_y_45.heic,False,,,False
+dusk,control,20,20,x_+20_y_20.heic,False,,,False
+dusk,control,15,20,x_+15_y_20.heic,True,VRJ7774,0.9974679946899414,True
+dusk,control,-15,20,x_-15_y_20.heic,False,,,False
+dusk,control,0,20,x_+00_y_20.heic,True,VRJ7774,0.9999953508377075,True
+dusk,control,-20,20,x_-20_y_20.heic,False,,,False
+dusk,control,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9999570846557617,True
+dusk,control,5,20,x_+05_y_20.heic,True,VRJ7774,0.9999587535858154,True
+dusk,control,-5,20,x_-05_y_20.heic,True,VRJ7774,0.99998939037323,True
+dusk,control,10,20,x_+10_y_20.heic,True,VRJ7774,0.9992178678512573,True
+dusk,control,-20,10,x_-20_y_10.heic,False,,,False
+dusk,control,0,10,x_+00_y_10.heic,True,VRJ7774,0.9999724626541138,True
+dusk,control,-15,10,x_-15_y_10.heic,False,,,False
+dusk,control,15,10,x_+15_y_10.heic,True,VRJ7774,0.9999474287033081,True
+dusk,control,20,10,x_+20_y_10.heic,False,,,False
+dusk,control,10,10,x_+10_y_10.heic,True,VRJ7774,0.9998987913131714,True
+dusk,control,5,10,x_+05_y_10.heic,True,VRJ7774,0.9999577403068542,True
+dusk,control,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9999618530273438,True
+dusk,control,-5,10,x_-5_y_10.heic,True,VRJ7774,0.9999961853027344,True
+dusk,control,-5,35,x_-05_y_35.heic,False,,,False
+dusk,control,10,35,x_+10_y_35.heic,False,,,False
+dusk,control,-10,35,x_-10_y_35.heic,False,,,False
+dusk,control,5,35,x_+05_y_35.heic,False,,,False
+dusk,control,-15,35,x_-15_y_35.heic,False,,,False
+dusk,control,-20,35,x_-20_y_35.heic,False,,,False
+dusk,control,0,35,x_+00_y_35.heic,False,,,False
+dusk,control,15,35,x_+15_y_35.heic,False,,,False
+dusk,control,-15,50,x_-15_y_50.heic,False,,,False
+dusk,control,0,50,x_+00_y_50.heic,False,,,False
+dusk,control,-20,50,x_-20_y_50.heic,False,,,False
+dusk,control,20,50,x_+20_y_50.heic,False,,,False
+dusk,control,15,50,x_+15_y_50.heic,False,,,False
+dusk,control,-5,50,x_-05_y_50.heic,False,,,False
+dusk,control,10,50,x_+10_y_50.heic,False,,,False
+dusk,control,-10,50,x_-10_y_50.heic,False,,,False
+dusk,control,5,50,x_+05_y_50.heic,False,,,False
+dusk,control,5,5,x_+05_y_05.heic,True,VRJ7774,0.9999176859855652,True
+dusk,control,-10,5,x_-10_y_05.heic,True,VRJ7774,0.9999722242355347,True
+dusk,control,10,5,x_+10_y_05.heic,True,VRJ7774,0.999973714351654,True
+dusk,control,-5,5,x_-05_y_05.heic,True,VRJ7774,0.9997904300689697,True
+dusk,control,15,5,x_+15_y_05.heic,True,PJ7777,0.5725406408309937,False
+dusk,control,20,5,x_+20_y_05.heic,False,,,False
+dusk,control,0,5,x_+00_y_05.heic,True,VRJ7774,0.9999648332595825,True
+dusk,control,-20,5,x_-20_y_05.heic,False,,,False
+dusk,control,-15,5,x_-15_y_05.heic,False,,,False
+full sun,impersonation,10,15,x_+10_y_15.heic,True,VRJ777,0.6874619722366333,False
+full sun,impersonation,-5,15,x_-05_y_15.heic,True,VRJ777,0.8472872972488403,False
+full sun,impersonation,5,15,x_+05_y_15.heic,True,147777,0.5789883136749268,False
+full sun,impersonation,-10,15,x_-10_y_15.heic,True,VR77774,0.8136252164840698,False
+full sun,impersonation,-20,15,x_-20_y_15.heic,True,3AJ7777,0.5283529758453369,False
+full sun,impersonation,0,15,x_+00_y_15.heic,True,VR77774,0.770274817943573,False
+full sun,impersonation,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9384543299674988,True
+full sun,impersonation,15,15,x_+15_y_15.heic,True,NNV7777,0.5945760011672974,False
+full sun,impersonation,20,15,x_+20_y_15.heic,False,,,False
+full sun,impersonation,-10,25,x_-10_y_25.heic,False,,,False
+full sun,impersonation,5,25,x_+05_y_25.heic,True,V4VJ777,0.669646143913269,False
+full sun,impersonation,-5,25,x_-05_y_25.heic,True,VR7777,0.8340383172035217,False
+full sun,impersonation,10,25,x_+10_y_25.heic,True,VRJ7774,0.9999563694000244,True
+full sun,impersonation,20,25,x_+20_y_25.heic,False,,,False
+full sun,impersonation,15,25,x_+15_y_25.heic,True,VR7777,0.7080138325691223,False
+full sun,impersonation,-15,25,x_-15_y_25.heic,False,,,False
+full sun,impersonation,0,25,x_+00_y_25.heic,True,VR77774,0.8848891854286194,False
+full sun,impersonation,-20,25,x_-20_y_25.heic,False,,,False
+full sun,impersonation,20,40,x_+20_y_40.heic,False,,,False
+full sun,impersonation,15,40,x_+15_y_40.heic,False,,,False
+full sun,impersonation,-15,40,x_-15_y_40.heic,False,,,False
+full sun,impersonation,-20,40,x_-20_y_40.heic,False,,,False
+full sun,impersonation,0,40,x_+00_y_40.heic,False,,,False
+full sun,impersonation,-10,40,x_-10_y_40.heic,False,,,False
+full sun,impersonation,5,40,x_+05_y_40.heic,False,,,False
+full sun,impersonation,-5,40,x_-05_y_40.heic,False,,,False
+full sun,impersonation,10,40,x_+10_y_40.heic,False,,,False
+full sun,impersonation,-15,30,x_-15_y_30.heic,False,,,False
+full sun,impersonation,-20,30,x_-20_y_30.heic,True,3NVJ777,0.733806312084198,False
+full sun,impersonation,0,30,x_+00_y_30.heic,False,,,False
+full sun,impersonation,20,30,x_+20_y_30.heic,False,,,False
+full sun,impersonation,15,30,x_+15_y_30.heic,True,3VVJ777,0.7473363280296326,False
+full sun,impersonation,-5,30,x_-05_y_30.heic,True,3HVRJ777,0.8446357250213623,False
+full sun,impersonation,10,30,x_+10_y_30.heic,True,7HRR777,0.6787452101707458,False
+full sun,impersonation,-10,30,x_-10_y_30.heic,True,34VRJ777,0.8470450639724731,False
+full sun,impersonation,5,30,x_+05_y_30.heic,False,,,False
+full sun,impersonation,-10,45,x_-10_y_45.heic,False,,,False
+full sun,impersonation,5,45,x_+05_y_45.heic,False,,,False
+full sun,impersonation,-5,45,x_-05_y_45.heic,False,,,False
+full sun,impersonation,10,45,x_+10_y_45.heic,False,,,False
+full sun,impersonation,20,45,x_+20_y_45.heic,False,,,False
+full sun,impersonation,15,45,x_+15_y_45.heic,False,,,False
+full sun,impersonation,-15,45,x_-15_y_45.heic,False,,,False
+full sun,impersonation,-20,45,x_-20_y_45.heic,False,,,False
+full sun,impersonation,0,45,x_+00_y_45.heic,False,,,False
+full sun,impersonation,20,20,x_+20_y_20.heic,False,,,False
+full sun,impersonation,15,20,x_+15_y_20.heic,True,9NR7777,0.5924994945526123,False
+full sun,impersonation,-15,20,x_-15_y_20.heic,True,5HVR777,0.7173453569412231,False
+full sun,impersonation,0,20,x_+00_y_20.heic,True,VRJ777,0.8473198413848877,False
+full sun,impersonation,-20,20,x_-20_y_20.heic,True,3HVJ777,0.6072820425033569,False
+full sun,impersonation,-10,20,x_-10_y_20.heic,True,VRJ7774,0.7917434573173523,True
+full sun,impersonation,5,20,x_+05_y_20.heic,True,VH7J777,0.6622976064682007,False
+full sun,impersonation,-5,20,x_-05_y_20.heic,True,VAV777,0.6321389079093933,False
+full sun,impersonation,10,20,x_+10_y_20.heic,True,VR7R77,0.6066784858703613,False
+full sun,impersonation,-20,10,x_-20_y_10.heic,False,,,False
+full sun,impersonation,0,10,x_+00_y_10.heic,True,747R777,0.589605987071991,False
+full sun,impersonation,-15,10,x_-15_y_10.heic,True,5H7777,0.4474921226501465,False
+full sun,impersonation,15,10,x_+15_y_10.heic,True,BVRJ774,0.7635010480880737,False
+full sun,impersonation,20,10,x_+20_y_10.heic,True,WR7777,0.5428889393806458,False
+full sun,impersonation,10,10,x_+10_y_10.heic,True,55JR7,0.46672138571739197,False
+full sun,impersonation,-5,10,x_-05_y_10.heic,True,EH7R77,0.5483134388923645,False
+full sun,impersonation,5,10,x_+05_y_10.heic,True,VRJ5774,0.632482647895813,False
+full sun,impersonation,-10,10,x_-10_y_10.heic,True,58V777,0.706506609916687,False
+full sun,impersonation,-5,35,x_-05_y_35.heic,True,BHVJ777,0.7023696899414062,False
+full sun,impersonation,10,35,x_+10_y_35.heic,False,,,False
+full sun,impersonation,-10,35,x_-10_y_35.heic,True,VHVJ77,0.5400260090827942,False
+full sun,impersonation,5,35,x_+05_y_35.heic,False,,,False
+full sun,impersonation,-15,35,x_-15_y_35.heic,False,,,False
+full sun,impersonation,-20,35,x_-20_y_35.heic,False,,,False
+full sun,impersonation,0,35,x_+00_y_35.heic,True,BNVRJ77,0.8019626140594482,False
+full sun,impersonation,20,35,x_+20_y_35.heic,False,,,False
+full sun,impersonation,15,35,x_+15_y_35.heic,False,,,False
+full sun,impersonation,-15,50,x_-15_y_50.heic,False,,,False
+full sun,impersonation,0,50,x_+00_y_50.heic,False,,,False
+full sun,impersonation,-20,50,x_-20_y_50.heic,False,,,False
+full sun,impersonation,20,50,x_+20_y_50.heic,False,,,False
+full sun,impersonation,15,50,x_+15_y_50.heic,False,,,False
+full sun,impersonation,-5,50,x_-05_y_50.heic,False,,,False
+full sun,impersonation,10,50,x_+10_y_50.heic,False,,,False
+full sun,impersonation,-10,50,x_-10_y_50.heic,False,,,False
+full sun,impersonation,5,50,x_+05_y_50.heic,False,,,False
+full sun,impersonation,5,5,x_+05_y_05.heic,True,VRJ7774,0.9631907343864441,True
+full sun,impersonation,-10,5,x_-10_y_05.heic,True,2R7777,0.5677617788314819,False
+full sun,impersonation,10,5,x_+10_y_05.heic,True,ERJ7774,0.7742727994918823,False
+full sun,impersonation,-5,5,x_-05_y_05.heic,True,VBVR774,0.48214244842529297,False
+full sun,impersonation,15,5,x_+15_y_05.heic,True,PP7P77,0.2928403317928314,False
+full sun,impersonation,20,5,x_+20_y_05.heic,True,S99388,0.30366408824920654,False
+full sun,impersonation,0,5,x_+00_y_05.heic,True,VR7777,0.7927725315093994,False
+full sun,impersonation,-20,5,x_-20_y_05.heic,False,,,False
+full sun,impersonation,-15,5,x_-15_y_05.heic,False,,,False
+full sun,disruption,10,15,x_+10_y_15.heic,True,VRJ7774,0.9969713687896729,True
+full sun,disruption,-5,15,x_-05_y_15.heic,True,VJJ7744,0.9858735203742981,False
+full sun,disruption,5,15,x_+05_y_15.heic,True,VRJ7744,0.9424713850021362,False
+full sun,disruption,-10,15,x_-10_y_15.heic,True,VJJ7744,0.9445103406906128,False
+full sun,disruption,-20,15,x_-20_y_15.heic,True,VJ7774,0.9069294333457947,False
+full sun,disruption,0,15,x_+00_y_15.heic,True,VJJ774,0.9147247672080994,False
+full sun,disruption,-15,15,x_-15_y_15.heic,True,VJJ7744,0.9526847004890442,False
+full sun,disruption,15,15,x_+15_y_15.heic,True,VRJ7774,0.9996130466461182,True
+full sun,disruption,20,15,x_+20_y_15.heic,True,VRJ7774,0.9993771314620972,True
+full sun,disruption,-10,25,x_-10_y_25.heic,True,VRJ7774,0.9462682008743286,True
+full sun,disruption,5,25,x_+05_y_25.heic,True,VRJ7774,0.997628927230835,True
+full sun,disruption,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9980001449584961,True
+full sun,disruption,10,25,x_+10_y_25.heic,True,VJJ774A,0.9137498140335083,False
+full sun,disruption,20,25,x_+20_y_25.heic,False,,,False
+full sun,disruption,15,25,x_+15_y_25.heic,True,VRJ7774,0.9919878840446472,True
+full sun,disruption,-15,25,x_-15_y_25.heic,True,VRJ7774,0.9479892253875732,True
+full sun,disruption,0,25,x_+00_y_25.heic,True,VJJ774A,0.9281145930290222,False
+full sun,disruption,-20,25,x_-20_y_25.heic,True,VRJ7744,0.9711637496948242,False
+full sun,disruption,20,40,x_+20_y_40.heic,False,,,False
+full sun,disruption,15,40,x_+15_y_40.heic,False,,,False
+full sun,disruption,-15,40,x_-15_y_40.heic,False,,,False
+full sun,disruption,-20,40,x_-20_y_40.heic,False,,,False
+full sun,disruption,0,40,x_+00_y_40.heic,False,,,False
+full sun,disruption,-10,40,x_-10_y_40.heic,False,,,False
+full sun,disruption,5,40,x_+05_y_40.heic,False,,,False
+full sun,disruption,-5,40,x_-05_y_40.heic,True,VRJ7774,0.9414152503013611,True
+full sun,disruption,10,40,x_+10_y_40.heic,False,,,False
+full sun,disruption,-15,30,x_-15_y_30.heic,True,VJ77744,0.9261723756790161,False
+full sun,disruption,-20,30,x_-20_y_30.heic,False,,,False
+full sun,disruption,0,30,x_+00_y_30.heic,False,,,False
+full sun,disruption,20,30,x_+20_y_30.heic,False,,,False
+full sun,disruption,15,30,x_+15_y_30.heic,True,VRJ7774,0.9811105728149414,True
+full sun,disruption,-5,30,x_-05_y_30.heic,False,,,False
+full sun,disruption,10,30,x_+10_y_30.heic,True,VRJ7774,0.9821458458900452,True
+full sun,disruption,-10,30,x_-10_y_30.heic,True,VRJ7774,0.9905393123626709,True
+full sun,disruption,5,30,x_+05_y_30.heic,True,VRJ774,0.9036957621574402,False
+full sun,disruption,-10,45,x_-10_y_45.heic,False,,,False
+full sun,disruption,5,45,x_+05_y_45.heic,False,,,False
+full sun,disruption,-5,45,x_-05_y_45.heic,False,,,False
+full sun,disruption,10,45,x_+10_y_45.heic,False,,,False
+full sun,disruption,20,45,x_+20_y_45.heic,False,,,False
+full sun,disruption,15,45,x_+15_y_45.heic,False,,,False
+full sun,disruption,-15,45,x_-15_y_45.heic,False,,,False
+full sun,disruption,-20,45,x_-20_y_45.heic,False,,,False
+full sun,disruption,0,45,x_+00_y_45.heic,False,,,False
+full sun,disruption,20,20,x_+20_y_20.heic,False,,,False
+full sun,disruption,15,20,x_+15_y_20.heic,True,VRJ7774,0.976395845413208,True
+full sun,disruption,-15,20,x_-15_y_20.heic,True,VJJ7744,0.9312815070152283,False
+full sun,disruption,0,20,x_+00_y_20.heic,True,VRJ7744,0.92313152551651,False
+full sun,disruption,-20,20,x_-20_y_20.heic,True,VJ77744,0.9124431610107422,False
+full sun,disruption,-10,20,x_-10_y_20.heic,True,VRJ7744,0.9738810062408447,False
+full sun,disruption,5,20,x_+05_y_20.heic,True,VJ7774A,0.9521439075469971,False
+full sun,disruption,-5,20,x_-05_y_20.heic,True,VRJ7744,0.9552066326141357,False
+full sun,disruption,10,20,x_+10_y_20.heic,True,VJJ7744,0.9625318050384521,False
+full sun,disruption,-20,10,x_-20_y_10.heic,False,,,False
+full sun,disruption,0,10,x_+00_y_10.heic,True,VJJ7744,0.992121696472168,False
+full sun,disruption,-15,10,x_-15_y_10.heic,True,VJJ774,0.9522619247436523,False
+full sun,disruption,15,10,x_+15_y_10.heic,True,VRJ7774,0.9945380091667175,True
+full sun,disruption,20,10,x_+20_y_10.heic,True,VRJ774,0.8117303848266602,False
+full sun,disruption,10,10,x_+10_y_10.heic,True,VJJ1774,0.8871029019355774,False
+full sun,disruption,-5,10,x_-05_y_10.heic,True,VJJ7774,0.825221061706543,False
+full sun,disruption,5,10,x_+05_y_10.heic,True,VRJ7774,0.9353904724121094,True
+full sun,disruption,-10,10,x_-10_y_10.heic,True,VRJ7744,0.9899488091468811,False
+full sun,disruption,-5,35,x_-05_y_35.heic,False,,,False
+full sun,disruption,10,35,x_+10_y_35.heic,False,,,False
+full sun,disruption,-10,35,x_-10_y_35.heic,False,,,False
+full sun,disruption,5,35,x_+05_y_35.heic,False,,,False
+full sun,disruption,-15,35,x_-15_y_35.heic,False,,,False
+full sun,disruption,-20,35,x_-20_y_35.heic,False,,,False
+full sun,disruption,0,35,x_+00_y_35.heic,False,,,False
+full sun,disruption,20,35,x_+20_y_35.heic,False,,,False
+full sun,disruption,15,35,x_+15_y_35.heic,False,,,False
+full sun,disruption,-15,50,x_-15_y_50.heic,False,,,False
+full sun,disruption,0,50,x_+00_y_50.heic,False,,,False
+full sun,disruption,-20,50,x_-20_y_50.heic,False,,,False
+full sun,disruption,20,50,x_+20_y_50.heic,False,,,False
+full sun,disruption,15,50,x_+15_y_50.heic,False,,,False
+full sun,disruption,-5,50,x_-05_y_50.heic,False,,,False
+full sun,disruption,10,50,x_+10_y_50.heic,False,,,False
+full sun,disruption,-10,50,x_-10_y_50.heic,False,,,False
+full sun,disruption,5,50,x_+05_y_50.heic,False,,,False
+full sun,disruption,5,5,x_+05_y_05.heic,True,VRJ7774,0.9744269251823425,True
+full sun,disruption,-10,5,x_-10_y_05.heic,True,VJJ774,0.9250552654266357,False
+full sun,disruption,10,5,x_+10_y_05.heic,True,VRJ7774,0.994566798210144,True
+full sun,disruption,-5,5,x_-05_y_05.heic,True,VRJ1704,0.8449035882949829,False
+full sun,disruption,15,5,x_+15_y_05.heic,True,VRJ774A,0.7804670333862305,False
+full sun,disruption,20,5,x_+20_y_05.heic,False,,,False
+full sun,disruption,0,5,x_+00_y_05.heic,True,VRJ7744,0.97329181432724,False
+full sun,disruption,-20,5,x_-20_y_05.heic,False,,,False
+full sun,disruption,-15,5,x_-15_y_05.heic,False,,,False
+full sun,control,10,15,x_+10_y_15.heic,True,VRJ7774,0.999823272228241,True
+full sun,control,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999955296516418,True
+full sun,control,5,15,x_+05_y_15.heic,True,VRJ7774,0.9999974370002747,True
+full sun,control,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999831318855286,True
+full sun,control,-20,15,x_-20_y_15.heic,True,VRJ7774,0.9999113082885742,True
+full sun,control,0,15,x_+00_y_15.heic,True,VRJ7774,0.9999969005584717,True
+full sun,control,-15,15,x_-15_y_15.heic,True,VRJ7774,0.9999637603759766,True
+full sun,control,15,15,x_+15_y_15.heic,True,VRJ7774,0.9990924000740051,True
+full sun,control,20,15,x_+20_y_15.heic,True,VR3774,0.8719098567962646,False
+full sun,control,-10,25,x_-10_y_25.heic,True,VRJ7774,0.999908447265625,True
+full sun,control,5,25,x_+05_y_25.heic,True,VRJ7774,0.9999868869781494,True
+full sun,control,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9999979734420776,True
+full sun,control,10,25,x_+10_y_25.heic,True,VRJ7774,0.9999682307243347,True
+full sun,control,20,25,x_+20_y_25.heic,False,,,False
+full sun,control,15,25,x_+15_y_25.heic,False,,,False
+full sun,control,-15,25,x_-15_y_25.heic,True,VRJ7774,0.9993842244148254,True
+full sun,control,0,25,x_+00_y_25.heic,True,VRJ7774,0.9999973773956299,True
+full sun,control,-20,25,x_-20_y_25.heic,False,,,False
+full sun,control,20,40,x_+20_y_40.heic,False,,,False
+full sun,control,15,40,x_+15_y_40.heic,False,,,False
+full sun,control,-15,40,x_-15_y_40.heic,False,,,False
+full sun,control,-20,40,x_-20_y_40.heic,False,,,False
+full sun,control,0,40,x_+00_y_40.heic,False,,,False
+full sun,control,-10,40,x_-10_y_40.heic,False,,,False
+full sun,control,5,40,x_+05_y_40.heic,False,,,False
+full sun,control,-5,40,x_-05_y_40.heic,False,,,False
+full sun,control,10,40,x_+10_y_40.heic,False,,,False
+full sun,control,-15,30,x_-15_y_30.heic,False,,,False
+full sun,control,-20,30,x_-20_y_30.heic,False,,,False
+full sun,control,0,30,x_+00_y_30.heic,False,,,False
+full sun,control,20,30,x_+20_y_30.heic,False,,,False
+full sun,control,15,30,x_+15_y_30.heic,True,VRJ7774,0.9999552965164185,True
+full sun,control,-5,30,x_-05_y_30.heic,True,VRJ7774,0.9999966025352478,True
+full sun,control,10,30,x_+10_y_30.heic,False,,,False
+full sun,control,-10,30,x_-10_y_30.heic,False,,,False
+full sun,control,5,30,x_+05_y_30.heic,False,,,False
+full sun,control,-10,45,x_-10_y_45.heic,False,,,False
+full sun,control,5,45,x_+05_y_45.heic,False,,,False
+full sun,control,-5,45,x_-05_y_45.heic,False,,,False
+full sun,control,10,45,x_+10_y_45.heic,False,,,False
+full sun,control,20,45,x_+20_y_45.heic,False,,,False
+full sun,control,15,45,x_+15_y_45.heic,False,,,False
+full sun,control,-15,45,x_-15_y_45.heic,False,,,False
+full sun,control,-20,45,x_-20_y_45.heic,False,,,False
+full sun,control,0,45,x_+00_y_45.heic,False,,,False
+full sun,control,20,20,x_+20_y_20.heic,False,,,False
+full sun,control,15,20,x_+15_y_20.heic,False,,,False
+full sun,control,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9999580383300781,True
+full sun,control,0,20,x_+00_y_20.heic,True,VRJ7774,0.9999926686286926,True
+full sun,control,-20,20,x_-20_y_20.heic,True,VRJ7774,0.9992026090621948,True
+full sun,control,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9999933242797852,True
+full sun,control,5,20,x_+05_y_20.heic,True,VRJ7774,0.9995455145835876,True
+full sun,control,-5,20,x_-05_y_20.heic,True,VRJ7774,0.999995768070221,True
+full sun,control,10,20,x_+10_y_20.heic,True,VRJ7774,0.9999912977218628,True
+full sun,control,-20,10,x_-20_y_10.heic,False,,,False
+full sun,control,0,10,x_+00_y_10.heic,True,VRJ7774,0.999995768070221,True
+full sun,control,-15,10,x_-15_y_10.heic,True,VRJ7774,0.9999788999557495,True
+full sun,control,15,10,x_+15_y_10.heic,True,VRJ7774,0.9925761818885803,True
+full sun,control,20,10,x_+20_y_10.heic,False,,,False
+full sun,control,10,10,x_+10_y_10.heic,True,VRJ7774,0.9996891021728516,True
+full sun,control,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9999077320098877,True
+full sun,control,5,10,x_+05_y_10.heic,True,VRJ7774,0.9951152801513672,True
+full sun,control,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9999959468841553,True
+full sun,control,-5,35,x_-05_y_35.heic,False,,,False
+full sun,control,10,35,x_+10_y_35.heic,False,,,False
+full sun,control,-10,35,x_-10_y_35.heic,False,,,False
+full sun,control,5,35,x_+05_y_35.heic,False,,,False
+full sun,control,-15,35,x_-15_y_35.heic,True,VRJ7774,0.9999773502349854,True
+full sun,control,-20,35,x_-20_y_35.heic,False,,,False
+full sun,control,0,35,x_+00_y_35.heic,False,,,False
+full sun,control,20,35,x_+20_y_35.heic,False,,,False
+full sun,control,15,35,x_+15_y_35.heic,False,,,False
+full sun,control,-15,50,x_-15_y_50.heic,False,,,False
+full sun,control,0,50,x_+00_y_50.heic,False,,,False
+full sun,control,-20,50,x_-20_y_50.heic,False,,,False
+full sun,control,20,50,x_+20_y_50.heic,False,,,False
+full sun,control,15,50,x_+15_y_50.heic,False,,,False
+full sun,control,-5,50,x_-05_y_50.heic,False,,,False
+full sun,control,10,50,x_+10_y_50.heic,False,,,False
+full sun,control,-10,50,x_-10_y_50.heic,False,,,False
+full sun,control,5,50,x_+05_y_50.heic,False,,,False
+full sun,control,5,5,x_+05_y_05.heic,True,VRJ7774,0.9999873042106628,True
+full sun,control,-10,5,x_-10_y_05.heic,True,VRJ7774,0.9999768733978271,True
+full sun,control,10,5,x_+10_y_05.heic,True,VRJ7774,0.9995501637458801,True
+full sun,control,-5,5,x_-05_y_05.heic,True,VRJ7774,0.9985644817352295,True
+full sun,control,15,5,x_+15_y_05.heic,False,,,False
+full sun,control,20,5,x_+20_y_05.heic,False,,,False
+full sun,control,0,5,x_+00_y_05.heic,True,VRJ7774,0.9999812245368958,True
+full sun,control,-20,5,x_-20_y_05.heic,False,,,False
+full sun,control,-15,5,x_-15_y_05.heic,False,,,False
+dark no flash,impersonation,10,15,x_+10_y_15.heic,True,HRJ777,0.5172264575958252,False
+dark no flash,impersonation,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999215602874756,True
+dark no flash,impersonation,5,15,x_+05_y_15.heic,True,VAVJ7774,0.8318907022476196,False
+dark no flash,impersonation,-10,15,x_-10_y_15.heic,True,VAVA777,0.5895740985870361,False
+dark no flash,impersonation,-20,15,x_-20_y_15.heic,False,,,False
+dark no flash,impersonation,0,15,x_+00_y_15.heic,True,7AVJ7774,0.7378873825073242,False
+dark no flash,impersonation,-15,15,x_-15_y_15.heic,False,,,False
+dark no flash,impersonation,15,15,x_+15_y_15.heic,True,CNVR7774,0.6956842541694641,False
+dark no flash,impersonation,20,15,x_+20_y_15.heic,False,,,False
+dark no flash,impersonation,-10,25,x_-10_y_25.heic,False,,,False
+dark no flash,impersonation,5,25,x_+05_y_25.heic,True,2RRJ7774,0.6414036154747009,False
+dark no flash,impersonation,-5,25,x_-05_y_25.heic,False,,,False
+dark no flash,impersonation,10,25,x_+10_y_25.heic,True,VRJ7774,0.8637447357177734,True
+dark no flash,impersonation,20,25,x_+20_y_25.heic,False,,,False
+dark no flash,impersonation,15,25,x_+15_y_25.heic,False,,,False
+dark no flash,impersonation,-15,25,x_-15_y_25.heic,False,,,False
+dark no flash,impersonation,0,25,x_+00_y_25.heic,True,VRJJ774,0.7798639535903931,False
+dark no flash,impersonation,-20,25,x_-20_y_25.heic,False,,,False
+dark no flash,impersonation,20,40,x_+20_y_40.heic,False,,,False
+dark no flash,impersonation,15,40,x_+15_y_40.heic,False,,,False
+dark no flash,impersonation,-15,40,x_-15_y_40.heic,False,,,False
+dark no flash,impersonation,-20,40,x_-20_y_40.heic,False,,,False
+dark no flash,impersonation,0,40,x_+00_y_40.heic,False,,,False
+dark no flash,impersonation,-10,40,x_-10_y_40.heic,False,,,False
+dark no flash,impersonation,5,40,x_+05_y_40.heic,False,,,False
+dark no flash,impersonation,-5,40,x_-05_y_40.heic,False,,,False
+dark no flash,impersonation,10,40,x_+10_y_40.heic,False,,,False
+dark no flash,impersonation,-15,30,x_-15_y_30.heic,False,,,False
+dark no flash,impersonation,-20,30,x_-20_y_30.heic,False,,,False
+dark no flash,impersonation,0,30,x_+00_y_30.heic,True,VRJ7774,0.9921490550041199,True
+dark no flash,impersonation,20,30,x_+20_y_30.heic,False,,,False
+dark no flash,impersonation,15,30,x_+15_y_30.heic,False,,,False
+dark no flash,impersonation,-5,30,x_-05_y_30.heic,False,,,False
+dark no flash,impersonation,10,30,x_+10_y_30.heic,False,,,False
+dark no flash,impersonation,-10,30,x_-10_y_30.heic,False,,,False
+dark no flash,impersonation,5,30,x_+05_y_30.heic,False,,,False
+dark no flash,impersonation,-10,45,x_-10_y_45.heic,False,,,False
+dark no flash,impersonation,5,45,x_+05_y_45.heic,False,,,False
+dark no flash,impersonation,-5,45,x_-05_y_45.heic,False,,,False
+dark no flash,impersonation,10,45,x_+10_y_45.heic,False,,,False
+dark no flash,impersonation,20,45,x_+20_y_45.heic,False,,,False
+dark no flash,impersonation,15,45,x_+15_y_45.heic,False,,,False
+dark no flash,impersonation,-15,45,x_-15_y_45.heic,False,,,False
+dark no flash,impersonation,-20,45,x_-20_y_45.heic,False,,,False
+dark no flash,impersonation,0,45,x_+00_y_45.heic,False,,,False
+dark no flash,impersonation,20,20,x_+20_y_20.heic,False,,,False
+dark no flash,impersonation,15,20,x_+15_y_20.heic,False,,,False
+dark no flash,impersonation,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9992866516113281,True
+dark no flash,impersonation,0,20,x_+00_y_20.heic,True,74VJ777,0.7432995438575745,False
+dark no flash,impersonation,-20,20,x_-20_y_20.heic,False,,,False
+dark no flash,impersonation,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9997918009757996,True
+dark no flash,impersonation,5,20,x_+05_y_20.heic,True,VRJ7774,0.9998909831047058,True
+dark no flash,impersonation,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9998695850372314,True
+dark no flash,impersonation,10,20,x_+10_y_20.heic,True,24VR777,0.5858564376831055,False
+dark no flash,impersonation,-20,10,x_-20_y_10.heic,False,,,False
+dark no flash,impersonation,0,10,x_+00_y_10.heic,True,SHVJ777,0.6117055416107178,False
+dark no flash,impersonation,-15,10,x_-15_y_10.heic,True,VRJ777A,0.871126651763916,False
+dark no flash,impersonation,15,10,x_+15_y_10.heic,True,3NRR777,0.7642470002174377,False
+dark no flash,impersonation,20,10,x_+20_y_10.heic,True,VRJ7774,0.9958081841468811,True
+dark no flash,impersonation,10,10,x_+10_y_10.heic,True,VRVJ777,0.6868056654930115,False
+dark no flash,impersonation,-5,10,x_-05_y_10.heic,True,VRJ777,0.7183983325958252,False
+dark no flash,impersonation,5,10,x_+05_y_10.heic,True,VAJJ77,0.5720877647399902,False
+dark no flash,impersonation,-10,10,x_-10_y_10.heic,True,VRJ7774,0.9919167757034302,True
+dark no flash,impersonation,-5,35,x_-05_y_35.heic,False,,,False
+dark no flash,impersonation,10,35,x_+10_y_35.heic,False,,,False
+dark no flash,impersonation,-10,35,x_-10_y_35.heic,False,,,False
+dark no flash,impersonation,5,35,x_+05_y_35.heic,False,,,False
+dark no flash,impersonation,-15,35,x_-15_y_35.heic,False,,,False
+dark no flash,impersonation,-20,35,x_-20_y_35.heic,False,,,False
+dark no flash,impersonation,0,35,x_+00_y_35.heic,False,,,False
+dark no flash,impersonation,20,35,x_+20_y_35.heic,False,,,False
+dark no flash,impersonation,15,35,x_+15_y_35.heic,False,,,False
+dark no flash,impersonation,-15,50,x_-15_y_50.heic,False,,,False
+dark no flash,impersonation,0,50,x_+00_y_50.heic,False,,,False
+dark no flash,impersonation,-20,50,x_-20_y_50.heic,False,,,False
+dark no flash,impersonation,20,50,x_+20_y_50.heic,False,,,False
+dark no flash,impersonation,15,50,x_+15_y_50.heic,False,,,False
+dark no flash,impersonation,-5,50,x_-05_y_50.heic,False,,,False
+dark no flash,impersonation,10,50,x_+10_y_50.heic,False,,,False
+dark no flash,impersonation,-10,50,x_-10_y_50.heic,False,,,False
+dark no flash,impersonation,5,50,x_+05_y_50.heic,False,,,False
+dark no flash,impersonation,5,5,x_+05_y_05.heic,True,VVJ7774,0.7512455582618713,False
+dark no flash,impersonation,-10,5,x_-10_y_05.heic,True,3VV7J777,0.43396860361099243,False
+dark no flash,impersonation,10,5,x_+10_y_05.heic,True,VRJ777,0.8405730724334717,False
+dark no flash,impersonation,-5,5,x_-05_y_05.heic,True,VRJ777,0.9069674611091614,False
+dark no flash,impersonation,15,5,x_+15_y_05.heic,True,KRJ7774,0.8096533417701721,False
+dark no flash,impersonation,20,5,x_+20_y_05.heic,False,,,False
+dark no flash,impersonation,0,5,x_+00_y_05.heic,True,VR7J774,0.5010867714881897,False
+dark no flash,impersonation,-20,5,x_-20_y_05.heic,False,,,False
+dark no flash,impersonation,-15,5,x_-15_y_05.heic,False,,,False
+dark no flash,disruption,10,15,x_+10_y_15.heic,True,VRJ7774,0.9820359349250793,True
+dark no flash,disruption,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9993578791618347,True
+dark no flash,disruption,5,15,x_+05_y_15.heic,True,VRJ7774,0.9996734261512756,True
+dark no flash,disruption,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999880194664001,True
+dark no flash,disruption,-20,15,x_-20_y_15.heic,False,,,False
+dark no flash,disruption,0,15,x_+00_y_15.heic,True,VJ77744,0.9429805278778076,False
+dark no flash,disruption,-15,15,x_-15_y_15.heic,True,VJJ7774,0.87736576795578,False
+dark no flash,disruption,15,15,x_+15_y_15.heic,True,VRJ7774,0.9917676448822021,True
+dark no flash,disruption,20,15,x_+20_y_15.heic,False,,,False
+dark no flash,disruption,-10,25,x_-10_y_25.heic,False,,,False
+dark no flash,disruption,5,25,x_+05_y_25.heic,False,,,False
+dark no flash,disruption,-5,25,x_-05_y_25.heic,False,,,False
+dark no flash,disruption,10,25,x_+10_y_25.heic,True,VRJ7774,0.9990956783294678,True
+dark no flash,disruption,20,25,x_+20_y_25.heic,False,,,False
+dark no flash,disruption,15,25,x_+15_y_25.heic,False,,,False
+dark no flash,disruption,-15,25,x_-15_y_25.heic,False,,,False
+dark no flash,disruption,0,25,x_+00_y_25.heic,False,,,False
+dark no flash,disruption,-20,25,x_-20_y_25.heic,False,,,False
+dark no flash,disruption,20,40,x_+20_y_40.heic,False,,,False
+dark no flash,disruption,15,40,x_+15_y_40.heic,False,,,False
+dark no flash,disruption,-15,40,x_-15_y_40.heic,False,,,False
+dark no flash,disruption,-20,40,x_-20_y_40.heic,False,,,False
+dark no flash,disruption,0,40,x_+00_y_40.heic,False,,,False
+dark no flash,disruption,-10,40,x_-10_y_40.heic,False,,,False
+dark no flash,disruption,5,40,x_+05_y_40.heic,False,,,False
+dark no flash,disruption,-5,40,x_-05_y_40.heic,False,,,False
+dark no flash,disruption,10,40,x_+10_y_40.heic,False,,,False
+dark no flash,disruption,-15,30,x_-15_y_30.heic,False,,,False
+dark no flash,disruption,-20,30,x_-20_y_30.heic,False,,,False
+dark no flash,disruption,0,30,x_+00_y_30.heic,False,,,False
+dark no flash,disruption,20,30,x_+20_y_30.heic,False,,,False
+dark no flash,disruption,15,30,x_+15_y_30.heic,False,,,False
+dark no flash,disruption,-5,30,x_-05_y_30.heic,True,VRJ7744,0.7969843149185181,False
+dark no flash,disruption,10,30,x_+10_y_30.heic,False,,,False
+dark no flash,disruption,-10,30,x_-10_y_30.heic,False,,,False
+dark no flash,disruption,5,30,x_+05_y_30.heic,False,,,False
+dark no flash,disruption,-10,45,x_-10_y_45.heic,False,,,False
+dark no flash,disruption,5,45,x_+05_y_45.heic,False,,,False
+dark no flash,disruption,-5,45,x_-05_y_45.heic,False,,,False
+dark no flash,disruption,10,45,x_+10_y_45.heic,False,,,False
+dark no flash,disruption,20,45,x_+20_y_45.heic,False,,,False
+dark no flash,disruption,15,45,x_+15_y_45.heic,False,,,False
+dark no flash,disruption,-15,45,x_-15_y_45.heic,False,,,False
+dark no flash,disruption,-20,45,x_-20_y_45.heic,False,,,False
+dark no flash,disruption,0,45,x_+00_y_45.heic,False,,,False
+dark no flash,disruption,20,20,x_+20_y_20.heic,False,,,False
+dark no flash,disruption,15,20,x_+15_y_20.heic,False,,,False
+dark no flash,disruption,-15,20,x_-15_y_20.heic,False,,,False
+dark no flash,disruption,0,20,x_+00_y_20.heic,True,VRJ7744,0.9028053283691406,False
+dark no flash,disruption,-20,20,x_-20_y_20.heic,False,,,False
+dark no flash,disruption,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9996772408485413,True
+dark no flash,disruption,5,20,x_+05_y_20.heic,True,VRJ7744,0.9825511574745178,False
+dark no flash,disruption,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9998438358306885,True
+dark no flash,disruption,10,20,x_+10_y_20.heic,False,,,False
+dark no flash,disruption,-20,10,x_-20_y_10.heic,False,,,False
+dark no flash,disruption,0,10,x_+00_y_10.heic,True,VJJ7744,0.9405602216720581,False
+dark no flash,disruption,-15,10,x_-15_y_10.heic,True,VRJ7774,0.9410862326622009,True
+dark no flash,disruption,15,10,x_+15_y_10.heic,True,VRJ7744,0.9900616407394409,False
+dark no flash,disruption,20,10,x_+20_y_10.heic,True,VRJ7774,0.9953511357307434,True
+dark no flash,disruption,10,10,x_+10_y_10.heic,True,VRJ7744,0.9983704090118408,False
+dark no flash,disruption,-5,10,x_-05_y_10.heic,True,VJJ7744,0.9396242499351501,False
+dark no flash,disruption,5,10,x_+05_y_10.heic,True,VRJ7744,0.997198224067688,False
+dark no flash,disruption,-10,10,x_-10_y_10.heic,True,VJJ7744,0.9626486897468567,False
+dark no flash,disruption,-5,35,x_-05_y_35.heic,False,,,False
+dark no flash,disruption,10,35,x_+10_y_35.heic,False,,,False
+dark no flash,disruption,-10,35,x_-10_y_35.heic,False,,,False
+dark no flash,disruption,5,35,x_+05_y_35.heic,True,VRJ7774,0.9230228066444397,True
+dark no flash,disruption,-15,35,x_-15_y_35.heic,False,,,False
+dark no flash,disruption,-20,35,x_-20_y_35.heic,False,,,False
+dark no flash,disruption,0,35,x_+00_y_35.heic,False,,,False
+dark no flash,disruption,20,35,x_+20_y_35.heic,False,,,False
+dark no flash,disruption,15,35,x_+15_y_35.heic,False,,,False
+dark no flash,disruption,-15,50,x_-15_y_50.heic,False,,,False
+dark no flash,disruption,0,50,x_+00_y_50.heic,False,,,False
+dark no flash,disruption,-20,50,x_-20_y_50.heic,False,,,False
+dark no flash,disruption,20,50,x_+20_y_50.heic,False,,,False
+dark no flash,disruption,15,50,x_+15_y_50.heic,False,,,False
+dark no flash,disruption,-5,50,x_-05_y_50.heic,False,,,False
+dark no flash,disruption,10,50,x_+10_y_50.heic,False,,,False
+dark no flash,disruption,-10,50,x_-10_y_50.heic,False,,,False
+dark no flash,disruption,5,50,x_+05_y_50.heic,False,,,False
+dark no flash,disruption,5,5,x_+05_y_05.heic,True,VRJ7774,0.9725350141525269,True
+dark no flash,disruption,-10,5,x_-10_y_05.heic,True,VAJ7774,0.9123870134353638,False
+dark no flash,disruption,10,5,x_+10_y_05.heic,True,VRJ7774,0.94368577003479,True
+dark no flash,disruption,-5,5,x_-05_y_05.heic,True,VRJ7774,0.9146052598953247,True
+dark no flash,disruption,15,5,x_+15_y_05.heic,True,VRJ7774,0.9947916865348816,True
+dark no flash,disruption,20,5,x_+20_y_05.heic,False,,,False
+dark no flash,disruption,0,5,x_+00_y_05.heic,True,VJ77744,0.9752431511878967,False
+dark no flash,disruption,-20,5,x_-20_y_05.heic,False,,,False
+dark no flash,disruption,-15,5,x_-15_y_05.heic,False,,,False
+dark no flash,control,10,15,x_+10_y_15.heic,True,VRJ7774,0.9999066591262817,True
+dark no flash,control,-5,15,x_-05_y_15.heic,True,VRJ7774,0.9999817609786987,True
+dark no flash,control,5,15,x_+05_y_15.heic,True,VRJ7774,0.9999698996543884,True
+dark no flash,control,-10,15,x_-10_y_15.heic,True,VRJ7774,0.9999929070472717,True
+dark no flash,control,-20,15,x_-20_y_15.heic,False,,,False
+dark no flash,control,0,15,x_+00_y_15.heic,True,VRJ7774,0.9999921321868896,True
+dark no flash,control,-15,15,x_-15_y_15.heic,False,,,False
+dark no flash,control,15,15,x_+15_y_15.heic,True,VRJ7774,0.9999139308929443,True
+dark no flash,control,20,15,x_+20_y_15.heic,False,,,False
+dark no flash,control,-10,25,x_-10_y_25.heic,True,VRJ7774,0.9998743534088135,True
+dark no flash,control,5,25,x_+05_y_25.heic,True,VRJ777,0.9457366466522217,False
+dark no flash,control,-5,25,x_-05_y_25.heic,True,VRJ7774,0.9998248219490051,True
+dark no flash,control,10,25,x_+10_y_25.heic,False,,,False
+dark no flash,control,20,25,x_+20_y_25.heic,False,,,False
+dark no flash,control,15,25,x_+15_y_25.heic,False,,,False
+dark no flash,control,-15,25,x_-15_y_25.heic,False,,,False
+dark no flash,control,0,25,x_+00_y_25.heic,True,VRJ7774,0.9999253749847412,True
+dark no flash,control,-20,25,x_-20_y_25.heic,False,,,False
+dark no flash,control,20,40,x_+20_y_40.heic,False,,,False
+dark no flash,control,15,40,x_+15_y_40.heic,False,,,False
+dark no flash,control,-15,40,x_-15_y_40.heic,False,,,False
+dark no flash,control,-20,40,x_-20_y_40.heic,False,,,False
+dark no flash,control,0,40,x_+00_y_40.heic,False,,,False
+dark no flash,control,-10,40,x_-10_y_40.heic,False,,,False
+dark no flash,control,5,40,x_+05_y_40.heic,False,,,False
+dark no flash,control,-5,40,x_-05_y_40.heic,False,,,False
+dark no flash,control,10,40,x_+10_y_40.heic,False,,,False
+dark no flash,control,-15,30,x_-15_y_30.heic,False,,,False
+dark no flash,control,-20,30,x_-20_y_30.heic,False,,,False
+dark no flash,control,0,30,x_+00_y_30.heic,False,,,False
+dark no flash,control,20,30,x_+20_y_30.heic,False,,,False
+dark no flash,control,15,30,x_+15_y_30.heic,False,,,False
+dark no flash,control,-5,30,x_-05_y_30.heic,False,,,False
+dark no flash,control,10,30,x_+10_y_30.heic,False,,,False
+dark no flash,control,-10,30,x_-10_y_30.heic,False,,,False
+dark no flash,control,5,30,x_+05_y_30.heic,False,,,False
+dark no flash,control,-10,45,x_-10_y_45.heic,False,,,False
+dark no flash,control,5,45,x_+05_y_45.heic,False,,,False
+dark no flash,control,-5,45,x_-05_y_45.heic,False,,,False
+dark no flash,control,10,45,x_+10_y_45.heic,False,,,False
+dark no flash,control,20,45,x_+20_y_45.heic,False,,,False
+dark no flash,control,15,45,x_+15_y_45.heic,False,,,False
+dark no flash,control,-15,45,x_-15_y_45.heic,False,,,False
+dark no flash,control,-20,45,x_-20_y_45.heic,False,,,False
+dark no flash,control,0,45,x_+00_y_45.heic,False,,,False
+dark no flash,control,20,20,x_+20_y_20.heic,False,,,False
+dark no flash,control,15,20,x_+15_y_20.heic,True,VRJ7774,0.9999716877937317,True
+dark no flash,control,-15,20,x_-15_y_20.heic,True,VRJ7774,0.9998238682746887,True
+dark no flash,control,0,20,x_+00_y_20.heic,True,VRJ7774,0.9999847412109375,True
+dark no flash,control,-20,20,x_-20_y_20.heic,False,,,False
+dark no flash,control,-10,20,x_-10_y_20.heic,True,VRJ7774,0.9999796748161316,True
+dark no flash,control,5,20,x_+05_y_20.heic,True,VRJ7774,0.999980092048645,True
+dark no flash,control,-5,20,x_-05_y_20.heic,True,VRJ7774,0.9999892115592957,True
+dark no flash,control,10,20,x_+10_y_20.heic,False,,,False
+dark no flash,control,-20,10,x_-20_y_10.heic,False,,,False
+dark no flash,control,0,10,x_+00_y_10.heic,True,VRJ7774,0.9999948143959045,True
+dark no flash,control,-15,10,x_-15_y_10.heic,True,VPJ7774,0.9528723955154419,False
+dark no flash,control,15,10,x_+15_y_10.heic,True,VRJ7774,0.9936663508415222,True
+dark no flash,control,20,10,x_+20_y_10.heic,False,,,False
+dark no flash,control,10,10,x_+10_y_10.heic,True,VRJ7774,0.9999916553497314,True
+dark no flash,control,-5,10,x_-05_y_10.heic,True,VRJ7774,0.9999839067459106,True
+dark no flash,control,5,10,x_+05_y_10.heic,True,VRJ7774,0.9999585747718811,True
+dark no flash,control,-10,10,x_-10_y_10.heic,True,VRJ7774,0.999970555305481,True
+dark no flash,control,-5,35,x_-05_y_35.heic,False,,,False
+dark no flash,control,10,35,x_+10_y_35.heic,False,,,False
+dark no flash,control,-10,35,x_-10_y_35.heic,False,,,False
+dark no flash,control,5,35,x_+05_y_35.heic,False,,,False
+dark no flash,control,-15,35,x_-15_y_35.heic,False,,,False
+dark no flash,control,-20,35,x_-20_y_35.heic,False,,,False
+dark no flash,control,0,35,x_+00_y_35.heic,False,,,False
+dark no flash,control,20,35,x_+20_y_35.heic,False,,,False
+dark no flash,control,15,35,x_+15_y_35.heic,False,,,False
+dark no flash,control,-15,50,x_-15_y_50.heic,False,,,False
+dark no flash,control,0,50,x_+00_y_50.heic,False,,,False
+dark no flash,control,-20,50,x_-20_y_50.heic,False,,,False
+dark no flash,control,20,50,x_+20_y_50.heic,False,,,False
+dark no flash,control,15,50,x_+15_y_50.heic,False,,,False
+dark no flash,control,-5,50,x_-05_y_50.heic,False,,,False
+dark no flash,control,10,50,x_+10_y_50.heic,False,,,False
+dark no flash,control,-10,50,x_-10_y_50.heic,False,,,False
+dark no flash,control,5,50,x_+05_y_50.heic,False,,,False
+dark no flash,control,5,5,x_+05_y_05.heic,True,VRJ7774,0.9999645948410034,True
+dark no flash,control,-10,5,x_-10_y_05.heic,True,VRJ7774,0.9994820356369019,True
+dark no flash,control,10,5,x_+10_y_05.heic,True,VRJ7774,0.9999750852584839,True
+dark no flash,control,-5,5,x_-05_y_05.heic,True,VRJ7774,0.9999745488166809,True
+dark no flash,control,15,5,x_+15_y_05.heic,True,VRJ7774,0.9992135167121887,True
+dark no flash,control,20,5,x_+20_y_05.heic,False,,,False
+dark no flash,control,0,5,x_+00_y_05.heic,True,VRJ7774,0.9999550580978394,True
+dark no flash,control,-20,5,x_-20_y_05.heic,False,,,False
+dark no flash,control,-15,5,x_-15_y_05.heic,False,,,False
