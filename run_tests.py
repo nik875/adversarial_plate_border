@@ -5,8 +5,8 @@ from plate_detector import LicensePlateDetector   # <-- rename if needed
 
 # ================= CONFIG =================
 
-DATASET_ROOT = Path("../full test/organized")
-OUTPUT_CSV = "full_results.csv2"
+DATASET_ROOT = Path("physical_world_test/full test/organized")
+OUTPUT_CSV = "full_results_largedet.csv"
 
 # Regex to extract x and y from filename
 FILENAME_REGEX = re.compile(r"x_([+-]\d+)_y_(\d+)", re.IGNORECASE)
@@ -15,8 +15,8 @@ FILENAME_REGEX = re.compile(r"x_([+-]\d+)_y_(\d+)", re.IGNORECASE)
 MAX_IMAGES = None   # set to None to process everything
 PLATE_LABEL_MAP = {
     "control": "control",
-    "plate1": "disruption",
-    "plate2": "impersonation",
+    "plate1": "impersonation",  # VJJ7744 patch
+    "plate2": "disruption",      # SHX8459 patch
 }
 
 
@@ -76,7 +76,6 @@ def run_batch():
 
                         is_correct = detected_text == detector.target_plate
 
-
                         rows.append({
                             "time_of_day": time_of_day,
                             "condition": plate,                     # control / disruption / impersonation
@@ -88,7 +87,6 @@ def run_batch():
                             "detected_plate_confidence": detected_conf,
                             "is_correct_plate": is_correct,
                         })
-
 
                     except Exception as e:
                         print(f"❌ Error on {img_path.name}: {e}")
@@ -107,7 +105,6 @@ def run_batch():
 
     write_csv(rows)
     print(f"\n✅ Finished full run ({processed} images). CSV saved.")
-
 
 
 def write_csv(rows):
