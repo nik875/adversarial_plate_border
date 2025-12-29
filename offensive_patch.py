@@ -414,6 +414,37 @@ class AdversarialPatchTrainer:
 
         return det_loss, ocr_loss
 
+    def patch_reg_loss(self):
+        """
+        Compute total variation (TV) regularization loss for the adversarial patch.
+
+        Encourages smooth, natural-looking patches by penalizing large differences
+        between adjacent pixels. Uses L2 norm of gradients in both horizontal and
+        vertical directions.
+
+        Returns:
+            torch.Tensor: Scalar regularization loss in range [0, 0.1] for natural patches
+        """
+        patch = self.patch  # shape (C, H, W) = (3, 128, 256)
+        C, H, W = patch.shape
+
+        # Horizontal total variation: differences along width dimension
+        tv_h = torch.pow(patch[:, :, 1:] - patch[:, :, :-1], 2).sum()
+
+        # Vertical total variation: differences along height dimension
+        tv_v = torch.pow(patch[:, 1:, :] - patch[:, :-1, :], 2).sum()
+
+        # Number of comparisons: C × (H×(W-1) + (H-1)×W) = 3 × (128×255 + 127×256) = 195,456
+        num_comparisons = C * (H * (W - 1) + (H - 1) * W)
+
+        # Normalize by number of comparisons
+        loss = (tv_h + tv_v) / num_comparisons
+
+        # Scale by 2.5x to get 0-0.1 range for loss balancing
+        loss = loss * 2.5
+
+        return loss
+
     def calculate_baseline_loss(self) -> float:
         """
         Calculate baseline OCR loss across entire dataset using ground truth boxes.
@@ -467,7 +498,10 @@ class AdversarialPatchTrainer:
         batch['orig_image'] = patched_image.squeeze()
 
         det_loss, ocr_loss = self.partial_loss(batch, use_ocr_baseline=use_ocr_baseline)
-        return (det_loss + ocr_loss) / 2
+        reg_loss = self.patch_reg_loss()
+
+        # Combine losses: average of detection and OCR, plus regularization
+        return (det_loss + ocr_loss) / 2 + reg_loss
 
     def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Train for one epoch with gradient accumulation"""
