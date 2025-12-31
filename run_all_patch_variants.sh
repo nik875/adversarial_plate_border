@@ -66,6 +66,7 @@ run_variant() {
 
         # Move training results if they exist
         [ -f "adversarial_training_results.png" ] && mv adversarial_training_results.png "$output_dir/"
+        [ -f "training_history.csv" ] && mv training_history.csv "$output_dir/"
 
         # Create a metadata file
         cat > "$output_dir/config.txt" <<EOF

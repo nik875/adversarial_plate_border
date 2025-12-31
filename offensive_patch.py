@@ -1860,6 +1860,13 @@ def main():
             early_stop_patience=20
         )
 
+        # Save training history as CSV
+        import pandas as pd
+        history_df = pd.DataFrame(history)
+        history_df.insert(0, 'epoch', range(1, len(history_df) + 1))
+        history_df.to_csv('training_history.csv', index=False)
+        print(f"\nTraining history saved to: training_history.csv")
+
         # Plot training results
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 10))
 
