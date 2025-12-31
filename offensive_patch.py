@@ -23,8 +23,8 @@ from dataset import create_dataloaders
 warnings.filterwarnings("ignore")
 
 
-PATCH_WIDTH = 256
-PATCH_HEIGHT = 128
+PATCH_WIDTH = 512
+PATCH_HEIGHT = 256
 
 
 class AdversarialPatchTrainer:
@@ -35,9 +35,13 @@ class AdversarialPatchTrainer:
                  match_detection: bool = False,
                  impersonation_target: str = None,
                  print_blur=0,  # Disabled print blur
-                 training=False):
+                 training=False,
+                 use_tv_loss: bool = True,
+                 use_homography: bool = True):
         self.training = training
         self.print_blur = print_blur
+        self.use_tv_loss = use_tv_loss
+        self.use_homography = use_homography
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -59,7 +63,7 @@ class AdversarialPatchTrainer:
         self.patch_height = PATCH_HEIGHT
 
         self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
-                                                                preload=True, batch_size=1,
+                                                                preload=True, batch_size=64,
                                                                 n_jobs=1)
 
         # Initialize adversarial patch with Xavier initialization
@@ -128,6 +132,68 @@ class AdversarialPatchTrainer:
 
         return target.to(self.device)
 
+    def _apply_patch_simple(self, image: torch.Tensor, corners: torch.Tensor,
+                            patch_normalized: torch.Tensor, border_scale: float = 1.4) \
+            -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply patch as simple rectangular overlay without homography transformation"""
+        batch_size = image.shape[0]
+        image_height, image_width = image.shape[2], image.shape[3]
+
+        # Get the 4 corners of the license plate
+        plate_corners = corners[0]  # [4, 2]
+
+        # Calculate center and create larger border box
+        center_x = plate_corners[:, 0].mean()
+        center_y = plate_corners[:, 1].mean()
+        center = torch.tensor([center_x, center_y], device=self.device)
+
+        border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
+
+        # Calculate bounding boxes for border and plate
+        border_min_x = torch.clamp(torch.min(border_corners[:, 0]), 0, image_width).int()
+        border_max_x = torch.clamp(torch.max(border_corners[:, 0]), 0, image_width).int()
+        border_min_y = torch.clamp(torch.min(border_corners[:, 1]), 0, image_height).int()
+        border_max_y = torch.clamp(torch.max(border_corners[:, 1]), 0, image_height).int()
+
+        plate_min_x = torch.clamp(torch.min(plate_corners[:, 0]), 0, image_width).int()
+        plate_max_x = torch.clamp(torch.max(plate_corners[:, 0]), 0, image_width).int()
+        plate_min_y = torch.clamp(torch.min(plate_corners[:, 1]), 0, image_height).int()
+        plate_max_y = torch.clamp(torch.max(plate_corners[:, 1]), 0, image_height).int()
+
+        # Create result image and mask
+        result_image = image.clone()
+        final_mask = torch.zeros(batch_size, 3, image_height, image_width,
+                                device=self.device, dtype=torch.float32)
+
+        # Resize patch to border area
+        border_h = border_max_y - border_min_y
+        border_w = border_max_x - border_min_x
+
+        if border_h > 0 and border_w > 0:
+            # Resize patch to fit border area
+            patch_resized = F.interpolate(
+                patch_normalized.unsqueeze(0),
+                size=(border_h, border_w),
+                mode='bilinear',
+                align_corners=True
+            )
+
+            # Apply to all batches
+            for b in range(batch_size):
+                # Fill border area with patch
+                result_image[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = patch_resized[0]
+                final_mask[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = 1.0
+
+                # Cut out plate area (restore original image)
+                if plate_max_y > plate_min_y and plate_max_x > plate_min_x:
+                    result_image[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x] = \
+                        image[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x]
+                    final_mask[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x] = 0.0
+
+        result_image = torch.clamp(result_image, 0, 1)
+
+        return result_image, final_mask
+
     def get_patch_bounding_box(self, corners: torch.Tensor,
                                border_scale: float = 1.4) -> torch.Tensor:
         """Calculate bounding box of the patch area (border around license plate)"""
@@ -153,7 +219,7 @@ class AdversarialPatchTrainer:
                              corners: torch.Tensor,
                              border_scale: float = 1.4) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply adversarial patch as border around license plate using homography"""
+        """Apply adversarial patch as border around license plate using homography or simple overlay"""
         batch_size = image.shape[0]
 
         # Extract image dimensions dynamically
@@ -176,6 +242,10 @@ class AdversarialPatchTrainer:
         if self.training:
             darkening_factor = torch.rand(1, device=self.device) * 0.2
             patch_normalized = patch_normalized * (1.0 - darkening_factor)
+
+        # If homography is disabled, use simple rectangle overlay
+        if not self.use_homography:
+            return self._apply_patch_simple(image, corners, patch_normalized, border_scale)
 
         # Get the 4 corners of the license plate
         plate_corners = corners[0]  # [4, 2]
@@ -498,7 +568,12 @@ class AdversarialPatchTrainer:
         batch['orig_image'] = patched_image.squeeze()
 
         det_loss, ocr_loss = self.partial_loss(batch, use_ocr_baseline=use_ocr_baseline)
-        reg_loss = self.patch_reg_loss()
+
+        # Add TV regularization loss if enabled
+        if self.use_tv_loss:
+            reg_loss = self.patch_reg_loss()
+        else:
+            reg_loss = 0.0
 
         # Combine losses: average of detection and OCR, plus regularization
         return (det_loss + ocr_loss) / 2 + reg_loss
@@ -645,6 +720,8 @@ class AdversarialPatchTrainer:
         print(f"   Match detection: {self.match_detection}")
         print(
             f"   Impersonation target: {self.impersonation_target or 'None (penalize correct reading)'}")
+        print(f"   TV loss: {'Enabled' if self.use_tv_loss else 'Disabled'}")
+        print(f"   Homography: {'Enabled' if self.use_homography else 'Disabled'}")
         print("   Processing: Full 384x384 images only")
         print("-" * 60)
 
@@ -1725,6 +1802,10 @@ def main():
     parser.add_argument('--impersonation-target', type=str, default=None,
                         help='Target plate text for impersonation (e.g., "ABC123"). If not provided, '
                         'uses disruption mode to prevent correct reading of VRJ7774')
+    parser.add_argument('--disable-tv-loss', action='store_true',
+                        help='Disable total variation (TV) regularization loss during training')
+    parser.add_argument('--disable-homography', action='store_true',
+                        help='Disable homography-based patch application (use simple rectangle overlay instead)')
     args = parser.parse_args()
 
     # Configuration
@@ -1734,10 +1815,12 @@ def main():
 
     # Common trainer kwargs
     trainer_kwargs = {
-        'device': 'cpu',
-        'grad_accumulate': 64,
+        'device': 'cuda',
+        'grad_accumulate': 1,
         'match_detection': args.match_detection,
-        'impersonation_target': args.impersonation_target
+        'impersonation_target': args.impersonation_target,
+        'use_tv_loss': not args.disable_tv_loss,
+        'use_homography': not args.disable_homography
     }
 
     if args.test:
