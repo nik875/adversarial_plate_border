@@ -63,7 +63,7 @@ class AdversarialPatchTrainer:
         self.patch_height = PATCH_HEIGHT
 
         self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
-                                                                preload=False, batch_size=64,
+                                                                preload=False, batch_size=1,
                                                                 n_jobs=0)
 
         # Initialize adversarial patch with Xavier initialization
@@ -1816,7 +1816,7 @@ def main():
     # Common trainer kwargs
     trainer_kwargs = {
         'device': 'cuda',
-        'grad_accumulate': 1,
+        'grad_accumulate': 64,
         'match_detection': args.match_detection,
         'impersonation_target': args.impersonation_target,
         'use_tv_loss': not args.disable_tv_loss,
