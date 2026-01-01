@@ -82,7 +82,7 @@ for variant_dir in "$PATCH_VARIANTS_DIR"/patches_*; do
     cmd="python analyze_patch.py --csv \"$CSV_PATH\" --patch \"$patch_file\" --output \"$output_dir\" --device $DEVICE"
 
     if [ -n "$impersonation_target" ]; then
-        cmd="$cmd --impersonating-plate $impersonation_target"
+        cmd="$cmd --impersonating $impersonation_target"
         echo "Target plate: $impersonation_target"
     fi
 
