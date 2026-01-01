@@ -16,21 +16,22 @@ import argparse
 
 def categorize_result(row, target_plate=None):
     """Categorize detection result"""
-    # Check if detection was eliminated (IoU = 0)
-    if pd.isna(row.get('best_iou')) or row.get('best_iou', 0) == 0:
+    # Check if detection was eliminated (IoU = 0 or very low)
+    best_iou = row.get('best_iou', 0)
+    if pd.isna(best_iou) or best_iou < 0.1:  # Consider < 0.1 as eliminated
         return 'Detection Eliminated'
 
     # Check OCR results
-    ocr_text = row.get('best_plate_text', '')
+    ocr_text = str(row.get('detection_text', '')).strip()
 
-    if pd.isna(ocr_text) or ocr_text == '':
+    if ocr_text == '' or ocr_text == 'nan':
         return 'Detected (No OCR)'
     elif target_plate and ocr_text == target_plate:
         return f'Impersonation Success ({target_plate})'
-    elif row.get('is_correct_ocr', False):
-        return 'Correct Read (Attack Failed)'
     else:
-        return 'Misread (Other Text)'
+        # For control images, we don't know the ground truth
+        # So any other text is just "Other Text Detected"
+        return 'Other Text Detected'
 
 
 def load_variant_results(eval_results_dir):
@@ -90,9 +91,8 @@ def create_comparison_plots(variants, output_dir):
         'Detection Eliminated': '#ff6b6b',  # Red
         'Impersonation Success (VJJ7744)': '#9775fa',  # Purple
         'Impersonation Success (SHX8459)': '#845ef7',  # Purple (darker)
-        'Misread (Other Text)': '#ff922b',  # Orange
-        'Detected (No OCR)': '#ffd43b',  # Light Orange
-        'Correct Read (Attack Failed)': '#51cf66'  # Green
+        'Other Text Detected': '#ffd43b',  # Yellow
+        'Detected (No OCR)': '#ff922b'  # Orange
     }
 
     # Organize variants by target
@@ -193,12 +193,11 @@ def create_summary_table(variants, output_dir):
         total = len(data)
         eliminated = len(data[data['category'] == 'Detection Eliminated'])
         impersonated = len(data[data['category'].str.contains('Impersonation Success', na=False)])
-        misread = len(data[data['category'] == 'Misread (Other Text)'])
-        correct = len(data[data['category'] == 'Correct Read (Attack Failed)'])
+        other_text = len(data[data['category'] == 'Other Text Detected'])
         no_ocr = len(data[data['category'] == 'Detected (No OCR)'])
 
         # Calculate effectiveness metrics
-        total_disruption = eliminated + impersonated + misread
+        total_disruption = eliminated + impersonated
 
         summary_data.append({
             'Variant': variant_name,
@@ -206,9 +205,8 @@ def create_summary_table(variants, output_dir):
             'Total Images': total,
             'Eliminated (%)': f'{eliminated} ({eliminated/total*100:.1f}%)',
             'Impersonation (%)': f'{impersonated} ({impersonated/total*100:.1f}%)' if target else 'N/A',
-            'Misread (%)': f'{misread} ({misread/total*100:.1f}%)',
+            'Other Text (%)': f'{other_text} ({other_text/total*100:.1f}%)',
             'No OCR (%)': f'{no_ocr} ({no_ocr/total*100:.1f}%)',
-            'Correct (%)': f'{correct} ({correct/total*100:.1f}%)',
             'Total Disruption (%)': f'{total_disruption} ({total_disruption/total*100:.1f}%)'
         })
 
@@ -242,8 +240,8 @@ def create_effectiveness_comparison(variants, output_dir):
         metrics = {
             'Eliminated': [],
             'Impersonation': [],
-            'Misread': [],
-            'Failed': []
+            'Other Text': [],
+            'No OCR': []
         }
 
         labels = []
@@ -253,13 +251,13 @@ def create_effectiveness_comparison(variants, output_dir):
 
             eliminated = len(data[data['category'] == 'Detection Eliminated']) / total * 100
             impersonated = len(data[data['category'].str.contains('Impersonation Success', na=False)]) / total * 100
-            misread = len(data[data['category'] == 'Misread (Other Text)']) / total * 100
-            failed = len(data[data['category'] == 'Correct Read (Attack Failed)']) / total * 100
+            other_text = len(data[data['category'] == 'Other Text Detected']) / total * 100
+            no_ocr = len(data[data['category'] == 'Detected (No OCR)']) / total * 100
 
             metrics['Eliminated'].append(eliminated)
             metrics['Impersonation'].append(impersonated)
-            metrics['Misread'].append(misread)
-            metrics['Failed'].append(failed)
+            metrics['Other Text'].append(other_text)
+            metrics['No OCR'].append(no_ocr)
 
             # Create short label
             label = 'Full'
@@ -281,12 +279,12 @@ def create_effectiveness_comparison(variants, output_dir):
         p1 = ax.bar(x, metrics['Eliminated'], width, label='Detection Eliminated', color='#ff6b6b')
         p2 = ax.bar(x, metrics['Impersonation'], width, bottom=metrics['Eliminated'],
                    label='Impersonation Success', color='#9775fa')
-        p3 = ax.bar(x, metrics['Misread'], width,
+        p3 = ax.bar(x, metrics['Other Text'], width,
                    bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']),
-                   label='Misread (Other)', color='#ff922b')
-        p4 = ax.bar(x, metrics['Failed'], width,
-                   bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']) + np.array(metrics['Misread']),
-                   label='Attack Failed (Correct)', color='#51cf66')
+                   label='Other Text Detected', color='#ffd43b')
+        p4 = ax.bar(x, metrics['No OCR'], width,
+                   bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']) + np.array(metrics['Other Text']),
+                   label='Detected (No OCR)', color='#ff922b')
 
         ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
         ax.set_title(f'Patch Effectiveness Comparison - {target_name}', fontsize=14, fontweight='bold')
@@ -298,7 +296,7 @@ def create_effectiveness_comparison(variants, output_dir):
 
         # Add value labels on bars
         for i in x:
-            total_disruption = metrics['Eliminated'][i] + metrics['Impersonation'][i] + metrics['Misread'][i]
+            total_disruption = metrics['Eliminated'][i] + metrics['Impersonation'][i]
             ax.text(i, total_disruption + 2, f'{total_disruption:.1f}%',
                    ha='center', va='bottom', fontweight='bold', fontsize=10)
 
