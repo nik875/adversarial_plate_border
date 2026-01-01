@@ -808,6 +808,12 @@ Patch Effectiveness:
 
         plt.tight_layout()
 
+        # Save focused plots
+        focused_path = Path(output_dir) / "patch_effectiveness_analysis.png"
+        plt.savefig(focused_path, dpi=300, bbox_inches='tight')
+        plt.close()  # Close figure to free memory
+        print(f"Effectiveness analysis saved to: {focused_path}")
+
     def _create_visual_examples(self, results_df: pd.DataFrame, output_dir: str):
         """Create visual examples showing actual images with patches and detection results"""
 
