@@ -16,22 +16,21 @@ import argparse
 
 def categorize_result(row, target_plate=None):
     """Categorize detection result"""
-    # Check if detection was eliminated (IoU = 0 or very low)
-    best_iou = row.get('best_iou', 0)
-    if pd.isna(best_iou) or best_iou < 0.1:  # Consider < 0.1 as eliminated
+    # Check if detection was eliminated (IoU = 0)
+    if pd.isna(row.get('best_iou')) or row.get('best_iou', 0) == 0:
         return 'Detection Eliminated'
 
     # Check OCR results
-    ocr_text = str(row.get('detection_text', '')).strip()
+    ocr_text = row.get('best_plate_text', '')
 
-    if ocr_text == '' or ocr_text == 'nan':
+    if pd.isna(ocr_text) or ocr_text == '':
         return 'Detected (No OCR)'
     elif target_plate and ocr_text == target_plate:
         return f'Impersonation Success ({target_plate})'
+    elif row.get('is_correct_ocr', False):
+        return 'Correct Read (Attack Failed)'
     else:
-        # For control images, we don't know the ground truth
-        # So any other text is just "Other Text Detected"
-        return 'Other Text Detected'
+        return 'Misread (Other Text)'
 
 
 def load_variant_results(eval_results_dir):
@@ -48,9 +47,9 @@ def load_variant_results(eval_results_dir):
         if not variant_dir.is_dir():
             continue
 
-        results_file = variant_dir / 'patch_evaluation_results.csv'
+        results_file = variant_dir / 'results.csv'
         if not results_file.exists():
-            print(f"Warning: No patch_evaluation_results.csv found in {variant_dir.name}, skipping...")
+            print(f"Warning: No results.csv found in {variant_dir.name}, skipping...")
             continue
 
         # Extract variant info from directory name
@@ -91,20 +90,113 @@ def create_comparison_plots(variants, output_dir):
         'Detection Eliminated': '#ff6b6b',  # Red
         'Impersonation Success (VJJ7744)': '#9775fa',  # Purple
         'Impersonation Success (SHX8459)': '#845ef7',  # Purple (darker)
-        'Other Text Detected': '#ffd43b',  # Yellow
-        'Detected (No OCR)': '#ff922b'  # Orange
+        'Misread (Other Text)': '#ff922b',  # Orange
+        'Detected (No OCR)': '#ffd43b',  # Light Orange
+        'Correct Read (Attack Failed)': '#51cf66'  # Green
     }
 
-    # Organize variants by target
+    # Create SINGLE figure with ALL 8 variants (2 rows x 4 cols)
+    # Organize: VJJ7744 variants in top row, SHX8459 in bottom row
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+
+    variant_positions = [
+        ('VJJ7744', 0, 0),
+        ('VJJ7744_notv', 0, 1),
+        ('VJJ7744_nohomo', 0, 2),
+        ('VJJ7744_notv_nohomo', 0, 3),
+        ('SHX8459', 1, 0),
+        ('SHX8459_notv', 1, 1),
+        ('SHX8459_nohomo', 1, 2),
+        ('SHX8459_notv_nohomo', 1, 3)
+    ]
+
+    for variant_name, row, col in variant_positions:
+        ax = axes[row, col]
+
+        if variant_name not in variants:
+            ax.axis('off')
+            ax.text(0.5, 0.5, f'{variant_name}\nNo data', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=12, color='gray')
+            continue
+
+        data = variants[variant_name]['data']
+        target = variants[variant_name]['target']
+
+        # Count categories
+        category_counts = data['category'].value_counts()
+
+        # Prepare data for pie chart
+        sizes = []
+        plot_colors = []
+        labels = []
+
+        for category in category_counts.index:
+            count = category_counts[category]
+            pct = (count / len(data)) * 100
+            # Simpler labels for cleaner look
+            labels.append(f'{category.split("(")[0].strip()}\n{pct:.1f}%')
+            sizes.append(count)
+            plot_colors.append(colors.get(category, '#cccccc'))
+
+        # Create pie chart
+        wedges, texts, autotexts = ax.pie(
+            sizes,
+            labels=labels,
+            colors=plot_colors,
+            autopct='%1.0f',
+            startangle=90,
+            textprops={'fontsize': 8}
+        )
+
+        # Style percentage text
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontweight('bold')
+            autotext.set_fontsize(9)
+
+        # Compact title with variant configuration
+        title_parts = []
+        if target:
+            title_parts.append(f'Target: {target}')
+
+        if '_notv' in variant_name and '_nohomo' in variant_name:
+            title_parts.append('No TV Loss + No Homography')
+        elif '_notv' in variant_name:
+            title_parts.append('No TV Loss')
+        elif '_nohomo' in variant_name:
+            title_parts.append('No Homography')
+        else:
+            title_parts.append('Full (TV + Homography)')
+
+        title_parts.append(f'n={len(data)}')
+
+        ax.set_title('\n'.join(title_parts), fontsize=11, fontweight='bold', pad=10)
+
+    # Add overall title
+    plt.suptitle('Patch Variant Comparison - All Ablation Conditions',
+                 fontsize=16, fontweight='bold', y=0.98)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    # Save combined plot
+    output_path = output_dir / 'all_variants_comparison.png'
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved combined comparison plot: {output_path}")
+
+    # Also create separate plots for each target (keep original functionality)
+    create_separate_target_plots(variants, output_dir, colors)
+
+
+def create_separate_target_plots(variants, output_dir, colors):
+    """Create separate comparison plots for each target (original functionality)"""
     vjj7744_variants = {k: v for k, v in variants.items() if 'VJJ7744' in k}
     shx8459_variants = {k: v for k, v in variants.items() if 'SHX8459' in k}
 
-    # Create separate plots for each target
     for target_name, target_variants in [('VJJ7744', vjj7744_variants), ('SHX8459', shx8459_variants)]:
         if len(target_variants) == 0:
             continue
 
-        # Sort variants: full, notv, nohomo, notv_nohomo
         variant_order = []
         for suffix in ['', '_notv', '_nohomo', '_notv_nohomo']:
             key = f'{target_name}{suffix}'
@@ -122,10 +214,8 @@ def create_comparison_plots(variants, output_dir):
             data = target_variants[variant_name]['data']
             target = target_variants[variant_name]['target']
 
-            # Count categories
             category_counts = data['category'].value_counts()
 
-            # Create labels with counts and percentages
             labels = []
             sizes = []
             plot_colors = []
@@ -137,7 +227,6 @@ def create_comparison_plots(variants, output_dir):
                 sizes.append(count)
                 plot_colors.append(colors.get(category, '#cccccc'))
 
-            # Create pie chart
             wedges, texts, autotexts = ax.pie(
                 sizes,
                 labels=labels,
@@ -147,13 +236,11 @@ def create_comparison_plots(variants, output_dir):
                 textprops={'fontsize': 9}
             )
 
-            # Make percentage text bold
             for autotext in autotexts:
                 autotext.set_color('white')
                 autotext.set_fontweight('bold')
                 autotext.set_fontsize(10)
 
-            # Title with variant configuration
             title_parts = [f'Target: {target}']
             if '_notv' in variant_name:
                 title_parts.append('TV Loss: OFF')
@@ -169,11 +256,10 @@ def create_comparison_plots(variants, output_dir):
 
         plt.tight_layout()
 
-        # Save plot
         output_path = output_dir / f'patch_comparison_{target_name}.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Saved comparison plot: {output_path}")
+        print(f"Saved {target_name} comparison plot: {output_path}")
 
     # Create combined summary statistics
     create_summary_table(variants, output_dir)
@@ -193,11 +279,12 @@ def create_summary_table(variants, output_dir):
         total = len(data)
         eliminated = len(data[data['category'] == 'Detection Eliminated'])
         impersonated = len(data[data['category'].str.contains('Impersonation Success', na=False)])
-        other_text = len(data[data['category'] == 'Other Text Detected'])
+        misread = len(data[data['category'] == 'Misread (Other Text)'])
+        correct = len(data[data['category'] == 'Correct Read (Attack Failed)'])
         no_ocr = len(data[data['category'] == 'Detected (No OCR)'])
 
         # Calculate effectiveness metrics
-        total_disruption = eliminated + impersonated
+        total_disruption = eliminated + impersonated + misread
 
         summary_data.append({
             'Variant': variant_name,
@@ -205,8 +292,9 @@ def create_summary_table(variants, output_dir):
             'Total Images': total,
             'Eliminated (%)': f'{eliminated} ({eliminated/total*100:.1f}%)',
             'Impersonation (%)': f'{impersonated} ({impersonated/total*100:.1f}%)' if target else 'N/A',
-            'Other Text (%)': f'{other_text} ({other_text/total*100:.1f}%)',
+            'Misread (%)': f'{misread} ({misread/total*100:.1f}%)',
             'No OCR (%)': f'{no_ocr} ({no_ocr/total*100:.1f}%)',
+            'Correct (%)': f'{correct} ({correct/total*100:.1f}%)',
             'Total Disruption (%)': f'{total_disruption} ({total_disruption/total*100:.1f}%)'
         })
 
@@ -240,8 +328,8 @@ def create_effectiveness_comparison(variants, output_dir):
         metrics = {
             'Eliminated': [],
             'Impersonation': [],
-            'Other Text': [],
-            'No OCR': []
+            'Misread': [],
+            'Failed': []
         }
 
         labels = []
@@ -251,13 +339,13 @@ def create_effectiveness_comparison(variants, output_dir):
 
             eliminated = len(data[data['category'] == 'Detection Eliminated']) / total * 100
             impersonated = len(data[data['category'].str.contains('Impersonation Success', na=False)]) / total * 100
-            other_text = len(data[data['category'] == 'Other Text Detected']) / total * 100
-            no_ocr = len(data[data['category'] == 'Detected (No OCR)']) / total * 100
+            misread = len(data[data['category'] == 'Misread (Other Text)']) / total * 100
+            failed = len(data[data['category'] == 'Correct Read (Attack Failed)']) / total * 100
 
             metrics['Eliminated'].append(eliminated)
             metrics['Impersonation'].append(impersonated)
-            metrics['Other Text'].append(other_text)
-            metrics['No OCR'].append(no_ocr)
+            metrics['Misread'].append(misread)
+            metrics['Failed'].append(failed)
 
             # Create short label
             label = 'Full'
@@ -279,12 +367,12 @@ def create_effectiveness_comparison(variants, output_dir):
         p1 = ax.bar(x, metrics['Eliminated'], width, label='Detection Eliminated', color='#ff6b6b')
         p2 = ax.bar(x, metrics['Impersonation'], width, bottom=metrics['Eliminated'],
                    label='Impersonation Success', color='#9775fa')
-        p3 = ax.bar(x, metrics['Other Text'], width,
+        p3 = ax.bar(x, metrics['Misread'], width,
                    bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']),
-                   label='Other Text Detected', color='#ffd43b')
-        p4 = ax.bar(x, metrics['No OCR'], width,
-                   bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']) + np.array(metrics['Other Text']),
-                   label='Detected (No OCR)', color='#ff922b')
+                   label='Misread (Other)', color='#ff922b')
+        p4 = ax.bar(x, metrics['Failed'], width,
+                   bottom=np.array(metrics['Eliminated']) + np.array(metrics['Impersonation']) + np.array(metrics['Misread']),
+                   label='Attack Failed (Correct)', color='#51cf66')
 
         ax.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
         ax.set_title(f'Patch Effectiveness Comparison - {target_name}', fontsize=14, fontweight='bold')
@@ -296,7 +384,7 @@ def create_effectiveness_comparison(variants, output_dir):
 
         # Add value labels on bars
         for i in x:
-            total_disruption = metrics['Eliminated'][i] + metrics['Impersonation'][i]
+            total_disruption = metrics['Eliminated'][i] + metrics['Impersonation'][i] + metrics['Misread'][i]
             ax.text(i, total_disruption + 2, f'{total_disruption:.1f}%',
                    ha='center', va='bottom', fontweight='bold', fontsize=10)
 
