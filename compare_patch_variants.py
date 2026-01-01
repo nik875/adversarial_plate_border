@@ -16,20 +16,25 @@ import argparse
 
 def categorize_result(row, target_plate=None):
     """Categorize detection result"""
+    TRUE_PLATE = 'VRJ7774'  # Ground truth plate number for control images
+
     # Check if detection was eliminated (IoU = 0)
     if pd.isna(row.get('best_iou')) or row.get('best_iou', 0) == 0:
         return 'Detection Eliminated'
 
-    # Check OCR results
-    ocr_text = row.get('best_plate_text', '')
+    # Get OCR text from detection
+    ocr_text = str(row.get('detection_text', '')).strip()
 
-    if pd.isna(ocr_text) or ocr_text == '':
+    if pd.isna(row.get('detection_text')) or ocr_text == '':
         return 'Detected (No OCR)'
-    elif target_plate and ocr_text == target_plate:
-        return f'Impersonation Success ({target_plate})'
-    elif row.get('is_correct_ocr', False):
+    elif ocr_text == TRUE_PLATE:
+        # Attack failed - correct plate read
         return 'Correct Read (Attack Failed)'
+    elif target_plate and ocr_text == target_plate:
+        # Impersonation success
+        return f'Impersonation Success ({target_plate})'
     else:
+        # Misread to some other text
         return 'Misread (Other Text)'
 
 
