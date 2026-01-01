@@ -739,15 +739,15 @@ class AdversarialPatchTrainer:
             history['val_score'].append(val_detection_score)
             history['learning_rate'].append(current_lr)
 
-            # Calculate detection reduction
-            initial_detection = history['val_score'][0] if len(history['val_score']) > 0 else 1.0
-            detection_reduction = (1 - val_detection_score / initial_detection) * 100
+            # Calculate loss change from initial
+            initial_loss = history['val_score'][0] if len(history['val_score']) > 0 else 1.0
+            loss_change = (val_detection_score / initial_loss - 1) * 100
 
             # Print epoch summary
             print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                   f"Loss: {train_loss:.4f} | "
-                  f"Val Det: {val_detection_score:.3f} | "
-                  f"Reduction: {detection_reduction:+.1f}% | "
+                  f"Val Loss: {val_detection_score:.3f} | "
+                  f"Change: {loss_change:+.1f}% | "
                   f"LR: {current_lr:.2e} | ")
 
             # Save best model
@@ -777,8 +777,8 @@ class AdversarialPatchTrainer:
 
         print("\nTraining completed!")
         print(f"   Best loss: {best_loss:.4f}")
-        final_reduction = (1 - history['val_score'][-1] / history['val_score'][0]) * 100
-        print(f"   Detection reduction: {final_reduction:.1f}%")
+        final_change = (history['val_score'][-1] / history['val_score'][0] - 1) * 100
+        print(f"   Final loss change: {final_change:+.1f}%")
 
         return history
 
