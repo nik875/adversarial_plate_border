@@ -47,9 +47,9 @@ def load_variant_results(eval_results_dir):
         if not variant_dir.is_dir():
             continue
 
-        results_file = variant_dir / 'results.csv'
+        results_file = variant_dir / 'patch_evaluation_results.csv'
         if not results_file.exists():
-            print(f"Warning: No results.csv found in {variant_dir.name}, skipping...")
+            print(f"Warning: No patch_evaluation_results.csv found in {variant_dir.name}, skipping...")
             continue
 
         # Extract variant info from directory name
