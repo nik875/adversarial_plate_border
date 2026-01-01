@@ -63,7 +63,7 @@ class AdversarialPatchTrainer:
         self.patch_height = PATCH_HEIGHT
 
         self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
-                                                                preload=False, batch_size=1,
+                                                                preload=True, batch_size=1,
                                                                 n_jobs=0)
 
         # Initialize adversarial patch with Xavier initialization
