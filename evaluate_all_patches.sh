@@ -26,7 +26,7 @@ echo "Using latest: $PATCH_VARIANTS_DIR"
 echo "=========================================="
 
 # Configuration
-CSV_PATH="preproc_labels.csv"
+CSV_PATH="control_plate_corners.csv"  # Use control/test dataset, not training data
 DEVICE="cuda"
 OUTPUT_BASE="evaluation_results_$(date +%Y%m%d_%H%M%S)"
 
