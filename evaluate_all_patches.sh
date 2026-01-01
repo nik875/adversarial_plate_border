@@ -5,23 +5,24 @@
 
 set -e  # Exit on error
 
-# Check if patch_variants directory exists
-if [ ! -d "patch_variants_"* ]; then
-    echo "Error: No patch_variants_* directory found!"
-    echo "Usage: Run this script in the directory containing patch_variants_TIMESTAMP/"
-    exit 1
-fi
-
-# Find the most recent patch_variants directory
+# Find the most recent patch_variants directory (sorted by timestamp)
 PATCH_VARIANTS_DIR=$(ls -dt patch_variants_* 2>/dev/null | head -1)
 
 if [ -z "$PATCH_VARIANTS_DIR" ]; then
-    echo "Error: No patch_variants directory found!"
+    echo "Error: No patch_variants_* directory found!"
+    echo "Usage: Run this script in the directory containing patch_variants_TIMESTAMP/"
+    echo ""
+    echo "Expected directory structure:"
+    echo "  patch_variants_YYYYMMDD_HHMMSS/"
+    echo "    ├── patches_VJJ7744/"
+    echo "    ├── patches_VJJ7744_notv/"
+    echo "    └── ..."
     exit 1
 fi
 
 echo "=========================================="
-echo "Evaluating all patches in: $PATCH_VARIANTS_DIR"
+echo "Found $(ls -d patch_variants_* 2>/dev/null | wc -l) patch_variants directories"
+echo "Using latest: $PATCH_VARIANTS_DIR"
 echo "=========================================="
 
 # Configuration
