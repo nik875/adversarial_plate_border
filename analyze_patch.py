@@ -20,6 +20,14 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore")
 
+# Register HEIC support
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    print("HEIC support enabled")
+except ImportError:
+    print("Warning: pillow-heif not installed, HEIC files may not load")
+
 
 class PatchEvaluator:
     """Evaluate adversarial patches against the original ALPR detection model"""
@@ -59,8 +67,17 @@ class PatchEvaluator:
 
         print(f"Loaded {len(self.df)} images from dataset")
 
+        # Handle different CSV formats
+        if 'filename' in self.df.columns and 'processed_filename' not in self.df.columns:
+            self.df['processed_filename'] = self.df['filename']
+
+        # If alpr_conf is missing, we'll compute it during evaluation
+        self.precompute_baseline = 'alpr_conf' not in self.df.columns
+        if self.precompute_baseline:
+            print("Note: alpr_conf not in CSV - will compute baseline confidence during evaluation")
+
         # Verify required columns exist
-        required_columns = ['processed_filename', 'alpr_conf', 'p1_x', 'p1_y', 'p2_x', 'p2_y',
+        required_columns = ['processed_filename', 'p1_x', 'p1_y', 'p2_x', 'p2_y',
                             'p3_x', 'p3_y', 'p4_x', 'p4_y', 'H00', 'H01', 'H02', 'H10', 'H11',
                             'H12', 'H20', 'H21', 'H22']
         missing_columns = [col for col in required_columns if col not in self.df.columns]
@@ -76,7 +93,7 @@ class PatchEvaluator:
         # Initialize ALPR detector (using fast_alpr)
         print("Loading ALPR detection model...")
         self.alpr = ALPR(
-            detector_model="yolo-v9-t-384-license-plate-end2end",
+            detector_model="yolo-v9-s-608-license-plate-end2end",
             ocr_model="cct-xs-v1-global-model"
         )
         print("ALPR model loaded successfully")
@@ -106,16 +123,17 @@ class PatchEvaluator:
             raise RuntimeError(
                 f"Failed to load patch from {patch_file}: {type(e).__name__}: {str(e)}")
 
-    def _load_image(self, image_path: str) -> torch.Tensor:
-        """Load and preprocess image to 384x384"""
+    def _load_image(self, image_path: str) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Load image at original resolution, return tensor and size"""
         if not Path(image_path).exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
         try:
             image = Image.open(image_path).convert('RGB')
-            image = image.resize((384, 384))
+            original_size = image.size  # (width, height)
+            # Keep original resolution - don't resize
             image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-            return image_tensor
+            return image_tensor, original_size
         except Exception as e:
             raise RuntimeError(f"Failed to load image {image_path}: {type(e).__name__}: {str(e)}")
 
@@ -136,8 +154,8 @@ class PatchEvaluator:
             raise ValueError(f"Failed to extract homography matrix: {type(e).__name__}: {str(e)}\n"
                              f"Row data: H00={row.get('H00')}, H01={row.get('H01')}, ..., H22={row.get('H22')}")
 
-    def _get_license_plate_corners(self, row) -> torch.Tensor:
-        """Get license plate corner coordinates"""
+    def _get_license_plate_corners(self, row, original_size: Tuple[int, int] = None) -> torch.Tensor:
+        """Get license plate corner coordinates in original image space"""
         try:
             corners = torch.tensor([
                 [row['p1_x'], row['p1_y']],
@@ -146,11 +164,13 @@ class PatchEvaluator:
                 [row['p4_x'], row['p4_y']]
             ], dtype=torch.float32, device=self.device).unsqueeze(0)
 
+            # Corners are already in original image coordinates - no scaling needed
+
             if torch.any(torch.isnan(corners)):
                 raise ValueError(f"Corner coordinates contain NaN values: {corners}")
 
-            if torch.any(corners < 0) or torch.any(corners > 384):
-                print(f"Warning: Corner coordinates outside image bounds [0,384]: {corners}")
+            # Note: bounds check removed since we're working at original resolution
+            # which can be any size (e.g., 3000x4000 for HEIC images)
 
             return corners
         except Exception as e:
@@ -162,6 +182,8 @@ class PatchEvaluator:
                               corners: torch.Tensor, border_scale: float = 1.4) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply patch as border around license plate using homography transformation"""
         batch_size = image.shape[0]
+        # Get actual image dimensions (C, H, W format)
+        img_h, img_w = image.shape[2], image.shape[3]
 
         try:
             # Get the 4 corners of the license plate
@@ -186,24 +208,24 @@ class PatchEvaluator:
             M_border = K.get_perspective_transform(src_corners, border_corners)
             M_plate = K.get_perspective_transform(src_corners, corners)
 
-            # Create and warp patch
+            # Create and warp patch - use actual image dimensions
             patch_batch = self.patch_tensor.unsqueeze(0).repeat(batch_size, 1, 1, 1)
             warped_patch = K.warp_perspective(
-                patch_batch, M_border, dsize=(384, 384),
+                patch_batch, M_border, dsize=(img_h, img_w),
                 mode='bilinear', padding_mode='zeros', align_corners=True
             )
 
-            # Create masks
+            # Create masks - use actual image dimensions
             patch_mask = torch.ones(batch_size, 1, self.patch_height, self.patch_width,
                                     dtype=torch.float32, device=self.device)
 
             warped_border_mask = K.warp_perspective(
-                patch_mask, M_border, dsize=(384, 384),
+                patch_mask, M_border, dsize=(img_h, img_w),
                 mode='bilinear', padding_mode='zeros', align_corners=True
             )
 
             warped_plate_mask = K.warp_perspective(
-                patch_mask, M_plate, dsize=(384, 384),
+                patch_mask, M_plate, dsize=(img_h, img_w),
                 mode='bilinear', padding_mode='zeros', align_corners=True
             )
 
@@ -326,12 +348,36 @@ class PatchEvaluator:
         for idx in tqdm(range(len(self.df)), desc="Processing images"):
             row = self.df.iloc[idx]
             image_path = row['processed_filename']
-            original_confidence = float(row['alpr_conf'])
+
+            # Get or compute original confidence
+            if self.precompute_baseline:
+                # Load original image and detect to get baseline
+                try:
+                    orig_image, orig_size = self._load_image(image_path)
+                    orig_detections = self._detect_license_plates(orig_image)
+                    corners = self._get_license_plate_corners(row, orig_size)
+                    ground_truth_bbox = self._corners_to_bbox(corners)
+
+                    # Find best detection
+                    best_orig_detection = None
+                    best_orig_iou = 0.0
+                    for det in orig_detections:
+                        iou = self._compute_iou(det['bbox'], ground_truth_bbox)
+                        if iou > best_orig_iou:
+                            best_orig_iou = iou
+                            best_orig_detection = det
+
+                    original_confidence = best_orig_detection['confidence'] if best_orig_detection else 0.0
+                except Exception as e:
+                    print(f"Error computing baseline for {image_path}: {e}")
+                    original_confidence = 0.0
+            else:
+                original_confidence = float(row['alpr_conf'])
 
             try:
                 # Load image and metadata
-                image = self._load_image(image_path)
-                corners = self._get_license_plate_corners(row)
+                image, orig_size = self._load_image(image_path)
+                corners = self._get_license_plate_corners(row, orig_size)
                 homography = self._extract_homography_matrix(row)
                 ground_truth_bbox = self._corners_to_bbox(corners)
 
@@ -719,7 +765,7 @@ Patch Effectiveness:
         # Save visualization
         viz_path = Path(output_dir) / "patch_evaluation_visualization.png"
         plt.savefig(viz_path, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()  # Close figure to free memory
         print(f"Visualization saved to: {viz_path}")
 
         # Create additional focused plots
@@ -832,8 +878,8 @@ Patch Effectiveness:
 
             try:
                 # Load and process image
-                image = self._load_image(row['image_path'])
-                corners = self._get_license_plate_corners(self.df.iloc[row['image_index']])
+                image, orig_size = self._load_image(row['image_path'])
+                corners = self._get_license_plate_corners(self.df.iloc[row['image_index']], orig_size)
                 homography = self._extract_homography_matrix(self.df.iloc[row['image_index']])
 
                 # Apply patch
@@ -925,7 +971,7 @@ Patch Effectiveness:
         # Save visual examples
         examples_path = Path(output_dir) / "patch_visual_examples.png"
         plt.savefig(examples_path, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()  # Close figure to free memory
         print(f"Visual examples saved to: {examples_path}")
 
         # Save detailed info about selected examples
