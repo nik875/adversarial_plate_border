@@ -8,6 +8,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+# Use non-interactive backend to prevent display blocking
+import matplotlib
+matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import seaborn as sns
