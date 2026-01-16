@@ -380,11 +380,11 @@ class SurrogateTrainer:
         # Learning rate schedulers (create if not provided)
         if ocr_scheduler is None:
             ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                ocr_optimizer, mode='min', factor=0.5, patience=3
+                ocr_optimizer, mode='min', factor=0.5, patience=6
             )
         if detector_scheduler is None:
             detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                detector_optimizer, mode='min', factor=0.5, patience=3
+                detector_optimizer, mode='min', factor=0.5, patience=6
             )
 
         converged = False
@@ -1082,10 +1082,10 @@ def optimize_patch_bb(
         lr=surrogate_trainer.learning_rate * 0.1
     )
     ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        ocr_optimizer, mode='min', factor=0.5, patience=3
+        ocr_optimizer, mode='min', factor=0.5, patience=6
     )
     detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        detector_optimizer, mode='min', factor=0.5, patience=3
+        detector_optimizer, mode='min', factor=0.5, patience=6
     )
 
     # Initial fine-tuning
@@ -1138,128 +1138,119 @@ def optimize_patch_bb(
     blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
-    try:
-        for epoch in range(num_epochs):
-            print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+    for epoch in range(num_epochs):
+        print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
 
-            # Step 1: Train patch for one epoch (single gradient update)
-            patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
-            print(f"Patch loss: {patch_losses['total']:.4f} "
-                  f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
+        # Step 1: Train patch for one epoch (single gradient update)
+        patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
+        print(f"Patch loss: {patch_losses['total']:.4f} "
+              f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
 
-            # Step 2: Apply patch to all images (with blur) and query black-box
-            print("Collecting patched samples...")
-            patched_samples, bb_success_rate = collect_patched_samples(
+        # Step 2: Apply patch to all images (with blur) and query black-box
+        print("Collecting patched samples...")
+        patched_samples, bb_success_rate = collect_patched_samples(
+            black_box=black_box,
+            trainer=trainer,
+            ground_truth_texts=ground_truth_texts,
+            blur_sigma=current_blur_sigma
+        )
+        print(f"Black-box success rate: {bb_success_rate:.1%}")
+
+        # Step 2b: Check if we need to reduce blur (attack too effective)
+        if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
+            print(
+                f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
+            print("*** Reducing blur to maintain training diversity...")
+
+            # Re-calibrate with a higher target (to reduce blur)
+            # Target: get back to ~50% success rate zone
+            new_blur_sigma, cached_clean_samples = calibrate_blur_level(
                 black_box=black_box,
-                trainer=trainer,
+                dataset_loader=trainer.train_loader,
                 ground_truth_texts=ground_truth_texts,
-                blur_sigma=current_blur_sigma
+                target_correct_rate=blur_target_rate,
+                sigma_min=0.0,
+                sigma_max=current_blur_sigma,  # Can only decrease blur
+                tolerance=0.10,
+                max_iterations=5,  # Quick recalibration
+                device=device
             )
-            print(f"Black-box success rate: {bb_success_rate:.1%}")
 
-            # Step 2b: Check if we need to reduce blur (attack too effective)
-            if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
-                print(
-                    f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
-                print("*** Reducing blur to maintain training diversity...")
+            if new_blur_sigma < current_blur_sigma:
+                current_blur_sigma = new_blur_sigma
+                trainer.set_blur_sigma(current_blur_sigma)
+                print(f"*** New blur sigma: {current_blur_sigma:.2f}")
 
-                # Re-calibrate with a higher target (to reduce blur)
-                # Target: get back to ~50% success rate zone
-                new_blur_sigma, cached_clean_samples = calibrate_blur_level(
-                    black_box=black_box,
-                    dataset_loader=trainer.train_loader,
-                    ground_truth_texts=ground_truth_texts,
-                    target_correct_rate=blur_target_rate,
-                    sigma_min=0.0,
-                    sigma_max=current_blur_sigma,  # Can only decrease blur
-                    tolerance=0.10,
-                    max_iterations=5,  # Quick recalibration
-                    device=device
+                # Use cached samples from calibration (no re-querying needed)
+                print("*** Using cached samples from calibration...")
+                clean_samples = cached_clean_samples
+                replay_buffer.add_clean_samples(clean_samples)
+
+                # Fine-tune surrogate on new clean samples
+                print("*** Fine-tuning surrogate on less blurred data...")
+                surrogate_trainer.fine_tune(
+                    clean_samples,
+                    verbose=verbose,
+                    ocr_optimizer=ocr_optimizer,
+                    ocr_scheduler=ocr_scheduler,
+                    detector_optimizer=detector_optimizer,
+                    detector_scheduler=detector_scheduler
                 )
 
-                if new_blur_sigma < current_blur_sigma:
-                    current_blur_sigma = new_blur_sigma
-                    trainer.set_blur_sigma(current_blur_sigma)
-                    print(f"*** New blur sigma: {current_blur_sigma:.2f}")
+        # Step 3: Update replay buffer
+        replay_buffer.add_patch_epoch(
+            epoch=epoch,
+            patch=trainer.patch.detach().clone(),
+            samples=patched_samples
+        )
 
-                    # Use cached samples from calibration (no re-querying needed)
-                    print("*** Using cached samples from calibration...")
-                    clean_samples = cached_clean_samples
-                    replay_buffer.add_clean_samples(clean_samples)
+        # Step 4: Fine-tune surrogate on replay buffer
+        print("Fine-tuning surrogate...")
+        training_samples = replay_buffer.get_training_samples()
+        metrics = surrogate_trainer.fine_tune(
+            training_samples,
+            verbose=verbose,
+            ocr_optimizer=ocr_optimizer,
+            ocr_scheduler=ocr_scheduler,
+            detector_optimizer=detector_optimizer,
+            detector_scheduler=detector_scheduler
+        )
 
-                    # Fine-tune surrogate on new clean samples
-                    print("*** Fine-tuning surrogate on less blurred data...")
-                    surrogate_trainer.fine_tune(
-                        clean_samples,
-                        verbose=verbose,
-                        ocr_optimizer=ocr_optimizer,
-                        ocr_scheduler=ocr_scheduler,
-                        detector_optimizer=detector_optimizer,
-                        detector_scheduler=detector_scheduler
-                    )
+        print(f"Surrogate metrics:")
+        print(f"  OCR loss: {metrics.ocr_loss:.4f}")
+        print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
+        print(f"  Converged: {metrics.converged}")
+        print(f"  OCR LR: {ocr_optimizer.param_groups[0]['lr']:.2e}, "
+              f"Detector LR: {detector_optimizer.param_groups[0]['lr']:.2e}")
 
-            # Step 3: Update replay buffer
-            replay_buffer.add_patch_epoch(
-                epoch=epoch,
-                patch=trainer.patch.detach().clone(),
-                samples=patched_samples
-            )
+        # Record history
+        history['epoch'].append(epoch + 1)
+        history['patch_loss_total'].append(patch_losses['total'])
+        history['patch_loss_det'].append(patch_losses['det'])
+        history['patch_loss_ocr'].append(patch_losses['ocr'])
+        history['patch_loss_tv'].append(patch_losses['tv'])
+        history['surrogate_ocr_loss'].append(metrics.ocr_loss)
+        history['surrogate_conf_mse'].append(metrics.confidence_mse)
+        history['surrogate_converged'].append(metrics.converged)
+        history['bb_success_rate'].append(bb_success_rate)
+        history['blur_sigma'].append(current_blur_sigma)
 
-            # Step 4: Fine-tune surrogate on replay buffer
-            print("Fine-tuning surrogate...")
-            training_samples = replay_buffer.get_training_samples()
-            metrics = surrogate_trainer.fine_tune(
-                training_samples,
-                verbose=verbose,
-                ocr_optimizer=ocr_optimizer,
-                ocr_scheduler=ocr_scheduler,
-                detector_optimizer=detector_optimizer,
-                detector_scheduler=detector_scheduler
-            )
+        # Save checkpoint every epoch
+        trainer.save_patch(epoch, save_dir="bb_patches")
 
-            print(f"Surrogate metrics:")
-            print(f"  OCR loss: {metrics.ocr_loss:.4f}")
-            print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
-            print(f"  Converged: {metrics.converged}")
-            print(f"  OCR LR: {ocr_optimizer.param_groups[0]['lr']:.2e}, "
-                  f"Detector LR: {detector_optimizer.param_groups[0]['lr']:.2e}")
-
-            # Record history
-            history['epoch'].append(epoch + 1)
-            history['patch_loss_total'].append(patch_losses['total'])
-            history['patch_loss_det'].append(patch_losses['det'])
-            history['patch_loss_ocr'].append(patch_losses['ocr'])
-            history['patch_loss_tv'].append(patch_losses['tv'])
-            history['surrogate_ocr_loss'].append(metrics.ocr_loss)
-            history['surrogate_conf_mse'].append(metrics.confidence_mse)
-            history['surrogate_converged'].append(metrics.converged)
-            history['bb_success_rate'].append(bb_success_rate)
-            history['blur_sigma'].append(current_blur_sigma)
-
-            # Save checkpoint every epoch
-            trainer.save_patch(epoch, save_dir="bb_patches")
-
-            # Save models periodically (less frequently to save disk space)
-            if (epoch + 1) % save_interval == 0:
-                models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
-
-    except KeyboardInterrupt:
-        print("\n" + "=" * 60)
-        print("Training interrupted by user")
-        print("=" * 60)
-        print(f"Saving partial results up to epoch {len(history['epoch'])}...")
+        # Save models periodically (less frequently to save disk space)
+        if (epoch + 1) % save_interval == 0:
+            models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
     models.save_state("bb_patches_final/models_final.pt")
 
     print("\n" + "=" * 60)
-    print("Optimization Complete" if len(history['epoch']) == num_epochs else "Optimization Interrupted")
+    print("Optimization Complete")
     print("=" * 60)
     print(f"Final blur sigma: {current_blur_sigma:.2f}")
-    if history['bb_success_rate']:
-        print(f"Final black-box success rate: {history['bb_success_rate'][-1]:.1%}")
-    print(f"Epochs completed: {len(history['epoch'])}/{num_epochs}")
+    print(f"Final black-box success rate: {history['bb_success_rate'][-1]:.1%}")
 
     return {
         'history': history,
