@@ -369,10 +369,10 @@ class SurrogateTrainer:
 
         # Learning rate schedulers for faster convergence
         ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            ocr_optimizer, mode='min', factor=0.5, patience=3, verbose=False
+            ocr_optimizer, mode='min', factor=0.5, patience=3
         )
         detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            detector_optimizer, mode='min', factor=0.5, patience=3, verbose=False
+            detector_optimizer, mode='min', factor=0.5, patience=3
         )
 
         converged = False
