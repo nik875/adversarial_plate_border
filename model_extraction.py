@@ -1007,9 +1007,9 @@ def optimize_patch_bb(
     # Create shared models
     models = ALPRModels(device=device).load()
 
-    # Create trainer with single gradient update per epoch
+    # Create trainer with gradient accumulation for more steps per epoch
     config = TrainerConfig(
-        grad_accumulate=None,  # Single update per epoch
+        grad_accumulate=64,  # Accumulate gradients over 64 steps per epoch
         use_tv_loss=True,
         use_homography=True,
         **{k: v for k, v in trainer_kwargs.items() if hasattr(TrainerConfig, k)}
