@@ -136,33 +136,51 @@ def main():
 
     black_box = LargeFastALPR(device=args.device)
 
-    results = optimize_patch_bb(
-        black_box=black_box,
-        csv_path=args.csv,
-        ground_truth_texts=ground_truth,
-        num_epochs=args.epochs,
-        device=args.device,
-        learning_rate=args.lr,
-        blur_sigma_init=args.blur_sigma,
-        save_interval=args.save_interval,
-        verbose=True,
-    )
+    try:
+        results = optimize_patch_bb(
+            black_box=black_box,
+            csv_path=args.csv,
+            ground_truth_texts=ground_truth,
+            num_epochs=args.epochs,
+            device=args.device,
+            learning_rate=args.lr,
+            blur_sigma_init=args.blur_sigma,
+            save_interval=args.save_interval,
+            verbose=True,
+        )
 
-    print("\n" + "=" * 60)
-    print("Optimization Summary")
-    print("=" * 60)
-    print(f"Initial blur sigma: {results['initial_blur_sigma']:.2f}")
-    print(f"Final blur sigma: {results['blur_sigma']:.2f}")
-    print(
-        f"Final black-box success rate: "
-        f"{results['history']['bb_success_rate'][-1]:.1%}"
-    )
+        print("\n" + "=" * 60)
+        print("Optimization Summary")
+        print("=" * 60)
+        print(f"Initial blur sigma: {results['initial_blur_sigma']:.2f}")
+        print(f"Final blur sigma: {results['blur_sigma']:.2f}")
+        print(
+            f"Final black-box success rate: "
+            f"{results['history']['bb_success_rate'][-1]:.1%}"
+        )
 
-    history_df = pd.DataFrame(results["history"])
-    history_df.to_csv("bb_optimization_history.csv", index=False)
+        history_df = pd.DataFrame(results["history"])
+        history_df.to_csv("bb_optimization_history.csv", index=False)
 
-    print("\nHistory saved to bb_optimization_history.csv")
-    print("Patches saved to bb_patches/ and bb_patches_final/")
+        print("\nHistory saved to bb_optimization_history.csv")
+        print("Patches saved to bb_patches/ and bb_patches_final/")
+
+    except KeyboardInterrupt:
+        print("\n" + "=" * 60)
+        print("Training interrupted by user")
+        print("=" * 60)
+
+        if 'results' in locals() and results is not None:
+            print(f"Saving training history up to epoch {len(results['history']['bb_success_rate'])}...")
+            history_df = pd.DataFrame(results["history"])
+            history_df.to_csv("bb_optimization_history_interrupted.csv", index=False)
+            print("Interrupted history saved to bb_optimization_history_interrupted.csv")
+            print(f"Initial blur sigma: {results['initial_blur_sigma']:.2f}")
+            print(f"Last blur sigma: {results['blur_sigma']:.2f}")
+            if results['history']['bb_success_rate']:
+                print(f"Last black-box success rate: {results['history']['bb_success_rate'][-1]:.1%}")
+        else:
+            print("Training was interrupted before completion. No history to save.")
 
 
 if __name__ == "__main__":
