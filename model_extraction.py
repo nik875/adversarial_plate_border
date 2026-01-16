@@ -1069,6 +1069,7 @@ def optimize_patch_bb(
 
             if new_blur_sigma < current_blur_sigma:
                 current_blur_sigma = new_blur_sigma
+                trainer.set_blur_sigma(current_blur_sigma)
                 print(f"*** New blur sigma: {current_blur_sigma:.2f}")
 
                 # Re-collect clean samples with new blur level

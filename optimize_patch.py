@@ -357,6 +357,57 @@ def compute_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     return inter_area / (union_area + 1e-8)
 
 
+def apply_plate_blur(
+    image: torch.Tensor,
+    corners: torch.Tensor,
+    sigma: float
+) -> torch.Tensor:
+    """
+    Apply Gaussian blur to the license plate region.
+
+    Args:
+        image: Image tensor [C, H, W]
+        corners: Plate corner coordinates [4, 2]
+        sigma: Blur sigma (0 = no blur)
+
+    Returns:
+        Blurred image tensor
+    """
+    if sigma <= 0:
+        return image
+
+    # Create a copy
+    result = image.clone()
+    C, H, W = image.shape
+
+    # Get bounding box of plate
+    min_x = int(max(0, corners[:, 0].min().item()))
+    max_x = int(min(W, corners[:, 0].max().item()))
+    min_y = int(max(0, corners[:, 1].min().item()))
+    max_y = int(min(H, corners[:, 1].max().item()))
+
+    if max_x <= min_x or max_y <= min_y:
+        return result
+
+    # Extract plate region
+    plate_region = image[:, min_y:max_y, min_x:max_x].unsqueeze(0)
+
+    # Apply Gaussian blur
+    kernel_size = int(sigma * 6) | 1  # Ensure odd
+    kernel_size = max(3, kernel_size)
+
+    blurred_region = kornia.filters.gaussian_blur2d(
+        plate_region,
+        kernel_size=(kernel_size, kernel_size),
+        sigma=(sigma, sigma)
+    ).squeeze(0)
+
+    # Replace plate region
+    result[:, min_y:max_y, min_x:max_x] = blurred_region
+
+    return result
+
+
 # =============================================================================
 # Adversarial Patch Trainer
 # =============================================================================
@@ -370,6 +421,7 @@ class TrainerConfig:
     match_detection: bool = False
     impersonation_target: Optional[str] = None
     print_blur: float = 0.0
+    blur_sigma: float = 0.0
     use_tv_loss: bool = True
     use_homography: bool = True
     border_scale: float = 1.4
@@ -507,6 +559,21 @@ class AdversarialPatchTrainer:
     def ocr(self) -> nn.Module:
         """Access the OCR model."""
         return self.models.ocr
+
+    def set_blur_sigma(self, blur_sigma: float) -> None:
+        """
+        Update the blur sigma for patch optimization.
+
+        This allows external scripts (e.g., model_extraction.py) to adjust
+        the blur level dynamically during training. Recalculates baseline losses
+        based on the new blur level.
+
+        Args:
+            blur_sigma: New blur sigma value
+        """
+        self.config.blur_sigma = blur_sigma
+        # Recalculate baseline losses with new blur level
+        self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
 
     # -------------------------------------------------------------------------
     # Patch Application
@@ -789,6 +856,24 @@ class AdversarialPatchTrainer:
             batch['orig_corners'].to(self.device).unsqueeze(0)
         )
         batch['orig_image'] = patched_image.squeeze()
+
+        # Apply blur after patching (simulates real-world degradation)
+        if self.config.blur_sigma > 0:
+            # Blur original image
+            batch['orig_image'] = apply_plate_blur(
+                batch['orig_image'],
+                batch['orig_corners'],
+                self.config.blur_sigma
+            )
+
+            # Blur preprocessed image with scaled sigma
+            orig_image_size = max(batch['orig_image'].shape[1], batch['orig_image'].shape[2])
+            prep_blur_sigma = self.config.blur_sigma * (384 / orig_image_size)
+            batch['prep_image'] = apply_plate_blur(
+                batch['prep_image'],
+                batch['new_corners'],
+                prep_blur_sigma
+            )
 
         det_loss, ocr_loss = self._compute_partial_loss(batch, use_ocr_baseline)
 
@@ -1575,6 +1660,8 @@ def main():
                         help='Device to use (cuda, mps, cpu)')
     parser.add_argument('--grad-accumulate', type=int, default=64,
                         help='Gradient accumulation steps')
+    parser.add_argument('--blur-sigma', type=float, default=0.0,
+                        help='Blur sigma to apply to plate region (0 = no blur)')
     args = parser.parse_args()
 
     CSV_PATH = "preproc_labels.csv"
@@ -1586,6 +1673,7 @@ def main():
         'use_tv_loss': not args.disable_tv_loss,
         'use_homography': not args.disable_homography,
         'grad_accumulate': args.grad_accumulate,
+        'blur_sigma': args.blur_sigma,
     }
 
     if args.test:
