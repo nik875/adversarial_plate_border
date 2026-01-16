@@ -823,7 +823,7 @@ class AdversarialPatchTrainer:
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         loss = (tv_h + tv_v) / num_comparisons
 
-        return loss * 2.5
+        return loss * 5.0
 
     def compute_loss(
         self,

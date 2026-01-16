@@ -333,7 +333,11 @@ class SurrogateTrainer:
         self,
         samples: List[Tuple],
         batch_size: int = 64,
-        verbose: bool = True
+        verbose: bool = True,
+        ocr_optimizer: Optional[optim.Optimizer] = None,
+        ocr_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None,
+        detector_optimizer: Optional[optim.Optimizer] = None,
+        detector_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
     ) -> FinetuneMetrics:
         """
         Fine-tune surrogate models until convergence or max epochs.
@@ -345,6 +349,10 @@ class SurrogateTrainer:
             samples: List of (prep_image, orig_image, corners, orig_corners, transform, bb_result)
             batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
+            ocr_optimizer: Optional pre-created OCR optimizer (reuses across epochs)
+            ocr_scheduler: Optional pre-created OCR scheduler
+            detector_optimizer: Optional pre-created detector optimizer (reuses across epochs)
+            detector_scheduler: Optional pre-created detector scheduler
 
         Returns:
             FinetuneMetrics with final metrics
@@ -360,20 +368,24 @@ class SurrogateTrainer:
         # Unfreeze models for training
         self.models.unfreeze_all()
 
-        # Set up optimizers
-        ocr_optimizer = optim.Adam(self.models.get_ocr_parameters(), lr=self.learning_rate)
-        detector_optimizer = optim.Adam(
-            self.models.get_detector_parameters(),
-            lr=self.learning_rate * 0.1  # Lower LR for detector
-        )
+        # Set up optimizers (create if not provided)
+        if ocr_optimizer is None:
+            ocr_optimizer = optim.Adam(self.models.get_ocr_parameters(), lr=self.learning_rate)
+        if detector_optimizer is None:
+            detector_optimizer = optim.Adam(
+                self.models.get_detector_parameters(),
+                lr=self.learning_rate * 0.1  # Lower LR for detector
+            )
 
-        # Learning rate schedulers for faster convergence
-        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            ocr_optimizer, mode='min', factor=0.5, patience=3
-        )
-        detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            detector_optimizer, mode='min', factor=0.5, patience=3
-        )
+        # Learning rate schedulers (create if not provided)
+        if ocr_scheduler is None:
+            ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                ocr_optimizer, mode='min', factor=0.5, patience=3
+            )
+        if detector_scheduler is None:
+            detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                detector_optimizer, mode='min', factor=0.5, patience=3
+            )
 
         converged = False
         best_ocr_loss = float('inf')
@@ -1060,9 +1072,32 @@ def optimize_patch_bb(
 
     replay_buffer.add_clean_samples(clean_samples)
 
+    # Create surrogate optimizers and schedulers (reuse across epochs)
+    ocr_optimizer = optim.Adam(
+        models.get_ocr_parameters(),
+        lr=surrogate_trainer.learning_rate
+    )
+    detector_optimizer = optim.Adam(
+        models.get_detector_parameters(),
+        lr=surrogate_trainer.learning_rate * 0.1
+    )
+    ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        ocr_optimizer, mode='min', factor=0.5, patience=3
+    )
+    detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        detector_optimizer, mode='min', factor=0.5, patience=3
+    )
+
     # Initial fine-tuning
     print("\nInitial surrogate fine-tuning...")
-    initial_metrics = surrogate_trainer.fine_tune(clean_samples, verbose=verbose)
+    initial_metrics = surrogate_trainer.fine_tune(
+        clean_samples,
+        verbose=verbose,
+        ocr_optimizer=ocr_optimizer,
+        ocr_scheduler=ocr_scheduler,
+        detector_optimizer=detector_optimizer,
+        detector_scheduler=detector_scheduler
+    )
 
     print(f"\nInitial extraction results:")
     print(f"  OCR loss: {initial_metrics.ocr_loss:.4f}")
@@ -1100,7 +1135,7 @@ def optimize_patch_bb(
     patch_optimizer = optim.Adam([trainer.patch], lr=learning_rate)
 
     # Threshold for reducing blur (when attack is too effective)
-    blur_reduction_threshold = 0.20  # 20% success rate
+    blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
     for epoch in range(num_epochs):
@@ -1153,7 +1188,14 @@ def optimize_patch_bb(
 
                 # Fine-tune surrogate on new clean samples
                 print("*** Fine-tuning surrogate on less blurred data...")
-                surrogate_trainer.fine_tune(clean_samples, verbose=verbose)
+                surrogate_trainer.fine_tune(
+                    clean_samples,
+                    verbose=verbose,
+                    ocr_optimizer=ocr_optimizer,
+                    ocr_scheduler=ocr_scheduler,
+                    detector_optimizer=detector_optimizer,
+                    detector_scheduler=detector_scheduler
+                )
 
         # Step 3: Update replay buffer
         replay_buffer.add_patch_epoch(
@@ -1165,12 +1207,21 @@ def optimize_patch_bb(
         # Step 4: Fine-tune surrogate on replay buffer
         print("Fine-tuning surrogate...")
         training_samples = replay_buffer.get_training_samples()
-        metrics = surrogate_trainer.fine_tune(training_samples, verbose=verbose)
+        metrics = surrogate_trainer.fine_tune(
+            training_samples,
+            verbose=verbose,
+            ocr_optimizer=ocr_optimizer,
+            ocr_scheduler=ocr_scheduler,
+            detector_optimizer=detector_optimizer,
+            detector_scheduler=detector_scheduler
+        )
 
         print(f"Surrogate metrics:")
         print(f"  OCR loss: {metrics.ocr_loss:.4f}")
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
+        print(f"  OCR LR: {ocr_optimizer.param_groups[0]['lr']:.2e}, "
+              f"Detector LR: {detector_optimizer.param_groups[0]['lr']:.2e}")
 
         # Record history
         history['epoch'].append(epoch + 1)
