@@ -139,21 +139,35 @@ class AdversarialPatchDataset(Dataset):
         }
 
 
-def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=0, **kwargs):
-    """Create train and validation DataLoaders"""
+def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=0, use_all_for_train=False, **kwargs):
+    """Create train and validation DataLoaders
+
+    Args:
+        csv_path: Path to CSV file with image paths and labels
+        batch_size: Batch size for dataloaders
+        train_split: Fraction of data to use for training (ignored if use_all_for_train=True)
+        n_jobs: Number of worker processes
+        limit: Limit number of samples (0 = no limit)
+        use_all_for_train: If True, use all data for training (val_loader will be empty)
+        **kwargs: Additional arguments passed to AdversarialPatchDataset
+    """
     df = pd.read_csv(csv_path)
     if limit:
         df = df.iloc[-limit:]
     print(f"Loaded {len(df)} samples")
 
-    # Shuffle and split
+    # Shuffle
     df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    train_size = int(train_split * len(df_shuffled))
 
-    train_df = df_shuffled[:train_size]
-    val_df = df_shuffled[train_size:]
-
-    print(f"Train: {train_size}, Val: {len(val_df)}")
+    if use_all_for_train:
+        train_df = df_shuffled
+        val_df = df_shuffled.iloc[0:0]  # Empty dataframe with same columns
+        print(f"Train: {len(train_df)}, Val: 0 (using all data for training)")
+    else:
+        train_size = int(train_split * len(df_shuffled))
+        train_df = df_shuffled[:train_size]
+        val_df = df_shuffled[train_size:]
+        print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Create datasets
     train_dataset = AdversarialPatchDataset(train_df, **kwargs)
