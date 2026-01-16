@@ -12,3 +12,4 @@ fast-alpr
 open_image_models[onnx]
 onnx2torch
 pillow_heif
+seaborn
