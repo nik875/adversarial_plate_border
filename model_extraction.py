@@ -309,7 +309,7 @@ class SurrogateTrainer:
         ocr_loss_threshold: float = 0.1,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 1e-4,
-        max_epochs: int = 50
+        max_epochs: int = 100
     ):
         """
         Args:
@@ -367,7 +367,16 @@ class SurrogateTrainer:
             lr=self.learning_rate * 0.1  # Lower LR for detector
         )
 
+        # Learning rate schedulers for faster convergence
+        ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            ocr_optimizer, mode='min', factor=0.5, patience=3, verbose=False
+        )
+        detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            detector_optimizer, mode='min', factor=0.5, patience=3, verbose=False
+        )
+
         converged = False
+        best_ocr_loss = float('inf')
 
         for epoch in range(self.max_epochs):
             # Shuffle samples at start of each epoch
@@ -376,24 +385,24 @@ class SurrogateTrainer:
             # Training pass over entire dataset
             epoch_ocr_loss = 0.0
             epoch_conf_loss = 0.0
-            batches_processed = 0
+            samples_processed = 0
 
             desc = f"Fine-tune epoch {epoch + 1}/{self.max_epochs}"
             pbar = tqdm(range(0, len(samples), batch_size), desc=desc,
-                       disable=not verbose, leave=False)
+                        disable=not verbose, leave=False)
 
             for i in pbar:
                 batch = samples[i:i + batch_size]
-                ocr_loss, conf_loss, _, _ = self._train_step(
+                ocr_loss, conf_loss, _, _, valid_samples = self._train_step(
                     batch, ocr_optimizer, detector_optimizer
                 )
                 epoch_ocr_loss += ocr_loss
                 epoch_conf_loss += conf_loss
-                batches_processed += 1
+                samples_processed += valid_samples
 
                 pbar.set_postfix({
-                    'ocr_loss': f'{epoch_ocr_loss / batches_processed:.4f}',
-                    'conf_loss': f'{epoch_conf_loss / batches_processed:.4f}'
+                    'ocr_loss': f'{epoch_ocr_loss / max(1, samples_processed):.4f}',
+                    'conf_loss': f'{epoch_conf_loss / max(1, samples_processed):.4f}'
                 })
 
             pbar.close()
@@ -402,12 +411,19 @@ class SurrogateTrainer:
             metrics = self._evaluate(samples)
 
             if verbose:
+                ocr_lr = ocr_optimizer.param_groups[0]['lr']
+                det_lr = detector_optimizer.param_groups[0]['lr']
                 print(f"  Epoch {epoch + 1}: ocr_loss={metrics.ocr_loss:.4f}, "
-                      f"conf_mse={metrics.confidence_mse:.4f}")
+                      f"conf_mse={metrics.confidence_mse:.4f} | "
+                      f"LR: ocr={ocr_lr:.2e}, det={det_lr:.2e}")
+
+            # Step schedulers to reduce LR if loss plateaus
+            ocr_scheduler.step(metrics.ocr_loss)
+            detector_scheduler.step(metrics.confidence_mse)
 
             # Check convergence based on whole-dataset metrics
             if (metrics.ocr_loss <= self.ocr_loss_threshold and
-                metrics.confidence_mse <= self.confidence_mse_threshold):
+                    metrics.confidence_mse <= self.confidence_mse_threshold):
                 converged = True
                 if verbose:
                     print(f"  Converged at epoch {epoch + 1}")
@@ -427,14 +443,20 @@ class SurrogateTrainer:
         batch: List[Tuple],
         ocr_optimizer: optim.Optimizer,
         detector_optimizer: optim.Optimizer
-    ) -> Tuple[float, float, float, float]:
-        """Single training step on a batch."""
+    ) -> Tuple[float, float, float, float, int]:
+        """Single training step on a batch.
+
+        Returns:
+            Tuple of (ocr_loss_sum, conf_loss_sum, match_rate, conf_mse, valid_samples)
+            where valid_samples is the count of samples that produced valid losses
+        """
         self.models.detector.train()
         self.models.ocr.train()
 
         total_ocr_loss = 0.0
         total_conf_loss = 0.0
         correct_matches = 0
+        valid_samples = 0
         conf_squared_errors = []
 
         ocr_optimizer.zero_grad()
@@ -469,6 +491,7 @@ class SurrogateTrainer:
             if best_det is None:
                 continue
 
+            valid_samples += 1
             pred_conf = best_det[6]
 
             # Confidence loss
@@ -527,7 +550,8 @@ class SurrogateTrainer:
             total_ocr_loss.item() if isinstance(total_ocr_loss, torch.Tensor) else 0.0,
             total_conf_loss.item() if isinstance(total_conf_loss, torch.Tensor) else 0.0,
             match_rate,
-            conf_mse
+            conf_mse,
+            valid_samples
         )
 
     def _evaluate(self, samples: List[Tuple]) -> FinetuneMetrics:
@@ -701,25 +725,29 @@ def calibrate_blur_level(
         correct = 0
         total = 0
 
-        for idx, batch in enumerate(dataset_loader):
-            batch = {k: v[0] for k, v in batch.items()}
+        with tqdm(enumerate(dataset_loader), total=len(dataset_loader),
+                  desc=f"  Evaluating sigma={sigma:.2f}", leave=False) as pbar:
+            for idx, batch in pbar:
+                batch = {k: v[0] for k, v in batch.items()}
 
-            if idx not in ground_truth_texts:
-                continue
+                if idx not in ground_truth_texts:
+                    continue
 
-            gt_text = ground_truth_texts[idx]
-            orig_image = batch['orig_image']
-            corners = batch['orig_corners']
+                gt_text = ground_truth_texts[idx]
+                orig_image = batch['orig_image']
+                corners = batch['orig_corners']
 
-            # Apply blur
-            blurred = apply_plate_blur(orig_image, corners, sigma)
+                # Apply blur
+                blurred = apply_plate_blur(orig_image, corners, sigma)
 
-            # Query black-box
-            results = black_box.evaluate([blurred])
+                # Query black-box
+                results = black_box.evaluate([blurred])
 
-            if results and results[0].text == gt_text:
-                correct += 1
-            total += 1
+                if results and results[0].text == gt_text:
+                    correct += 1
+                total += 1
+
+                pbar.set_postfix({'correct': correct, 'total': total})
 
         return correct / total if total > 0 else 0.0
 
@@ -730,11 +758,12 @@ def calibrate_blur_level(
         mid = (low + high) / 2
         rate = evaluate_sigma(mid)
 
-        print(f"  Iteration {iteration + 1}: sigma={mid:.2f}, correct_rate={rate:.2%}")
+        print(
+            f"  Iteration {iteration + 1}/{max_iterations}: sigma={mid:.2f}, correct_rate={rate:.2%}")
 
         # Accept if within tolerance (±10%)
         if abs(rate - target_correct_rate) <= tolerance:
-            print(f"  Good enough at sigma={mid:.2f} (rate={rate:.1%})")
+            print(f"  ✓ Converged at sigma={mid:.2f} (rate={rate:.1%})")
             return mid
 
         if rate > target_correct_rate:
@@ -745,7 +774,7 @@ def calibrate_blur_level(
             high = mid
 
     final_sigma = (low + high) / 2
-    print(f"  Max iterations reached, using sigma={final_sigma:.2f}")
+    print(f"  ⚠ Max iterations reached, using sigma={final_sigma:.2f}")
     return final_sigma
 
 
