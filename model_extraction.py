@@ -747,7 +747,8 @@ def calibrate_blur_level(
                     correct += 1
                 total += 1
 
-                pbar.set_postfix({'correct': correct, 'total': total})
+                rate = correct / total if total > 0 else 0.0
+                pbar.set_postfix({'rate': f'{rate:.1%}'})
 
         return correct / total if total > 0 else 0.0
 
@@ -796,37 +797,39 @@ def collect_dataset_with_blur(
     """
     samples = []
 
-    for idx, batch in enumerate(trainer.train_loader):
-        batch = {k: v[0] for k, v in batch.items()}
+    with tqdm(enumerate(trainer.train_loader), total=len(trainer.train_loader),
+              desc="Collecting clean samples", unit="image") as pbar:
+        for idx, batch in pbar:
+            batch = {k: v[0] for k, v in batch.items()}
 
-        orig_image = batch['orig_image']
-        prep_image = batch['prep_image']
-        corners = batch['new_corners']
-        orig_corners = batch['orig_corners']
-        transform = batch['transform']
+            orig_image = batch['orig_image']
+            prep_image = batch['prep_image']
+            corners = batch['new_corners']
+            orig_corners = batch['orig_corners']
+            transform = batch['transform']
 
-        # Apply blur to original image
-        if blur_sigma > 0:
-            blurred_orig = apply_plate_blur(orig_image, orig_corners, blur_sigma)
-            # Also blur prep image proportionally
-            prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
-            blurred_prep = apply_plate_blur(prep_image, corners, prep_blur_sigma)
-        else:
-            blurred_orig = orig_image
-            blurred_prep = prep_image
+            # Apply blur to original image
+            if blur_sigma > 0:
+                blurred_orig = apply_plate_blur(orig_image, orig_corners, blur_sigma)
+                # Also blur prep image proportionally
+                prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
+                blurred_prep = apply_plate_blur(prep_image, corners, prep_blur_sigma)
+            else:
+                blurred_orig = orig_image
+                blurred_prep = prep_image
 
-        # Query black-box
-        results = black_box.evaluate([blurred_orig])
-        bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
+            # Query black-box
+            results = black_box.evaluate([blurred_orig])
+            bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
-        samples.append((
-            blurred_prep,
-            blurred_orig,
-            corners,
-            orig_corners,
-            transform,
-            bb_result
-        ))
+            samples.append((
+                blurred_prep,
+                blurred_orig,
+                corners,
+                orig_corners,
+                transform,
+                bb_result
+            ))
 
     return samples
 
@@ -855,53 +858,58 @@ def collect_patched_samples(
     total = 0
 
     with torch.no_grad():
-        for idx, batch in enumerate(trainer.train_loader):
-            batch = {k: v[0] for k, v in batch.items()}
+        with tqdm(enumerate(trainer.train_loader), total=len(trainer.train_loader),
+                  desc="Collecting patched samples", unit="image") as pbar:
+            for idx, batch in pbar:
+                batch = {k: v[0] for k, v in batch.items()}
 
-            orig_image = batch['orig_image'].to(trainer.device)
-            prep_image = batch['prep_image'].to(trainer.device)
-            corners = batch['new_corners'].to(trainer.device)
-            orig_corners = batch['orig_corners'].to(trainer.device)
-            transform = batch['transform']
+                orig_image = batch['orig_image'].to(trainer.device)
+                prep_image = batch['prep_image'].to(trainer.device)
+                corners = batch['new_corners'].to(trainer.device)
+                orig_corners = batch['orig_corners'].to(trainer.device)
+                transform = batch['transform']
 
-            # Apply patch
-            patched_prep, _ = trainer.apply_patch_to_image(
-                prep_image.unsqueeze(0),
-                corners.unsqueeze(0)
-            )
-            patched_orig, _ = trainer.apply_patch_to_image(
-                orig_image.unsqueeze(0),
-                orig_corners.unsqueeze(0)
-            )
+                # Apply patch
+                patched_prep, _ = trainer.apply_patch_to_image(
+                    prep_image.unsqueeze(0),
+                    corners.unsqueeze(0)
+                )
+                patched_orig, _ = trainer.apply_patch_to_image(
+                    orig_image.unsqueeze(0),
+                    orig_corners.unsqueeze(0)
+                )
 
-            patched_prep = patched_prep.squeeze(0).cpu()
-            patched_orig = patched_orig.squeeze(0).cpu()
+                patched_prep = patched_prep.squeeze(0).cpu()
+                patched_orig = patched_orig.squeeze(0).cpu()
 
-            # Apply blur after patching (simulates real-world degradation)
-            if blur_sigma > 0:
-                patched_orig = apply_plate_blur(patched_orig, orig_corners.cpu(), blur_sigma)
-                # Scale blur for preprocessed image
-                prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
-                patched_prep = apply_plate_blur(patched_prep, corners.cpu(), prep_blur_sigma)
+                # Apply blur after patching (simulates real-world degradation)
+                if blur_sigma > 0:
+                    patched_orig = apply_plate_blur(patched_orig, orig_corners.cpu(), blur_sigma)
+                    # Scale blur for preprocessed image
+                    prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
+                    patched_prep = apply_plate_blur(patched_prep, corners.cpu(), prep_blur_sigma)
 
-            # Query black-box
-            results = black_box.evaluate([patched_orig])
-            bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
+                # Query black-box
+                results = black_box.evaluate([patched_orig])
+                bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
-            samples.append((
-                patched_prep,
-                patched_orig,
-                corners.cpu(),
-                orig_corners.cpu(),
-                transform,
-                bb_result
-            ))
+                samples.append((
+                    patched_prep,
+                    patched_orig,
+                    corners.cpu(),
+                    orig_corners.cpu(),
+                    transform,
+                    bb_result
+                ))
 
-            # Track success rate against ground truth
-            if idx in ground_truth_texts:
-                total += 1
-                if bb_result.text == ground_truth_texts[idx]:
-                    correct += 1
+                # Track success rate against ground truth
+                if idx in ground_truth_texts:
+                    total += 1
+                    if bb_result.text == ground_truth_texts[idx]:
+                        correct += 1
+
+                    success_rate = correct / total if total > 0 else 0.0
+                    pbar.set_postfix({'success_rate': f'{success_rate:.1%}'})
 
     success_rate = correct / total if total > 0 else 0.0
     return samples, success_rate
