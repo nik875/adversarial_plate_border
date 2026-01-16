@@ -2,22 +2,19 @@
 """
 Black-box adversarial patch optimization using fast-alpr as a true black box.
 
-This version uses ONLY the high-level fast_alpr.ALPR API and does not
-touch model internals, ONNX, or torch inference.
-
-Usage:
-    python run_blackbox_optimization.py --csv preproc_labels.csv --epochs 100
+Ground truth plate is fixed (VRJ7774).
+Detection selection is based on minimum Levenshtein distance to ground truth,
+NOT highest confidence.
 """
 
 import argparse
-from typing import List, Dict
-from pathlib import Path
-
+from typing import List
 import torch
 import numpy as np
 import cv2
 
 from fast_alpr import ALPR
+from Levenshtein import distance as levenshtein_distance
 
 from model_extraction import (
     BlackBoxModel,
@@ -26,13 +23,12 @@ from model_extraction import (
 )
 
 
+GROUND_TRUTH_PLATE = "VRJ7774"
+
+
 class LargeFastALPR(BlackBoxModel):
     """
     True black-box ALPR using fast-alpr high-level API.
-
-    Models:
-      - Detector: yolo-v9-s-608-license-plate-end2end
-      - OCR: cct-s-v1-global-model
     """
 
     def __init__(self, device: str = None):
@@ -46,7 +42,7 @@ class LargeFastALPR(BlackBoxModel):
         else:
             self.device = device
 
-        print("Loading fast-alpr (black-box)...")
+        print("Loading fast-alpr (true black box)...")
 
         self.alpr = ALPR(
             detector_model="yolo-v9-s-608-license-plate-end2end",
@@ -57,18 +53,13 @@ class LargeFastALPR(BlackBoxModel):
 
     def evaluate(self, images: List[torch.Tensor]) -> List[ALPRResult]:
         """
-        Evaluate images using fast-alpr as a black box.
-
-        Args:
-            images: list of torch.Tensor [C, H, W] in [0, 1]
-
-        Returns:
-            List[ALPRResult]
+        Evaluate images using fast-alpr.
+        Detection is chosen by minimum Levenshtein distance to ground truth.
         """
         results: List[ALPRResult] = []
 
         for image in images:
-            # Convert tensor → uint8 BGR numpy (fast-alpr contract)
+            # torch [C,H,W] -> uint8 BGR numpy
             img_np = image.permute(1, 2, 0).cpu().numpy()
             img_np = (img_np * 255).astype(np.uint8)
 
@@ -89,16 +80,18 @@ class LargeFastALPR(BlackBoxModel):
                 results.append(ALPRResult(text=None, confidence=0.0))
                 continue
 
-            # Select best prediction by OCR confidence
             best_pred = None
-            best_conf = 0.0
+            best_distance = float("inf")
 
             for pred in predictions:
-                if pred.ocr is None:
+                if pred.ocr is None or not pred.ocr.text:
                     continue
-                conf = float(pred.ocr.confidence)
-                if conf > best_conf:
-                    best_conf = conf
+
+                pred_text = pred.ocr.text.upper()
+                dist = levenshtein_distance(pred_text, GROUND_TRUTH_PLATE)
+
+                if dist < best_distance:
+                    best_distance = dist
                     best_pred = pred
 
             if best_pred is None or best_pred.ocr is None:
@@ -112,32 +105,6 @@ class LargeFastALPR(BlackBoxModel):
                 )
 
         return results
-
-
-def load_ground_truth(csv_path: str) -> Dict[int, str]:
-    """Load ground-truth plate strings from CSV."""
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-
-    text_col = None
-    for col in ["plate_text", "text", "label", "plate"]:
-        if col in df.columns:
-            text_col = col
-            break
-
-    if text_col is None:
-        raise ValueError(
-            f"Could not find plate text column in {csv_path}. "
-            f"Available columns: {list(df.columns)}"
-        )
-
-    gt = {}
-    for idx, row in df.iterrows():
-        gt[idx] = str(row[text_col]).upper().strip()
-
-    print(f"Loaded {len(gt)} ground truth labels from '{text_col}' column")
-    return gt
 
 
 def main():
@@ -155,11 +122,15 @@ def main():
     print("=" * 60)
     print("Black-Box Adversarial Patch Optimization")
     print("Target: fast-alpr (true black box)")
-    print("  - Detector: yolo-v9-s-608-license-plate-end2end")
-    print("  - OCR: cct-s-v1-global-model")
+    print("Ground truth plate:", GROUND_TRUTH_PLATE)
+    print("Selection: minimum Levenshtein distance")
     print("=" * 60)
 
-    ground_truth = load_ground_truth(args.csv)
+    # Ground truth dictionary: same label for all indices
+    # optimize_patch_bb only needs index -> string mapping
+    import pandas as pd
+    df = pd.read_csv(args.csv)
+    ground_truth = {idx: GROUND_TRUTH_PLATE for idx in range(len(df))}
 
     black_box = LargeFastALPR(device=args.device)
 
@@ -183,8 +154,6 @@ def main():
         f"Final black-box success rate: "
         f"{results['history']['bb_success_rate'][-1]:.1%}"
     )
-
-    import pandas as pd
 
     history_df = pd.DataFrame(results["history"])
     history_df.to_csv("bb_optimization_history.csv", index=False)
