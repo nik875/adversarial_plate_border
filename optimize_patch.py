@@ -808,7 +808,7 @@ class AdversarialPatchTrainer:
                 if self.config.impersonation_target:
                     ocr_loss = ocr_loss / self.ocr_baseline
                 else:
-                    ocr_loss = self.ocr_baseline / ocr_loss
+                    ocr_loss = self.ocr_baseline - ocr_loss
 
         return det_loss, ocr_loss
 
@@ -823,7 +823,7 @@ class AdversarialPatchTrainer:
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         loss = (tv_h + tv_v) / num_comparisons
 
-        return loss * 5.0
+        return loss * 2.5
 
     def compute_loss(
         self,
@@ -882,7 +882,7 @@ class AdversarialPatchTrainer:
         tv_loss = torch.tensor(0.0, device=self.device)
         if self.config.use_tv_loss:
             tv_loss = self._compute_tv_loss()
-            loss = loss + tv_loss
+            loss = loss + tv_loss  # tv_loss already includes scaling coefficient
 
         if return_components:
             return {
