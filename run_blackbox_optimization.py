@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--save-interval", type=int, default=10)
+    parser.add_argument("--blur-sigma", type=float, default=7.5,
+                        help="Initial blur sigma suggestion (speeds up calibration)")
 
     args = parser.parse_args()
 
@@ -141,6 +143,7 @@ def main():
         num_epochs=args.epochs,
         device=args.device,
         learning_rate=args.lr,
+        blur_sigma_init=args.blur_sigma,
         save_interval=args.save_interval,
         verbose=True,
     )

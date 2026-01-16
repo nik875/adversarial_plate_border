@@ -694,10 +694,11 @@ def calibrate_blur_level(
     target_correct_rate: float = 0.5,
     sigma_min: float = 0.0,
     sigma_max: float = 20.0,
+    sigma_init: Optional[float] = None,
     tolerance: float = 0.10,  # ±10% is acceptable
     max_iterations: int = 20,
     device: str = 'cpu'
-) -> float:
+) -> Tuple[float, List[Tuple]]:
     """
     Find blur sigma that gives target correct read rate on black-box.
 
@@ -710,62 +711,103 @@ def calibrate_blur_level(
         target_correct_rate: Target correct read rate (default 0.5)
         sigma_min: Minimum blur sigma
         sigma_max: Maximum blur sigma
+        sigma_init: Optional initial sigma to evaluate first (speeds up binary search)
         tolerance: Acceptable deviation from target rate (default ±10%)
         max_iterations: Maximum binary search iterations
         device: Device for processing
 
     Returns:
-        Calibrated blur sigma
+        Tuple of (calibrated_blur_sigma, cached_samples)
+        where cached_samples is from the final evaluation to avoid re-querying
     """
     print(
         f"Calibrating blur level for {target_correct_rate:.0%} (±{tolerance:.0%}) correct rate...")
 
-    def evaluate_sigma(sigma: float) -> float:
-        """Get correct rate at given sigma."""
+    def evaluate_sigma(sigma: float) -> Tuple[float, List[Tuple]]:
+        """Evaluate sigma and return (rate, cached_samples)."""
         correct = 0
         total = 0
+        samples = []
 
         with tqdm(enumerate(dataset_loader), total=len(dataset_loader),
                   desc=f"  Evaluating sigma={sigma:.2f}", leave=False) as pbar:
             for idx, batch in pbar:
                 batch = {k: v[0] for k, v in batch.items()}
 
-                if idx not in ground_truth_texts:
-                    continue
-
-                gt_text = ground_truth_texts[idx]
                 orig_image = batch['orig_image']
-                corners = batch['orig_corners']
+                prep_image = batch['prep_image']
+                corners = batch['new_corners']
+                orig_corners = batch['orig_corners']
+                transform = batch['transform']
 
                 # Apply blur
-                blurred = apply_plate_blur(orig_image, corners, sigma)
+                blurred_orig = apply_plate_blur(orig_image, orig_corners, sigma)
+                prep_blur_sigma = sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
+                blurred_prep = apply_plate_blur(prep_image, corners, prep_blur_sigma)
 
                 # Query black-box
-                results = black_box.evaluate([blurred])
+                results = black_box.evaluate([blurred_orig])
+                bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
-                if results and results[0].text == gt_text:
-                    correct += 1
-                total += 1
+                # Cache sample
+                samples.append((
+                    blurred_prep,
+                    blurred_orig,
+                    corners,
+                    orig_corners,
+                    transform,
+                    bb_result
+                ))
 
-                rate = correct / total if total > 0 else 0.0
-                pbar.set_postfix({'rate': f'{rate:.1%}'})
+                # Track success rate only for indices in ground truth
+                if idx in ground_truth_texts:
+                    if bb_result.text == ground_truth_texts[idx]:
+                        correct += 1
+                    total += 1
 
-        return correct / total if total > 0 else 0.0
+                    rate = correct / total if total > 0 else 0.0
+                    pbar.set_postfix({'rate': f'{rate:.1%}'})
+
+        return (correct / total if total > 0 else 0.0), samples
 
     # Binary search
     low, high = sigma_min, sigma_max
+    final_samples = []
+    iteration = 0
+
+    # If sigma_init provided, evaluate it first to narrow search bounds
+    if sigma_init is not None:
+        print(f"  Evaluating initial suggestion sigma={sigma_init:.2f}...")
+        rate, samples = evaluate_sigma(sigma_init)
+        final_samples = samples
+        print(f"  Initial: sigma={sigma_init:.2f}, correct_rate={rate:.2%}")
+
+        # Accept if within tolerance
+        if abs(rate - target_correct_rate) <= tolerance:
+            print(f"  ✓ Converged at sigma={sigma_init:.2f} (rate={rate:.1%})")
+            return sigma_init, final_samples
+
+        # Use the initial evaluation to narrow search bounds
+        if rate > target_correct_rate:
+            # Need more blur, so search above sigma_init
+            low = sigma_init
+        else:
+            # Need less blur, so search below sigma_init
+            high = sigma_init
 
     for iteration in range(max_iterations):
         mid = (low + high) / 2
-        rate = evaluate_sigma(mid)
+        rate, samples = evaluate_sigma(mid)
+        final_samples = samples  # Cache the latest evaluation
 
+        iter_num = (iteration + 2) if sigma_init is not None else (iteration + 1)
         print(
-            f"  Iteration {iteration + 1}/{max_iterations}: sigma={mid:.2f}, correct_rate={rate:.2%}")
+            f"  Iteration {iter_num}/{max_iterations}: sigma={mid:.2f}, correct_rate={rate:.2%}")
 
         # Accept if within tolerance (±10%)
         if abs(rate - target_correct_rate) <= tolerance:
             print(f"  ✓ Converged at sigma={mid:.2f} (rate={rate:.1%})")
-            return mid
+            return mid, final_samples
 
         if rate > target_correct_rate:
             # Need more blur
@@ -776,7 +818,7 @@ def calibrate_blur_level(
 
     final_sigma = (low + high) / 2
     print(f"  ⚠ Max iterations reached, using sigma={final_sigma:.2f}")
-    return final_sigma
+    return final_sigma, final_samples
 
 
 # =============================================================================
@@ -923,6 +965,7 @@ def optimize_patch_bb(
     device: str = None,
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
+    blur_sigma_init: Optional[float] = None,
     ocr_loss_threshold: float = 0.1,
     confidence_mse_threshold: float = 0.1,
     save_interval: int = 10,
@@ -940,6 +983,7 @@ def optimize_patch_bb(
         device: Target device
         learning_rate: Learning rate for patch optimization
         blur_target_rate: Target correct rate for blur calibration
+        blur_sigma_init: Optional initial blur sigma suggestion (speeds up calibration)
         ocr_loss_threshold: Maximum average OCR loss for surrogate convergence
         confidence_mse_threshold: Confidence MSE threshold for surrogate convergence
         save_interval: Save patch every N epochs
@@ -1002,24 +1046,17 @@ def optimize_patch_bb(
     print("=" * 60)
 
     # Calibrate blur level
-    blur_sigma = calibrate_blur_level(
+    blur_sigma, clean_samples = calibrate_blur_level(
         black_box=black_box,
         dataset_loader=trainer.train_loader,
         ground_truth_texts=ground_truth_texts,
         target_correct_rate=blur_target_rate,
+        sigma_init=blur_sigma_init,
         device=device
     )
 
     print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
-
-    # Collect blurred samples with black-box labels
-    print("\nCollecting initial blurred samples...")
-    clean_samples = collect_dataset_with_blur(
-        black_box=black_box,
-        trainer=trainer,
-        blur_sigma=blur_sigma,
-        ground_truth_texts=ground_truth_texts
-    )
+    print(f"Using cached samples from final calibration iteration (no re-querying needed)")
 
     replay_buffer.add_clean_samples(clean_samples)
 
@@ -1092,7 +1129,7 @@ def optimize_patch_bb(
 
             # Re-calibrate with a higher target (to reduce blur)
             # Target: get back to ~50% success rate zone
-            new_blur_sigma = calibrate_blur_level(
+            new_blur_sigma, cached_clean_samples = calibrate_blur_level(
                 black_box=black_box,
                 dataset_loader=trainer.train_loader,
                 ground_truth_texts=ground_truth_texts,
@@ -1109,14 +1146,9 @@ def optimize_patch_bb(
                 trainer.set_blur_sigma(current_blur_sigma)
                 print(f"*** New blur sigma: {current_blur_sigma:.2f}")
 
-                # Re-collect clean samples with new blur level
-                print("*** Re-collecting clean samples with reduced blur...")
-                clean_samples = collect_dataset_with_blur(
-                    black_box=black_box,
-                    trainer=trainer,
-                    blur_sigma=current_blur_sigma,
-                    ground_truth_texts=ground_truth_texts
-                )
+                # Use cached samples from calibration (no re-querying needed)
+                print("*** Using cached samples from calibration...")
+                clean_samples = cached_clean_samples
                 replay_buffer.add_clean_samples(clean_samples)
 
                 # Fine-tune surrogate on new clean samples
