@@ -11,7 +11,7 @@ The models are designed to be shared between this module and external scripts
 """
 
 import os
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Union
 from dataclasses import dataclass
 import warnings
 import argparse
@@ -448,14 +448,15 @@ class AdversarialPatchTrainer:
         else:
             self.models = ALPRModels(device=self.device).load()
 
-        # Data loading
+        # Data loading - use all data for training
         self.transform = T.Compose([T.ToTensor()])
         self.train_loader, self.val_loader = create_dataloaders(
             csv_path,
             transform=self.transform,
             preload=True,
             batch_size=1,
-            n_jobs=0
+            n_jobs=0,
+            use_all_for_train=True
         )
 
         # Initialize adversarial patch
@@ -578,7 +579,8 @@ class AdversarialPatchTrainer:
             )
 
             for b in range(batch_size):
-                result_image[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = patch_resized[0]
+                result_image[b, :, border_min_y:border_max_y,
+                             border_min_x:border_max_x] = patch_resized[0]
                 final_mask[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = 1.0
 
                 if plate_max_y > plate_min_y and plate_max_x > plate_min_x:
@@ -759,9 +761,19 @@ class AdversarialPatchTrainer:
     def compute_loss(
         self,
         batch: Dict[str, torch.Tensor],
-        use_ocr_baseline: bool = True
-    ) -> torch.Tensor:
-        """Compute total loss for a batch."""
+        use_ocr_baseline: bool = True,
+        return_components: bool = False
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute total loss for a batch.
+
+        Args:
+            batch: Batch dict from dataloader
+            use_ocr_baseline: Whether to use OCR baseline normalization
+            return_components: If True, return dict with individual loss components
+
+        Returns:
+            Total loss tensor, or dict with 'total', 'det', 'ocr', 'tv' if return_components=True
+        """
         batch = {k: v[0] for k, v in batch.items()}
 
         # Apply patch to preprocessed image
@@ -782,9 +794,18 @@ class AdversarialPatchTrainer:
 
         loss = (det_loss + ocr_loss) / 2
 
+        tv_loss = torch.tensor(0.0, device=self.device)
         if self.config.use_tv_loss:
-            loss = loss + self._compute_tv_loss()
+            tv_loss = self._compute_tv_loss()
+            loss = loss + tv_loss
 
+        if return_components:
+            return {
+                'total': loss,
+                'det': det_loss,
+                'ocr': ocr_loss,
+                'tv': tv_loss
+            }
         return loss
 
     def _calculate_baseline_loss(self) -> Tuple[float, float]:
@@ -817,7 +838,7 @@ class AdversarialPatchTrainer:
         self,
         epoch: int,
         optimizer: Optional[optim.Optimizer] = None
-    ) -> float:
+    ) -> Dict[str, float]:
         """
         Train for a single epoch.
 
@@ -829,7 +850,7 @@ class AdversarialPatchTrainer:
             optimizer: Optional optimizer (uses internal if not provided)
 
         Returns:
-            Average loss for the epoch
+            Dict with 'total', 'det', 'ocr', 'tv' average losses for the epoch
         """
         # IMPORTANT: Freeze models at the start of each epoch
         # This ensures weights are frozen even if an external script unfroze them
@@ -842,8 +863,9 @@ class AdversarialPatchTrainer:
                 self._optimizer = optim.AdamW([self.patch], lr=0.01, weight_decay=1e-4)
             optimizer = self._optimizer
 
-        total_loss = 0.0
-        accumulation_loss = 0.0
+        # Track individual loss components
+        total_losses = {'total': 0.0, 'det': 0.0, 'ocr': 0.0, 'tv': 0.0}
+        accum_losses = {'total': 0.0, 'det': 0.0, 'ocr': 0.0, 'tv': 0.0}
         step_count = 0
         num_updates = 0
 
@@ -859,11 +881,14 @@ class AdversarialPatchTrainer:
                   total=len(self.train_loader)) as pbar:
 
             for idx, batch in pbar:
-                loss = self.compute_loss(batch)
+                loss_dict = self.compute_loss(batch, return_components=True)
+                loss = loss_dict['total']
                 scaled_loss = loss / effective_batch_size
                 scaled_loss.backward()
 
-                accumulation_loss += loss.item()
+                # Accumulate component losses
+                for key in accum_losses:
+                    accum_losses[key] += loss_dict[key].item()
                 step_count += 1
 
                 if step_count % update_every == 0:
@@ -871,22 +896,23 @@ class AdversarialPatchTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    total_loss += accumulation_loss
+                    for key in total_losses:
+                        total_losses[key] += accum_losses[key]
                     num_updates += 1
 
-                    del loss, scaled_loss
+                    del loss, scaled_loss, loss_dict
                     if self.device == 'cuda':
                         torch.cuda.empty_cache()
                     elif self.device == 'mps':
                         torch.mps.empty_cache()
 
-                    avg_loss = total_loss / (num_updates * update_every)
+                    avg_loss = total_losses['total'] / (num_updates * update_every)
                     pbar.set_postfix({'Loss': f"{avg_loss:.4f}", 'Updates': num_updates})
 
-                    accumulation_loss = 0.0
+                    accum_losses = {'total': 0.0, 'det': 0.0, 'ocr': 0.0, 'tv': 0.0}
                 else:
-                    del loss, scaled_loss
-                    current_avg = accumulation_loss / (step_count % update_every)
+                    del loss, scaled_loss, loss_dict
+                    current_avg = accum_losses['total'] / (step_count % update_every)
                     pbar.set_postfix({
                         'AccumLoss': f"{current_avg:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
@@ -897,14 +923,17 @@ class AdversarialPatchTrainer:
                 torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                total_loss += accumulation_loss
+                for key in total_losses:
+                    total_losses[key] += accum_losses[key]
                 num_updates += 1
 
         self._training_mode = False
         self._current_epoch = epoch + 1
 
-        total_batches = num_updates * update_every if self.config.grad_accumulate else len(self.train_loader)
-        return total_loss / total_batches
+        total_batches = num_updates * \
+            update_every if self.config.grad_accumulate else len(self.train_loader)
+
+        return {key: val / total_batches for key, val in total_losses.items()}
 
     def validate(self) -> float:
         """Run validation and return average loss."""
@@ -1062,7 +1091,8 @@ class AdversarialPatchTrainer:
         print("-" * 60)
 
         for epoch in range(num_epochs):
-            train_loss = self.train_single_epoch(epoch, optimizer)
+            loss_dict = self.train_single_epoch(epoch, optimizer)
+            train_loss = loss_dict['total']
             val_loss = self.validate()
 
             scheduler.step(train_loss)
@@ -1485,8 +1515,10 @@ def debug_ocr_accuracy(
     results_with_patch = run_pipeline(use_patch=True)
 
     print(f"\nOCR Results:")
-    print(f"  Without patch: '{results_no_patch['text']}' (loss: {results_no_patch['ocr_loss']:.4f})")
-    print(f"  With patch:    '{results_with_patch['text']}' (loss: {results_with_patch['ocr_loss']:.4f})")
+    print(
+        f"  Without patch: '{results_no_patch['text']}' (loss: {results_no_patch['ocr_loss']:.4f})")
+    print(
+        f"  With patch:    '{results_with_patch['text']}' (loss: {results_with_patch['ocr_loss']:.4f})")
 
     # Simple visualization
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))

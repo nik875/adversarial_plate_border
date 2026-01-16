@@ -75,7 +75,7 @@ class ALPRResult:
 @dataclass
 class FinetuneMetrics:
     """Metrics from surrogate fine-tuning."""
-    exact_match_rate: float
+    ocr_loss: float
     confidence_mse: float
     num_samples: int
     converged: bool
@@ -306,41 +306,44 @@ class SurrogateTrainer:
         self,
         models: ALPRModels,
         device: str,
-        match_rate_threshold: float = 0.90,
+        ocr_loss_threshold: float = 0.1,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 1e-4,
-        max_steps: int = 1000
+        max_epochs: int = 50
     ):
         """
         Args:
             models: ALPRModels instance to fine-tune
             device: Target device
-            match_rate_threshold: Minimum exact match rate for convergence
+            ocr_loss_threshold: Maximum average OCR loss for convergence
             confidence_mse_threshold: Maximum confidence MSE for convergence
             learning_rate: Learning rate for fine-tuning
-            max_steps: Maximum training steps before giving up
+            max_epochs: Maximum training epochs before giving up
         """
         self.models = models
         self.device = device
-        self.match_rate_threshold = match_rate_threshold
+        self.ocr_loss_threshold = ocr_loss_threshold
         self.confidence_mse_threshold = confidence_mse_threshold
         self.learning_rate = learning_rate
-        self.max_steps = max_steps
+        self.max_epochs = max_epochs
 
         self.ocr_loss_fn = create_focal_cce_loss(len(OCR_ALPHABET))
 
     def fine_tune(
         self,
         samples: List[Tuple],
-        batch_size: int = 16,
+        batch_size: int = 64,
         verbose: bool = True
     ) -> FinetuneMetrics:
         """
-        Fine-tune surrogate models until convergence or max steps.
+        Fine-tune surrogate models until convergence or max epochs.
+
+        Each epoch processes the entire dataset with batched gradient updates.
+        Convergence is checked based on metrics over the whole dataset after each epoch.
 
         Args:
             samples: List of (prep_image, orig_image, corners, orig_corners, transform, bb_result)
-            batch_size: Training batch size
+            batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
 
         Returns:
@@ -348,7 +351,7 @@ class SurrogateTrainer:
         """
         if not samples:
             return FinetuneMetrics(
-                exact_match_rate=0.0,
+                ocr_loss=float('inf'),
                 confidence_mse=float('inf'),
                 num_samples=0,
                 converged=False
@@ -357,52 +360,58 @@ class SurrogateTrainer:
         # Unfreeze models for training
         self.models.unfreeze_all()
 
-        # Set up optimizers (only for confidence head of detector + full OCR)
-        # Note: We don't have direct access to confidence head, so we train full detector
-        # but the loss only backprops through confidence
+        # Set up optimizers
         ocr_optimizer = optim.Adam(self.models.get_ocr_parameters(), lr=self.learning_rate)
-
-        # For detector, we only train on confidence matching
-        # This is tricky since YOLO doesn't separate confidence head
-        # We'll compute confidence loss and backprop through full model
         detector_optimizer = optim.Adam(
             self.models.get_detector_parameters(),
             lr=self.learning_rate * 0.1  # Lower LR for detector
         )
 
-        step = 0
         converged = False
 
-        pbar = tqdm(total=self.max_steps, desc="Fine-tuning surrogate", disable=not verbose)
-
-        while step < self.max_steps and not converged:
-            # Shuffle samples
+        for epoch in range(self.max_epochs):
+            # Shuffle samples at start of each epoch
             random.shuffle(samples)
 
-            for i in range(0, len(samples), batch_size):
-                batch = samples[i:i + batch_size]
+            # Training pass over entire dataset
+            epoch_ocr_loss = 0.0
+            epoch_conf_loss = 0.0
+            batches_processed = 0
 
-                ocr_loss, conf_loss, match_rate, conf_mse = self._train_step(
+            desc = f"Fine-tune epoch {epoch + 1}/{self.max_epochs}"
+            pbar = tqdm(range(0, len(samples), batch_size), desc=desc,
+                       disable=not verbose, leave=False)
+
+            for i in pbar:
+                batch = samples[i:i + batch_size]
+                ocr_loss, conf_loss, _, _ = self._train_step(
                     batch, ocr_optimizer, detector_optimizer
                 )
+                epoch_ocr_loss += ocr_loss
+                epoch_conf_loss += conf_loss
+                batches_processed += 1
 
-                step += 1
-                pbar.update(1)
                 pbar.set_postfix({
-                    'match': f'{match_rate:.2%}',
-                    'conf_mse': f'{conf_mse:.4f}',
-                    'ocr_loss': f'{ocr_loss:.4f}'
+                    'ocr_loss': f'{epoch_ocr_loss / batches_processed:.4f}',
+                    'conf_loss': f'{epoch_conf_loss / batches_processed:.4f}'
                 })
 
-                # Check convergence
-                if match_rate >= self.match_rate_threshold and conf_mse <= self.confidence_mse_threshold:
-                    converged = True
-                    break
+            pbar.close()
 
-                if step >= self.max_steps:
-                    break
+            # Evaluate on entire dataset after epoch
+            metrics = self._evaluate(samples)
 
-        pbar.close()
+            if verbose:
+                print(f"  Epoch {epoch + 1}: ocr_loss={metrics.ocr_loss:.4f}, "
+                      f"conf_mse={metrics.confidence_mse:.4f}")
+
+            # Check convergence based on whole-dataset metrics
+            if (metrics.ocr_loss <= self.ocr_loss_threshold and
+                metrics.confidence_mse <= self.confidence_mse_threshold):
+                converged = True
+                if verbose:
+                    print(f"  Converged at epoch {epoch + 1}")
+                break
 
         # Freeze models again
         self.models.freeze_all()
@@ -439,14 +448,27 @@ class SurrogateTrainer:
 
             # Run detector
             prep_image = prep_image.to(self.device)
+            corners = corners.to(self.device)
             detector_output = self.models.detector(prep_image.unsqueeze(0))
 
             if len(detector_output) == 0:
                 continue
 
-            # Find best detection (highest confidence)
-            best_idx = torch.argmax(torch.tensor([d[6].item() for d in detector_output]))
-            best_det = detector_output[best_idx]
+            # Find best detection (highest IoU with target plate region)
+            target_box = corners_to_bbox(corners)
+            best_det = None
+            best_iou = -1.0
+
+            for detection in detector_output:
+                pred_box = detection[1:5]
+                iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det = detection
+
+            if best_det is None:
+                continue
+
             pred_conf = best_det[6]
 
             # Confidence loss
@@ -510,7 +532,7 @@ class SurrogateTrainer:
 
     def _evaluate(self, samples: List[Tuple]) -> FinetuneMetrics:
         """Evaluate current model on all samples."""
-        correct_matches = 0
+        ocr_losses = []
         conf_squared_errors = []
         valid_samples = 0
 
@@ -525,15 +547,29 @@ class SurrogateTrainer:
 
                 # Run detector
                 prep_image = prep_image.to(self.device)
+                corners = corners.to(self.device)
                 detector_output = self.models.detector(prep_image.unsqueeze(0))
 
                 if len(detector_output) == 0:
                     conf_squared_errors.append(bb_result.confidence ** 2)
                     continue
 
-                # Find best detection
-                best_idx = torch.argmax(torch.tensor([d[6].item() for d in detector_output]))
-                best_det = detector_output[best_idx]
+                # Find best detection (highest IoU with target plate region)
+                target_box = corners_to_bbox(corners)
+                best_det = None
+                best_iou = -1.0
+
+                for detection in detector_output:
+                    pred_box = detection[1:5]
+                    iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_det = detection
+
+                if best_det is None:
+                    conf_squared_errors.append(bb_result.confidence ** 2)
+                    continue
+
                 pred_conf = best_det[6].item()
 
                 conf_squared_errors.append((pred_conf - bb_result.confidence) ** 2)
@@ -553,16 +589,19 @@ class SurrogateTrainer:
 
                 ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
                 ocr_output = self.models.ocr(ocr_input)
-                pred_text = logits_to_text(ocr_output)
 
-                if pred_text == bb_result.text:
-                    correct_matches += 1
+                # Compute OCR loss against black-box text
+                target_tensor = text_to_target_tensor(
+                    bb_result.text, OCR_MAX_SLOTS, OCR_ALPHABET, self.device
+                )
+                ocr_loss = self.ocr_loss_fn(target_tensor, ocr_output)
+                ocr_losses.append(ocr_loss.item())
 
-        match_rate = correct_matches / valid_samples if valid_samples > 0 else 0.0
+        avg_ocr_loss = np.mean(ocr_losses) if ocr_losses else float('inf')
         conf_mse = np.mean(conf_squared_errors) if conf_squared_errors else float('inf')
 
         return FinetuneMetrics(
-            exact_match_rate=match_rate,
+            ocr_loss=avg_ocr_loss,
             confidence_mse=conf_mse,
             num_samples=valid_samples,
             converged=False
@@ -654,7 +693,8 @@ def calibrate_blur_level(
     Returns:
         Calibrated blur sigma
     """
-    print(f"Calibrating blur level for {target_correct_rate:.0%} (±{tolerance:.0%}) correct rate...")
+    print(
+        f"Calibrating blur level for {target_correct_rate:.0%} (±{tolerance:.0%}) correct rate...")
 
     def evaluate_sigma(sigma: float) -> float:
         """Get correct rate at given sigma."""
@@ -765,15 +805,17 @@ def collect_dataset_with_blur(
 def collect_patched_samples(
     black_box: BlackBoxModel,
     trainer: AdversarialPatchTrainer,
-    ground_truth_texts: Dict[int, str]
+    ground_truth_texts: Dict[int, str],
+    blur_sigma: float = 0.0
 ) -> Tuple[List[Tuple], float]:
     """
-    Apply current patch to all images and collect black-box results.
+    Apply current patch to all images, apply blur, and collect black-box results.
 
     Args:
         black_box: Black-box ALPR model
         trainer: Patch trainer instance
         ground_truth_texts: Dict mapping dataset index to ground truth plate text
+        blur_sigma: Blur sigma to apply after patching (simulates real-world degradation)
 
     Returns:
         Tuple of (samples, success_rate) where success_rate is the rate
@@ -806,6 +848,13 @@ def collect_patched_samples(
             patched_prep = patched_prep.squeeze(0).cpu()
             patched_orig = patched_orig.squeeze(0).cpu()
 
+            # Apply blur after patching (simulates real-world degradation)
+            if blur_sigma > 0:
+                patched_orig = apply_plate_blur(patched_orig, orig_corners.cpu(), blur_sigma)
+                # Scale blur for preprocessed image
+                prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
+                patched_prep = apply_plate_blur(patched_prep, corners.cpu(), prep_blur_sigma)
+
             # Query black-box
             results = black_box.evaluate([patched_orig])
             bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
@@ -833,11 +882,11 @@ def optimize_patch_bb(
     black_box: BlackBoxModel,
     csv_path: str,
     ground_truth_texts: Dict[int, str],
-    num_epochs: int = 100,
+    num_epochs: int = 400,
     device: str = None,
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
-    match_rate_threshold: float = 0.90,
+    ocr_loss_threshold: float = 0.1,
     confidence_mse_threshold: float = 0.1,
     save_interval: int = 10,
     verbose: bool = True,
@@ -850,11 +899,11 @@ def optimize_patch_bb(
         black_box: BlackBoxModel instance
         csv_path: Path to dataset CSV
         ground_truth_texts: Dict mapping dataset index to ground truth plate text
-        num_epochs: Number of optimization epochs
+        num_epochs: Number of optimization epochs (default: 400)
         device: Target device
         learning_rate: Learning rate for patch optimization
         blur_target_rate: Target correct rate for blur calibration
-        match_rate_threshold: OCR match rate threshold for surrogate convergence
+        ocr_loss_threshold: Maximum average OCR loss for surrogate convergence
         confidence_mse_threshold: Confidence MSE threshold for surrogate convergence
         save_interval: Save patch every N epochs
         verbose: Whether to print progress
@@ -896,7 +945,7 @@ def optimize_patch_bb(
     surrogate_trainer = SurrogateTrainer(
         models=models,
         device=device,
-        match_rate_threshold=match_rate_threshold,
+        ocr_loss_threshold=ocr_loss_threshold,
         confidence_mse_threshold=confidence_mse_threshold
     )
 
@@ -942,7 +991,7 @@ def optimize_patch_bb(
     initial_metrics = surrogate_trainer.fine_tune(clean_samples, verbose=verbose)
 
     print(f"\nInitial extraction results:")
-    print(f"  Exact match rate: {initial_metrics.exact_match_rate:.2%}")
+    print(f"  OCR loss: {initial_metrics.ocr_loss:.4f}")
     print(f"  Confidence MSE: {initial_metrics.confidence_mse:.4f}")
     print(f"  Converged: {initial_metrics.converged}")
 
@@ -958,11 +1007,18 @@ def optimize_patch_bb(
 
     history = {
         'epoch': [],
-        'patch_loss': [],
-        'match_rate': [],
-        'confidence_mse': [],
-        'converged': [],
+        # Patch optimization losses
+        'patch_loss_total': [],
+        'patch_loss_det': [],
+        'patch_loss_ocr': [],
+        'patch_loss_tv': [],
+        # Surrogate fine-tuning metrics
+        'surrogate_ocr_loss': [],
+        'surrogate_conf_mse': [],
+        'surrogate_converged': [],
+        # Black-box evaluation
         'bb_success_rate': [],
+        # Training state
         'blur_sigma': [],
     }
 
@@ -977,21 +1033,24 @@ def optimize_patch_bb(
         print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
 
         # Step 1: Train patch for one epoch (single gradient update)
-        patch_loss = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
-        print(f"Patch loss: {patch_loss:.4f}")
+        patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
+        print(f"Patch loss: {patch_losses['total']:.4f} "
+              f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
 
-        # Step 2: Apply patch to all images and query black-box
+        # Step 2: Apply patch to all images (with blur) and query black-box
         print("Collecting patched samples...")
         patched_samples, bb_success_rate = collect_patched_samples(
             black_box=black_box,
             trainer=trainer,
-            ground_truth_texts=ground_truth_texts
+            ground_truth_texts=ground_truth_texts,
+            blur_sigma=current_blur_sigma
         )
         print(f"Black-box success rate: {bb_success_rate:.1%}")
 
         # Step 2b: Check if we need to reduce blur (attack too effective)
         if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
-            print(f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
+            print(
+                f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
             print("*** Reducing blur to maintain training diversity...")
 
             # Re-calibrate with a higher target (to reduce blur)
@@ -1039,23 +1098,28 @@ def optimize_patch_bb(
         metrics = surrogate_trainer.fine_tune(training_samples, verbose=verbose)
 
         print(f"Surrogate metrics:")
-        print(f"  Exact match rate: {metrics.exact_match_rate:.2%}")
+        print(f"  OCR loss: {metrics.ocr_loss:.4f}")
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
 
         # Record history
         history['epoch'].append(epoch + 1)
-        history['patch_loss'].append(patch_loss)
-        history['match_rate'].append(metrics.exact_match_rate)
-        history['confidence_mse'].append(metrics.confidence_mse)
-        history['converged'].append(metrics.converged)
+        history['patch_loss_total'].append(patch_losses['total'])
+        history['patch_loss_det'].append(patch_losses['det'])
+        history['patch_loss_ocr'].append(patch_losses['ocr'])
+        history['patch_loss_tv'].append(patch_losses['tv'])
+        history['surrogate_ocr_loss'].append(metrics.ocr_loss)
+        history['surrogate_conf_mse'].append(metrics.confidence_mse)
+        history['surrogate_converged'].append(metrics.converged)
         history['bb_success_rate'].append(bb_success_rate)
         history['blur_sigma'].append(current_blur_sigma)
 
-        # Save checkpoint
+        # Save checkpoint every epoch
+        trainer.save_patch(epoch, save_dir="bb_patches")
+
+        # Save models periodically (less frequently to save disk space)
         if (epoch + 1) % save_interval == 0:
-            trainer.save_patch(epoch, save_dir="bb_patches")
-            models.save_state(f"bb_patches/models_epoch_{epoch:04d}.pt")
+            models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
