@@ -246,8 +246,7 @@ class ReplayBuffer:
             return all_samples
 
         # After initial epochs: apply 33/67 split (recent/historical)
-        # Use full capacity since we have multiple patches accumulated
-        target_size = self.max_size
+        target_size = min(self.max_size, len(self.last_patch_samples) * 3)
 
         last_patch_count = target_size // 3
         historical_count = target_size - last_patch_count
