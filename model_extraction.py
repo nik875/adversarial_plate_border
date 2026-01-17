@@ -291,59 +291,6 @@ class ReplayBuffer:
 
 
 # =============================================================================
-# Helper Functions
-# =============================================================================
-
-def apply_adapter_to_patch_region(
-    image: torch.Tensor,
-    corners: torch.Tensor,
-    adapter: PatchAdapter,
-    border_scale: float = 1.4
-) -> torch.Tensor:
-    """
-    Apply adapter transformation to the patch bounding box region.
-
-    Args:
-        image: Image tensor [C, H, W]
-        corners: Plate corner coordinates [4, 2]
-        adapter: PatchAdapter module
-        border_scale: Scale factor for patch border
-
-    Returns:
-        Image with adapter applied to patch region
-    """
-    C, H, W = image.shape
-    device = image.device
-
-    # Calculate patch bounding box
-    center_x = corners[:, 0].mean()
-    center_y = corners[:, 1].mean()
-    center = torch.tensor([center_x, center_y], device=device)
-
-    border_corners = center.unsqueeze(0) + (corners - center.unsqueeze(0)) * border_scale
-
-    min_x = int(max(0, border_corners[:, 0].min().item()))
-    max_x = int(min(W, border_corners[:, 0].max().item()))
-    min_y = int(max(0, border_corners[:, 1].min().item()))
-    max_y = int(min(H, border_corners[:, 1].max().item()))
-
-    if max_x <= min_x or max_y <= min_y:
-        return image
-
-    # Extract patch region
-    patch_region = image[:, min_y:max_y, min_x:max_x].unsqueeze(0)  # [1, C, h, w]
-
-    # Apply adapter
-    transformed_region = adapter(patch_region).squeeze(0)  # [C, h, w]
-
-    # Insert back into image
-    result = image.clone()
-    result[:, min_y:max_y, min_x:max_x] = transformed_region
-
-    return result
-
-
-# =============================================================================
 # Surrogate Trainer
 # =============================================================================
 
@@ -351,17 +298,18 @@ class SurrogateTrainer:
     """
     Fine-tunes a lightweight adapter to match black-box behavior.
 
-    Instead of fine-tuning the entire ALPR model, this trains a small CNN
-    adapter that transforms the patch region before ALPR processing. The
-    ALPR detector and OCR models remain frozen.
+    Instead of fine-tuning the entire ALPR model, this trains a U-Net adapter
+    that transforms the adversarial patch tensor. The ALPR detector and OCR
+    models remain completely frozen.
 
-    The adapter learns to apply transformations that make the surrogate's
-    behavior match the black-box system's detection confidence and OCR output.
+    The adapter learns to transform patches so the surrogate perceives them
+    the same way the black-box does.
     """
 
     def __init__(
         self,
         models: ALPRModels,
+        trainer: 'AdversarialPatchTrainer',
         device: str,
         ocr_loss_threshold: float = 0.1,
         confidence_mse_threshold: float = 0.1,
@@ -370,14 +318,16 @@ class SurrogateTrainer:
     ):
         """
         Args:
-            models: ALPRModels instance to fine-tune
+            models: ALPRModels instance containing adapter
+            trainer: AdversarialPatchTrainer instance (for patch application)
             device: Target device
             ocr_loss_threshold: Maximum average OCR loss for convergence
             confidence_mse_threshold: Maximum confidence MSE for convergence
-            learning_rate: Learning rate for fine-tuning
+            learning_rate: Learning rate for adapter training
             max_epochs: Maximum training epochs before giving up
         """
         self.models = models
+        self.trainer = trainer
         self.device = device
         self.ocr_loss_threshold = ocr_loss_threshold
         self.confidence_mse_threshold = confidence_mse_threshold
@@ -522,26 +472,30 @@ class SurrogateTrainer:
         adapter_optimizer.zero_grad()
 
         for sample in batch:
-            prep_image, orig_image, corners, orig_corners, transform, bb_result = sample
+            unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
 
             if bb_result.text is None:
                 continue
 
-            # Apply adapter to patch region
-            prep_image = prep_image.to(self.device)
-            corners = corners.to(self.device)
-            prep_image_adapted = apply_adapter_to_patch_region(
-                prep_image, corners, self.models.adapter
-            )
+            # Transform patch through adapter
+            adapted_patch = self.models.adapter(self.trainer.patch.unsqueeze(0)).squeeze(0)
 
-            # Run detector on adapted image
-            detector_output = self.models.detector(prep_image_adapted.unsqueeze(0))
+            # Apply adapted patch to unpatched prep image
+            patched_prep, _ = self.trainer.apply_patch_to_image(
+                unpatched_prep.to(self.device).unsqueeze(0),
+                corners.to(self.device).unsqueeze(0),
+                patch_override=adapted_patch
+            )
+            patched_prep = patched_prep.squeeze(0)
+
+            # Run detector on patched image
+            detector_output = self.models.detector(patched_prep.unsqueeze(0))
 
             if len(detector_output) == 0:
                 continue
 
             # Find best detection (highest IoU with target plate region)
-            target_box = corners_to_bbox(corners)
+            target_box = corners_to_bbox(corners.to(self.device))
             best_det = None
             best_iou = -1.0
 
@@ -565,13 +519,21 @@ class SurrogateTrainer:
 
             conf_squared_errors.append((pred_conf.item() - bb_result.confidence) ** 2)
 
+            # Apply adapted patch to original image for OCR
+            patched_orig, _ = self.trainer.apply_patch_to_image(
+                unpatched_orig.to(self.device).unsqueeze(0),
+                orig_corners.to(self.device).unsqueeze(0),
+                patch_override=adapted_patch
+            )
+            patched_orig = patched_orig.squeeze(0)
+
             # Get plate crop for OCR
             pred_box = best_det[1:5]
             orig_projection = invert_bbox(pred_box.to('cpu'), transform)
             corners_box = bbox_to_corners(orig_projection, device='cpu')
 
             cropped_plate = kornia.geometry.crop_and_resize(
-                orig_image.unsqueeze(0),
+                patched_orig.unsqueeze(0),
                 corners_box,
                 OCR_INPUT_SHAPE[:2],
                 mode='bilinear',
@@ -622,22 +584,26 @@ class SurrogateTrainer:
 
         with torch.no_grad():
             for sample in samples:
-                prep_image, orig_image, corners, orig_corners, transform, bb_result = sample
+                unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
 
                 if bb_result.text is None:
                     continue
 
                 valid_samples += 1
 
-                # Apply adapter to patch region
-                prep_image = prep_image.to(self.device)
-                corners = corners.to(self.device)
-                prep_image_adapted = apply_adapter_to_patch_region(
-                    prep_image, corners, self.models.adapter
-                )
+                # Transform patch through adapter
+                adapted_patch = self.models.adapter(self.trainer.patch.unsqueeze(0)).squeeze(0)
 
-                # Run detector on adapted image
-                detector_output = self.models.detector(prep_image_adapted.unsqueeze(0))
+                # Apply adapted patch to unpatched prep image
+                patched_prep, _ = self.trainer.apply_patch_to_image(
+                    unpatched_prep.to(self.device).unsqueeze(0),
+                    corners.to(self.device).unsqueeze(0),
+                    patch_override=adapted_patch
+                )
+                patched_prep = patched_prep.squeeze(0)
+
+                # Run detector on patched image
+                detector_output = self.models.detector(patched_prep.unsqueeze(0))
 
                 if len(detector_output) == 0:
                     conf_squared_errors.append(bb_result.confidence ** 2)
@@ -663,13 +629,21 @@ class SurrogateTrainer:
 
                 conf_squared_errors.append((pred_conf - bb_result.confidence) ** 2)
 
+                # Apply adapted patch to original image for OCR
+                patched_orig, _ = self.trainer.apply_patch_to_image(
+                    unpatched_orig.to(self.device).unsqueeze(0),
+                    orig_corners.to(self.device).unsqueeze(0),
+                    patch_override=adapted_patch
+                )
+                patched_orig = patched_orig.squeeze(0)
+
                 # Get OCR prediction
                 pred_box = best_det[1:5]
                 orig_projection = invert_bbox(pred_box.to('cpu'), transform)
                 corners_box = bbox_to_corners(orig_projection, device='cpu')
 
                 cropped_plate = kornia.geometry.crop_and_resize(
-                    orig_image.unsqueeze(0),
+                    patched_orig.unsqueeze(0),
                     corners_box,
                     OCR_INPUT_SHAPE[:2],
                     mode='bilinear',
@@ -970,20 +944,21 @@ def collect_patched_samples(
             for idx, batch in pbar:
                 batch = {k: v[0] for k, v in batch.items()}
 
-                orig_image = batch['orig_image'].to(trainer.device)
-                prep_image = batch['prep_image'].to(trainer.device)
-                corners = batch['new_corners'].to(trainer.device)
-                orig_corners = batch['orig_corners'].to(trainer.device)
+                # Store unpatched images (for adapter training)
+                unpatched_prep = batch['prep_image'].cpu()
+                unpatched_orig = batch['orig_image'].cpu()
+                corners = batch['new_corners']
+                orig_corners = batch['orig_corners']
                 transform = batch['transform']
 
-                # Apply patch
+                # Apply ORIGINAL patch (without adapter) for black-box query
                 patched_prep, _ = trainer.apply_patch_to_image(
-                    prep_image.unsqueeze(0),
-                    corners.unsqueeze(0)
+                    batch['prep_image'].to(trainer.device).unsqueeze(0),
+                    batch['new_corners'].to(trainer.device).unsqueeze(0)
                 )
                 patched_orig, _ = trainer.apply_patch_to_image(
-                    orig_image.unsqueeze(0),
-                    orig_corners.unsqueeze(0)
+                    batch['orig_image'].to(trainer.device).unsqueeze(0),
+                    batch['orig_corners'].to(trainer.device).unsqueeze(0)
                 )
 
                 patched_prep = patched_prep.squeeze(0).cpu()
@@ -991,20 +966,21 @@ def collect_patched_samples(
 
                 # Apply blur after patching (simulates real-world degradation)
                 if blur_sigma > 0:
-                    patched_orig = apply_plate_blur(patched_orig, orig_corners.cpu(), blur_sigma)
+                    patched_orig = apply_plate_blur(patched_orig, orig_corners, blur_sigma)
                     # Scale blur for preprocessed image
-                    prep_blur_sigma = blur_sigma * (384 / max(orig_image.shape[1], orig_image.shape[2]))
-                    patched_prep = apply_plate_blur(patched_prep, corners.cpu(), prep_blur_sigma)
+                    prep_blur_sigma = blur_sigma * (384 / max(batch['orig_image'].shape[1], batch['orig_image'].shape[2]))
+                    patched_prep = apply_plate_blur(patched_prep, corners, prep_blur_sigma)
 
-                # Query black-box
+                # Query black-box with ORIGINAL patch
                 results = black_box.evaluate([patched_orig])
                 bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
+                # Store both unpatched (for adapter training) and black-box result
                 samples.append((
-                    patched_prep,
-                    patched_orig,
-                    corners.cpu(),
-                    orig_corners.cpu(),
+                    unpatched_prep,
+                    unpatched_orig,
+                    corners,
+                    orig_corners,
                     transform,
                     bb_result
                 ))
@@ -1090,6 +1066,7 @@ def optimize_patch_bb(
     # Create surrogate trainer
     surrogate_trainer = SurrogateTrainer(
         models=models,
+        trainer=trainer,
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
         confidence_mse_threshold=confidence_mse_threshold
@@ -1104,14 +1081,14 @@ def optimize_patch_bb(
     )
 
     # =========================================================================
-    # Phase 1: Calibrate blur and initial surrogate extraction
+    # Phase 1: Initial setup and blur calibration
     # =========================================================================
     print("\n" + "=" * 60)
-    print("Phase 1: Initial Model Extraction")
+    print("Phase 1: Blur Calibration")
     print("=" * 60)
 
-    # Calibrate blur level
-    blur_sigma, clean_samples = calibrate_blur_level(
+    # Calibrate blur level (no initial fine-tuning - adapter trains on patch samples)
+    blur_sigma, _ = calibrate_blur_level(
         black_box=black_box,
         dataset_loader=trainer.train_loader,
         ground_truth_texts=ground_truth_texts,
@@ -1121,9 +1098,6 @@ def optimize_patch_bb(
     )
 
     print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
-    print(f"Using cached samples from final calibration iteration (no re-querying needed)")
-
-    replay_buffer.add_clean_samples(clean_samples)
 
     # Create adapter optimizer and scheduler (reuse across epochs)
     adapter_optimizer = optim.Adam(
@@ -1134,26 +1108,6 @@ def optimize_patch_bb(
         adapter_optimizer, mode='min', factor=0.5, patience=6
     )
 
-    # Initial fine-tuning
-    print("\nInitial adapter fine-tuning...")
-    initial_metrics = surrogate_trainer.fine_tune(
-        clean_samples,
-        verbose=verbose,
-        adapter_optimizer=adapter_optimizer,
-        adapter_scheduler=adapter_scheduler
-    )
-
-    print(f"\nInitial extraction results:")
-    print(f"  OCR loss: {initial_metrics.ocr_loss:.4f}")
-    print(f"  Confidence MSE: {initial_metrics.confidence_mse:.4f}")
-    print(f"  Converged: {initial_metrics.converged}")
-
-    if not initial_metrics.converged:
-        print("WARNING: Initial extraction did not converge. Continuing anyway...")
-
-    # =========================================================================
-    # Phase 2: Iterative patch optimization
-    # =========================================================================
     print("\n" + "=" * 60)
     print("Phase 2: Adversarial Patch Optimization")
     print("=" * 60)
@@ -1296,7 +1250,6 @@ def optimize_patch_bb(
         'final_patch': trainer.patch.detach().cpu(),
         'blur_sigma': current_blur_sigma,
         'initial_blur_sigma': blur_sigma,
-        'initial_metrics': initial_metrics,
     }
 
 

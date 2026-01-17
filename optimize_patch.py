@@ -54,45 +54,102 @@ OCR_MAX_SLOTS = 9
 
 class PatchAdapter(nn.Module):
     """
-    Small CNN adapter that transforms the patch region before ALPR processing.
+    U-Net style encoder-decoder that transforms adversarial patches.
 
-    This module applies learnable transformations to the patch bounding box region,
-    allowing the surrogate to adapt to black-box behavior without fine-tuning the
-    entire ALPR model. Uses pure convolutions to handle variable input sizes.
+    This module operates on the fixed-size patch tensor (512×256×3) and learns
+    to transform it into an equivalent representation that makes the surrogate
+    perceive it the same way the black-box does.
+
+    The bottleneck captures the low-dimensional adversarial manifold, and the
+    decoder reconstructs pixels that express the same adversarial intent in the
+    surrogate's perceptual space.
     """
 
-    def __init__(self, in_channels: int = 3, hidden_channels: int = 32):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512):
         """
         Args:
-            in_channels: Number of input channels (3 for RGB)
-            hidden_channels: Number of hidden layer channels
+            patch_height: Fixed patch height (256)
+            patch_width: Fixed patch width (512)
         """
         super().__init__()
 
-        # Pure convolutional network - no pooling or size changes
-        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
-        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)
-        self.conv3 = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
-        self.activation = nn.ReLU()
+        # Encoder (downsampling path)
+        self.enc1 = self._conv_block(3, 32)      # 512×256
+        self.enc2 = self._conv_block(32, 64)     # 256×128
+        self.enc3 = self._conv_block(64, 128)    # 128×64
+        self.enc4 = self._conv_block(128, 256)   # 64×32
+
+        # Bottleneck
+        self.bottleneck = self._conv_block(256, 256)  # 32×16
+
+        # Decoder (upsampling path)
+        self.dec4 = self._upconv_block(256, 128)  # 64×32
+        self.dec3 = self._upconv_block(256, 64)   # 128×64 (cat with enc3)
+        self.dec2 = self._upconv_block(128, 32)   # 256×128 (cat with enc2)
+        self.dec1 = self._upconv_block(64, 16)    # 512×256 (cat with enc1)
+
+        # Final output
+        self.out_conv = nn.Conv2d(32, 3, 1)  # 1×1 conv to get 3 channels
+        self.out_activation = nn.Sigmoid()   # Keep in [0, 1]
+
+        self.pool = nn.MaxPool2d(2, 2)
+
+    def _conv_block(self, in_ch: int, out_ch: int) -> nn.Module:
+        """Double convolution block."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def _upconv_block(self, in_ch: int, out_ch: int) -> nn.Module:
+        """Upsampling + convolution block."""
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Apply adaptive transformation to patch region.
+        Transform adversarial patch.
 
         Args:
-            x: Input tensor [B, C, H, W] (variable H, W)
+            x: Patch tensor [B, 3, 256, 512]
 
         Returns:
-            Transformed tensor with same shape via skip connection
+            Transformed patch [B, 3, 256, 512]
         """
-        identity = x
+        # Encoder
+        e1 = self.enc1(x)          # 32 × 256 × 512
+        e2 = self.enc2(self.pool(e1))  # 64 × 128 × 256
+        e3 = self.enc3(self.pool(e2))  # 128 × 64 × 128
+        e4 = self.enc4(self.pool(e3))  # 256 × 32 × 64
 
-        out = self.activation(self.conv1(x))
-        out = self.activation(self.conv2(out))
-        out = self.conv3(out)  # No activation on last layer
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))  # 256 × 16 × 32
 
-        # Skip connection - add transformation to original
-        return identity + out
+        # Decoder with skip connections
+        d4 = self.dec4(b)                    # 128 × 32 × 64
+        d4 = torch.cat([d4, e4], dim=1)      # 256 × 32 × 64
+
+        d3 = self.dec3(d4)                   # 64 × 64 × 128
+        d3 = torch.cat([d3, e3], dim=1)      # 128 × 64 × 128
+
+        d2 = self.dec2(d3)                   # 32 × 128 × 256
+        d2 = torch.cat([d2, e2], dim=1)      # 64 × 128 × 256
+
+        d1 = self.dec1(d2)                   # 16 × 256 × 512
+        d1 = torch.cat([d1, e1], dim=1)      # 32 × 256 × 512
+
+        # Output
+        out = self.out_conv(d1)              # 3 × 256 × 512
+        out = self.out_activation(out)
+
+        return out
 
 
 # =============================================================================
@@ -215,8 +272,8 @@ class ALPRModels:
         self._ocr.eval()
 
         # Create patch adapter
-        print(f"  Initializing patch adapter")
-        self._adapter = PatchAdapter(in_channels=3, hidden_channels=32)
+        print(f"  Initializing patch adapter (U-Net)")
+        self._adapter = PatchAdapter(patch_height=PATCH_HEIGHT, patch_width=PATCH_WIDTH)
         self._adapter.to(self.device)
         self._adapter.train()  # Adapter starts trainable
 
@@ -742,7 +799,8 @@ class AdversarialPatchTrainer:
     def apply_patch_to_image(
         self,
         image: torch.Tensor,
-        corners: torch.Tensor
+        corners: torch.Tensor,
+        patch_override: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Apply adversarial patch as border around license plate.
@@ -750,6 +808,7 @@ class AdversarialPatchTrainer:
         Args:
             image: Input image tensor [B, C, H, W]
             corners: Plate corner coordinates [B, 4, 2]
+            patch_override: Optional pre-transformed patch [C, H, W] to use instead of self.patch
 
         Returns:
             Tuple of (patched_image, mask)
@@ -758,8 +817,16 @@ class AdversarialPatchTrainer:
         image_height, image_width = image.shape[2], image.shape[3]
         dsize = (image_height, image_width)
 
-        # Normalize patch to [0, 1]
-        patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
+        # Use provided patch or default to self.patch
+        if patch_override is not None:
+            # Patch already transformed, just normalize to [0, 1] if needed
+            if patch_override.max() <= 1.0 and patch_override.min() >= 0.0:
+                patch_normalized = patch_override
+            else:
+                patch_normalized = torch.tanh(patch_override) * 0.5 + 0.5
+        else:
+            # Normalize patch to [0, 1]
+            patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
 
         # Optional blur
         if self.config.print_blur > 0:
@@ -926,17 +993,23 @@ class AdversarialPatchTrainer:
         """
         batch = {k: v[0] for k, v in batch.items()}
 
-        # Apply patch to preprocessed image
+        # Transform patch through adapter (for surrogate perception)
+        with torch.no_grad() if not self.patch.requires_grad else torch.enable_grad():
+            adapted_patch = self.models.adapter(self.patch.unsqueeze(0)).squeeze(0)
+
+        # Apply adapted patch to preprocessed image
         patched_image, _ = self.apply_patch_to_image(
             batch['prep_image'].to(self.device).unsqueeze(0),
-            batch['new_corners'].to(self.device).unsqueeze(0)
+            batch['new_corners'].to(self.device).unsqueeze(0),
+            patch_override=adapted_patch
         )
         batch['prep_image'] = patched_image.squeeze()
 
-        # Apply patch to original image
+        # Apply adapted patch to original image
         patched_image, _ = self.apply_patch_to_image(
             batch['orig_image'].to(self.device).unsqueeze(0),
-            batch['orig_corners'].to(self.device).unsqueeze(0)
+            batch['orig_corners'].to(self.device).unsqueeze(0),
+            patch_override=adapted_patch
         )
         batch['orig_image'] = patched_image.squeeze()
 
