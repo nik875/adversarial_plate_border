@@ -142,7 +142,7 @@ def main():
         description="Black-box adversarial patch optimization (fast-alpr)"
     )
     parser.add_argument("--csv", type=str, default="preproc_labels.csv")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=400)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--save-interval", type=int, default=10)
