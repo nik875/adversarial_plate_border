@@ -531,19 +531,13 @@ class SurrogateTrainer:
             patch_override=adapted_patch
         )
 
-        # Run detector on ALL images at once (major speedup)
+        # Run detector on images (loop due to ONNX batch size constraints, but much faster than before)
+        # Note: OCR is batched which is the bigger win
         with torch.no_grad():
-            detector_outputs = self.models.detector(patched_prep_batch)
-
-        # Parse detector outputs based on format (list or tensor with batch index)
-        if isinstance(detector_outputs, list):
-            detections_per_image = detector_outputs
-        else:
-            # Single tensor with batch indices in column 0
             detections_per_image = []
             for i in range(batch_size):
-                img_dets = detector_outputs[detector_outputs[:, 0] == i]
-                detections_per_image.append(img_dets)
+                detector_output = self.models.detector(patched_prep_batch[i:i+1])
+                detections_per_image.append(detector_output)
 
         # Find best detection for each image via IoU
         best_detections = []
