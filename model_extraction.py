@@ -59,6 +59,50 @@ from optimize_patch import (
 
 
 # =============================================================================
+# Learning Rate Schedulers
+# =============================================================================
+
+class LinearWarmupCosineAnnealingLR(optim.lr_scheduler._LRScheduler):
+    """
+    Linear warmup followed by cosine annealing learning rate scheduler.
+
+    Args:
+        optimizer: Wrapped optimizer
+        warmup_epochs: Number of epochs for linear warmup
+        max_epochs: Total number of epochs (warmup + annealing)
+        min_lr: Minimum learning rate (default: 0)
+        last_epoch: The index of last epoch (default: -1)
+    """
+
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        warmup_epochs: int,
+        max_epochs: int,
+        min_lr: float = 0.0,
+        last_epoch: int = -1
+    ):
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            # Linear warmup
+            alpha = self.last_epoch / max(1, self.warmup_epochs)
+            return [base_lr * alpha for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing
+            progress = (self.last_epoch - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return [
+                self.min_lr + (base_lr - self.min_lr) * cosine_factor
+                for base_lr in self.base_lrs
+            ]
+
+
+# =============================================================================
 # Data Structures
 # =============================================================================
 
@@ -347,7 +391,7 @@ class SurrogateTrainer:
         batch_size: int = 32,
         verbose: bool = True,
         adapter_optimizer: Optional[optim.Optimizer] = None,
-        adapter_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
+        adapter_scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
     ) -> FinetuneMetrics:
         """
         Fine-tune adapter module until convergence or max epochs.
@@ -385,8 +429,11 @@ class SurrogateTrainer:
 
         # Learning rate scheduler (create if not provided)
         if adapter_scheduler is None:
-            adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                adapter_optimizer, mode='min', factor=0.5, patience=6
+            adapter_scheduler = LinearWarmupCosineAnnealingLR(
+                adapter_optimizer,
+                warmup_epochs=5,
+                max_epochs=self.max_epochs,
+                min_lr=1e-6
             )
 
         converged = False
@@ -430,10 +477,8 @@ class SurrogateTrainer:
                       f"conf_mse={metrics.confidence_mse:.4f} | "
                       f"LR: adapter={adapter_lr:.2e}")
 
-            # Step scheduler to reduce LR if loss plateaus
-            # Use combined metric for scheduling
-            combined_loss = (metrics.ocr_loss + metrics.confidence_mse) / 2
-            adapter_scheduler.step(combined_loss)
+            # Step scheduler (linear warmup + cosine annealing)
+            adapter_scheduler.step()
 
             # Check convergence based on whole-dataset metrics
             if (metrics.ocr_loss <= self.ocr_loss_threshold and
@@ -1116,8 +1161,11 @@ def optimize_patch_bb(
         models.get_adapter_parameters(),
         lr=surrogate_trainer.learning_rate
     )
-    adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        adapter_optimizer, mode='min', factor=0.5, patience=6
+    adapter_scheduler = LinearWarmupCosineAnnealingLR(
+        adapter_optimizer,
+        warmup_epochs=5,
+        max_epochs=surrogate_trainer.max_epochs,
+        min_lr=1e-6
     )
 
     print("\n" + "=" * 60)
