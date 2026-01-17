@@ -477,8 +477,11 @@ class SurrogateTrainer:
             if bb_result.text is None:
                 continue
 
+            # Normalize patch to [0,1] before adapter
+            patch_normalized = torch.sigmoid(self.trainer.patch)
+
             # Transform patch through adapter
-            adapted_patch = self.models.adapter(self.trainer.patch.unsqueeze(0)).squeeze(0)
+            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
             # Apply adapted patch to unpatched prep image
             patched_prep, _ = self.trainer.apply_patch_to_image(
@@ -591,8 +594,11 @@ class SurrogateTrainer:
 
                 valid_samples += 1
 
+                # Normalize patch to [0,1] before adapter
+                patch_normalized = torch.sigmoid(self.trainer.patch)
+
                 # Transform patch through adapter
-                adapted_patch = self.models.adapter(self.trainer.patch.unsqueeze(0)).squeeze(0)
+                adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
                 # Apply adapted patch to unpatched prep image
                 patched_prep, _ = self.trainer.apply_patch_to_image(

@@ -993,9 +993,12 @@ class AdversarialPatchTrainer:
         """
         batch = {k: v[0] for k, v in batch.items()}
 
+        # Normalize patch to [0,1] before adapter
+        patch_normalized = torch.sigmoid(self.patch)
+
         # Transform patch through adapter (for surrogate perception)
         with torch.no_grad() if not self.patch.requires_grad else torch.enable_grad():
-            adapted_patch = self.models.adapter(self.patch.unsqueeze(0)).squeeze(0)
+            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
         # Apply adapted patch to preprocessed image
         patched_image, _ = self.apply_patch_to_image(
