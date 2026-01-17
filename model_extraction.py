@@ -418,7 +418,7 @@ class SurrogateTrainer:
         if adapter_scheduler is None:
             adapter_scheduler = LinearWarmupCosineAnnealingLR(
                 adapter_optimizer,
-                warmup_epochs=5,
+                warmup_epochs=10,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
@@ -1113,7 +1113,8 @@ def optimize_patch_bb(
         trainer=trainer,
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
-        confidence_mse_threshold=confidence_mse_threshold
+        confidence_mse_threshold=confidence_mse_threshold,
+        max_epochs=200
     )
 
     # Create replay buffer
@@ -1150,7 +1151,7 @@ def optimize_patch_bb(
     )
     adapter_scheduler = LinearWarmupCosineAnnealingLR(
         adapter_optimizer,
-        warmup_epochs=5,
+        warmup_epochs=10,
         max_epochs=surrogate_trainer.max_epochs,
         min_lr=1e-6
     )
