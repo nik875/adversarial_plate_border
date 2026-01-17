@@ -1184,8 +1184,8 @@ def optimize_patch_bb(
     blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
-    # Train 4 patch epochs per adapter training cycle
-    patch_epochs_per_cycle = 4
+    # Train 1 patch epoch per adapter training cycle
+    patch_epochs_per_cycle = 1
     num_cycles = num_epochs // patch_epochs_per_cycle
 
     total_patch_epoch = 0
@@ -1264,7 +1264,7 @@ def optimize_patch_bb(
             if (epoch + 1) % save_interval == 0:
                 models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
 
-        # Step 4: Fine-tune adapter after 4 patch epochs
+        # Step 4: Fine-tune adapter after patch epoch
         print(f"\n{'*' * 60}")
         print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
         print('*' * 60)
