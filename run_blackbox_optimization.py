@@ -97,15 +97,15 @@ class LargeFastALPR(BlackBoxModel):
                 best_iou = -1.0
 
                 for pred in predictions:
-                    if pred.bounding_box is None:
+                    if pred.detection is None or pred.detection.bounding_box is None:
                         continue
 
                     # fast-alpr bbox: [x1, y1, x2, y2]
                     pred_box = torch.tensor([
-                        pred.bounding_box.x1,
-                        pred.bounding_box.y1,
-                        pred.bounding_box.x2,
-                        pred.bounding_box.y2
+                        pred.detection.bounding_box.x1,
+                        pred.detection.bounding_box.y1,
+                        pred.detection.bounding_box.x2,
+                        pred.detection.bounding_box.y2
                     ], dtype=torch.float32)
 
                     iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
