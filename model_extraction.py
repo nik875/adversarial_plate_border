@@ -184,27 +184,27 @@ class ReplayBuffer:
         self,
         original_dataset_size: int,
         decay_half_life: int = 4,
-        initial_cycles: int = 3
+        initial_epochs: int = 3
     ):
         """
         Args:
             original_dataset_size: Size of the original training set
             decay_half_life: Half-life for exponential decay (in epochs)
-            initial_cycles: Number of cycles before applying sampling strategy
+            initial_epochs: Number of epochs before applying sampling strategy
         """
         self.original_size = original_dataset_size
         self.max_size = 4 * original_dataset_size
         self.decay_half_life = decay_half_life
-        self.initial_cycles = initial_cycles
+        self.initial_epochs = initial_epochs
         self.decay_rate = math.log(2) / decay_half_life
 
         # Storage: each entry is (image_tensor, corners, transform, bb_result)
         self.last_patch_samples: List[Tuple] = []
+        self.last_patch: Optional[torch.Tensor] = None
         # Historical: list of (epoch, patch_tensor, samples)
         self.historical: List[Tuple[int, torch.Tensor, List[Tuple]]] = []
 
         self.current_epoch = 0
-        self.current_cycle = 0
 
     def add_patch_epoch(
         self,
@@ -222,23 +222,14 @@ class ReplayBuffer:
         """
         self.current_epoch = epoch
 
-        # Move previous "last patch" to historical
-        if self.last_patch_samples:
+        # Move previous "last patch" to historical (if exists)
+        if self.last_patch_samples and self.last_patch is not None:
             prev_epoch = epoch - 1
-            # Find the patch from previous epoch if it exists
-            prev_patch = None
-            if self.historical:
-                prev_patch = self.historical[-1][1]
-            if prev_patch is not None:
-                self.historical.append((prev_epoch, prev_patch, self.last_patch_samples))
+            self.historical.append((prev_epoch, self.last_patch, self.last_patch_samples))
 
-        # Update last patch samples
+        # Update last patch samples and store patch for later
         self.last_patch_samples = samples
-
-        # Store current patch for when it becomes historical
-        if not self.historical or epoch > 0:
-            # We'll add the patch reference when it moves to historical
-            pass
+        self.last_patch = patch.clone()
 
     def get_training_samples(self) -> List[Tuple]:
         """
@@ -247,14 +238,14 @@ class ReplayBuffer:
         Returns:
             List of (image, corners, transform, bb_result) tuples
         """
-        if self.current_cycle < self.initial_cycles:
-            # Initial cycles: use all available samples to build diverse adapter
+        if self.current_epoch < self.initial_epochs:
+            # Initial epochs: use all available samples
             all_samples = list(self.last_patch_samples)
             for _, _, samples in self.historical:
                 all_samples.extend(samples)
             return all_samples
 
-        # After initial cycles: apply 33/67 split (recent/historical)
+        # After initial epochs: apply 33/67 split (recent/historical)
         target_size = min(self.max_size, len(self.last_patch_samples) * 3)
 
         last_patch_count = target_size // 3
@@ -1126,7 +1117,7 @@ def optimize_patch_bb(
     replay_buffer = ReplayBuffer(
         original_dataset_size=dataset_size,
         decay_half_life=4,
-        initial_cycles=3
+        initial_epochs=3
     )
 
     # =========================================================================
@@ -1297,7 +1288,6 @@ def optimize_patch_bb(
             history['surrogate_converged'].append(metrics.converged)
 
         total_patch_epoch += patch_epochs_per_cycle
-        replay_buffer.current_cycle += 1
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
