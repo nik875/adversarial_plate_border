@@ -347,7 +347,7 @@ class SurrogateTrainer:
         models: ALPRModels,
         trainer: 'AdversarialPatchTrainer',
         device: str,
-        ocr_loss_threshold: float = 0.2,
+        ocr_loss_threshold: float = 0.25,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 1e-3,
         max_epochs: int = 100
@@ -418,7 +418,7 @@ class SurrogateTrainer:
         if adapter_scheduler is None:
             adapter_scheduler = LinearWarmupCosineAnnealingLR(
                 adapter_optimizer,
-                warmup_epochs=10,
+                warmup_epochs=5,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
@@ -1051,7 +1051,7 @@ def optimize_patch_bb(
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
     blur_sigma_init: Optional[float] = None,
-    ocr_loss_threshold: float = 0.2,
+    ocr_loss_threshold: float = 0.25,
     confidence_mse_threshold: float = 0.1,
     save_interval: int = 10,
     verbose: bool = True,
@@ -1144,16 +1144,10 @@ def optimize_patch_bb(
 
     print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
 
-    # Create adapter optimizer and scheduler (reuse across epochs)
+    # Create adapter optimizer (reuse across cycles)
     adapter_optimizer = optim.Adam(
         models.get_adapter_parameters(),
         lr=surrogate_trainer.learning_rate
-    )
-    adapter_scheduler = LinearWarmupCosineAnnealingLR(
-        adapter_optimizer,
-        warmup_epochs=10,
-        max_epochs=surrogate_trainer.max_epochs,
-        min_lr=1e-6
     )
 
     print("\n" + "=" * 60)
@@ -1268,6 +1262,15 @@ def optimize_patch_bb(
         print(f"\n{'*' * 60}")
         print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
         print('*' * 60)
+
+        # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
+        adapter_scheduler = LinearWarmupCosineAnnealingLR(
+            adapter_optimizer,
+            warmup_epochs=5,
+            max_epochs=surrogate_trainer.max_epochs,
+            min_lr=1e-6
+        )
+
         training_samples = replay_buffer.get_training_samples()
         metrics = surrogate_trainer.fine_tune(
             training_samples,
