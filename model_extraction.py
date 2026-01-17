@@ -1277,6 +1277,7 @@ def optimize_patch_bb(
         training_samples = replay_buffer.get_training_samples()
         metrics = surrogate_trainer.fine_tune(
             training_samples,
+            batch_size=100,
             verbose=verbose,
             adapter_optimizer=adapter_optimizer,
             adapter_scheduler=adapter_scheduler
