@@ -49,6 +49,53 @@ OCR_MAX_SLOTS = 9
 
 
 # =============================================================================
+# Patch Adapter Layer
+# =============================================================================
+
+class PatchAdapter(nn.Module):
+    """
+    Small CNN adapter that transforms the patch region before ALPR processing.
+
+    This module applies learnable transformations to the patch bounding box region,
+    allowing the surrogate to adapt to black-box behavior without fine-tuning the
+    entire ALPR model. Uses pure convolutions to handle variable input sizes.
+    """
+
+    def __init__(self, in_channels: int = 3, hidden_channels: int = 32):
+        """
+        Args:
+            in_channels: Number of input channels (3 for RGB)
+            hidden_channels: Number of hidden layer channels
+        """
+        super().__init__()
+
+        # Pure convolutional network - no pooling or size changes
+        self.conv1 = nn.Conv2d(in_channels, hidden_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1)
+        self.conv3 = nn.Conv2d(hidden_channels, in_channels, 3, padding=1)
+        self.activation = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply adaptive transformation to patch region.
+
+        Args:
+            x: Input tensor [B, C, H, W] (variable H, W)
+
+        Returns:
+            Transformed tensor with same shape via skip connection
+        """
+        identity = x
+
+        out = self.activation(self.conv1(x))
+        out = self.activation(self.conv2(out))
+        out = self.conv3(out)  # No activation on last layer
+
+        # Skip connection - add transformation to original
+        return identity + out
+
+
+# =============================================================================
 # Shared ALPR Models
 # =============================================================================
 
@@ -94,6 +141,7 @@ class ALPRModels:
 
         self._detector: Optional[nn.Module] = None
         self._ocr: Optional[nn.Module] = None
+        self._adapter: Optional[PatchAdapter] = None
         self._loaded = False
 
     @property
@@ -109,6 +157,13 @@ class ALPRModels:
         if not self._loaded:
             raise RuntimeError("Models not loaded. Call load() first.")
         return self._ocr
+
+    @property
+    def adapter(self) -> PatchAdapter:
+        """Get the patch adapter module."""
+        if not self._loaded:
+            raise RuntimeError("Models not loaded. Call load() first.")
+        return self._adapter
 
     @property
     def is_loaded(self) -> bool:
@@ -159,7 +214,13 @@ class ALPRModels:
         self._ocr.to(self.device)
         self._ocr.eval()
 
-        # Freeze by default
+        # Create patch adapter
+        print(f"  Initializing patch adapter")
+        self._adapter = PatchAdapter(in_channels=3, hidden_channels=32)
+        self._adapter.to(self.device)
+        self._adapter.train()  # Adapter starts trainable
+
+        # Freeze by default (but not adapter)
         self.freeze_all()
 
         self._loaded = True
@@ -168,12 +229,12 @@ class ALPRModels:
         return self
 
     def freeze_all(self) -> None:
-        """Freeze all model parameters (no gradients)."""
+        """Freeze all model parameters (no gradients). Does NOT freeze adapter."""
         self.freeze_detector()
         self.freeze_ocr()
 
     def unfreeze_all(self) -> None:
-        """Unfreeze all model parameters (enable gradients)."""
+        """Unfreeze all model parameters (enable gradients). Does NOT affect adapter."""
         self.unfreeze_detector()
         self.unfreeze_ocr()
 
@@ -201,6 +262,18 @@ class ALPRModels:
             for param in self._ocr.parameters():
                 param.requires_grad = True
 
+    def freeze_adapter(self) -> None:
+        """Freeze adapter parameters."""
+        if self._adapter is not None:
+            for param in self._adapter.parameters():
+                param.requires_grad = False
+
+    def unfreeze_adapter(self) -> None:
+        """Unfreeze adapter parameters for fine-tuning."""
+        if self._adapter is not None:
+            for param in self._adapter.parameters():
+                param.requires_grad = True
+
     def get_detector_parameters(self):
         """Get detector parameters for optimizer."""
         if self._detector is None:
@@ -213,11 +286,18 @@ class ALPRModels:
             return []
         return list(self._ocr.parameters())
 
+    def get_adapter_parameters(self):
+        """Get adapter parameters for optimizer."""
+        if self._adapter is None:
+            return []
+        return list(self._adapter.parameters())
+
     def save_state(self, path: str) -> None:
         """Save model states to file."""
         torch.save({
             'detector': self._detector.state_dict() if self._detector else None,
             'ocr': self._ocr.state_dict() if self._ocr else None,
+            'adapter': self._adapter.state_dict() if self._adapter else None,
         }, path)
 
     def load_state(self, path: str) -> None:
@@ -229,6 +309,8 @@ class ALPRModels:
             self._detector.load_state_dict(state['detector'])
         if state['ocr'] is not None:
             self._ocr.load_state_dict(state['ocr'])
+        if 'adapter' in state and state['adapter'] is not None:
+            self._adapter.load_state_dict(state['adapter'])
 
 
 # =============================================================================

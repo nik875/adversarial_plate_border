@@ -42,6 +42,7 @@ from optimize_patch import (
     ALPRModels,
     AdversarialPatchTrainer,
     TrainerConfig,
+    PatchAdapter,
     create_focal_cce_loss,
     text_to_target_tensor,
     logits_to_text,
@@ -290,16 +291,72 @@ class ReplayBuffer:
 
 
 # =============================================================================
+# Helper Functions
+# =============================================================================
+
+def apply_adapter_to_patch_region(
+    image: torch.Tensor,
+    corners: torch.Tensor,
+    adapter: PatchAdapter,
+    border_scale: float = 1.4
+) -> torch.Tensor:
+    """
+    Apply adapter transformation to the patch bounding box region.
+
+    Args:
+        image: Image tensor [C, H, W]
+        corners: Plate corner coordinates [4, 2]
+        adapter: PatchAdapter module
+        border_scale: Scale factor for patch border
+
+    Returns:
+        Image with adapter applied to patch region
+    """
+    C, H, W = image.shape
+    device = image.device
+
+    # Calculate patch bounding box
+    center_x = corners[:, 0].mean()
+    center_y = corners[:, 1].mean()
+    center = torch.tensor([center_x, center_y], device=device)
+
+    border_corners = center.unsqueeze(0) + (corners - center.unsqueeze(0)) * border_scale
+
+    min_x = int(max(0, border_corners[:, 0].min().item()))
+    max_x = int(min(W, border_corners[:, 0].max().item()))
+    min_y = int(max(0, border_corners[:, 1].min().item()))
+    max_y = int(min(H, border_corners[:, 1].max().item()))
+
+    if max_x <= min_x or max_y <= min_y:
+        return image
+
+    # Extract patch region
+    patch_region = image[:, min_y:max_y, min_x:max_x].unsqueeze(0)  # [1, C, h, w]
+
+    # Apply adapter
+    transformed_region = adapter(patch_region).squeeze(0)  # [C, h, w]
+
+    # Insert back into image
+    result = image.clone()
+    result[:, min_y:max_y, min_x:max_x] = transformed_region
+
+    return result
+
+
+# =============================================================================
 # Surrogate Trainer
 # =============================================================================
 
 class SurrogateTrainer:
     """
-    Fine-tunes the fast-alpr surrogate models to match black-box behavior.
+    Fine-tunes a lightweight adapter to match black-box behavior.
 
-    Only trains:
-    - Detection confidence (not bounding boxes)
-    - OCR text output
+    Instead of fine-tuning the entire ALPR model, this trains a small CNN
+    adapter that transforms the patch region before ALPR processing. The
+    ALPR detector and OCR models remain frozen.
+
+    The adapter learns to apply transformations that make the surrogate's
+    behavior match the black-box system's detection confidence and OCR output.
     """
 
     def __init__(
@@ -334,25 +391,23 @@ class SurrogateTrainer:
         samples: List[Tuple],
         batch_size: int = 64,
         verbose: bool = True,
-        ocr_optimizer: Optional[optim.Optimizer] = None,
-        ocr_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None,
-        detector_optimizer: Optional[optim.Optimizer] = None,
-        detector_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
+        adapter_optimizer: Optional[optim.Optimizer] = None,
+        adapter_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
     ) -> FinetuneMetrics:
         """
-        Fine-tune surrogate models until convergence or max epochs.
+        Fine-tune adapter module until convergence or max epochs.
 
         Each epoch processes the entire dataset with batched gradient updates.
         Convergence is checked based on metrics over the whole dataset after each epoch.
+
+        The ALPR detector and OCR models remain frozen - only the adapter is trained.
 
         Args:
             samples: List of (prep_image, orig_image, corners, orig_corners, transform, bb_result)
             batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
-            ocr_optimizer: Optional pre-created OCR optimizer (reuses across epochs)
-            ocr_scheduler: Optional pre-created OCR scheduler
-            detector_optimizer: Optional pre-created detector optimizer (reuses across epochs)
-            detector_scheduler: Optional pre-created detector scheduler
+            adapter_optimizer: Optional pre-created adapter optimizer (reuses across epochs)
+            adapter_scheduler: Optional pre-created adapter scheduler
 
         Returns:
             FinetuneMetrics with final metrics
@@ -365,26 +420,18 @@ class SurrogateTrainer:
                 converged=False
             )
 
-        # Unfreeze models for training
-        self.models.unfreeze_all()
+        # Freeze ALPR models, unfreeze adapter
+        self.models.freeze_all()
+        self.models.unfreeze_adapter()
 
-        # Set up optimizers (create if not provided)
-        if ocr_optimizer is None:
-            ocr_optimizer = optim.Adam(self.models.get_ocr_parameters(), lr=self.learning_rate)
-        if detector_optimizer is None:
-            detector_optimizer = optim.Adam(
-                self.models.get_detector_parameters(),
-                lr=self.learning_rate * 0.1  # Lower LR for detector
-            )
+        # Set up optimizer (create if not provided)
+        if adapter_optimizer is None:
+            adapter_optimizer = optim.Adam(self.models.get_adapter_parameters(), lr=self.learning_rate)
 
-        # Learning rate schedulers (create if not provided)
-        if ocr_scheduler is None:
-            ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                ocr_optimizer, mode='min', factor=0.5, patience=6
-            )
-        if detector_scheduler is None:
-            detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                detector_optimizer, mode='min', factor=0.5, patience=6
+        # Learning rate scheduler (create if not provided)
+        if adapter_scheduler is None:
+            adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                adapter_optimizer, mode='min', factor=0.5, patience=6
             )
 
         converged = False
@@ -406,7 +453,7 @@ class SurrogateTrainer:
             for i in pbar:
                 batch = samples[i:i + batch_size]
                 ocr_loss, conf_loss, _, _, valid_samples = self._train_step(
-                    batch, ocr_optimizer, detector_optimizer
+                    batch, adapter_optimizer
                 )
                 epoch_ocr_loss += ocr_loss
                 epoch_conf_loss += conf_loss
@@ -423,15 +470,15 @@ class SurrogateTrainer:
             metrics = self._evaluate(samples)
 
             if verbose:
-                ocr_lr = ocr_optimizer.param_groups[0]['lr']
-                det_lr = detector_optimizer.param_groups[0]['lr']
+                adapter_lr = adapter_optimizer.param_groups[0]['lr']
                 print(f"  Epoch {epoch + 1}: ocr_loss={metrics.ocr_loss:.4f}, "
                       f"conf_mse={metrics.confidence_mse:.4f} | "
-                      f"LR: ocr={ocr_lr:.2e}, det={det_lr:.2e}")
+                      f"LR: adapter={adapter_lr:.2e}")
 
-            # Step schedulers to reduce LR if loss plateaus
-            ocr_scheduler.step(metrics.ocr_loss)
-            detector_scheduler.step(metrics.confidence_mse)
+            # Step scheduler to reduce LR if loss plateaus
+            # Use combined metric for scheduling
+            combined_loss = (metrics.ocr_loss + metrics.confidence_mse) / 2
+            adapter_scheduler.step(combined_loss)
 
             # Check convergence based on whole-dataset metrics
             if (metrics.ocr_loss <= self.ocr_loss_threshold and
@@ -453,8 +500,7 @@ class SurrogateTrainer:
     def _train_step(
         self,
         batch: List[Tuple],
-        ocr_optimizer: optim.Optimizer,
-        detector_optimizer: optim.Optimizer
+        adapter_optimizer: optim.Optimizer
     ) -> Tuple[float, float, float, float, int]:
         """Single training step on a batch.
 
@@ -462,8 +508,10 @@ class SurrogateTrainer:
             Tuple of (ocr_loss_sum, conf_loss_sum, match_rate, conf_mse, valid_samples)
             where valid_samples is the count of samples that produced valid losses
         """
-        self.models.detector.train()
-        self.models.ocr.train()
+        # Keep ALPR models frozen, train adapter
+        self.models.detector.eval()
+        self.models.ocr.eval()
+        self.models.adapter.train()
 
         total_ocr_loss = 0.0
         total_conf_loss = 0.0
@@ -471,8 +519,7 @@ class SurrogateTrainer:
         valid_samples = 0
         conf_squared_errors = []
 
-        ocr_optimizer.zero_grad()
-        detector_optimizer.zero_grad()
+        adapter_optimizer.zero_grad()
 
         for sample in batch:
             prep_image, orig_image, corners, orig_corners, transform, bb_result = sample
@@ -480,10 +527,15 @@ class SurrogateTrainer:
             if bb_result.text is None:
                 continue
 
-            # Run detector
+            # Apply adapter to patch region
             prep_image = prep_image.to(self.device)
             corners = corners.to(self.device)
-            detector_output = self.models.detector(prep_image.unsqueeze(0))
+            prep_image_adapted = apply_adapter_to_patch_region(
+                prep_image, corners, self.models.adapter
+            )
+
+            # Run detector on adapted image
+            detector_output = self.models.detector(prep_image_adapted.unsqueeze(0))
 
             if len(detector_output) == 0:
                 continue
@@ -542,17 +594,13 @@ class SurrogateTrainer:
             if pred_text == bb_result.text:
                 correct_matches += 1
 
-        # Backward passes
-        if total_ocr_loss > 0:
-            total_ocr_loss.backward(retain_graph=True)
-            ocr_optimizer.step()
+        # Backward pass - combine losses and train adapter only
+        total_loss = total_ocr_loss + total_conf_loss
+        if total_loss > 0:
+            total_loss.backward()
+            adapter_optimizer.step()
 
-        if total_conf_loss > 0:
-            total_conf_loss.backward()
-            detector_optimizer.step()
-
-        self.models.detector.eval()
-        self.models.ocr.eval()
+        self.models.adapter.eval()
 
         n = len(batch)
         match_rate = correct_matches / n if n > 0 else 0.0
@@ -581,10 +629,15 @@ class SurrogateTrainer:
 
                 valid_samples += 1
 
-                # Run detector
+                # Apply adapter to patch region
                 prep_image = prep_image.to(self.device)
                 corners = corners.to(self.device)
-                detector_output = self.models.detector(prep_image.unsqueeze(0))
+                prep_image_adapted = apply_adapter_to_patch_region(
+                    prep_image, corners, self.models.adapter
+                )
+
+                # Run detector on adapted image
+                detector_output = self.models.detector(prep_image_adapted.unsqueeze(0))
 
                 if len(detector_output) == 0:
                     conf_squared_errors.append(bb_result.confidence ** 2)
@@ -1072,31 +1125,22 @@ def optimize_patch_bb(
 
     replay_buffer.add_clean_samples(clean_samples)
 
-    # Create surrogate optimizers and schedulers (reuse across epochs)
-    ocr_optimizer = optim.Adam(
-        models.get_ocr_parameters(),
+    # Create adapter optimizer and scheduler (reuse across epochs)
+    adapter_optimizer = optim.Adam(
+        models.get_adapter_parameters(),
         lr=surrogate_trainer.learning_rate
     )
-    detector_optimizer = optim.Adam(
-        models.get_detector_parameters(),
-        lr=surrogate_trainer.learning_rate * 0.1
-    )
-    ocr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        ocr_optimizer, mode='min', factor=0.5, patience=6
-    )
-    detector_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        detector_optimizer, mode='min', factor=0.5, patience=6
+    adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        adapter_optimizer, mode='min', factor=0.5, patience=6
     )
 
     # Initial fine-tuning
-    print("\nInitial surrogate fine-tuning...")
+    print("\nInitial adapter fine-tuning...")
     initial_metrics = surrogate_trainer.fine_tune(
         clean_samples,
         verbose=verbose,
-        ocr_optimizer=ocr_optimizer,
-        ocr_scheduler=ocr_scheduler,
-        detector_optimizer=detector_optimizer,
-        detector_scheduler=detector_scheduler
+        adapter_optimizer=adapter_optimizer,
+        adapter_scheduler=adapter_scheduler
     )
 
     print(f"\nInitial extraction results:")
@@ -1186,15 +1230,13 @@ def optimize_patch_bb(
                 clean_samples = cached_clean_samples
                 replay_buffer.add_clean_samples(clean_samples)
 
-                # Fine-tune surrogate on new clean samples
-                print("*** Fine-tuning surrogate on less blurred data...")
+                # Fine-tune adapter on new clean samples
+                print("*** Fine-tuning adapter on less blurred data...")
                 surrogate_trainer.fine_tune(
                     clean_samples,
                     verbose=verbose,
-                    ocr_optimizer=ocr_optimizer,
-                    ocr_scheduler=ocr_scheduler,
-                    detector_optimizer=detector_optimizer,
-                    detector_scheduler=detector_scheduler
+                    adapter_optimizer=adapter_optimizer,
+                    adapter_scheduler=adapter_scheduler
                 )
 
         # Step 3: Update replay buffer
@@ -1204,24 +1246,21 @@ def optimize_patch_bb(
             samples=patched_samples
         )
 
-        # Step 4: Fine-tune surrogate on replay buffer
-        print("Fine-tuning surrogate...")
+        # Step 4: Fine-tune adapter on replay buffer
+        print("Fine-tuning adapter...")
         training_samples = replay_buffer.get_training_samples()
         metrics = surrogate_trainer.fine_tune(
             training_samples,
             verbose=verbose,
-            ocr_optimizer=ocr_optimizer,
-            ocr_scheduler=ocr_scheduler,
-            detector_optimizer=detector_optimizer,
-            detector_scheduler=detector_scheduler
+            adapter_optimizer=adapter_optimizer,
+            adapter_scheduler=adapter_scheduler
         )
 
-        print(f"Surrogate metrics:")
+        print(f"Adapter metrics:")
         print(f"  OCR loss: {metrics.ocr_loss:.4f}")
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
-        print(f"  OCR LR: {ocr_optimizer.param_groups[0]['lr']:.2e}, "
-              f"Detector LR: {detector_optimizer.param_groups[0]['lr']:.2e}")
+        print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
 
         # Record history
         history['epoch'].append(epoch + 1)
