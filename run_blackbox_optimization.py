@@ -100,58 +100,93 @@ class LargeFastALPR(BlackBoxModel):
                     results.append(ALPRResult(text=None, confidence=0.0))
                 continue
 
-            # Process each image's detections
+            # Collect all cropped plates from this batch for batch OCR
+            batch_crops = []
+            crop_metadata = []  # Track (image_idx, detection_idx) for each crop
+
             for local_idx, (pred_list, global_idx) in enumerate(zip(batch_predictions, batch_indices)):
                 if not pred_list:
                     results.append(ALPRResult(text=None, confidence=0.0))
                     continue
 
-                # Select best detection based on IoU or confidence
-                best_pred = None
+                # Crop plates for OCR
+                for det_idx, pred in enumerate(pred_list):
+                    if pred.bounding_box is None:
+                        continue
 
-                if corners is not None and global_idx < len(corners):
-                    # IoU-based selection (matches model_extraction approach)
-                    gt_corners = corners[global_idx]
-                    target_box = corners_to_bbox(gt_corners)
-                    best_iou = -1.0
+                    x1 = max(0, int(pred.bounding_box.x1))
+                    y1 = max(0, int(pred.bounding_box.y1))
+                    x2 = min(batch_images[local_idx].shape[1], int(pred.bounding_box.x2))
+                    y2 = min(batch_images[local_idx].shape[0], int(pred.bounding_box.y2))
 
-                    for pred in pred_list:
-                        if pred.bounding_box is None:
-                            continue
+                    cropped = batch_images[local_idx][y1:y2, x1:x2]
+                    if cropped.size > 0:
+                        batch_crops.append(cropped)
+                        crop_metadata.append((global_idx, det_idx, pred))
 
-                        # fast-alpr bbox: [x1, y1, x2, y2]
-                        pred_box = torch.tensor([
-                            pred.bounding_box.x1,
-                            pred.bounding_box.y1,
-                            pred.bounding_box.x2,
-                            pred.bounding_box.y2
-                        ], dtype=torch.float32)
-
-                        iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
-
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_pred = pred
-
-                else:
-                    # Confidence-based selection (fallback)
-                    best_conf = -1.0
-                    for pred in pred_list:
-                        if pred.ocr is None:
-                            continue
-                        if pred.ocr.confidence > best_conf:
-                            best_conf = pred.ocr.confidence
-                            best_pred = pred
-
-                if best_pred is None or best_pred.ocr is None:
+            if not batch_crops:
+                # No valid detections in this batch
+                for local_idx, global_idx in enumerate(batch_indices):
                     results.append(ALPRResult(text=None, confidence=0.0))
+                continue
+
+            # Batch OCR on all crops
+            try:
+                ocr_texts, ocr_confidences = self.alpr.ocr.ocr_model.run(batch_crops, return_confidence=True)
+            except Exception as e:
+                print(f"OCR inference failed: {e}")
+                # Fill results with None for all images with detections
+                processed = set()
+                for global_idx, _, _ in crop_metadata:
+                    if global_idx not in processed:
+                        results.append(ALPRResult(text=None, confidence=0.0))
+                        processed.add(global_idx)
+                continue
+
+            # Select best detection per image based on IoU or confidence
+            image_results = {}  # global_idx -> (text, confidence, det_metadata)
+
+            for crop_idx, (global_idx, det_idx, pred) in enumerate(crop_metadata):
+                ocr_text = ocr_texts[crop_idx].strip('_')  # Remove padding
+                ocr_conf = float(np.max(ocr_confidences[crop_idx])) if len(ocr_confidences) > crop_idx else 0.0
+
+                if global_idx not in image_results:
+                    image_results[global_idx] = (ocr_text, ocr_conf, pred)
                 else:
-                    results.append(
-                        ALPRResult(
-                            text=best_pred.ocr.text,
-                            confidence=float(best_pred.ocr.confidence),
-                        )
-                    )
+                    # Keep better result based on selection criterion
+                    if corners is not None and global_idx < len(corners):
+                        # IoU-based selection
+                        gt_corners = corners[global_idx]
+                        target_box = corners_to_bbox(gt_corners)
+
+                        # Compare current vs stored
+                        pred_box_new = torch.tensor([
+                            pred.bounding_box.x1, pred.bounding_box.y1,
+                            pred.bounding_box.x2, pred.bounding_box.y2
+                        ], dtype=torch.float32)
+                        iou_new = compute_iou(pred_box_new.unsqueeze(0), target_box.unsqueeze(0)).item()
+
+                        old_text, old_conf, old_pred = image_results[global_idx]
+                        pred_box_old = torch.tensor([
+                            old_pred.bounding_box.x1, old_pred.bounding_box.y1,
+                            old_pred.bounding_box.x2, old_pred.bounding_box.y2
+                        ], dtype=torch.float32)
+                        iou_old = compute_iou(pred_box_old.unsqueeze(0), target_box.unsqueeze(0)).item()
+
+                        if iou_new > iou_old:
+                            image_results[global_idx] = (ocr_text, ocr_conf, pred)
+                    else:
+                        # Confidence-based selection
+                        if ocr_conf > image_results[global_idx][1]:
+                            image_results[global_idx] = (ocr_text, ocr_conf, pred)
+
+            # Add results in order
+            for global_idx in batch_indices:
+                if global_idx in image_results:
+                    text, conf, _ = image_results[global_idx]
+                    results.append(ALPRResult(text=text if text else None, confidence=conf))
+                else:
+                    results.append(ALPRResult(text=None, confidence=0.0))
 
         return results
 
