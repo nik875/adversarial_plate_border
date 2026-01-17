@@ -1281,6 +1281,10 @@ def optimize_patch_bb(
         print(f"  Converged: {metrics.converged}")
         print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
 
+        # Save adapter and models after fine-tuning
+        final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1
+        models.save_state(f"bb_patches/models_adapter_epoch_{final_patch_epoch + 1:04d}.pt")
+
         # Record adapter metrics for all patch epochs in this cycle
         for _ in range(patch_epochs_per_cycle):
             history['surrogate_ocr_loss'].append(metrics.ocr_loss)
