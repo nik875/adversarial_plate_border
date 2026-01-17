@@ -344,7 +344,7 @@ class SurrogateTrainer:
     def fine_tune(
         self,
         samples: List[Tuple],
-        batch_size: int = 64,
+        batch_size: int = 32,
         verbose: bool = True,
         adapter_optimizer: Optional[optim.Optimizer] = None,
         adapter_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
