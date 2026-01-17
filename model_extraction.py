@@ -184,18 +184,18 @@ class ReplayBuffer:
         self,
         original_dataset_size: int,
         decay_half_life: int = 4,
-        initial_epochs: int = 3
+        initial_cycles: int = 3
     ):
         """
         Args:
             original_dataset_size: Size of the original training set
             decay_half_life: Half-life for exponential decay (in epochs)
-            initial_epochs: Number of epochs before applying sampling strategy
+            initial_cycles: Number of cycles before applying sampling strategy
         """
         self.original_size = original_dataset_size
         self.max_size = 4 * original_dataset_size
         self.decay_half_life = decay_half_life
-        self.initial_epochs = initial_epochs
+        self.initial_cycles = initial_cycles
         self.decay_rate = math.log(2) / decay_half_life
 
         # Storage: each entry is (image_tensor, corners, transform, bb_result)
@@ -204,6 +204,7 @@ class ReplayBuffer:
         self.historical: List[Tuple[int, torch.Tensor, List[Tuple]]] = []
 
         self.current_epoch = 0
+        self.current_cycle = 0
 
     def add_patch_epoch(
         self,
@@ -246,14 +247,14 @@ class ReplayBuffer:
         Returns:
             List of (image, corners, transform, bb_result) tuples
         """
-        if self.current_epoch < self.initial_epochs:
-            # Initial epochs: use all available samples
+        if self.current_cycle < self.initial_cycles:
+            # Initial cycles: use all available samples to build diverse adapter
             all_samples = list(self.last_patch_samples)
             for _, _, samples in self.historical:
                 all_samples.extend(samples)
             return all_samples
 
-        # After initial epochs: apply 33/67 split (recent/historical)
+        # After initial cycles: apply 33/67 split (recent/historical)
         target_size = min(self.max_size, len(self.last_patch_samples) * 3)
 
         last_patch_count = target_size // 3
@@ -1125,7 +1126,7 @@ def optimize_patch_bb(
     replay_buffer = ReplayBuffer(
         original_dataset_size=dataset_size,
         decay_half_life=4,
-        initial_epochs=3
+        initial_cycles=3
     )
 
     # =========================================================================
@@ -1296,6 +1297,7 @@ def optimize_patch_bb(
             history['surrogate_converged'].append(metrics.converged)
 
         total_patch_epoch += patch_epochs_per_cycle
+        replay_buffer.current_cycle += 1
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
