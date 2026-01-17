@@ -496,8 +496,9 @@ class SurrogateTrainer:
             )
             patched_prep = patched_prep.squeeze(0)
 
-            # Run detector on patched image
-            detector_output = self.models.detector(patched_prep.unsqueeze(0))
+            # Run detector on patched image (frozen model, no gradients needed)
+            with torch.no_grad():
+                detector_output = self.models.detector(patched_prep.unsqueeze(0))
 
             if len(detector_output) == 0:
                 continue
@@ -548,9 +549,10 @@ class SurrogateTrainer:
                 align_corners=True
             ).to(self.device)
 
-            # OCR forward
-            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            ocr_output = self.models.ocr(ocr_input)
+            # OCR forward (frozen model, no gradients needed)
+            with torch.no_grad():
+                ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+                ocr_output = self.models.ocr(ocr_input)
 
             # OCR loss against black-box text
             target_tensor = text_to_target_tensor(
