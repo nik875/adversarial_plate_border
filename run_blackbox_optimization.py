@@ -3,24 +3,24 @@
 Black-box adversarial patch optimization using fast-alpr as a true black box.
 
 Ground truth plate is fixed (VRJ7774).
-Detection selection is based on minimum Levenshtein distance to ground truth,
-NOT highest confidence.
+Detection selection is based on IoU with ground truth corners (when provided),
+matching the approach used in model_extraction and optimize_patch.
 """
 
 import argparse
-from typing import List
+from typing import List, Optional
 import torch
 import numpy as np
 import cv2
 
 from fast_alpr import ALPR
-from Levenshtein import distance as levenshtein_distance
 
 from model_extraction import (
     BlackBoxModel,
     ALPRResult,
     optimize_patch_bb,
 )
+from optimize_patch import corners_to_bbox, compute_iou
 
 
 GROUND_TRUTH_PLATE = "VRJ7774"
@@ -51,14 +51,21 @@ class LargeFastALPR(BlackBoxModel):
 
         print(f"fast-alpr loaded on device: {self.device}")
 
-    def evaluate(self, images: List[torch.Tensor]) -> List[ALPRResult]:
+    def evaluate(
+        self,
+        images: List[torch.Tensor],
+        corners: Optional[List[torch.Tensor]] = None
+    ) -> List[ALPRResult]:
         """
         Evaluate images using fast-alpr.
-        Detection is chosen by minimum Levenshtein distance to ground truth.
+
+        Detection is chosen by:
+        - IoU with ground truth corners (when corners provided)
+        - Highest confidence (when corners not provided)
         """
         results: List[ALPRResult] = []
 
-        for image in images:
+        for idx, image in enumerate(images):
             # torch [C,H,W] -> uint8 BGR numpy
             img_np = image.permute(1, 2, 0).cpu().numpy()
             img_np = (img_np * 255).astype(np.uint8)
@@ -80,19 +87,42 @@ class LargeFastALPR(BlackBoxModel):
                 results.append(ALPRResult(text=None, confidence=0.0))
                 continue
 
+            # Select best detection based on IoU or confidence
             best_pred = None
-            best_distance = float("inf")
 
-            for pred in predictions:
-                if pred.ocr is None or not pred.ocr.text:
-                    continue
+            if corners is not None and idx < len(corners):
+                # IoU-based selection (matches model_extraction approach)
+                gt_corners = corners[idx]
+                target_box = corners_to_bbox(gt_corners)
+                best_iou = -1.0
 
-                pred_text = pred.ocr.text.upper()
-                dist = levenshtein_distance(pred_text, GROUND_TRUTH_PLATE)
+                for pred in predictions:
+                    if pred.bounding_box is None:
+                        continue
 
-                if dist < best_distance:
-                    best_distance = dist
-                    best_pred = pred
+                    # fast-alpr bbox: [x1, y1, x2, y2]
+                    pred_box = torch.tensor([
+                        pred.bounding_box.x1,
+                        pred.bounding_box.y1,
+                        pred.bounding_box.x2,
+                        pred.bounding_box.y2
+                    ], dtype=torch.float32)
+
+                    iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
+
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_pred = pred
+
+            else:
+                # Confidence-based selection (fallback)
+                best_conf = -1.0
+                for pred in predictions:
+                    if pred.ocr is None:
+                        continue
+                    if pred.ocr.confidence > best_conf:
+                        best_conf = pred.ocr.confidence
+                        best_pred = pred
 
             if best_pred is None or best_pred.ocr is None:
                 results.append(ALPRResult(text=None, confidence=0.0))
@@ -125,7 +155,7 @@ def main():
     print("Black-Box Adversarial Patch Optimization")
     print("Target: fast-alpr (true black box)")
     print("Ground truth plate:", GROUND_TRUTH_PLATE)
-    print("Selection: minimum Levenshtein distance")
+    print("Selection: IoU with ground truth corners")
     print("=" * 60)
 
     # Ground truth dictionary: same label for all indices

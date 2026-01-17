@@ -104,12 +104,17 @@ class BlackBoxModel(ABC):
     """
 
     @abstractmethod
-    def evaluate(self, images: List[torch.Tensor]) -> List[ALPRResult]:
+    def evaluate(
+        self,
+        images: List[torch.Tensor],
+        corners: Optional[List[torch.Tensor]] = None
+    ) -> List[ALPRResult]:
         """
         Evaluate the black-box ALPR on a batch of images.
 
         Args:
             images: List of image tensors [C, H, W] in [0, 1] range, RGB format
+            corners: Optional list of ground truth corner tensors [4, 2] for IoU-based selection
 
         Returns:
             List of ALPRResult, one per image. If no plate detected,
@@ -977,8 +982,8 @@ def collect_patched_samples(
                     prep_blur_sigma = blur_sigma * (384 / max(batch['orig_image'].shape[1], batch['orig_image'].shape[2]))
                     patched_prep = apply_plate_blur(patched_prep, corners, prep_blur_sigma)
 
-                # Query black-box with ORIGINAL patch
-                results = black_box.evaluate([patched_orig])
+                # Query black-box with ORIGINAL patch (pass corners for IoU-based selection)
+                results = black_box.evaluate([patched_orig], corners=[orig_corners])
                 bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
                 # Store both unpatched (for adapter training) and black-box result
