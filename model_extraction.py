@@ -1183,58 +1183,90 @@ def optimize_patch_bb(
     blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
-    for epoch in range(num_epochs):
-        print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+    # Train 4 patch epochs per adapter training cycle
+    patch_epochs_per_cycle = 4
+    num_cycles = num_epochs // patch_epochs_per_cycle
 
-        # Step 1: Train patch for one epoch (single gradient update)
-        patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
-        print(f"Patch loss: {patch_losses['total']:.4f} "
-              f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
+    total_patch_epoch = 0
 
-        # Step 2: Apply patch to all images (with blur) and query black-box
-        print("Collecting patched samples...")
-        patched_samples, bb_success_rate = collect_patched_samples(
-            black_box=black_box,
-            trainer=trainer,
-            ground_truth_texts=ground_truth_texts,
-            blur_sigma=current_blur_sigma
-        )
-        print(f"Black-box success rate: {bb_success_rate:.1%}")
+    for cycle in range(num_cycles):
+        print(f"\n{'=' * 60}")
+        print(f"Cycle {cycle + 1}/{num_cycles} (Epochs {total_patch_epoch + 1}-{total_patch_epoch + patch_epochs_per_cycle})")
+        print('=' * 60)
 
-        # Step 2b: Check if we need to reduce blur (attack too effective)
-        if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
-            print(
-                f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
-            print("*** Reducing blur to maintain training diversity...")
+        # Train patch for 4 epochs before adapter fine-tuning
+        cycle_samples = []
+        for patch_epoch_in_cycle in range(patch_epochs_per_cycle):
+            epoch = total_patch_epoch + patch_epoch_in_cycle
+            print(f"\n--- Patch Epoch {epoch + 1}/{num_epochs} ---")
 
-            # Re-calibrate with a higher target (to reduce blur)
-            # Target: get back to ~50% success rate zone
-            new_blur_sigma, cached_clean_samples = calibrate_blur_level(
+            # Step 1: Train patch for one epoch
+            patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
+            print(f"Patch loss: {patch_losses['total']:.4f} "
+                  f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
+
+            # Step 2: Apply patch to all images (with blur) and query black-box
+            print("Collecting patched samples...")
+            patched_samples, bb_success_rate = collect_patched_samples(
                 black_box=black_box,
-                dataset_loader=trainer.train_loader,
+                trainer=trainer,
                 ground_truth_texts=ground_truth_texts,
-                target_correct_rate=blur_target_rate,
-                sigma_min=0.0,
-                sigma_max=current_blur_sigma,  # Can only decrease blur
-                tolerance=0.10,
-                max_iterations=5,  # Quick recalibration
-                device=device
+                blur_sigma=current_blur_sigma
             )
+            print(f"Black-box success rate: {bb_success_rate:.1%}")
 
-            if new_blur_sigma < current_blur_sigma:
-                current_blur_sigma = new_blur_sigma
-                trainer.set_blur_sigma(current_blur_sigma)
-                print(f"*** New blur sigma: {current_blur_sigma:.2f}")
+            # Step 2b: Check if we need to reduce blur (attack too effective)
+            if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
+                print(
+                    f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
+                print("*** Reducing blur to maintain training diversity...")
 
-        # Step 3: Update replay buffer
-        replay_buffer.add_patch_epoch(
-            epoch=epoch,
-            patch=trainer.patch.detach().clone(),
-            samples=patched_samples
-        )
+                # Re-calibrate with a higher target (to reduce blur)
+                new_blur_sigma, cached_clean_samples = calibrate_blur_level(
+                    black_box=black_box,
+                    dataset_loader=trainer.train_loader,
+                    ground_truth_texts=ground_truth_texts,
+                    target_correct_rate=blur_target_rate,
+                    sigma_min=0.0,
+                    sigma_max=current_blur_sigma,  # Can only decrease blur
+                    tolerance=0.10,
+                    max_iterations=5,  # Quick recalibration
+                    device=device
+                )
 
-        # Step 4: Fine-tune adapter on replay buffer
-        print("Fine-tuning adapter...")
+                if new_blur_sigma < current_blur_sigma:
+                    current_blur_sigma = new_blur_sigma
+                    trainer.set_blur_sigma(current_blur_sigma)
+                    print(f"*** New blur sigma: {current_blur_sigma:.2f}")
+
+            # Step 3: Update replay buffer
+            replay_buffer.add_patch_epoch(
+                epoch=epoch,
+                patch=trainer.patch.detach().clone(),
+                samples=patched_samples
+            )
+            cycle_samples.extend(patched_samples)
+
+            # Record history
+            history['epoch'].append(epoch + 1)
+            history['patch_loss_total'].append(patch_losses['total'])
+            history['patch_loss_det'].append(patch_losses['det'])
+            history['patch_loss_ocr'].append(patch_losses['ocr'])
+            history['patch_loss_tv'].append(patch_losses['tv'])
+            history['bb_success_rate'].append(bb_success_rate)
+            history['blur_sigma'].append(current_blur_sigma)
+
+            # Save checkpoint every epoch
+            trainer.save_patch(epoch, save_dir="bb_patches")
+
+            # Save models periodically (less frequently to save disk space)
+            if (epoch + 1) % save_interval == 0:
+                models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
+
+        # Step 4: Fine-tune adapter after 4 patch epochs
+        print(f"\n{'*' * 60}")
+        print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
+        print('*' * 60)
         training_samples = replay_buffer.get_training_samples()
         metrics = surrogate_trainer.fine_tune(
             training_samples,
@@ -1249,24 +1281,13 @@ def optimize_patch_bb(
         print(f"  Converged: {metrics.converged}")
         print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
 
-        # Record history
-        history['epoch'].append(epoch + 1)
-        history['patch_loss_total'].append(patch_losses['total'])
-        history['patch_loss_det'].append(patch_losses['det'])
-        history['patch_loss_ocr'].append(patch_losses['ocr'])
-        history['patch_loss_tv'].append(patch_losses['tv'])
-        history['surrogate_ocr_loss'].append(metrics.ocr_loss)
-        history['surrogate_conf_mse'].append(metrics.confidence_mse)
-        history['surrogate_converged'].append(metrics.converged)
-        history['bb_success_rate'].append(bb_success_rate)
-        history['blur_sigma'].append(current_blur_sigma)
+        # Record adapter metrics for all patch epochs in this cycle
+        for _ in range(patch_epochs_per_cycle):
+            history['surrogate_ocr_loss'].append(metrics.ocr_loss)
+            history['surrogate_conf_mse'].append(metrics.confidence_mse)
+            history['surrogate_converged'].append(metrics.converged)
 
-        # Save checkpoint every epoch
-        trainer.save_patch(epoch, save_dir="bb_patches")
-
-        # Save models periodically (less frequently to save disk space)
-        if (epoch + 1) % save_interval == 0:
-            models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
+        total_patch_epoch += patch_epochs_per_cycle
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
