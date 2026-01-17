@@ -1114,7 +1114,7 @@ def optimize_patch_bb(
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
         confidence_mse_threshold=confidence_mse_threshold,
-        max_epochs=200
+        max_epochs=100
     )
 
     # Create replay buffer
