@@ -176,9 +176,8 @@ class ReplayBuffer:
     Manages fine-tuning dataset with structured sampling.
 
     After initial epochs, maintains:
-    - 25% clean (unpatched) images
-    - 25% images with the most recent patch
-    - 50% historical patches with exponential decay favoring recency
+    - 33% images with the most recent patch
+    - 67% historical patches with exponential decay favoring recency
     """
 
     def __init__(
@@ -200,16 +199,11 @@ class ReplayBuffer:
         self.decay_rate = math.log(2) / decay_half_life
 
         # Storage: each entry is (image_tensor, corners, transform, bb_result)
-        self.clean_samples: List[Tuple] = []
         self.last_patch_samples: List[Tuple] = []
         # Historical: list of (epoch, patch_tensor, samples)
         self.historical: List[Tuple[int, torch.Tensor, List[Tuple]]] = []
 
         self.current_epoch = 0
-
-    def add_clean_samples(self, samples: List[Tuple]):
-        """Add clean (unpatched) samples with their black-box results."""
-        self.clean_samples = samples
 
     def add_patch_epoch(
         self,
@@ -254,32 +248,25 @@ class ReplayBuffer:
         """
         if self.current_epoch < self.initial_epochs:
             # Initial epochs: use all available samples
-            all_samples = list(self.clean_samples)
-            all_samples.extend(self.last_patch_samples)
+            all_samples = list(self.last_patch_samples)
             for _, _, samples in self.historical:
                 all_samples.extend(samples)
             return all_samples
 
-        # After initial epochs: apply 25/25/50 split
-        target_size = min(self.max_size, len(self.clean_samples) * 4)
+        # After initial epochs: apply 33/67 split (recent/historical)
+        target_size = min(self.max_size, len(self.last_patch_samples) * 3)
 
-        clean_count = target_size // 4
-        last_patch_count = target_size // 4
-        historical_count = target_size - clean_count - last_patch_count
+        last_patch_count = target_size // 3
+        historical_count = target_size - last_patch_count
 
         result = []
 
-        # 25% clean samples
-        if self.clean_samples:
-            clean_indices = self._sample_indices(len(self.clean_samples), clean_count)
-            result.extend([self.clean_samples[i] for i in clean_indices])
-
-        # 25% last patch samples
+        # 33% last patch samples
         if self.last_patch_samples:
             last_indices = self._sample_indices(len(self.last_patch_samples), last_patch_count)
             result.extend([self.last_patch_samples[i] for i in last_indices])
 
-        # 50% historical with exponential decay
+        # 67% historical with exponential decay
         if self.historical and historical_count > 0:
             historical_samples = self._sample_historical(historical_count)
             result.extend(historical_samples)
@@ -333,7 +320,7 @@ class ReplayBuffer:
         return [all_samples_with_epoch[i] for i in indices]
 
     def __len__(self) -> int:
-        total = len(self.clean_samples) + len(self.last_patch_samples)
+        total = len(self.last_patch_samples)
         for _, _, samples in self.historical:
             total += len(samples)
         return total
@@ -1238,20 +1225,6 @@ def optimize_patch_bb(
                 current_blur_sigma = new_blur_sigma
                 trainer.set_blur_sigma(current_blur_sigma)
                 print(f"*** New blur sigma: {current_blur_sigma:.2f}")
-
-                # Use cached samples from calibration (no re-querying needed)
-                print("*** Using cached samples from calibration...")
-                clean_samples = cached_clean_samples
-                replay_buffer.add_clean_samples(clean_samples)
-
-                # Fine-tune adapter on new clean samples
-                print("*** Fine-tuning adapter on less blurred data...")
-                surrogate_trainer.fine_tune(
-                    clean_samples,
-                    verbose=verbose,
-                    adapter_optimizer=adapter_optimizer,
-                    adapter_scheduler=adapter_scheduler
-                )
 
         # Step 3: Update replay buffer
         replay_buffer.add_patch_epoch(
