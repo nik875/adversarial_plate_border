@@ -455,21 +455,22 @@ class SurrogateTrainer:
 
             pbar.close()
 
-            # Evaluate on entire dataset after epoch
-            metrics = self._evaluate(samples)
+            # Use training metrics instead of re-evaluating (much faster)
+            avg_ocr_loss = epoch_ocr_loss / max(1, samples_processed)
+            avg_conf_loss = epoch_conf_loss / max(1, samples_processed)
 
             if verbose:
                 adapter_lr = adapter_optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch + 1}: ocr_loss={metrics.ocr_loss:.4f}, "
-                      f"conf_mse={metrics.confidence_mse:.4f} | "
+                print(f"  Epoch {epoch + 1}: ocr_loss={avg_ocr_loss:.4f}, "
+                      f"conf_mse={avg_conf_loss:.4f} | "
                       f"LR: adapter={adapter_lr:.2e}")
 
             # Step scheduler (linear warmup + cosine annealing)
             adapter_scheduler.step()
 
-            # Check convergence based on whole-dataset metrics
-            if (metrics.ocr_loss <= self.ocr_loss_threshold and
-                    metrics.confidence_mse <= self.confidence_mse_threshold):
+            # Check convergence based on training metrics
+            if (avg_ocr_loss <= self.ocr_loss_threshold and
+                    avg_conf_loss <= self.confidence_mse_threshold):
                 converged = True
                 if verbose:
                     print(f"  Converged at epoch {epoch + 1}")
@@ -478,11 +479,13 @@ class SurrogateTrainer:
         # Freeze models again
         self.models.freeze_all()
 
-        # Final evaluation
-        final_metrics = self._evaluate(samples)
-        final_metrics.converged = converged
-
-        return final_metrics
+        # Return final metrics from last training epoch
+        return FinetuneMetrics(
+            ocr_loss=avg_ocr_loss,
+            confidence_mse=avg_conf_loss,
+            num_samples=samples_processed,
+            converged=converged
+        )
 
     def _train_step(
         self,
