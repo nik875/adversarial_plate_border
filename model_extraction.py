@@ -347,7 +347,7 @@ class SurrogateTrainer:
         models: ALPRModels,
         trainer: 'AdversarialPatchTrainer',
         device: str,
-        ocr_loss_threshold: float = 0.25,
+        ocr_loss_threshold: float = 0.2,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 1e-3,
         max_epochs: int = 100
@@ -1051,7 +1051,7 @@ def optimize_patch_bb(
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
     blur_sigma_init: Optional[float] = None,
-    ocr_loss_threshold: float = 0.25,
+    ocr_loss_threshold: float = 0.2,
     confidence_mse_threshold: float = 0.1,
     save_interval: int = 10,
     verbose: bool = True,
