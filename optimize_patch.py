@@ -83,13 +83,13 @@ class PatchAdapter(nn.Module):
         self.bottleneck = self._conv_block(256, 256)  # 32×16
 
         # Decoder (upsampling path)
-        self.dec4 = self._upconv_block(256, 128)  # 64×32
-        self.dec3 = self._upconv_block(256, 64)   # 128×64 (cat with enc3)
-        self.dec2 = self._upconv_block(128, 32)   # 256×128 (cat with enc2)
-        self.dec1 = self._upconv_block(64, 16)    # 512×256 (cat with enc1)
+        self.dec4 = self._upconv_block(256, 128)  # 64×32 (takes bottleneck)
+        self.dec3 = self._upconv_block(384, 64)   # 128×64 (takes d4+e4: 128+256=384)
+        self.dec2 = self._upconv_block(192, 32)   # 256×128 (takes d3+e3: 64+128=192)
+        self.dec1 = self._upconv_block(96, 16)    # 512×256 (takes d2+e2: 32+64=96)
 
         # Final output
-        self.out_conv = nn.Conv2d(32, 3, 1)  # 1×1 conv to get 3 channels
+        self.out_conv = nn.Conv2d(48, 3, 1)  # 1×1 conv (takes d1+e1: 16+32=48)
         self.out_activation = nn.Sigmoid()   # Keep in [0, 1]
 
         self.pool = nn.MaxPool2d(2, 2)
