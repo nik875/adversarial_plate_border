@@ -476,17 +476,17 @@ class SurrogateTrainer:
 
         adapter_optimizer.zero_grad()
 
+        # Normalize patch to [0,1] before adapter (once for all samples)
+        patch_normalized = torch.sigmoid(self.trainer.patch)
+
+        # Transform patch through adapter (once for all samples)
+        adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
         for sample in batch:
             unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
 
             if bb_result.text is None:
                 continue
-
-            # Normalize patch to [0,1] before adapter
-            patch_normalized = torch.sigmoid(self.trainer.patch)
-
-            # Transform patch through adapter
-            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
             # Apply adapted patch to unpatched prep image
             patched_prep, _ = self.trainer.apply_patch_to_image(
@@ -549,10 +549,9 @@ class SurrogateTrainer:
                 align_corners=True
             ).to(self.device)
 
-            # OCR forward (frozen model, no gradients needed)
-            with torch.no_grad():
-                ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-                ocr_output = self.models.ocr(ocr_input)
+            # OCR forward
+            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+            ocr_output = self.models.ocr(ocr_input)
 
             # OCR loss against black-box text
             target_tensor = text_to_target_tensor(
@@ -593,6 +592,12 @@ class SurrogateTrainer:
         valid_samples = 0
 
         with torch.no_grad():
+            # Normalize patch to [0,1] before adapter (once for all samples)
+            patch_normalized = torch.sigmoid(self.trainer.patch)
+
+            # Transform patch through adapter (once for all samples)
+            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
             for sample in samples:
                 unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
 
@@ -600,12 +605,6 @@ class SurrogateTrainer:
                     continue
 
                 valid_samples += 1
-
-                # Normalize patch to [0,1] before adapter
-                patch_normalized = torch.sigmoid(self.trainer.patch)
-
-                # Transform patch through adapter
-                adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
                 # Apply adapted patch to unpatched prep image
                 patched_prep, _ = self.trainer.apply_patch_to_image(
