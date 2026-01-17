@@ -57,14 +57,18 @@ class LargeFastALPR(BlackBoxModel):
         corners: Optional[List[torch.Tensor]] = None
     ) -> List[ALPRResult]:
         """
-        Evaluate images using fast-alpr.
+        Evaluate images using fast-alpr with batch processing.
 
         Detection is chosen by:
         - IoU with ground truth corners (when corners provided)
         - Highest confidence (when corners not provided)
         """
         results: List[ALPRResult] = []
+        batch_size = 32
 
+        # Convert all images to BGR numpy arrays
+        images_bgr = []
+        valid_indices = []
         for idx, image in enumerate(images):
             # torch [C,H,W] -> uint8 BGR numpy
             img_np = image.permute(1, 2, 0).cpu().numpy()
@@ -75,64 +79,79 @@ class LargeFastALPR(BlackBoxModel):
                 continue
 
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            images_bgr.append(img_bgr)
+            valid_indices.append(idx)
+
+        if not images_bgr:
+            return results
+
+        # Process in batches
+        for batch_start in range(0, len(images_bgr), batch_size):
+            batch_end = min(batch_start + batch_size, len(images_bgr))
+            batch_images = images_bgr[batch_start:batch_end]
+            batch_indices = valid_indices[batch_start:batch_end]
 
             try:
-                predictions = self.alpr.predict(img_bgr)
+                # Batch detection
+                batch_predictions = self.alpr.detector.detector.predict(batch_images)
             except Exception as e:
-                print(f"ALPR inference failed: {e}")
-                results.append(ALPRResult(text=None, confidence=0.0))
+                print(f"ALPR batch inference failed: {e}")
+                for _ in batch_indices:
+                    results.append(ALPRResult(text=None, confidence=0.0))
                 continue
 
-            if not predictions:
-                results.append(ALPRResult(text=None, confidence=0.0))
-                continue
+            # Process each image's detections
+            for local_idx, (pred_list, global_idx) in enumerate(zip(batch_predictions, batch_indices)):
+                if not pred_list:
+                    results.append(ALPRResult(text=None, confidence=0.0))
+                    continue
 
-            # Select best detection based on IoU or confidence
-            best_pred = None
+                # Select best detection based on IoU or confidence
+                best_pred = None
 
-            if corners is not None and idx < len(corners):
-                # IoU-based selection (matches model_extraction approach)
-                gt_corners = corners[idx]
-                target_box = corners_to_bbox(gt_corners)
-                best_iou = -1.0
+                if corners is not None and global_idx < len(corners):
+                    # IoU-based selection (matches model_extraction approach)
+                    gt_corners = corners[global_idx]
+                    target_box = corners_to_bbox(gt_corners)
+                    best_iou = -1.0
 
-                for pred in predictions:
-                    if pred.bounding_box is None:
-                        continue
+                    for pred in pred_list:
+                        if pred.bounding_box is None:
+                            continue
 
-                    # fast-alpr bbox: [x1, y1, x2, y2]
-                    pred_box = torch.tensor([
-                        pred.bounding_box.x1,
-                        pred.bounding_box.y1,
-                        pred.bounding_box.x2,
-                        pred.bounding_box.y2
-                    ], dtype=torch.float32)
+                        # fast-alpr bbox: [x1, y1, x2, y2]
+                        pred_box = torch.tensor([
+                            pred.bounding_box.x1,
+                            pred.bounding_box.y1,
+                            pred.bounding_box.x2,
+                            pred.bounding_box.y2
+                        ], dtype=torch.float32)
 
-                    iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
+                        iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
 
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_pred = pred
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_pred = pred
 
-            else:
-                # Confidence-based selection (fallback)
-                best_conf = -1.0
-                for pred in predictions:
-                    if pred.ocr is None:
-                        continue
-                    if pred.ocr.confidence > best_conf:
-                        best_conf = pred.ocr.confidence
-                        best_pred = pred
+                else:
+                    # Confidence-based selection (fallback)
+                    best_conf = -1.0
+                    for pred in pred_list:
+                        if pred.ocr is None:
+                            continue
+                        if pred.ocr.confidence > best_conf:
+                            best_conf = pred.ocr.confidence
+                            best_pred = pred
 
-            if best_pred is None or best_pred.ocr is None:
-                results.append(ALPRResult(text=None, confidence=0.0))
-            else:
-                results.append(
-                    ALPRResult(
-                        text=best_pred.ocr.text,
-                        confidence=float(best_pred.ocr.confidence),
+                if best_pred is None or best_pred.ocr is None:
+                    results.append(ALPRResult(text=None, confidence=0.0))
+                else:
+                    results.append(
+                        ALPRResult(
+                            text=best_pred.ocr.text,
+                            confidence=float(best_pred.ocr.confidence),
+                        )
                     )
-                )
 
         return results
 
