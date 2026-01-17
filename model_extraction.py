@@ -492,7 +492,7 @@ class SurrogateTrainer:
         batch: List[Tuple],
         adapter_optimizer: optim.Optimizer
     ) -> Tuple[float, float, float, float, int]:
-        """Single training step on a batch.
+        """Batched training step - processes all samples together for faster inference.
 
         Returns:
             Tuple of (ocr_loss_sum, conf_loss_sum, match_rate, conf_mse, valid_samples)
@@ -503,100 +503,139 @@ class SurrogateTrainer:
         self.models.ocr.eval()
         self.models.adapter.train()
 
-        total_ocr_loss = 0.0
-        total_conf_loss = 0.0
-        correct_matches = 0
-        valid_samples = 0
-        conf_squared_errors = []
-
         adapter_optimizer.zero_grad()
 
-        # Normalize patch to [0,1] before adapter (once for all samples)
-        patch_normalized = torch.sigmoid(self.trainer.patch)
-
         # Transform patch through adapter (once for all samples)
+        patch_normalized = torch.sigmoid(self.trainer.patch)
         adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
-        for sample in batch:
-            unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
+        # Filter valid samples (those with black-box text)
+        valid_samples_list = [s for s in batch if s[5].text is not None]
+        if len(valid_samples_list) == 0:
+            return 0.0, 0.0, 0.0, float('inf'), 0
 
-            if bb_result.text is None:
-                continue
+        # Stack into batch tensors
+        unpatched_prep_batch = torch.stack([s[0] for s in valid_samples_list]).to(self.device)
+        unpatched_orig_batch = torch.stack([s[1] for s in valid_samples_list]).to(self.device)
+        corners_batch = torch.stack([s[2] for s in valid_samples_list]).to(self.device)
+        orig_corners_batch = torch.stack([s[3] for s in valid_samples_list]).to(self.device)
+        transforms_batch = [s[4] for s in valid_samples_list]
+        bb_results_batch = [s[5] for s in valid_samples_list]
 
-            # Apply adapted patch to unpatched prep image
-            patched_prep, _ = self.trainer.apply_patch_to_image(
-                unpatched_prep.to(self.device).unsqueeze(0),
-                corners.to(self.device).unsqueeze(0),
-                patch_override=adapted_patch
-            )
-            patched_prep = patched_prep.squeeze(0)
+        batch_size = len(valid_samples_list)
 
-            # Run detector on patched image (frozen model, no gradients needed)
-            with torch.no_grad():
-                detector_output = self.models.detector(patched_prep.unsqueeze(0))
+        # Apply patch to ALL prep images at once
+        patched_prep_batch, _ = self.trainer.apply_patch_to_image(
+            unpatched_prep_batch,
+            corners_batch,
+            patch_override=adapted_patch
+        )
 
-            if len(detector_output) == 0:
+        # Run detector on ALL images at once (major speedup)
+        with torch.no_grad():
+            detector_outputs = self.models.detector(patched_prep_batch)
+
+        # Parse detector outputs based on format (list or tensor with batch index)
+        if isinstance(detector_outputs, list):
+            detections_per_image = detector_outputs
+        else:
+            # Single tensor with batch indices in column 0
+            detections_per_image = []
+            for i in range(batch_size):
+                img_dets = detector_outputs[detector_outputs[:, 0] == i]
+                detections_per_image.append(img_dets)
+
+        # Find best detection for each image via IoU
+        best_detections = []
+        valid_indices = []
+
+        for i in range(batch_size):
+            img_detections = detections_per_image[i]
+
+            if len(img_detections) == 0:
                 continue
 
             # Find best detection (highest IoU with target plate region)
-            target_box = corners_to_bbox(corners.to(self.device))
+            target_box = corners_to_bbox(corners_batch[i])
             best_det = None
             best_iou = -1.0
 
-            for detection in detector_output:
+            for detection in img_detections:
                 pred_box = detection[1:5]
                 iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
                 if iou > best_iou:
                     best_iou = iou
                     best_det = detection
 
-            if best_det is None:
-                continue
+            if best_det is not None:
+                best_detections.append(best_det)
+                valid_indices.append(i)
 
-            valid_samples += 1
-            pred_conf = best_det[6]
+        if len(valid_indices) == 0:
+            return 0.0, 0.0, 0.0, float('inf'), 0
+
+        # Filter to only samples with valid detections
+        valid_orig_batch = unpatched_orig_batch[valid_indices]
+        valid_orig_corners = orig_corners_batch[valid_indices]
+        valid_transforms = [transforms_batch[i] for i in valid_indices]
+        valid_bb_results = [bb_results_batch[i] for i in valid_indices]
+        num_valid = len(valid_indices)
+
+        # Apply patch to ALL orig images at once
+        patched_orig_batch, _ = self.trainer.apply_patch_to_image(
+            valid_orig_batch,
+            valid_orig_corners,
+            patch_override=adapted_patch
+        )
+
+        # Crop ALL plate regions at once
+        corners_boxes = []
+        for i, det in enumerate(best_detections):
+            pred_box = det[1:5]
+            orig_projection = invert_bbox(pred_box.to('cpu'), valid_transforms[i])
+            corners_box = bbox_to_corners(orig_projection, device='cpu')
+            corners_boxes.append(corners_box)
+
+        corners_boxes_batch = torch.cat(corners_boxes, dim=0)
+
+        cropped_plates = kornia.geometry.crop_and_resize(
+            patched_orig_batch,
+            corners_boxes_batch,
+            OCR_INPUT_SHAPE[:2],
+            mode='bilinear',
+            align_corners=True
+        ).to(self.device)
+
+        # Run OCR on ALL crops at once (major speedup)
+        ocr_inputs = cropped_plates.permute(0, 2, 3, 1) * 255
+        ocr_outputs = self.models.ocr(ocr_inputs)
+
+        # Compute losses for all samples
+        total_ocr_loss = 0.0
+        total_conf_loss = 0.0
+        correct_matches = 0
+        conf_squared_errors = []
+
+        for i in range(num_valid):
+            det = best_detections[i]
+            bb_result = valid_bb_results[i]
 
             # Confidence loss
+            pred_conf = det[6]
             target_conf = torch.tensor(bb_result.confidence, device=self.device)
             conf_loss = F.mse_loss(pred_conf, target_conf)
             total_conf_loss += conf_loss
-
             conf_squared_errors.append((pred_conf.item() - bb_result.confidence) ** 2)
 
-            # Apply adapted patch to original image for OCR
-            patched_orig, _ = self.trainer.apply_patch_to_image(
-                unpatched_orig.to(self.device).unsqueeze(0),
-                orig_corners.to(self.device).unsqueeze(0),
-                patch_override=adapted_patch
-            )
-            patched_orig = patched_orig.squeeze(0)
-
-            # Get plate crop for OCR
-            pred_box = best_det[1:5]
-            orig_projection = invert_bbox(pred_box.to('cpu'), transform)
-            corners_box = bbox_to_corners(orig_projection, device='cpu')
-
-            cropped_plate = kornia.geometry.crop_and_resize(
-                patched_orig.unsqueeze(0),
-                corners_box,
-                OCR_INPUT_SHAPE[:2],
-                mode='bilinear',
-                align_corners=True
-            ).to(self.device)
-
-            # OCR forward
-            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            ocr_output = self.models.ocr(ocr_input)
-
-            # OCR loss against black-box text
+            # OCR loss
             target_tensor = text_to_target_tensor(
                 bb_result.text, OCR_MAX_SLOTS, OCR_ALPHABET, self.device
             )
-            ocr_loss = self.ocr_loss_fn(target_tensor, ocr_output)
+            ocr_loss = self.ocr_loss_fn(target_tensor, ocr_outputs[i:i+1])
             total_ocr_loss += ocr_loss
 
             # Check exact match
-            pred_text = logits_to_text(ocr_output)
+            pred_text = logits_to_text(ocr_outputs[i:i+1])
             if pred_text == bb_result.text:
                 correct_matches += 1
 
@@ -608,8 +647,7 @@ class SurrogateTrainer:
 
         self.models.adapter.eval()
 
-        n = len(batch)
-        match_rate = correct_matches / n if n > 0 else 0.0
+        match_rate = correct_matches / num_valid if num_valid > 0 else 0.0
         conf_mse = np.mean(conf_squared_errors) if conf_squared_errors else float('inf')
 
         return (
@@ -617,7 +655,7 @@ class SurrogateTrainer:
             total_conf_loss.item() if isinstance(total_conf_loss, torch.Tensor) else 0.0,
             match_rate,
             conf_mse,
-            valid_samples
+            num_valid
         )
 
     def _evaluate(self, samples: List[Tuple]) -> FinetuneMetrics:
