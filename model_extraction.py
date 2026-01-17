@@ -622,7 +622,7 @@ class SurrogateTrainer:
                     continue
 
                 # Find best detection (highest IoU with target plate region)
-                target_box = corners_to_bbox(corners)
+                target_box = corners_to_bbox(corners).to(self.device)
                 best_det = None
                 best_iou = -1.0
 
