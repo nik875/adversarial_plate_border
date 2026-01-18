@@ -198,11 +198,11 @@ class ReplayBuffer:
         self.initial_epochs = initial_epochs
         self.decay_rate = math.log(2) / decay_half_life
 
-        # Storage: each entry is (image_tensor, corners, transform, bb_result)
-        self.last_patch_samples: List[Tuple] = []
+        # Storage: lightweight metadata dicts (dataset_idx, corners, transform, bb_result)
+        self.last_patch_samples: List[Dict] = []
         self.last_patch: Optional[torch.Tensor] = None
         # Historical: list of (epoch, patch_tensor, samples)
-        self.historical: List[Tuple[int, torch.Tensor, List[Tuple]]] = []
+        self.historical: List[Tuple[int, torch.Tensor, List[Dict]]] = []
 
         self.current_epoch = 0
 
@@ -210,7 +210,7 @@ class ReplayBuffer:
         self,
         epoch: int,
         patch: torch.Tensor,
-        samples: List[Tuple]
+        samples: List[Dict]
     ):
         """
         Add samples from a patch optimization epoch.
@@ -218,7 +218,7 @@ class ReplayBuffer:
         Args:
             epoch: Current epoch number
             patch: The patch tensor used
-            samples: List of (image, corners, transform, bb_result)
+            samples: List of metadata dicts (dataset_idx, corners, transform, bb_result)
         """
         self.current_epoch = epoch
 
@@ -231,12 +231,12 @@ class ReplayBuffer:
         self.last_patch_samples = samples
         self.last_patch = patch.clone()
 
-    def get_training_samples(self) -> List[Tuple]:
+    def get_training_samples(self) -> List[Dict]:
         """
         Get samples for fine-tuning according to the sampling strategy.
 
         Returns:
-            List of (image, corners, transform, bb_result) tuples
+            List of metadata dicts (dataset_idx, corners, transform, bb_result)
         """
         if self.current_epoch < self.initial_epochs:
             # Initial epochs: use all available samples
@@ -381,7 +381,7 @@ class SurrogateTrainer:
         The ALPR detector and OCR models remain frozen - only the adapter is trained.
 
         Args:
-            samples: List of (prep_image, orig_image, corners, orig_corners, transform, bb_result)
+            samples: List of metadata dicts (dataset_idx, corners, orig_corners, transform, bb_result)
             batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
             adapter_optimizer: Optional pre-created adapter optimizer (reuses across epochs)
@@ -510,12 +510,22 @@ class SurrogateTrainer:
         adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
         for sample in batch:
-            unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
+            # Sample is now a dict with metadata
+            dataset_idx = sample['dataset_idx']
+            corners = sample['corners']
+            orig_corners = sample['orig_corners']
+            transform = sample['transform']
+            bb_result = sample['bb_result']
 
             if bb_result.text is None:
                 continue
 
-            # Apply adapted patch to unpatched prep image
+            # Load original images from dataset on-the-fly
+            dataset_item = self.trainer.train_loader.dataset[dataset_idx]
+            unpatched_prep = dataset_item['prep_image']
+            unpatched_orig = dataset_item['orig_image']
+
+            # Apply adapted patch to prep image
             patched_prep, _ = self.trainer.apply_patch_to_image(
                 unpatched_prep.to(self.device).unsqueeze(0),
                 corners.to(self.device).unsqueeze(0),
@@ -971,7 +981,8 @@ def collect_patched_samples(
 
     Returns:
         Tuple of (samples, success_rate) where success_rate is the rate
-        at which black-box correctly reads plates (compared to ground truth)
+        at which black-box correctly reads plates (compared to ground truth).
+        Samples are now lightweight metadata dicts, not full images.
     """
     samples = []
     correct = 0
@@ -983,9 +994,6 @@ def collect_patched_samples(
             for idx, batch in pbar:
                 batch = {k: v[0] for k, v in batch.items()}
 
-                # Store unpatched images (for adapter training)
-                unpatched_prep = batch['prep_image'].cpu()
-                unpatched_orig = batch['orig_image'].cpu()
                 corners = batch['new_corners']
                 orig_corners = batch['orig_corners']
                 transform = batch['transform']
@@ -1014,15 +1022,16 @@ def collect_patched_samples(
                 results = black_box.evaluate([patched_orig], corners=[orig_corners])
                 bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
-                # Store both unpatched (for adapter training) and black-box result
-                samples.append((
-                    unpatched_prep,
-                    unpatched_orig,
-                    corners,
-                    orig_corners,
-                    transform,
-                    bb_result
-                ))
+                # Discard images, store only lightweight metadata
+                del patched_prep, patched_orig
+
+                samples.append({
+                    'dataset_idx': idx,
+                    'corners': corners.cpu(),
+                    'orig_corners': orig_corners.cpu(),
+                    'transform': transform.cpu(),
+                    'bb_result': bb_result
+                })
 
                 # Track success rate against ground truth
                 if idx in ground_truth_texts:
