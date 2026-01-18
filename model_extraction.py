@@ -480,13 +480,16 @@ class SurrogateTrainer:
         batch_size: int = 32,
         verbose: bool = True,
         optimizer: Optional[optim.Optimizer] = None,
-        scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
+        scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
+        val_samples: Optional[List[Dict]] = None,
+        early_stopping_patience: int = 20
     ) -> FinetuneMetrics:
         """
         Train surrogate model until convergence or max epochs.
 
         Each epoch processes the entire dataset with batched gradient updates.
         Convergence is checked when MSE of both predictions is below threshold.
+        If validation samples are provided, uses early stopping based on validation metrics.
 
         Args:
             samples: List of metadata dicts (dataset_idx, corners, bb_result, gt_text)
@@ -494,6 +497,8 @@ class SurrogateTrainer:
             verbose: Whether to show progress bar
             optimizer: Optional pre-created optimizer (reuses across epochs)
             scheduler: Optional pre-created scheduler
+            val_samples: Optional validation samples for early stopping
+            early_stopping_patience: Number of epochs without validation improvement before stopping
 
         Returns:
             FinetuneMetrics with final metrics
@@ -539,6 +544,11 @@ class SurrogateTrainer:
 
         converged = False
 
+        # Early stopping tracking
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+
         for epoch in range(self.max_epochs):
             # Shuffle samples at start of each epoch
             random.shuffle(samples)
@@ -573,10 +583,28 @@ class SurrogateTrainer:
             avg_ocr_mse = epoch_ocr_mse / max(1, samples_processed)
             avg_conf_mse = epoch_conf_mse / max(1, samples_processed)
 
+            # Validate on holdout set if provided
+            val_ocr_mse = None
+            val_conf_mse = None
+            if val_samples is not None and len(val_samples) > 0:
+                val_ocr_mse, val_conf_mse, _ = self._eval_step(val_samples)
+                val_loss = val_ocr_mse + val_conf_mse
+
+                # Early stopping logic
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    # Save best model state
+                    best_model_state = {k: v.cpu().clone() for k, v in self.surrogate.state_dict().items()}
+                else:
+                    patience_counter += 1
+
             if verbose:
                 lr = optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch + 1}: ocr_mse={avg_ocr_mse:.4f}, "
-                      f"conf_mse={avg_conf_mse:.4f} | LR={lr:.2e} | samples={samples_processed}")
+                msg = f"  Epoch {epoch + 1}: ocr_mse={avg_ocr_mse:.4f}, conf_mse={avg_conf_mse:.4f} | LR={lr:.2e} | samples={samples_processed}"
+                if val_samples is not None:
+                    msg += f" | val_ocr={val_ocr_mse:.4f}, val_conf={val_conf_mse:.4f}"
+                print(msg)
 
             # Step scheduler
             scheduler.step()
@@ -591,6 +619,15 @@ class SurrogateTrainer:
                     print(f"    - The 'Analyzing samples' output above shows the breakdown")
                 # Don't declare convergence with 0 samples - keep training
                 continue
+
+            # Check early stopping (on validation metrics if available, else training metrics)
+            if val_samples is not None and patience_counter >= early_stopping_patience:
+                if verbose:
+                    print(f"  Early stopping at epoch {epoch + 1} (validation loss plateau)")
+                # Restore best model
+                if best_model_state is not None:
+                    self.surrogate.load_state_dict({k: v.to(self.device) for k, v in best_model_state.items()})
+                break
 
             # Check convergence (only if we have valid samples)
             if (avg_ocr_mse <= self.edit_distance_threshold and
@@ -752,6 +789,95 @@ class SurrogateTrainer:
             actual_valid_samples
         )
 
+    def _eval_step(self, batch: List[Dict]) -> Tuple[float, float, int]:
+        """
+        Evaluation step on a batch (no backprop).
+
+        Returns:
+            Tuple of (ocr_mse_sum, conf_mse_sum, valid_samples)
+        """
+        self.surrogate.eval()
+
+        total_ocr_mse = 0.0
+        total_conf_mse = 0.0
+        valid_samples = 0
+
+        # Collect batch data
+        homographies = []
+        gt_edit_distances = []
+        gt_confidences = []
+
+        for sample in batch:
+            bb_result = sample['bb_result']
+            gt_text = sample.get('gt_text', bb_result.text)
+
+            if bb_result.text is None or gt_text is None:
+                continue
+
+            # Compute homography from corners
+            if 'orig_corners' in sample and 'corners' in sample:
+                try:
+                    src_pts = sample['orig_corners'].float().unsqueeze(0)
+                    dst_pts = sample['corners'].float().unsqueeze(0)
+                    transform = kornia.geometry.transform.get_perspective_transform(src_pts, dst_pts).squeeze(0)
+                except Exception:
+                    continue
+            else:
+                continue
+
+            # Compute normalized edit distance
+            edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+            gt_len = len(gt_text)
+            normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
+
+            homographies.append(transform)
+            gt_edit_distances.append(normalized_edit_dist)
+            gt_confidences.append(bb_result.confidence)
+            valid_samples += 1
+
+        if valid_samples == 0:
+            return 0.0, 0.0, 0
+
+        # Get current patch
+        patch_normalized = torch.sigmoid(self.trainer.patch)
+        patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1).to(self.device)
+
+        # Process homographies
+        processed_homographies = []
+        for h in homographies:
+            if h.dim() == 1:
+                if h.numel() == 9:
+                    h = h.reshape(3, 3)
+                elif h.numel() == 3:
+                    continue
+            processed_homographies.append(h)
+
+        if len(processed_homographies) == 0:
+            return 0.0, 0.0, 0
+
+        actual_valid_samples = len(processed_homographies)
+        homography_batch = torch.stack(processed_homographies).to(self.device).float().contiguous()
+        gt_edit_distances = gt_edit_distances[:actual_valid_samples]
+        gt_confidences = gt_confidences[:actual_valid_samples]
+        patch_batch = patch_batch[:actual_valid_samples]
+
+        # Stack ground truth
+        gt_edit_distances_tensor = torch.tensor(gt_edit_distances, device=self.device, dtype=torch.float32).unsqueeze(1)
+        gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device, dtype=torch.float32).unsqueeze(1)
+
+        # Forward (no backprop)
+        with torch.no_grad():
+            pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
+            edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
+            conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+
+        self.surrogate.train()  # Return to train mode
+
+        return (
+            edit_dist_mse.item() * actual_valid_samples,
+            conf_mse.item() * actual_valid_samples,
+            actual_valid_samples
+        )
 
 
 # =============================================================================
@@ -1333,12 +1459,23 @@ def optimize_patch_bb(
         )
 
         training_samples = replay_buffer.get_training_samples()
+
+        # Split cycle_samples into train/val for holdout validation
+        val_fraction = 0.2  # 20% for validation
+        num_val = max(1, int(len(cycle_samples) * val_fraction))
+        val_samples = cycle_samples[-num_val:]  # Take last samples (most recent patch data)
+
+        if verbose:
+            print(f"Using {num_val} samples for validation (holdout set)")
+
         metrics = surrogate_trainer.fine_tune(
             training_samples,
             batch_size=100,
             verbose=verbose,
             optimizer=surrogate_optimizer,
-            scheduler=surrogate_scheduler
+            scheduler=surrogate_scheduler,
+            val_samples=val_samples,
+            early_stopping_patience=20
         )
 
         print(f"Surrogate metrics:")
