@@ -674,12 +674,10 @@ class SurrogateTrainer:
 
         for sample in batch:
             bb_result = sample['bb_result']
-            gt_text = sample.get('gt_text', bb_result.text)
+            gt_text = sample.get('gt_text')
             transform = sample['transform']
 
-            if bb_result.text is None:
-                skip_reasons['bb_text_none'] += 1
-                continue
+            # Skip only if ground truth is missing
             if gt_text is None:
                 skip_reasons['gt_text_none'] += 1
                 continue
@@ -703,16 +701,25 @@ class SurrogateTrainer:
                 skip_reasons['transform_malformed_no_corners'] += 1
                 continue
 
-            # Compute normalized edit distance between bb_result and ground truth
-            # Normalize by ground truth length (fixed reference point)
-            # Clamp to [0, 1] so model has a bounded target
-            edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-            gt_len = len(gt_text)
-            normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
+            # When bb_result.text is None: detection failed, so confidence=0 and edit_dist=1.0
+            # Otherwise: compute edit distance to ground truth
+            if bb_result.text is None:
+                confidence = 0.0
+                normalized_edit_dist = 1.0  # No detection = completely wrong
+                if debug_first_batch:
+                    skip_reasons['bb_text_none'] += 1
+            else:
+                confidence = bb_result.confidence
+                # Compute normalized edit distance between bb_result and ground truth
+                # Normalize by ground truth length (fixed reference point)
+                # Clamp to [0, 1] so model has a bounded target
+                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                gt_len = len(gt_text)
+                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
-            gt_confidences.append(bb_result.confidence)
+            gt_confidences.append(confidence)
             valid_samples += 1
 
         if valid_samples == 0:
@@ -809,9 +816,9 @@ class SurrogateTrainer:
 
         for sample in batch:
             bb_result = sample['bb_result']
-            gt_text = sample.get('gt_text', bb_result.text)
+            gt_text = sample.get('gt_text')
 
-            if bb_result.text is None or gt_text is None:
+            if gt_text is None:
                 continue
 
             # Compute homography from corners
@@ -825,14 +832,21 @@ class SurrogateTrainer:
             else:
                 continue
 
-            # Compute normalized edit distance
-            edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-            gt_len = len(gt_text)
-            normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
+            # When bb_result.text is None: detection failed, so confidence=0 and edit_dist=1.0
+            # Otherwise: compute edit distance to ground truth
+            if bb_result.text is None:
+                confidence = 0.0
+                normalized_edit_dist = 1.0  # No detection = completely wrong
+            else:
+                confidence = bb_result.confidence
+                # Compute normalized edit distance
+                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                gt_len = len(gt_text)
+                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
-            gt_confidences.append(bb_result.confidence)
+            gt_confidences.append(confidence)
             valid_samples += 1
 
         if valid_samples == 0:
