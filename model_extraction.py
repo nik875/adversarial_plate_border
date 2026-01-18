@@ -341,7 +341,7 @@ class SurrogateTrainer:
         device: str,
         ocr_loss_threshold: float = 0.2,
         confidence_mse_threshold: float = 0.1,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 2.5e-3,
         max_epochs: int = 100
     ):
         """
@@ -1187,6 +1187,7 @@ def optimize_patch_bb(
     num_cycles = num_epochs // patch_epochs_per_cycle
 
     total_patch_epoch = 0
+    initial_ocr_loss = None  # Saved from first fine-tune for adaptive LR scaling
 
     for cycle in range(num_cycles):
         print(f"\n{'=' * 60}")
@@ -1267,6 +1268,16 @@ def optimize_patch_bb(
         print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
         print('*' * 60)
 
+        # Scale learning rate for subsequent cycles based on OCR loss improvement
+        if cycle > 0 and initial_ocr_loss is not None:
+            # Ratio = current_loss / initial_loss; as loss improves (< 1), lr scales down
+            lr_scale = metrics.ocr_loss / initial_ocr_loss
+            scaled_lr = surrogate_trainer.learning_rate * lr_scale
+            for param_group in adapter_optimizer.param_groups:
+                param_group['lr'] = scaled_lr
+            if verbose:
+                print(f"Scaled learning rate: {scaled_lr:.2e} (ratio: {lr_scale:.3f})")
+
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
         adapter_scheduler = LinearWarmupCosineAnnealingLR(
             adapter_optimizer,
@@ -1289,6 +1300,12 @@ def optimize_patch_bb(
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
         print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
+
+        # Save initial OCR loss from first cycle for adaptive LR scaling
+        if cycle == 0:
+            initial_ocr_loss = metrics.ocr_loss
+            if verbose:
+                print(f"Saved initial OCR loss: {initial_ocr_loss:.4f}")
 
         # Save adapter and models after fine-tuning
         final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1
