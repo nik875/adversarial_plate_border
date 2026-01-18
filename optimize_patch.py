@@ -1119,9 +1119,11 @@ class AdversarialPatchTrainer:
         )
         effective_batch_size = update_every
 
+        # Create all batches upfront (enables parallel processing)
+        all_batches = list(enumerate(self.train_loader))
+
         desc = f"Epoch {epoch + 1} (AccumSteps={update_every})"
-        with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
-                  total=len(self.train_loader)) as pbar:
+        with tqdm(all_batches, desc=desc, leave=False, total=len(self.train_loader)) as pbar:
 
             for idx, batch in pbar:
                 loss_dict = self.compute_loss(batch, return_components=True)
