@@ -75,12 +75,13 @@ class BlackBoxSurrogate(nn.Module):
     - Detection confidence
 
     This replaces the adapter-based approach with a simple query-based model.
+    Uses residual connections in CNN and cross-attention for feature fusion.
     """
 
     def __init__(self, patch_height: int = 256, patch_width: int = 512):
         super().__init__()
 
-        # CNN encoder for patch
+        # CNN encoder for patch with residual connections
         # Input: 3x256x512 (patch)
         self.conv1 = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 32x128x256
@@ -88,18 +89,21 @@ class BlackBoxSurrogate(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.1),
         )
+        self.conv2_proj = nn.Conv2d(32, 64, 1)  # Project for residual
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64x64x128
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.1),
         )
+        self.conv3_proj = nn.Conv2d(64, 128, 1)  # Project for residual
         self.conv3 = nn.Sequential(
             nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 128x32x64
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Dropout2d(0.15),
         )
+        self.conv4_proj = nn.Conv2d(128, 256, 1)  # Project for residual
         self.conv4 = nn.Sequential(
             nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 256x16x32
             nn.BatchNorm2d(256),
@@ -126,10 +130,19 @@ class BlackBoxSurrogate(nn.Module):
             nn.Dropout(0.2),
         )
 
-        # Fusion layer (concatenate CNN features + homography features)
-        # 256 (CNN) + 128 (homography) = 384
+        # Cross-attention fusion (patch features attend to homography features)
+        # Project patch features to match homography feature dim for attention
+        self.patch_to_homo_dim = nn.Linear(256, 128)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=128,
+            num_heads=4,
+            dropout=0.2,
+            batch_first=True
+        )
+
+        # Fusion layer after attention
         self.fc_fusion = nn.Sequential(
-            nn.Linear(256 + 128, 256),
+            nn.Linear(128 + 128, 256),  # Attended patch + homography features
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
         )
@@ -171,24 +184,36 @@ class BlackBoxSurrogate(nn.Module):
         assert patch.dim() == 4 and patch.size(1) == 3, \
             f"Expected patch shape [B, 3, H, W], got {patch.shape}"
 
-        # Encode patch through CNN
-        x = self.conv1(patch)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.conv5(x)
+        # Encode patch through CNN with residual connections
+        x = self.conv1(patch)  # [B, 32, 128, 256]
+
+        # Conv2 with residual (stride 2, so need projection)
+        x_res = self.conv2_proj(F.avg_pool2d(x, 2))  # [B, 64, 64, 128]
+        x = self.conv2(x)  # [B, 64, 64, 128]
+        x = x + x_res  # Residual connection
+
+        # Conv3 with residual (stride 2)
+        x_res = self.conv3_proj(F.avg_pool2d(x, 2))  # [B, 128, 32, 64]
+        x = self.conv3(x)  # [B, 128, 32, 64]
+        x = x + x_res  # Residual connection
+
+        # Conv4 with residual (stride 2)
+        x_res = self.conv4_proj(F.avg_pool2d(x, 2))  # [B, 256, 16, 32]
+        x = self.conv4(x)  # [B, 256, 16, 32]
+        x = x + x_res  # Residual connection
+
+        # Conv5 (no residual, different size)
+        x = self.conv5(x)  # [B, 256, 8, 16]
 
         # Global pooling
         x = self.gap(x)  # [B, 256, 1, 1]
         patch_features = x.view(x.size(0), -1)  # [B, 256]
 
-        # Flatten homography if needed and normalize
+        # Flatten homography if needed
         if homography.dim() == 3:  # [B, 3, 3]
             batch_size = homography.size(0)
             assert homography.size(1) == 3 and homography.size(2) == 3, \
                 f"Expected homography shape [B, 3, 3], got {homography.shape}"
-            # Flatten and take first 8 parameters (exclude h33 which is typically 1)
-            # Use reshape instead of view to handle non-contiguous tensors
             h_flat = homography.reshape(batch_size, 9)[:, :8]  # [B, 8]
         elif homography.dim() == 2 and homography.size(1) == 9:  # [B, 9]
             h_flat = homography[:, :8]  # [B, 8]
@@ -201,8 +226,20 @@ class BlackBoxSurrogate(nn.Module):
         # Encode homography
         homography_features = self.homography_encoder(h_flat)  # [B, 128]
 
-        # Concatenate features
-        combined = torch.cat([patch_features, homography_features], dim=1)  # [B, 384]
+        # Cross-attention fusion: patch features attend to homography features
+        patch_proj = self.patch_to_homo_dim(patch_features)  # [B, 128]
+        patch_proj = patch_proj.unsqueeze(1)  # [B, 1, 128] - query
+        homo_feat = homography_features.unsqueeze(1)  # [B, 1, 128] - key/value
+
+        attended_patch, _ = self.cross_attention(
+            patch_proj,  # query
+            homo_feat,   # key
+            homo_feat    # value
+        )  # [B, 1, 128]
+        attended_patch = attended_patch.squeeze(1)  # [B, 128]
+
+        # Concatenate attended patch features with homography features
+        combined = torch.cat([attended_patch, homography_features], dim=1)  # [B, 256]
 
         # Fusion
         fused = self.fc_fusion(combined)  # [B, 256]
@@ -537,7 +574,7 @@ class SurrogateTrainer:
         if scheduler is None:
             scheduler = LinearWarmupCosineAnnealingLR(
                 optimizer,
-                warmup_epochs=20,
+                warmup_epochs=5,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
@@ -1473,7 +1510,7 @@ def optimize_patch_bb(
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
         surrogate_scheduler = LinearWarmupCosineAnnealingLR(
             surrogate_optimizer,
-            warmup_epochs=20,
+            warmup_epochs=5,
             max_epochs=surrogate_trainer.max_epochs,
             min_lr=1e-6
         )
@@ -1509,9 +1546,9 @@ def optimize_patch_bb(
             initial_edit_dist_mse = metrics.ocr_loss  # ocr_loss field contains edit dist MSE
             if verbose:
                 print(f"Saved initial edit distance MSE: {initial_edit_dist_mse:.4f}")
-
-        # Save metrics for next cycle's LR scaling
-        prev_metrics = metrics
+        else:
+            # Save metrics for next cycle's LR scaling (skip cycle 0 to avoid 1.0 ratio)
+            prev_metrics = metrics
 
         # Save surrogate model after fine-tuning
         final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1

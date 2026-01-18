@@ -986,7 +986,8 @@ class AdversarialPatchTrainer:
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         loss = (tv_h + tv_v) / num_comparisons
 
-        return loss * 2.5
+        # Apply floor of 0.1 to prevent over-regularization
+        return torch.clamp_min(loss * 2.5, 0.1)
 
     def compute_loss(
         self,
