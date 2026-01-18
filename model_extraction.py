@@ -715,6 +715,7 @@ class SurrogateTrainer:
         for sample in batch:
             bb_result = sample['bb_result']
             gt_text = sample.get('gt_text')
+            gt_confidence = sample.get('gt_confidence', 0.0)
             transform = sample['transform']
 
             # Skip only if ground truth is missing
@@ -741,25 +742,33 @@ class SurrogateTrainer:
                 skip_reasons['transform_malformed_no_corners'] += 1
                 continue
 
-            # When bb_result.text is None: detection failed, so confidence=0 and edit_dist=1.0
-            # Otherwise: compute edit distance to ground truth
+            # Compute edit distance between bb_result (with patch) and gt_text (blur-only baseline)
+            # This measures how much the patch changed the black-box output
             if bb_result.text is None:
+                # No detection with patch -> maximum deviation from baseline
                 confidence = 0.0
-                normalized_edit_dist = 1.0  # No detection = completely wrong
+                if gt_text is None:
+                    # Both failed -> no change (edit_dist = 0)
+                    normalized_edit_dist = 0.0
+                else:
+                    # Baseline succeeded, patch failed -> complete disruption
+                    normalized_edit_dist = 1.0
                 if debug_first_batch:
                     skip_reasons['bb_text_none'] += 1
             else:
                 confidence = bb_result.confidence
-                # Compute normalized edit distance between bb_result and ground truth
-                # Normalize by ground truth length (fixed reference point)
-                # Clamp to [0, 1] so model has a bounded target
-                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-                gt_len = len(gt_text)
-                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
+                if gt_text is None:
+                    # Baseline failed, patch succeeded -> reverse effect (unexpected)
+                    normalized_edit_dist = 1.0
+                else:
+                    # Both detected -> compute edit distance
+                    edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                    gt_len = len(gt_text)
+                    normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
-            gt_confidences.append(confidence)
+            gt_confidences.append(gt_confidence)
             valid_samples += 1
 
         if valid_samples == 0:
@@ -819,9 +828,27 @@ class SurrogateTrainer:
         # Forward through surrogate
         pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
 
-        # Compute MSE losses
-        edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
-        conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+        # Z-score normalization within batch to prevent mean-seeking behavior
+        # This forces the model to learn relative differences, not absolute values
+        def zscore_normalize(x, eps=1e-8):
+            """Normalize to z-scores within batch."""
+            mean = x.mean()
+            std = x.std() + eps
+            return (x - mean) / std
+
+        # Only apply z-score if batch has variance (std > 0)
+        if actual_valid_samples > 1:
+            pred_edit_z = zscore_normalize(pred_edit_distance)
+            gt_edit_z = zscore_normalize(gt_edit_distances_tensor)
+            pred_conf_z = zscore_normalize(pred_confidence)
+            gt_conf_z = zscore_normalize(gt_confidences_tensor)
+
+            edit_dist_mse = F.mse_loss(pred_edit_z, gt_edit_z)
+            conf_mse = F.mse_loss(pred_conf_z, gt_conf_z)
+        else:
+            # Fall back to regular MSE for single-sample batches
+            edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
+            conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
 
         # Combined loss
         total_loss = edit_dist_mse + conf_mse
@@ -857,6 +884,7 @@ class SurrogateTrainer:
         for sample in batch:
             bb_result = sample['bb_result']
             gt_text = sample.get('gt_text')
+            gt_confidence = sample.get('gt_confidence', 0.0)
 
             if gt_text is None:
                 continue
@@ -872,21 +900,25 @@ class SurrogateTrainer:
             else:
                 continue
 
-            # When bb_result.text is None: detection failed, so confidence=0 and edit_dist=1.0
-            # Otherwise: compute edit distance to ground truth
+            # Compute edit distance between bb_result (with patch) and gt_text (blur-only baseline)
             if bb_result.text is None:
                 confidence = 0.0
-                normalized_edit_dist = 1.0  # No detection = completely wrong
+                if gt_text is None:
+                    normalized_edit_dist = 0.0
+                else:
+                    normalized_edit_dist = 1.0
             else:
                 confidence = bb_result.confidence
-                # Compute normalized edit distance
-                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-                gt_len = len(gt_text)
-                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
+                if gt_text is None:
+                    normalized_edit_dist = 1.0
+                else:
+                    edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                    gt_len = len(gt_text)
+                    normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
-            gt_confidences.append(confidence)
+            gt_confidences.append(gt_confidence)
             valid_samples += 1
 
         if valid_samples == 0:
@@ -922,8 +954,24 @@ class SurrogateTrainer:
         # Forward (no backprop)
         with torch.no_grad():
             pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
-            edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
-            conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+
+            # Z-score normalization (same as training)
+            def zscore_normalize(x, eps=1e-8):
+                mean = x.mean()
+                std = x.std() + eps
+                return (x - mean) / std
+
+            if actual_valid_samples > 1:
+                pred_edit_z = zscore_normalize(pred_edit_distance)
+                gt_edit_z = zscore_normalize(gt_edit_distances_tensor)
+                pred_conf_z = zscore_normalize(pred_confidence)
+                gt_conf_z = zscore_normalize(gt_confidences_tensor)
+
+                edit_dist_mse = F.mse_loss(pred_edit_z, gt_edit_z)
+                conf_mse = F.mse_loss(pred_conf_z, gt_conf_z)
+            else:
+                edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
+                conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
 
         self.surrogate.train()  # Return to train mode
 
@@ -1181,7 +1229,8 @@ def collect_dataset_with_blur(
 def collect_patched_samples(
     black_box: BlackBoxModel,
     trainer: AdversarialPatchTrainer,
-    ground_truth_texts: Dict[int, str],
+    blur_only_ground_truth: Dict[int, Tuple[Optional[str], float]],
+    actual_plate_texts: Dict[int, str],
     blur_sigma: float = 0.0
 ) -> Tuple[List[Tuple], float]:
     """
@@ -1190,12 +1239,13 @@ def collect_patched_samples(
     Args:
         black_box: Black-box ALPR model
         trainer: Patch trainer instance
-        ground_truth_texts: Dict mapping dataset index to ground truth plate text
+        blur_only_ground_truth: Dict mapping dataset index to (blur_only_text, blur_only_confidence)
+        actual_plate_texts: Dict mapping dataset index to actual plate text (for success rate tracking)
         blur_sigma: Blur sigma to apply after patching (simulates real-world degradation)
 
     Returns:
         Tuple of (samples, success_rate) where success_rate is the rate
-        at which black-box correctly reads plates (compared to ground truth).
+        at which black-box correctly reads plates (compared to actual plate text).
         Samples are now lightweight metadata dicts, not full images.
     """
     samples = []
@@ -1239,8 +1289,8 @@ def collect_patched_samples(
                 # Discard images, store only lightweight metadata
                 del patched_prep, patched_orig
 
-                # Get ground truth text for this sample
-                gt_text = ground_truth_texts.get(idx, None)
+                # Get ground truth from blur-only baseline (what black-box said without patch)
+                gt_text, gt_confidence = blur_only_ground_truth.get(idx, (None, 0.0))
 
                 samples.append({
                     'dataset_idx': idx,
@@ -1248,13 +1298,14 @@ def collect_patched_samples(
                     'orig_corners': orig_corners.cpu(),
                     'transform': transform.cpu(),
                     'bb_result': bb_result,
-                    'gt_text': gt_text
+                    'gt_text': gt_text,
+                    'gt_confidence': gt_confidence
                 })
 
-                # Track success rate against ground truth
-                if idx in ground_truth_texts:
+                # Track success rate against actual plate text (for monitoring only)
+                if idx in actual_plate_texts:
                     total += 1
-                    if bb_result.text == ground_truth_texts[idx]:
+                    if bb_result.text == actual_plate_texts[idx]:
                         correct += 1
 
                     success_rate = correct / total if total > 0 else 0.0
@@ -1349,27 +1400,31 @@ def optimize_patch_bb(
     replay_buffer = ReplayBuffer(decay_half_life=4)
 
     # =========================================================================
-    # Phase 1: Initial setup and blur calibration
+    # Phase 1: Blur calibration and ground truth collection
     # =========================================================================
     print("\n" + "=" * 60)
-    if blur_sigma_init is not None:
-        print("Phase 1: Using provided blur sigma (skipping calibration)")
-        print("=" * 60)
-        blur_sigma = blur_sigma_init
-        print(f"\nUsing blur sigma: {blur_sigma:.2f}")
-    else:
-        print("Phase 1: Blur Calibration")
-        print("=" * 60)
-        # Calibrate blur level (no initial fine-tuning - adapter trains on patch samples)
-        blur_sigma, _ = calibrate_blur_level(
-            black_box=black_box,
-            dataset_loader=trainer.train_loader,
-            ground_truth_texts=ground_truth_texts,
-            target_correct_rate=blur_target_rate,
-            sigma_init=None,
-            device=device
-        )
-        print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
+    print("Phase 1: Blur Calibration and Ground Truth Collection")
+    print("=" * 60)
+
+    # Always run calibration to collect blur-only ground truth labels
+    # The ground truth is what the black-box outputs with ONLY blur (no patch)
+    blur_sigma, calibration_samples = calibrate_blur_level(
+        black_box=black_box,
+        dataset_loader=trainer.train_loader,
+        ground_truth_texts=ground_truth_texts,  # Only used to compute success rate
+        target_correct_rate=blur_target_rate,
+        sigma_init=blur_sigma_init,
+        device=device
+    )
+    print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
+
+    # Extract ground truth labels from calibration (blur-only black-box results)
+    # This is what the surrogate should learn to deviate from when patch is applied
+    blur_only_ground_truth = {}  # dataset_idx -> (text, confidence)
+    for idx, (_, _, _, _, _, bb_result) in enumerate(calibration_samples):
+        blur_only_ground_truth[idx] = (bb_result.text, bb_result.confidence)
+
+    print(f"Collected {len(blur_only_ground_truth)} ground truth labels from blur-only baseline")
 
     # Create surrogate optimizer (reuse across cycles)
     surrogate_optimizer = optim.Adam(
@@ -1433,7 +1488,8 @@ def optimize_patch_bb(
             patched_samples, bb_success_rate = collect_patched_samples(
                 black_box=black_box,
                 trainer=trainer,
-                ground_truth_texts=ground_truth_texts,
+                blur_only_ground_truth=blur_only_ground_truth,
+                actual_plate_texts=ground_truth_texts,
                 blur_sigma=current_blur_sigma
             )
             print(f"Black-box success rate: {bb_success_rate:.1%}")
