@@ -86,26 +86,31 @@ class BlackBoxSurrogate(nn.Module):
             nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 32x128x256
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
         )
         self.conv2 = nn.Sequential(
             nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64x64x128
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
         )
         self.conv3 = nn.Sequential(
             nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 128x32x64
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.15),
         )
         self.conv4 = nn.Sequential(
             nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 256x16x32
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.15),
         )
         self.conv5 = nn.Sequential(
             nn.Conv2d(256, 256, 3, stride=2, padding=1),  # 256x8x16
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
         )
 
         # Global average pooling
@@ -133,6 +138,7 @@ class BlackBoxSurrogate(nn.Module):
         self.edit_distance_head = nn.Sequential(
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
             nn.Linear(64, 1),
             nn.Sigmoid()  # Output in [0, 1]
         )
@@ -141,6 +147,7 @@ class BlackBoxSurrogate(nn.Module):
         self.confidence_head = nn.Sequential(
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
             nn.Linear(64, 1),
             nn.Sigmoid()  # Output in [0, 1]
         )
