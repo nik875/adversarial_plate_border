@@ -500,6 +500,24 @@ class SurrogateTrainer:
                 converged=False
             )
 
+        # Debug: analyze sample composition
+        if verbose:
+            print(f"\n  Analyzing {len(samples)} training samples...")
+            bb_text_none = sum(1 for s in samples if s['bb_result'].text is None)
+            gt_text_none = sum(1 for s in samples if s.get('gt_text') is None)
+            both_valid = sum(1 for s in samples if s['bb_result'].text is not None and s.get('gt_text') is not None)
+            print(f"    - bb_result.text is None: {bb_text_none}/{len(samples)}")
+            print(f"    - gt_text is None: {gt_text_none}/{len(samples)}")
+            print(f"    - Both valid (can be used for training): {both_valid}/{len(samples)}")
+
+            # Show sample of the data
+            if samples:
+                sample = samples[0]
+                print(f"    - Sample 0: dataset_idx={sample.get('dataset_idx')}, "
+                      f"gt_text={sample.get('gt_text')!r}, "
+                      f"bb_text={sample['bb_result'].text!r}, "
+                      f"transform.shape={sample['transform'].shape}")
+
         # Set up optimizer (create if not provided)
         if optimizer is None:
             optimizer = optim.Adam(self.surrogate.parameters(), lr=self.learning_rate)
@@ -559,10 +577,12 @@ class SurrogateTrainer:
 
             # Check for no valid samples - this indicates a data problem
             if samples_processed == 0:
-                if verbose:
+                if verbose and epoch == 0:
+                    # Only print detailed warning on first epoch to avoid spam
                     print(f"  WARNING: No valid samples processed! Check that:")
                     print(f"    - ground_truth_texts dict has matching dataset indices")
                     print(f"    - bb_result.text is not None (black-box detected plates)")
+                    print(f"    - The 'Analyzing samples' output above shows the breakdown")
                 # Don't declare convergence with 0 samples - keep training
                 continue
 
