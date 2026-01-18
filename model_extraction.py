@@ -886,23 +886,17 @@ class SurrogateTrainer:
                 continue
 
             # Compute targets for surrogate training
-            # Only skip if patch failed to detect (bb_result is None)
-            if bb_result.text is None:
-                # Patch failed to detect -> maximum error with zero confidence
+            # When either bb_result or gt_text is None, target max error with zero confidence
+            if bb_result.text is None or gt_text is None:
+                # Either patch failed or baseline failed -> treat as maximum error
                 confidence = 0.0
                 normalized_edit_dist = 1.0
             else:
-                # Patch detected something -> record what it detected
+                # Both detected -> compute actual edit distance
                 confidence = bb_result.confidence
-                if gt_text is None:
-                    # Baseline failed but patch succeeded -> treat as maximum error
-                    # (complete change from no detection)
-                    normalized_edit_dist = 1.0
-                else:
-                    # Both detected -> compute edit distance between them
-                    edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-                    gt_len = len(gt_text)
-                    normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
+                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                gt_len = len(gt_text)
+                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
