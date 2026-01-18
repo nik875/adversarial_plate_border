@@ -68,7 +68,10 @@ class BlackBoxSurrogate(nn.Module):
     Lightweight regression model that predicts black-box ALPR behavior.
 
     Given an adversarial patch and homography transformation, predicts:
-    - Normalized edit distance (Levenshtein distance between prediction and ground truth, normalized to [0, 1])
+    - Normalized edit distance (Levenshtein distance / ground truth length, clamped to [0, 1])
+      * 0 = perfect match
+      * 1 = completely different (edit distance >= ground truth length)
+      * Normalized by ground truth length (fixed reference) to avoid moving targets
     - Detection confidence
 
     This replaces the adapter-based approach with a simple query-based model.
@@ -612,9 +615,11 @@ class SurrogateTrainer:
                         continue
 
             # Compute normalized edit distance between bb_result and ground truth
+            # Normalize by ground truth length (fixed reference point)
+            # Clamp to [0, 1] so model has a bounded target
             edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-            max_len = max(len(bb_result.text), len(gt_text))
-            normalized_edit_dist = edit_dist / max_len if max_len > 0 else 0.0
+            gt_len = len(gt_text)
+            normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 1.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
