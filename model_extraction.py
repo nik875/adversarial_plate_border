@@ -156,6 +156,10 @@ class BlackBoxSurrogate(nn.Module):
         Returns:
             Tuple of (ocr_loss, confidence) predictions, each [B, 1]
         """
+        # Validate inputs
+        assert patch.dim() == 4 and patch.size(1) == 3, \
+            f"Expected patch shape [B, 3, H, W], got {patch.shape}"
+
         # Encode patch through CNN
         x = self.conv1(patch)
         x = self.conv2(x)
@@ -169,10 +173,19 @@ class BlackBoxSurrogate(nn.Module):
 
         # Flatten homography if needed and normalize
         if homography.dim() == 3:  # [B, 3, 3]
-            # Take first 8 parameters (exclude h33 which is typically 1)
-            h_flat = homography.view(homography.size(0), 9)[:, :8]  # [B, 8]
-        else:  # Already [B, 8]
+            batch_size = homography.size(0)
+            assert homography.size(1) == 3 and homography.size(2) == 3, \
+                f"Expected homography shape [B, 3, 3], got {homography.shape}"
+            # Flatten and take first 8 parameters (exclude h33 which is typically 1)
+            # Use reshape instead of view to handle non-contiguous tensors
+            h_flat = homography.reshape(batch_size, 9)[:, :8]  # [B, 8]
+        elif homography.dim() == 2 and homography.size(1) == 9:  # [B, 9]
+            h_flat = homography[:, :8]  # [B, 8]
+        elif homography.dim() == 2 and homography.size(1) == 8:  # Already [B, 8]
             h_flat = homography
+        else:
+            raise ValueError(f"Unsupported homography shape: {homography.shape}. "
+                           f"Expected [B, 3, 3], [B, 9], or [B, 8]")
 
         # Encode homography
         homography_features = self.homography_encoder(h_flat)  # [B, 128]
@@ -615,7 +628,14 @@ class SurrogateTrainer:
         patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1).to(self.device)  # [B, 3, 256, 512]
 
         # Stack homographies and convert to float32
-        homography_batch = torch.stack(homographies).to(self.device).float()  # [B, 3, 3]
+        # Ensure contiguous memory layout for proper reshaping
+        homography_batch = torch.stack(homographies).to(self.device).float().contiguous()  # [B, 3, 3]
+
+        # Validate shapes
+        assert patch_batch.shape == (valid_samples, 3, 256, 512), \
+            f"Unexpected patch_batch shape: {patch_batch.shape}, expected ({valid_samples}, 3, 256, 512)"
+        assert homography_batch.shape == (valid_samples, 3, 3), \
+            f"Unexpected homography_batch shape: {homography_batch.shape}, expected ({valid_samples}, 3, 3)"
 
         # Stack ground truth
         gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
