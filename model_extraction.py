@@ -66,50 +66,61 @@ class BlackBoxSurrogate(nn.Module):
     """
     Lightweight regression model that predicts black-box ALPR behavior.
 
-    Given a patch-applied image, predicts:
+    Given an adversarial patch and homography transformation, predicts:
     - OCR loss (how different the prediction will be from ground truth)
     - Detection confidence
 
     This replaces the adapter-based approach with a simple query-based model.
     """
 
-    def __init__(self):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512):
         super().__init__()
 
-        # Simple CNN encoder
-        # Input: 3x384x384
+        # CNN encoder for patch
+        # Input: 3x256x512 (patch)
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 32x192x192
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 32x128x256
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
         )
         self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64x96x96
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64x64x128
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
         self.conv3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 128x48x48
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 128x32x64
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
         self.conv4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 256x24x24
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 256x16x32
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
         self.conv5 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, stride=2, padding=1),  # 512x12x12
-            nn.BatchNorm2d(512),
+            nn.Conv2d(256, 256, 3, stride=2, padding=1),  # 256x8x16
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
 
         # Global average pooling
-        self.gap = nn.AdaptiveAvgPool2d(1)  # 512x1x1
+        self.gap = nn.AdaptiveAvgPool2d(1)  # 256x1x1
 
-        # Regression heads
-        self.fc_shared = nn.Sequential(
-            nn.Linear(512, 256),
+        # Homography encoder (processes 3x3 matrix → 8 params)
+        # Homography has 8 DOF (9 params with scale normalization)
+        self.homography_encoder = nn.Sequential(
+            nn.Linear(8, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
+
+        # Fusion layer (concatenate CNN features + homography features)
+        # 256 (CNN) + 128 (homography) = 384
+        self.fc_fusion = nn.Sequential(
+            nn.Linear(256 + 128, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
         )
@@ -130,33 +141,51 @@ class BlackBoxSurrogate(nn.Module):
             nn.Sigmoid()  # Output in [0, 1]
         )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        patch: torch.Tensor,
+        homography: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Predict black-box behavior from patched image.
+        Predict black-box behavior from patch and homography.
 
         Args:
-            x: Patched preprocessed image [B, 3, 384, 384]
+            patch: Adversarial patch [B, 3, 256, 512]
+            homography: Homography matrix [B, 3, 3] or [B, 8] (flattened without last scale)
 
         Returns:
             Tuple of (ocr_loss, confidence) predictions, each [B, 1]
         """
-        # Convolutional features
-        x = self.conv1(x)
+        # Encode patch through CNN
+        x = self.conv1(patch)
         x = self.conv2(x)
         x = self.conv3(x)
         x = self.conv4(x)
         x = self.conv5(x)
 
         # Global pooling
-        x = self.gap(x)  # [B, 512, 1, 1]
-        x = x.view(x.size(0), -1)  # [B, 512]
+        x = self.gap(x)  # [B, 256, 1, 1]
+        patch_features = x.view(x.size(0), -1)  # [B, 256]
 
-        # Shared features
-        shared = self.fc_shared(x)  # [B, 256]
+        # Flatten homography if needed and normalize
+        if homography.dim() == 3:  # [B, 3, 3]
+            # Take first 8 parameters (exclude h33 which is typically 1)
+            h_flat = homography.view(homography.size(0), 9)[:, :8]  # [B, 8]
+        else:  # Already [B, 8]
+            h_flat = homography
+
+        # Encode homography
+        homography_features = self.homography_encoder(h_flat)  # [B, 128]
+
+        # Concatenate features
+        combined = torch.cat([patch_features, homography_features], dim=1)  # [B, 384]
+
+        # Fusion
+        fused = self.fc_fusion(combined)  # [B, 256]
 
         # Predictions
-        ocr_loss = self.ocr_loss_head(shared)  # [B, 1]
-        confidence = self.confidence_head(shared)  # [B, 1]
+        ocr_loss = self.ocr_loss_head(fused)  # [B, 1]
+        confidence = self.confidence_head(fused)  # [B, 1]
 
         return ocr_loss, confidence
 
@@ -591,29 +620,17 @@ class SurrogateTrainer:
         valid_samples = 0
 
         # Collect batch data
-        patched_images = []
+        homographies = []
         gt_ocr_losses = []
         gt_confidences = []
 
         for sample in batch:
-            dataset_idx = sample['dataset_idx']
-            corners = sample['corners']
             bb_result = sample['bb_result']
             gt_text = sample.get('gt_text', bb_result.text)
+            transform = sample['transform']
 
             if bb_result.text is None or gt_text is None:
                 continue
-
-            # Load and patch image
-            dataset_item = self.trainer.train_loader.dataset[dataset_idx]
-            unpatched_prep = dataset_item['prep_image']
-
-            # Apply current patch (no adapter, just raw patch)
-            patched_prep, _ = self.trainer.apply_patch_to_image(
-                unpatched_prep.to(self.device).unsqueeze(0),
-                corners.to(self.device).unsqueeze(0)
-            )
-            patched_prep = patched_prep.squeeze(0)
 
             # Compute ground truth OCR loss from black-box result
             # (How different is bb_result.text from gt_text)
@@ -630,7 +647,7 @@ class SurrogateTrainer:
                 # This gives us the "ground truth" OCR loss to predict
                 gt_ocr_loss = self.ocr_loss_fn(target_tensor, bb_text_tensor.unsqueeze(0))
 
-            patched_images.append(patched_prep)
+            homographies.append(transform)
             gt_ocr_losses.append(gt_ocr_loss.item())
             gt_confidences.append(bb_result.confidence)
             valid_samples += 1
@@ -638,13 +655,21 @@ class SurrogateTrainer:
         if valid_samples == 0:
             return 0.0, 0.0, 0
 
-        # Stack batch
-        patched_batch = torch.stack(patched_images)  # [B, 3, 384, 384]
+        # Get current patch (normalized to [0, 1])
+        patch_normalized = torch.sigmoid(self.trainer.patch)  # [3, 256, 512]
+
+        # Repeat patch for batch
+        patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1)  # [B, 3, 256, 512]
+
+        # Stack homographies
+        homography_batch = torch.stack(homographies).to(self.device)  # [B, 3, 3]
+
+        # Stack ground truth
         gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device).unsqueeze(1)  # [B, 1]
         gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device).unsqueeze(1)  # [B, 1]
 
         # Forward through surrogate
-        pred_ocr_loss, pred_confidence = self.surrogate(patched_batch)
+        pred_ocr_loss, pred_confidence = self.surrogate(patch_batch, homography_batch)
 
         # Compute MSE losses
         ocr_mse = F.mse_loss(pred_ocr_loss, gt_ocr_losses_tensor)
