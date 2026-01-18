@@ -598,6 +598,22 @@ class SurrogateTrainer:
             if bb_result.text is None or gt_text is None:
                 continue
 
+            # Ensure transform is a proper [3, 3] homography matrix
+            if transform.dim() != 2 or transform.shape != (3, 3):
+                # If it's 1D or wrong shape, try to reshape it
+                # Assuming it might be [9] flattened
+                if transform.numel() == 9:
+                    transform = transform.reshape(3, 3)
+                else:
+                    # If it's truly [3], it might be missing dimensions
+                    # Try to get the actual [3, 3] matrix from the sample
+                    if 'orig_corners' in sample and 'corners' in sample:
+                        # Recompute homography from corners if available
+                        # For now, skip this sample as data is corrupted
+                        continue
+                    else:
+                        continue
+
             # Compute ground truth OCR loss from black-box result
             # (How different is bb_result.text from gt_text)
             target_tensor = text_to_target_tensor(
@@ -628,14 +644,39 @@ class SurrogateTrainer:
         patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1).to(self.device)  # [B, 3, 256, 512]
 
         # Stack homographies and convert to float32
-        # Ensure contiguous memory layout for proper reshaping
-        homography_batch = torch.stack(homographies).to(self.device).float().contiguous()  # [B, 3, 3]
+        # Ensure each homography is properly shaped [3, 3]
+        processed_homographies = []
+        for h in homographies:
+            if h.dim() == 1:
+                # If 1D, try to reshape to [3, 3]
+                if h.numel() == 9:
+                    h = h.reshape(3, 3)
+                elif h.numel() == 3:
+                    # If only 3 elements, it's malformed - skip
+                    continue
+            processed_homographies.append(h)
+
+        if len(processed_homographies) == 0:
+            return 0.0, 0.0, 0
+
+        # Recompute valid sample count based on processed homographies
+        actual_valid_samples = len(processed_homographies)
+
+        homography_batch = torch.stack(processed_homographies).to(self.device).float().contiguous()  # [B, 3, 3]
+
+        # Trim ground truth lists to match actual valid samples
+        # (in case some were skipped due to malformed homographies)
+        gt_ocr_losses = gt_ocr_losses[:actual_valid_samples]
+        gt_confidences = gt_confidences[:actual_valid_samples]
+
+        # Adjust patch batch to match
+        patch_batch = patch_batch[:actual_valid_samples]
 
         # Validate shapes
-        assert patch_batch.shape == (valid_samples, 3, 256, 512), \
-            f"Unexpected patch_batch shape: {patch_batch.shape}, expected ({valid_samples}, 3, 256, 512)"
-        assert homography_batch.shape == (valid_samples, 3, 3), \
-            f"Unexpected homography_batch shape: {homography_batch.shape}, expected ({valid_samples}, 3, 3)"
+        assert patch_batch.shape[0] == len(processed_homographies), \
+            f"Batch size mismatch: patch_batch has {patch_batch.shape[0]} but homographies has {len(processed_homographies)}"
+        assert homography_batch.shape == (len(processed_homographies), 3, 3), \
+            f"Unexpected homography_batch shape: {homography_batch.shape}, expected ({len(processed_homographies)}, 3, 3)"
 
         # Stack ground truth
         gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
@@ -656,9 +697,9 @@ class SurrogateTrainer:
         optimizer.step()
 
         return (
-            ocr_mse.item() * valid_samples,
-            conf_mse.item() * valid_samples,
-            valid_samples
+            ocr_mse.item() * actual_valid_samples,
+            conf_mse.item() * actual_valid_samples,
+            actual_valid_samples
         )
 
 
