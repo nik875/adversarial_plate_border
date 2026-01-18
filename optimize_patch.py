@@ -49,6 +49,110 @@ OCR_MAX_SLOTS = 9
 
 
 # =============================================================================
+# Patch Adapter Layer
+# =============================================================================
+
+class PatchAdapter(nn.Module):
+    """
+    U-Net style encoder-decoder that transforms adversarial patches.
+
+    This module operates on the fixed-size patch tensor (512×256×3) and learns
+    to transform it into an equivalent representation that makes the surrogate
+    perceive it the same way the black-box does.
+
+    The bottleneck captures the low-dimensional adversarial manifold, and the
+    decoder reconstructs pixels that express the same adversarial intent in the
+    surrogate's perceptual space.
+    """
+
+    def __init__(self, patch_height: int = 256, patch_width: int = 512):
+        """
+        Args:
+            patch_height: Fixed patch height (256)
+            patch_width: Fixed patch width (512)
+        """
+        super().__init__()
+
+        # Encoder (downsampling path)
+        self.enc1 = self._conv_block(3, 32)      # 512×256
+        self.enc2 = self._conv_block(32, 64)     # 256×128
+        self.enc3 = self._conv_block(64, 128)    # 128×64
+        self.enc4 = self._conv_block(128, 256)   # 64×32
+
+        # Bottleneck
+        self.bottleneck = self._conv_block(256, 256)  # 32×16
+
+        # Decoder (upsampling path)
+        self.dec4 = self._upconv_block(256, 128)  # 64×32 (takes bottleneck)
+        self.dec3 = self._upconv_block(384, 64)   # 128×64 (takes d4+e4: 128+256=384)
+        self.dec2 = self._upconv_block(192, 32)   # 256×128 (takes d3+e3: 64+128=192)
+        self.dec1 = self._upconv_block(96, 16)    # 512×256 (takes d2+e2: 32+64=96)
+
+        # Final output
+        self.out_conv = nn.Conv2d(48, 3, 1)  # 1×1 conv (takes d1+e1: 16+32=48)
+        self.out_activation = nn.Sigmoid()   # Keep in [0, 1]
+
+        self.pool = nn.MaxPool2d(2, 2)
+
+    def _conv_block(self, in_ch: int, out_ch: int) -> nn.Module:
+        """Double convolution block."""
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def _upconv_block(self, in_ch: int, out_ch: int) -> nn.Module:
+        """Upsampling + convolution block."""
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, 2, stride=2),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Transform adversarial patch.
+
+        Args:
+            x: Patch tensor [B, 3, 256, 512]
+
+        Returns:
+            Transformed patch [B, 3, 256, 512]
+        """
+        # Encoder
+        e1 = self.enc1(x)          # 32 × 256 × 512
+        e2 = self.enc2(self.pool(e1))  # 64 × 128 × 256
+        e3 = self.enc3(self.pool(e2))  # 128 × 64 × 128
+        e4 = self.enc4(self.pool(e3))  # 256 × 32 × 64
+
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))  # 256 × 16 × 32
+
+        # Decoder with skip connections
+        d4 = self.dec4(b)                    # 128 × 32 × 64
+        d4 = torch.cat([d4, e4], dim=1)      # 256 × 32 × 64
+
+        d3 = self.dec3(d4)                   # 64 × 64 × 128
+        d3 = torch.cat([d3, e3], dim=1)      # 128 × 64 × 128
+
+        d2 = self.dec2(d3)                   # 32 × 128 × 256
+        d2 = torch.cat([d2, e2], dim=1)      # 64 × 128 × 256
+
+        d1 = self.dec1(d2)                   # 16 × 256 × 512
+        d1 = torch.cat([d1, e1], dim=1)      # 32 × 256 × 512
+
+        # Output
+        out = self.out_conv(d1)              # 3 × 256 × 512
+        out = self.out_activation(out)
+
+        return out
+
+
+# =============================================================================
 # Shared ALPR Models
 # =============================================================================
 
@@ -94,6 +198,7 @@ class ALPRModels:
 
         self._detector: Optional[nn.Module] = None
         self._ocr: Optional[nn.Module] = None
+        self._adapter: Optional[PatchAdapter] = None
         self._loaded = False
 
     @property
@@ -109,6 +214,13 @@ class ALPRModels:
         if not self._loaded:
             raise RuntimeError("Models not loaded. Call load() first.")
         return self._ocr
+
+    @property
+    def adapter(self) -> PatchAdapter:
+        """Get the patch adapter module."""
+        if not self._loaded:
+            raise RuntimeError("Models not loaded. Call load() first.")
+        return self._adapter
 
     @property
     def is_loaded(self) -> bool:
@@ -159,7 +271,13 @@ class ALPRModels:
         self._ocr.to(self.device)
         self._ocr.eval()
 
-        # Freeze by default
+        # Create patch adapter
+        print(f"  Initializing patch adapter (U-Net)")
+        self._adapter = PatchAdapter(patch_height=PATCH_HEIGHT, patch_width=PATCH_WIDTH)
+        self._adapter.to(self.device)
+        self._adapter.train()  # Adapter starts trainable
+
+        # Freeze by default (but not adapter)
         self.freeze_all()
 
         self._loaded = True
@@ -168,12 +286,12 @@ class ALPRModels:
         return self
 
     def freeze_all(self) -> None:
-        """Freeze all model parameters (no gradients)."""
+        """Freeze all model parameters (no gradients). Does NOT freeze adapter."""
         self.freeze_detector()
         self.freeze_ocr()
 
     def unfreeze_all(self) -> None:
-        """Unfreeze all model parameters (enable gradients)."""
+        """Unfreeze all model parameters (enable gradients). Does NOT affect adapter."""
         self.unfreeze_detector()
         self.unfreeze_ocr()
 
@@ -201,6 +319,18 @@ class ALPRModels:
             for param in self._ocr.parameters():
                 param.requires_grad = True
 
+    def freeze_adapter(self) -> None:
+        """Freeze adapter parameters."""
+        if self._adapter is not None:
+            for param in self._adapter.parameters():
+                param.requires_grad = False
+
+    def unfreeze_adapter(self) -> None:
+        """Unfreeze adapter parameters for fine-tuning."""
+        if self._adapter is not None:
+            for param in self._adapter.parameters():
+                param.requires_grad = True
+
     def get_detector_parameters(self):
         """Get detector parameters for optimizer."""
         if self._detector is None:
@@ -213,11 +343,18 @@ class ALPRModels:
             return []
         return list(self._ocr.parameters())
 
+    def get_adapter_parameters(self):
+        """Get adapter parameters for optimizer."""
+        if self._adapter is None:
+            return []
+        return list(self._adapter.parameters())
+
     def save_state(self, path: str) -> None:
         """Save model states to file."""
         torch.save({
             'detector': self._detector.state_dict() if self._detector else None,
             'ocr': self._ocr.state_dict() if self._ocr else None,
+            'adapter': self._adapter.state_dict() if self._adapter else None,
         }, path)
 
     def load_state(self, path: str) -> None:
@@ -229,6 +366,8 @@ class ALPRModels:
             self._detector.load_state_dict(state['detector'])
         if state['ocr'] is not None:
             self._ocr.load_state_dict(state['ocr'])
+        if 'adapter' in state and state['adapter'] is not None:
+            self._adapter.load_state_dict(state['adapter'])
 
 
 # =============================================================================
@@ -660,7 +799,8 @@ class AdversarialPatchTrainer:
     def apply_patch_to_image(
         self,
         image: torch.Tensor,
-        corners: torch.Tensor
+        corners: torch.Tensor,
+        patch_override: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Apply adversarial patch as border around license plate.
@@ -668,6 +808,7 @@ class AdversarialPatchTrainer:
         Args:
             image: Input image tensor [B, C, H, W]
             corners: Plate corner coordinates [B, 4, 2]
+            patch_override: Optional pre-transformed patch [C, H, W] to use instead of self.patch
 
         Returns:
             Tuple of (patched_image, mask)
@@ -676,8 +817,16 @@ class AdversarialPatchTrainer:
         image_height, image_width = image.shape[2], image.shape[3]
         dsize = (image_height, image_width)
 
-        # Normalize patch to [0, 1]
-        patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
+        # Use provided patch or default to self.patch
+        if patch_override is not None:
+            # Patch already transformed, just normalize to [0, 1] if needed
+            if patch_override.max() <= 1.0 and patch_override.min() >= 0.0:
+                patch_normalized = patch_override
+            else:
+                patch_normalized = torch.tanh(patch_override) * 0.5 + 0.5
+        else:
+            # Normalize patch to [0, 1]
+            patch_normalized = torch.tanh(self.patch) * 0.5 + 0.5
 
         # Optional blur
         if self.config.print_blur > 0:
@@ -803,7 +952,6 @@ class AdversarialPatchTrainer:
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             ocr_output = self.models.ocr(ocr_input)
             ocr_loss = self.ocr_loss_fn(self.ocr_target, ocr_output)
-            ocr_loss = torch.sqrt(ocr_loss)
 
             if use_ocr_baseline:
                 if self.config.impersonation_target:
@@ -844,17 +992,26 @@ class AdversarialPatchTrainer:
         """
         batch = {k: v[0] for k, v in batch.items()}
 
-        # Apply patch to preprocessed image
+        # Normalize patch to [0,1] before adapter
+        patch_normalized = torch.sigmoid(self.patch)
+
+        # Transform patch through adapter (for surrogate perception)
+        with torch.no_grad() if not self.patch.requires_grad else torch.enable_grad():
+            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
+        # Apply adapted patch to preprocessed image
         patched_image, _ = self.apply_patch_to_image(
             batch['prep_image'].to(self.device).unsqueeze(0),
-            batch['new_corners'].to(self.device).unsqueeze(0)
+            batch['new_corners'].to(self.device).unsqueeze(0),
+            patch_override=adapted_patch
         )
         batch['prep_image'] = patched_image.squeeze()
 
-        # Apply patch to original image
+        # Apply adapted patch to original image
         patched_image, _ = self.apply_patch_to_image(
             batch['orig_image'].to(self.device).unsqueeze(0),
-            batch['orig_corners'].to(self.device).unsqueeze(0)
+            batch['orig_corners'].to(self.device).unsqueeze(0),
+            patch_override=adapted_patch
         )
         batch['orig_image'] = patched_image.squeeze()
 

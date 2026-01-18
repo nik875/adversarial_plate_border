@@ -59,6 +59,50 @@ from optimize_patch import (
 
 
 # =============================================================================
+# Learning Rate Schedulers
+# =============================================================================
+
+class LinearWarmupCosineAnnealingLR(optim.lr_scheduler._LRScheduler):
+    """
+    Linear warmup followed by cosine annealing learning rate scheduler.
+
+    Args:
+        optimizer: Wrapped optimizer
+        warmup_epochs: Number of epochs for linear warmup
+        max_epochs: Total number of epochs (warmup + annealing)
+        min_lr: Minimum learning rate (default: 0)
+        last_epoch: The index of last epoch (default: -1)
+    """
+
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        warmup_epochs: int,
+        max_epochs: int,
+        min_lr: float = 0.0,
+        last_epoch: int = -1
+    ):
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            # Linear warmup
+            alpha = self.last_epoch / max(1, self.warmup_epochs)
+            return [base_lr * alpha for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing
+            progress = (self.last_epoch - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return [
+                self.min_lr + (base_lr - self.min_lr) * cosine_factor
+                for base_lr in self.base_lrs
+            ]
+
+
+# =============================================================================
 # Data Structures
 # =============================================================================
 
@@ -132,9 +176,8 @@ class ReplayBuffer:
     Manages fine-tuning dataset with structured sampling.
 
     After initial epochs, maintains:
-    - 25% clean (unpatched) images
-    - 25% images with the most recent patch
-    - 50% historical patches with exponential decay favoring recency
+    - 33% images with the most recent patch
+    - 67% historical patches with exponential decay favoring recency
     """
 
     def __init__(
@@ -155,23 +198,19 @@ class ReplayBuffer:
         self.initial_epochs = initial_epochs
         self.decay_rate = math.log(2) / decay_half_life
 
-        # Storage: each entry is (image_tensor, corners, transform, bb_result)
-        self.clean_samples: List[Tuple] = []
-        self.last_patch_samples: List[Tuple] = []
+        # Storage: lightweight metadata dicts (dataset_idx, corners, transform, bb_result)
+        self.last_patch_samples: List[Dict] = []
+        self.last_patch: Optional[torch.Tensor] = None
         # Historical: list of (epoch, patch_tensor, samples)
-        self.historical: List[Tuple[int, torch.Tensor, List[Tuple]]] = []
+        self.historical: List[Tuple[int, torch.Tensor, List[Dict]]] = []
 
         self.current_epoch = 0
-
-    def add_clean_samples(self, samples: List[Tuple]):
-        """Add clean (unpatched) samples with their black-box results."""
-        self.clean_samples = samples
 
     def add_patch_epoch(
         self,
         epoch: int,
         patch: torch.Tensor,
-        samples: List[Tuple]
+        samples: List[Dict]
     ):
         """
         Add samples from a patch optimization epoch.
@@ -179,63 +218,47 @@ class ReplayBuffer:
         Args:
             epoch: Current epoch number
             patch: The patch tensor used
-            samples: List of (image, corners, transform, bb_result)
+            samples: List of metadata dicts (dataset_idx, corners, transform, bb_result)
         """
         self.current_epoch = epoch
 
-        # Move previous "last patch" to historical
-        if self.last_patch_samples:
+        # Move previous "last patch" to historical (if exists)
+        if self.last_patch_samples and self.last_patch is not None:
             prev_epoch = epoch - 1
-            # Find the patch from previous epoch if it exists
-            prev_patch = None
-            if self.historical:
-                prev_patch = self.historical[-1][1]
-            if prev_patch is not None:
-                self.historical.append((prev_epoch, prev_patch, self.last_patch_samples))
+            self.historical.append((prev_epoch, self.last_patch, self.last_patch_samples))
 
-        # Update last patch samples
+        # Update last patch samples and store patch for later
         self.last_patch_samples = samples
+        self.last_patch = patch.clone()
 
-        # Store current patch for when it becomes historical
-        if not self.historical or epoch > 0:
-            # We'll add the patch reference when it moves to historical
-            pass
-
-    def get_training_samples(self) -> List[Tuple]:
+    def get_training_samples(self) -> List[Dict]:
         """
         Get samples for fine-tuning according to the sampling strategy.
 
         Returns:
-            List of (image, corners, transform, bb_result) tuples
+            List of metadata dicts (dataset_idx, corners, transform, bb_result)
         """
         if self.current_epoch < self.initial_epochs:
             # Initial epochs: use all available samples
-            all_samples = list(self.clean_samples)
-            all_samples.extend(self.last_patch_samples)
+            all_samples = list(self.last_patch_samples)
             for _, _, samples in self.historical:
                 all_samples.extend(samples)
             return all_samples
 
-        # After initial epochs: apply 25/25/50 split
-        target_size = min(self.max_size, len(self.clean_samples) * 4)
+        # After initial epochs: apply 33/67 split (recent/historical)
+        target_size = min(self.max_size, len(self.last_patch_samples) * 3)
 
-        clean_count = target_size // 4
-        last_patch_count = target_size // 4
-        historical_count = target_size - clean_count - last_patch_count
+        last_patch_count = target_size // 3
+        historical_count = target_size - last_patch_count
 
         result = []
 
-        # 25% clean samples
-        if self.clean_samples:
-            clean_indices = self._sample_indices(len(self.clean_samples), clean_count)
-            result.extend([self.clean_samples[i] for i in clean_indices])
-
-        # 25% last patch samples
+        # 33% last patch samples
         if self.last_patch_samples:
             last_indices = self._sample_indices(len(self.last_patch_samples), last_patch_count)
             result.extend([self.last_patch_samples[i] for i in last_indices])
 
-        # 50% historical with exponential decay
+        # 67% historical with exponential decay
         if self.historical and historical_count > 0:
             historical_samples = self._sample_historical(historical_count)
             result.extend(historical_samples)
@@ -289,7 +312,7 @@ class ReplayBuffer:
         return [all_samples_with_epoch[i] for i in indices]
 
     def __len__(self) -> int:
-        total = len(self.clean_samples) + len(self.last_patch_samples)
+        total = len(self.last_patch_samples)
         for _, _, samples in self.historical:
             total += len(samples)
         return total
@@ -316,7 +339,7 @@ class SurrogateTrainer:
         models: ALPRModels,
         trainer: 'AdversarialPatchTrainer',
         device: str,
-        ocr_loss_threshold: float = 0.1,
+        ocr_loss_threshold: float = 0.2,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 1e-3,
         max_epochs: int = 100
@@ -344,10 +367,10 @@ class SurrogateTrainer:
     def fine_tune(
         self,
         samples: List[Tuple],
-        batch_size: int = 64,
+        batch_size: int = 32,
         verbose: bool = True,
         adapter_optimizer: Optional[optim.Optimizer] = None,
-        adapter_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = None
+        adapter_scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
     ) -> FinetuneMetrics:
         """
         Fine-tune adapter module until convergence or max epochs.
@@ -358,7 +381,7 @@ class SurrogateTrainer:
         The ALPR detector and OCR models remain frozen - only the adapter is trained.
 
         Args:
-            samples: List of (prep_image, orig_image, corners, orig_corners, transform, bb_result)
+            samples: List of metadata dicts (dataset_idx, corners, orig_corners, transform, bb_result)
             batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
             adapter_optimizer: Optional pre-created adapter optimizer (reuses across epochs)
@@ -385,8 +408,11 @@ class SurrogateTrainer:
 
         # Learning rate scheduler (create if not provided)
         if adapter_scheduler is None:
-            adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                adapter_optimizer, mode='min', factor=0.5, patience=6
+            adapter_scheduler = LinearWarmupCosineAnnealingLR(
+                adapter_optimizer,
+                warmup_epochs=5,
+                max_epochs=self.max_epochs,
+                min_lr=1e-6
             )
 
         converged = False
@@ -421,23 +447,22 @@ class SurrogateTrainer:
 
             pbar.close()
 
-            # Evaluate on entire dataset after epoch
-            metrics = self._evaluate(samples)
+            # Use training metrics instead of re-evaluating (much faster)
+            avg_ocr_loss = epoch_ocr_loss / max(1, samples_processed)
+            avg_conf_loss = epoch_conf_loss / max(1, samples_processed)
 
             if verbose:
                 adapter_lr = adapter_optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch + 1}: ocr_loss={metrics.ocr_loss:.4f}, "
-                      f"conf_mse={metrics.confidence_mse:.4f} | "
+                print(f"  Epoch {epoch + 1}: ocr_loss={avg_ocr_loss:.4f}, "
+                      f"conf_mse={avg_conf_loss:.4f} | "
                       f"LR: adapter={adapter_lr:.2e}")
 
-            # Step scheduler to reduce LR if loss plateaus
-            # Use combined metric for scheduling
-            combined_loss = (metrics.ocr_loss + metrics.confidence_mse) / 2
-            adapter_scheduler.step(combined_loss)
+            # Step scheduler (linear warmup + cosine annealing)
+            adapter_scheduler.step()
 
-            # Check convergence based on whole-dataset metrics
-            if (metrics.ocr_loss <= self.ocr_loss_threshold and
-                    metrics.confidence_mse <= self.confidence_mse_threshold):
+            # Check convergence based on training metrics
+            if (avg_ocr_loss <= self.ocr_loss_threshold and
+                    avg_conf_loss <= self.confidence_mse_threshold):
                 converged = True
                 if verbose:
                     print(f"  Converged at epoch {epoch + 1}")
@@ -446,11 +471,13 @@ class SurrogateTrainer:
         # Freeze models again
         self.models.freeze_all()
 
-        # Final evaluation
-        final_metrics = self._evaluate(samples)
-        final_metrics.converged = converged
-
-        return final_metrics
+        # Return final metrics from last training epoch
+        return FinetuneMetrics(
+            ocr_loss=avg_ocr_loss,
+            confidence_mse=avg_conf_loss,
+            num_samples=samples_processed,
+            converged=converged
+        )
 
     def _train_step(
         self,
@@ -476,19 +503,29 @@ class SurrogateTrainer:
 
         adapter_optimizer.zero_grad()
 
+        # Normalize patch to [0,1] before adapter (once for all samples)
+        patch_normalized = torch.sigmoid(self.trainer.patch)
+
+        # Transform patch through adapter (once for all samples)
+        adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
         for sample in batch:
-            unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
+            # Sample is now a dict with metadata
+            dataset_idx = sample['dataset_idx']
+            corners = sample['corners']
+            orig_corners = sample['orig_corners']
+            transform = sample['transform']
+            bb_result = sample['bb_result']
 
             if bb_result.text is None:
                 continue
 
-            # Normalize patch to [0,1] before adapter
-            patch_normalized = torch.sigmoid(self.trainer.patch)
+            # Load original images from dataset on-the-fly
+            dataset_item = self.trainer.train_loader.dataset[dataset_idx]
+            unpatched_prep = dataset_item['prep_image']
+            unpatched_orig = dataset_item['orig_image']
 
-            # Transform patch through adapter
-            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
-
-            # Apply adapted patch to unpatched prep image
+            # Apply adapted patch to prep image
             patched_prep, _ = self.trainer.apply_patch_to_image(
                 unpatched_prep.to(self.device).unsqueeze(0),
                 corners.to(self.device).unsqueeze(0),
@@ -496,8 +533,9 @@ class SurrogateTrainer:
             )
             patched_prep = patched_prep.squeeze(0)
 
-            # Run detector on patched image
-            detector_output = self.models.detector(patched_prep.unsqueeze(0))
+            # Run detector on patched image (frozen model, no gradients needed)
+            with torch.no_grad():
+                detector_output = self.models.detector(patched_prep.unsqueeze(0))
 
             if len(detector_output) == 0:
                 continue
@@ -591,6 +629,12 @@ class SurrogateTrainer:
         valid_samples = 0
 
         with torch.no_grad():
+            # Normalize patch to [0,1] before adapter (once for all samples)
+            patch_normalized = torch.sigmoid(self.trainer.patch)
+
+            # Transform patch through adapter (once for all samples)
+            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
             for sample in samples:
                 unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
 
@@ -598,12 +642,6 @@ class SurrogateTrainer:
                     continue
 
                 valid_samples += 1
-
-                # Normalize patch to [0,1] before adapter
-                patch_normalized = torch.sigmoid(self.trainer.patch)
-
-                # Transform patch through adapter
-                adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
 
                 # Apply adapted patch to unpatched prep image
                 patched_prep, _ = self.trainer.apply_patch_to_image(
@@ -621,7 +659,7 @@ class SurrogateTrainer:
                     continue
 
                 # Find best detection (highest IoU with target plate region)
-                target_box = corners_to_bbox(corners)
+                target_box = corners_to_bbox(corners).to(self.device)
                 best_det = None
                 best_iou = -1.0
 
@@ -943,7 +981,8 @@ def collect_patched_samples(
 
     Returns:
         Tuple of (samples, success_rate) where success_rate is the rate
-        at which black-box correctly reads plates (compared to ground truth)
+        at which black-box correctly reads plates (compared to ground truth).
+        Samples are now lightweight metadata dicts, not full images.
     """
     samples = []
     correct = 0
@@ -955,9 +994,6 @@ def collect_patched_samples(
             for idx, batch in pbar:
                 batch = {k: v[0] for k, v in batch.items()}
 
-                # Store unpatched images (for adapter training)
-                unpatched_prep = batch['prep_image'].cpu()
-                unpatched_orig = batch['orig_image'].cpu()
                 corners = batch['new_corners']
                 orig_corners = batch['orig_corners']
                 transform = batch['transform']
@@ -986,15 +1022,16 @@ def collect_patched_samples(
                 results = black_box.evaluate([patched_orig], corners=[orig_corners])
                 bb_result = results[0] if results else ALPRResult(text=None, confidence=0.0)
 
-                # Store both unpatched (for adapter training) and black-box result
-                samples.append((
-                    unpatched_prep,
-                    unpatched_orig,
-                    corners,
-                    orig_corners,
-                    transform,
-                    bb_result
-                ))
+                # Discard images, store only lightweight metadata
+                del patched_prep, patched_orig
+
+                samples.append({
+                    'dataset_idx': idx,
+                    'corners': corners.cpu(),
+                    'orig_corners': orig_corners.cpu(),
+                    'transform': transform.cpu(),
+                    'bb_result': bb_result
+                })
 
                 # Track success rate against ground truth
                 if idx in ground_truth_texts:
@@ -1018,7 +1055,7 @@ def optimize_patch_bb(
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
     blur_sigma_init: Optional[float] = None,
-    ocr_loss_threshold: float = 0.1,
+    ocr_loss_threshold: float = 0.2,
     confidence_mse_threshold: float = 0.1,
     save_interval: int = 10,
     verbose: bool = True,
@@ -1080,7 +1117,8 @@ def optimize_patch_bb(
         trainer=trainer,
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
-        confidence_mse_threshold=confidence_mse_threshold
+        confidence_mse_threshold=confidence_mse_threshold,
+        max_epochs=100
     )
 
     # Create replay buffer
@@ -1110,13 +1148,10 @@ def optimize_patch_bb(
 
     print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
 
-    # Create adapter optimizer and scheduler (reuse across epochs)
+    # Create adapter optimizer (reuse across cycles)
     adapter_optimizer = optim.Adam(
         models.get_adapter_parameters(),
         lr=surrogate_trainer.learning_rate
-    )
-    adapter_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        adapter_optimizer, mode='min', factor=0.5, patience=6
     )
 
     print("\n" + "=" * 60)
@@ -1147,75 +1182,103 @@ def optimize_patch_bb(
     blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
-    for epoch in range(num_epochs):
-        print(f"\n--- Epoch {epoch + 1}/{num_epochs} ---")
+    # Train 4 patch epochs per adapter training cycle
+    patch_epochs_per_cycle = 4
+    num_cycles = num_epochs // patch_epochs_per_cycle
 
-        # Step 1: Train patch for one epoch (single gradient update)
-        patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
-        print(f"Patch loss: {patch_losses['total']:.4f} "
-              f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
+    total_patch_epoch = 0
 
-        # Step 2: Apply patch to all images (with blur) and query black-box
-        print("Collecting patched samples...")
-        patched_samples, bb_success_rate = collect_patched_samples(
-            black_box=black_box,
-            trainer=trainer,
-            ground_truth_texts=ground_truth_texts,
-            blur_sigma=current_blur_sigma
-        )
-        print(f"Black-box success rate: {bb_success_rate:.1%}")
+    for cycle in range(num_cycles):
+        print(f"\n{'=' * 60}")
+        print(f"Cycle {cycle + 1}/{num_cycles} (Epochs {total_patch_epoch + 1}-{total_patch_epoch + patch_epochs_per_cycle})")
+        print('=' * 60)
 
-        # Step 2b: Check if we need to reduce blur (attack too effective)
-        if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
-            print(
-                f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
-            print("*** Reducing blur to maintain training diversity...")
+        # Train patch for 4 epochs before adapter fine-tuning
+        cycle_samples = []
+        for patch_epoch_in_cycle in range(patch_epochs_per_cycle):
+            epoch = total_patch_epoch + patch_epoch_in_cycle
+            print(f"\n--- Patch Epoch {epoch + 1}/{num_epochs} ---")
 
-            # Re-calibrate with a higher target (to reduce blur)
-            # Target: get back to ~50% success rate zone
-            new_blur_sigma, cached_clean_samples = calibrate_blur_level(
+            # Step 1: Train patch for one epoch
+            patch_losses = trainer.train_single_epoch(epoch, optimizer=patch_optimizer)
+            print(f"Patch loss: {patch_losses['total']:.4f} "
+                  f"(det={patch_losses['det']:.4f}, ocr={patch_losses['ocr']:.4f}, tv={patch_losses['tv']:.4f})")
+
+            # Step 2: Apply patch to all images (with blur) and query black-box
+            print("Collecting patched samples...")
+            patched_samples, bb_success_rate = collect_patched_samples(
                 black_box=black_box,
-                dataset_loader=trainer.train_loader,
+                trainer=trainer,
                 ground_truth_texts=ground_truth_texts,
-                target_correct_rate=blur_target_rate,
-                sigma_min=0.0,
-                sigma_max=current_blur_sigma,  # Can only decrease blur
-                tolerance=0.10,
-                max_iterations=5,  # Quick recalibration
-                device=device
+                blur_sigma=current_blur_sigma
             )
+            print(f"Black-box success rate: {bb_success_rate:.1%}")
 
-            if new_blur_sigma < current_blur_sigma:
-                current_blur_sigma = new_blur_sigma
-                trainer.set_blur_sigma(current_blur_sigma)
-                print(f"*** New blur sigma: {current_blur_sigma:.2f}")
+            # Step 2b: Check if we need to reduce blur (attack too effective)
+            if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
+                print(
+                    f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
+                print("*** Reducing blur to maintain training diversity...")
 
-                # Use cached samples from calibration (no re-querying needed)
-                print("*** Using cached samples from calibration...")
-                clean_samples = cached_clean_samples
-                replay_buffer.add_clean_samples(clean_samples)
-
-                # Fine-tune adapter on new clean samples
-                print("*** Fine-tuning adapter on less blurred data...")
-                surrogate_trainer.fine_tune(
-                    clean_samples,
-                    verbose=verbose,
-                    adapter_optimizer=adapter_optimizer,
-                    adapter_scheduler=adapter_scheduler
+                # Re-calibrate with a higher target (to reduce blur)
+                new_blur_sigma, cached_clean_samples = calibrate_blur_level(
+                    black_box=black_box,
+                    dataset_loader=trainer.train_loader,
+                    ground_truth_texts=ground_truth_texts,
+                    target_correct_rate=blur_target_rate,
+                    sigma_min=0.0,
+                    sigma_max=current_blur_sigma,  # Can only decrease blur
+                    tolerance=0.10,
+                    max_iterations=5,  # Quick recalibration
+                    device=device
                 )
 
-        # Step 3: Update replay buffer
-        replay_buffer.add_patch_epoch(
-            epoch=epoch,
-            patch=trainer.patch.detach().clone(),
-            samples=patched_samples
+                if new_blur_sigma < current_blur_sigma:
+                    current_blur_sigma = new_blur_sigma
+                    trainer.set_blur_sigma(current_blur_sigma)
+                    print(f"*** New blur sigma: {current_blur_sigma:.2f}")
+
+            # Step 3: Update replay buffer
+            replay_buffer.add_patch_epoch(
+                epoch=epoch,
+                patch=trainer.patch.detach().clone(),
+                samples=patched_samples
+            )
+            cycle_samples.extend(patched_samples)
+
+            # Record history
+            history['epoch'].append(epoch + 1)
+            history['patch_loss_total'].append(patch_losses['total'])
+            history['patch_loss_det'].append(patch_losses['det'])
+            history['patch_loss_ocr'].append(patch_losses['ocr'])
+            history['patch_loss_tv'].append(patch_losses['tv'])
+            history['bb_success_rate'].append(bb_success_rate)
+            history['blur_sigma'].append(current_blur_sigma)
+
+            # Save checkpoint every epoch
+            trainer.save_patch(epoch, save_dir="bb_patches")
+
+            # Save models periodically (less frequently to save disk space)
+            if (epoch + 1) % save_interval == 0:
+                models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
+
+        # Step 4: Fine-tune adapter after 4 patch epochs
+        print(f"\n{'*' * 60}")
+        print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
+        print('*' * 60)
+
+        # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
+        adapter_scheduler = LinearWarmupCosineAnnealingLR(
+            adapter_optimizer,
+            warmup_epochs=5,
+            max_epochs=surrogate_trainer.max_epochs,
+            min_lr=1e-6
         )
 
-        # Step 4: Fine-tune adapter on replay buffer
-        print("Fine-tuning adapter...")
         training_samples = replay_buffer.get_training_samples()
         metrics = surrogate_trainer.fine_tune(
             training_samples,
+            batch_size=100,
             verbose=verbose,
             adapter_optimizer=adapter_optimizer,
             adapter_scheduler=adapter_scheduler
@@ -1227,24 +1290,17 @@ def optimize_patch_bb(
         print(f"  Converged: {metrics.converged}")
         print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
 
-        # Record history
-        history['epoch'].append(epoch + 1)
-        history['patch_loss_total'].append(patch_losses['total'])
-        history['patch_loss_det'].append(patch_losses['det'])
-        history['patch_loss_ocr'].append(patch_losses['ocr'])
-        history['patch_loss_tv'].append(patch_losses['tv'])
-        history['surrogate_ocr_loss'].append(metrics.ocr_loss)
-        history['surrogate_conf_mse'].append(metrics.confidence_mse)
-        history['surrogate_converged'].append(metrics.converged)
-        history['bb_success_rate'].append(bb_success_rate)
-        history['blur_sigma'].append(current_blur_sigma)
+        # Save adapter and models after fine-tuning
+        final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1
+        models.save_state(f"bb_patches/models_adapter_epoch_{final_patch_epoch + 1:04d}.pt")
 
-        # Save checkpoint every epoch
-        trainer.save_patch(epoch, save_dir="bb_patches")
+        # Record adapter metrics for all patch epochs in this cycle
+        for _ in range(patch_epochs_per_cycle):
+            history['surrogate_ocr_loss'].append(metrics.ocr_loss)
+            history['surrogate_conf_mse'].append(metrics.confidence_mse)
+            history['surrogate_converged'].append(metrics.converged)
 
-        # Save models periodically (less frequently to save disk space)
-        if (epoch + 1) % save_interval == 0:
-            models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
+        total_patch_epoch += patch_epochs_per_cycle
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
