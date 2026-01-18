@@ -393,11 +393,8 @@ class ReplayBuffer:
             total_weight = len(weights)
         normalized_weights = [w / total_weight for w in weights]
 
-        # Scale target samples based on number of patches
-        # Start with 300 for one patch, scale up as we accumulate more patches
-        # This ensures training data diversity increases with replay buffer size
-        num_patches = len(self.patches)
-        target_total = 300 * num_patches  # Scale with number of patches
+        # Target total samples for each surrogate training cycle
+        target_total = 5000
 
         result = []
 
@@ -528,7 +525,7 @@ class SurrogateTrainer:
         if scheduler is None:
             scheduler = LinearWarmupCosineAnnealingLR(
                 optimizer,
-                warmup_epochs=10,
+                warmup_epochs=20,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
@@ -1091,7 +1088,7 @@ def optimize_patch_bb(
     blur_sigma_init: Optional[float] = None,
     edit_distance_threshold: float = 0.05,
     confidence_mse_threshold: float = 0.05,
-    patch_epochs_per_cycle: int = 1,
+    patch_epochs_per_cycle: int = 4,
     save_interval: int = 10,
     verbose: bool = True,
     **trainer_kwargs
@@ -1153,7 +1150,7 @@ def optimize_patch_bb(
         device=device,
         edit_distance_threshold=edit_distance_threshold,
         confidence_mse_threshold=confidence_mse_threshold,
-        max_epochs=100
+        max_epochs=200
     )
 
     # Create replay buffer (uses exponential decay to weight patch frequency)
@@ -1323,7 +1320,7 @@ def optimize_patch_bb(
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
         surrogate_scheduler = LinearWarmupCosineAnnealingLR(
             surrogate_optimizer,
-            warmup_epochs=10,
+            warmup_epochs=20,
             max_epochs=surrogate_trainer.max_epochs,
             min_lr=1e-6
         )
