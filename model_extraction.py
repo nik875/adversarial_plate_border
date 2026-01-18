@@ -641,29 +641,24 @@ class SurrogateTrainer:
                 skip_reasons['gt_text_none'] += 1
                 continue
 
-            # Ensure transform is a proper [3, 3] homography matrix
-            if transform.dim() != 2 or transform.shape != (3, 3):
-                # If it's 1D or wrong shape, try to reshape it
-                # Assuming it might be [9] flattened
-                if transform.numel() == 9:
-                    transform = transform.reshape(3, 3)
-                else:
-                    # Try to compute homography from corners
-                    if 'orig_corners' in sample and 'corners' in sample:
-                        try:
-                            # Use kornia to compute perspective transform from corners
-                            # orig_corners -> corners (original image space to preprocessed space)
-                            src_pts = sample['orig_corners'].float().unsqueeze(0)  # [1, 4, 2]
-                            dst_pts = sample['corners'].float().unsqueeze(0)  # [1, 4, 2]
-                            transform = kornia.geometry.transform.get_perspective_transform(src_pts, dst_pts).squeeze(0)  # [3, 3]
-                        except Exception as e:
-                            if debug_first_batch:
-                                print(f"    Failed to compute homography from corners: {e}")
-                            skip_reasons['transform_malformed'] += 1
-                            continue
-                    else:
-                        skip_reasons['transform_malformed_no_corners'] += 1
-                        continue
+            # The 'transform' field from the dataloader is (ratio, dw, dh) preprocessing params,
+            # NOT a homography matrix. We need to compute the actual perspective transform
+            # from the corner correspondences.
+            if 'orig_corners' in sample and 'corners' in sample:
+                try:
+                    # Compute perspective transform from corners
+                    # orig_corners -> corners (original image space to preprocessed space)
+                    src_pts = sample['orig_corners'].float().unsqueeze(0)  # [1, 4, 2]
+                    dst_pts = sample['corners'].float().unsqueeze(0)  # [1, 4, 2]
+                    transform = kornia.geometry.transform.get_perspective_transform(src_pts, dst_pts).squeeze(0)  # [3, 3]
+                except Exception as e:
+                    if debug_first_batch:
+                        print(f"    Failed to compute homography from corners: {e}")
+                    skip_reasons['transform_malformed'] += 1
+                    continue
+            else:
+                skip_reasons['transform_malformed_no_corners'] += 1
+                continue
 
             # Compute normalized edit distance between bb_result and ground truth
             # Normalize by ground truth length (fixed reference point)
