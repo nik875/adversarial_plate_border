@@ -718,11 +718,6 @@ class SurrogateTrainer:
             gt_confidence = sample.get('gt_confidence', 0.0)
             transform = sample['transform']
 
-            # Skip only if ground truth is missing
-            if gt_text is None:
-                skip_reasons['gt_text_none'] += 1
-                continue
-
             # The 'transform' field from the dataloader is (ratio, dw, dh) preprocessing params,
             # NOT a homography matrix. We need to compute the actual perspective transform
             # from the corner correspondences.
@@ -742,29 +737,22 @@ class SurrogateTrainer:
                 skip_reasons['transform_malformed_no_corners'] += 1
                 continue
 
-            # Compute edit distance between bb_result (with patch) and gt_text (blur-only baseline)
-            # This measures how much the patch changed the black-box output
-            if bb_result.text is None:
-                # No detection with patch -> maximum deviation from baseline
+            # Compute targets for surrogate training
+            # When either bb_result or gt_text is None, target max error with zero confidence
+            if bb_result.text is None or gt_text is None:
+                # Either patch failed or baseline failed -> treat as maximum error
                 confidence = 0.0
-                if gt_text is None:
-                    # Both failed -> no change (edit_dist = 0)
-                    normalized_edit_dist = 0.0
-                else:
-                    # Baseline succeeded, patch failed -> complete disruption
-                    normalized_edit_dist = 1.0
-                if debug_first_batch:
+                normalized_edit_dist = 1.0
+                if bb_result.text is None:
                     skip_reasons['bb_text_none'] += 1
-            else:
-                confidence = bb_result.confidence
                 if gt_text is None:
-                    # Baseline failed, patch succeeded -> reverse effect (unexpected)
-                    normalized_edit_dist = 1.0
-                else:
-                    # Both detected -> compute edit distance
-                    edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-                    gt_len = len(gt_text)
-                    normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
+                    skip_reasons['gt_text_none'] += 1
+            else:
+                # Both detected -> compute actual edit distance
+                confidence = bb_result.confidence
+                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                gt_len = len(gt_text)
+                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
@@ -886,9 +874,6 @@ class SurrogateTrainer:
             gt_text = sample.get('gt_text')
             gt_confidence = sample.get('gt_confidence', 0.0)
 
-            if gt_text is None:
-                continue
-
             # Compute homography from corners
             if 'orig_corners' in sample and 'corners' in sample:
                 try:
@@ -900,21 +885,18 @@ class SurrogateTrainer:
             else:
                 continue
 
-            # Compute edit distance between bb_result (with patch) and gt_text (blur-only baseline)
-            if bb_result.text is None:
+            # Compute targets for surrogate training
+            # When either bb_result or gt_text is None, target max error with zero confidence
+            if bb_result.text is None or gt_text is None:
+                # Either patch failed or baseline failed -> treat as maximum error
                 confidence = 0.0
-                if gt_text is None:
-                    normalized_edit_dist = 0.0
-                else:
-                    normalized_edit_dist = 1.0
+                normalized_edit_dist = 1.0
             else:
+                # Both detected -> compute actual edit distance
                 confidence = bb_result.confidence
-                if gt_text is None:
-                    normalized_edit_dist = 1.0
-                else:
-                    edit_dist = Levenshtein.distance(bb_result.text, gt_text)
-                    gt_len = len(gt_text)
-                    normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
+                edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+                gt_len = len(gt_text)
+                normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
