@@ -828,30 +828,30 @@ class SurrogateTrainer:
         # Forward through surrogate
         pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
 
-        # Z-score normalization within batch to prevent mean-seeking behavior
-        # This forces the model to learn relative differences, not absolute values
-        def zscore_normalize(x, eps=1e-8):
-            """Normalize to z-scores within batch."""
-            mean = x.mean()
-            std = x.std() + eps
-            return (x - mean) / std
+        # Compute MSE losses
+        edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
+        conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
 
-        # Only apply z-score if batch has variance (std > 0)
-        if actual_valid_samples > 1:
-            pred_edit_z = zscore_normalize(pred_edit_distance)
-            gt_edit_z = zscore_normalize(gt_edit_distances_tensor)
-            pred_conf_z = zscore_normalize(pred_confidence)
-            gt_conf_z = zscore_normalize(gt_confidences_tensor)
+        # Add variance matching loss to prevent mean-seeking behavior
+        # Penalizes when model's prediction variance doesn't match label variance
+        eps = 1e-8
 
-            edit_dist_mse = F.mse_loss(pred_edit_z, gt_edit_z)
-            conf_mse = F.mse_loss(pred_conf_z, gt_conf_z)
-        else:
-            # Fall back to regular MSE for single-sample batches
-            edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
-            conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+        # Edit distance variance matching
+        pred_edit_var = pred_edit_distance.var() + eps
+        gt_edit_var = gt_edit_distances_tensor.var() + eps
+        edit_var_loss = (pred_edit_var - gt_edit_var) ** 2
 
-        # Combined loss
-        total_loss = edit_dist_mse + conf_mse
+        # Confidence variance matching
+        pred_conf_var = pred_confidence.var() + eps
+        gt_conf_var = gt_confidences_tensor.var() + eps
+        conf_var_loss = (pred_conf_var - gt_conf_var) ** 2
+
+        # Combined variance loss (equal weight to both dimensions)
+        variance_loss = (edit_var_loss + conf_var_loss) / 2
+
+        # Total loss: MSE + variance matching
+        # Variance loss has equal weight to MSE loss
+        total_loss = edit_dist_mse + conf_mse + variance_loss
 
         # Backward and optimize
         total_loss.backward()
@@ -955,29 +955,31 @@ class SurrogateTrainer:
         with torch.no_grad():
             pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
 
-            # Z-score normalization (same as training)
-            def zscore_normalize(x, eps=1e-8):
-                mean = x.mean()
-                std = x.std() + eps
-                return (x - mean) / std
+            # Compute MSE losses
+            edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
+            conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
 
-            if actual_valid_samples > 1:
-                pred_edit_z = zscore_normalize(pred_edit_distance)
-                gt_edit_z = zscore_normalize(gt_edit_distances_tensor)
-                pred_conf_z = zscore_normalize(pred_confidence)
-                gt_conf_z = zscore_normalize(gt_confidences_tensor)
+            # Variance matching loss (same as training)
+            eps = 1e-8
+            pred_edit_var = pred_edit_distance.var() + eps
+            gt_edit_var = gt_edit_distances_tensor.var() + eps
+            edit_var_loss = (pred_edit_var - gt_edit_var) ** 2
 
-                edit_dist_mse = F.mse_loss(pred_edit_z, gt_edit_z)
-                conf_mse = F.mse_loss(pred_conf_z, gt_conf_z)
-            else:
-                edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
-                conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+            pred_conf_var = pred_confidence.var() + eps
+            gt_conf_var = gt_confidences_tensor.var() + eps
+            conf_var_loss = (pred_conf_var - gt_conf_var) ** 2
+
+            variance_loss = (edit_var_loss + conf_var_loss) / 2
 
         self.surrogate.train()  # Return to train mode
 
+        # Return combined loss (MSE + variance matching)
+        combined_mse = edit_dist_mse + conf_mse
+        total_loss = combined_mse + variance_loss
+
         return (
-            edit_dist_mse.item() * actual_valid_samples,
-            conf_mse.item() * actual_valid_samples,
+            total_loss.item() * actual_valid_samples,
+            total_loss.item() * actual_valid_samples,
             actual_valid_samples
         )
 
