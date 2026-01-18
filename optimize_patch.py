@@ -601,6 +601,7 @@ class AdversarialPatchTrainer:
         models: Optional[ALPRModels] = None,
         device: str = None,
         config: Optional[TrainerConfig] = None,
+        surrogate: Optional[nn.Module] = None,
         **kwargs
     ):
         """
@@ -608,9 +609,10 @@ class AdversarialPatchTrainer:
 
         Args:
             csv_path: Path to dataset CSV file
-            models: Optional shared ALPRModels instance
+            models: Optional shared ALPRModels instance (legacy, not used when surrogate provided)
             device: Target device (uses models.device if models provided)
             config: Trainer configuration
+            surrogate: Optional surrogate model for black-box optimization
             **kwargs: Override config fields (grad_accumulate, match_detection, etc.)
         """
         # Handle configuration
@@ -631,13 +633,19 @@ class AdversarialPatchTrainer:
         else:
             self.device = 'cpu'
 
-        # Models setup
-        if models is not None:
-            self.models = models
-            if not models.is_loaded:
-                models.load()
+        # Store surrogate (used for black-box optimization)
+        self.surrogate = surrogate
+
+        # Models setup (only needed if not using surrogate)
+        if surrogate is None:
+            if models is not None:
+                self.models = models
+                if not models.is_loaded:
+                    models.load()
+            else:
+                self.models = ALPRModels(device=self.device).load()
         else:
-            self.models = ALPRModels(device=self.device).load()
+            self.models = None  # Not needed when using surrogate
 
         # Data loading - use all data for training
         self.transform = T.Compose([T.ToTensor()])
@@ -984,7 +992,7 @@ class AdversarialPatchTrainer:
 
         Args:
             batch: Batch dict from dataloader
-            use_ocr_baseline: Whether to use OCR baseline normalization
+            use_ocr_baseline: Unused (legacy parameter)
             return_components: If True, return dict with individual loss components
 
         Returns:
@@ -992,55 +1000,84 @@ class AdversarialPatchTrainer:
         """
         batch = {k: v[0] for k, v in batch.items()}
 
-        # Normalize patch to [0,1] before adapter
-        patch_normalized = torch.sigmoid(self.patch)
+        if self.surrogate is not None:
+            # Surrogate-based optimization (black-box)
+            # Normalize patch to [0,1]
+            patch_normalized = torch.sigmoid(self.patch)
 
-        # Transform patch through adapter (for surrogate perception)
-        with torch.no_grad() if not self.patch.requires_grad else torch.enable_grad():
-            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+            # Compute homography from corners using kornia
+            import kornia.geometry.transform
+            src_pts = batch['orig_corners'].float().unsqueeze(0).to(self.device)  # [1, 4, 2]
+            dst_pts = batch['new_corners'].float().unsqueeze(0).to(self.device)   # [1, 4, 2]
+            homography = kornia.geometry.transform.get_perspective_transform(src_pts, dst_pts)  # [1, 3, 3]
 
-        # Apply adapted patch to preprocessed image
-        patched_image, _ = self.apply_patch_to_image(
-            batch['prep_image'].to(self.device).unsqueeze(0),
-            batch['new_corners'].to(self.device).unsqueeze(0),
-            patch_override=adapted_patch
-        )
-        batch['prep_image'] = patched_image.squeeze()
+            # Prepare patch for surrogate [1, 3, H, W]
+            patch_batch = patch_normalized.unsqueeze(0)
 
-        # Apply adapted patch to original image
-        patched_image, _ = self.apply_patch_to_image(
-            batch['orig_image'].to(self.device).unsqueeze(0),
-            batch['orig_corners'].to(self.device).unsqueeze(0),
-            patch_override=adapted_patch
-        )
-        batch['orig_image'] = patched_image.squeeze()
+            # Forward through surrogate: predicts (edit_distance, confidence)
+            pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography)
 
-        # Apply blur after patching (simulates real-world degradation)
-        if self.config.blur_sigma > 0:
-            # Blur original image
-            batch['orig_image'] = apply_plate_blur(
-                batch['orig_image'],
-                batch['orig_corners'],
-                self.config.blur_sigma
+            # Adversarial loss: maximize edit distance, minimize confidence
+            # edit_distance in [0, 1]: 0=perfect match, 1=complete mismatch
+            # confidence in [0, 1]: detection confidence
+            adversarial_loss = pred_confidence.mean() - pred_edit_distance.mean()
+
+            det_loss = pred_confidence.mean()  # For logging
+            ocr_loss = -pred_edit_distance.mean()  # For logging (negative because we maximize)
+
+        else:
+            # White-box optimization (legacy)
+            # Normalize patch to [0,1] before adapter
+            patch_normalized = torch.sigmoid(self.patch)
+
+            # Transform patch through adapter (for surrogate perception)
+            with torch.no_grad() if not self.patch.requires_grad else torch.enable_grad():
+                adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+
+            # Apply adapted patch to preprocessed image
+            patched_image, _ = self.apply_patch_to_image(
+                batch['prep_image'].to(self.device).unsqueeze(0),
+                batch['new_corners'].to(self.device).unsqueeze(0),
+                patch_override=adapted_patch
             )
+            batch['prep_image'] = patched_image.squeeze()
 
-            # Blur preprocessed image with scaled sigma
-            orig_image_size = max(batch['orig_image'].shape[1], batch['orig_image'].shape[2])
-            prep_blur_sigma = self.config.blur_sigma * (384 / orig_image_size)
-            batch['prep_image'] = apply_plate_blur(
-                batch['prep_image'],
-                batch['new_corners'],
-                prep_blur_sigma
+            # Apply adapted patch to original image
+            patched_image, _ = self.apply_patch_to_image(
+                batch['orig_image'].to(self.device).unsqueeze(0),
+                batch['orig_corners'].to(self.device).unsqueeze(0),
+                patch_override=adapted_patch
             )
+            batch['orig_image'] = patched_image.squeeze()
 
-        det_loss, ocr_loss = self._compute_partial_loss(batch, use_ocr_baseline)
+            # Apply blur after patching (simulates real-world degradation)
+            if self.config.blur_sigma > 0:
+                # Blur original image
+                batch['orig_image'] = apply_plate_blur(
+                    batch['orig_image'],
+                    batch['orig_corners'],
+                    self.config.blur_sigma
+                )
 
-        loss = (det_loss + ocr_loss) / 2
+                # Blur preprocessed image with scaled sigma
+                orig_image_size = max(batch['orig_image'].shape[1], batch['orig_image'].shape[2])
+                prep_blur_sigma = self.config.blur_sigma * (384 / orig_image_size)
+                batch['prep_image'] = apply_plate_blur(
+                    batch['prep_image'],
+                    batch['new_corners'],
+                    prep_blur_sigma
+                )
 
+            det_loss, ocr_loss = self._compute_partial_loss(batch, use_ocr_baseline)
+            adversarial_loss = (det_loss + ocr_loss) / 2
+
+        # TV loss (same for both surrogate and white-box)
         tv_loss = torch.tensor(0.0, device=self.device)
         if self.config.use_tv_loss:
             tv_loss = self._compute_tv_loss()
-            loss = loss + tv_loss
+            loss = adversarial_loss + tv_loss
+        else:
+            loss = adversarial_loss
 
         if return_components:
             return {
@@ -1095,9 +1132,10 @@ class AdversarialPatchTrainer:
         Returns:
             Dict with 'total', 'det', 'ocr', 'tv' average losses for the epoch
         """
-        # IMPORTANT: Freeze models at the start of each epoch
+        # IMPORTANT: Freeze models at the start of each epoch (only if using white-box)
         # This ensures weights are frozen even if an external script unfroze them
-        self.models.freeze_all()
+        if self.models is not None:
+            self.models.freeze_all()
 
         self._training_mode = True
 

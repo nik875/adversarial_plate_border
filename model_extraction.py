@@ -1259,9 +1259,6 @@ def optimize_patch_bb(
 
     print(f"Using device: {device}")
 
-    # Create shared models
-    models = ALPRModels(device=device).load()
-
     # Create trainer with gradient accumulation for more steps per epoch
     config = TrainerConfig(
         grad_accumulate=64,  # Accumulate gradients over 64 steps per epoch
@@ -1270,14 +1267,19 @@ def optimize_patch_bb(
         **{k: v for k, v in trainer_kwargs.items() if hasattr(TrainerConfig, k)}
     )
 
+    # Create surrogate model first
+    surrogate = BlackBoxSurrogate().to(device)
+
+    # Create trainer with surrogate (no white-box models needed)
     trainer = AdversarialPatchTrainer(
         csv_path=csv_path,
-        models=models,
+        models=None,  # Not needed when using surrogate
         device=device,
-        config=config
+        config=config,
+        surrogate=surrogate
     )
 
-    # Create surrogate trainer (query-based, no ALPR models needed)
+    # Create surrogate trainer (query-based, trains the surrogate model)
     surrogate_trainer = SurrogateTrainer(
         trainer=trainer,
         device=device,
@@ -1285,6 +1287,9 @@ def optimize_patch_bb(
         confidence_mse_threshold=confidence_mse_threshold,
         max_epochs=200
     )
+
+    # Use the same surrogate instance
+    surrogate_trainer.surrogate = surrogate
 
     # Create replay buffer (uses exponential decay to weight patch frequency)
     replay_buffer = ReplayBuffer(decay_half_life=4)
@@ -1423,9 +1428,7 @@ def optimize_patch_bb(
             # Save checkpoint every epoch
             trainer.save_patch(epoch, save_dir="bb_patches")
 
-            # Save models periodically (less frequently to save disk space)
-            if (epoch + 1) % save_interval == 0:
-                models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
+            # Models are no longer used (optimizing against surrogate now)
 
         # Step 4: Train surrogate after patch optimization cycle
         print(f"\n{'*' * 60}")
@@ -1508,8 +1511,7 @@ def optimize_patch_bb(
 
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
-    models.save_state("bb_patches_final/models_final.pt")
-    torch.save(surrogate_trainer.surrogate.state_dict(), "bb_patches_final/surrogate_final.pt")
+    torch.save(surrogate.state_dict(), "bb_patches_final/surrogate_final.pt")
 
     print("\n" + "=" * 60)
     print("Optimization Complete")
