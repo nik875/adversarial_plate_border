@@ -611,15 +611,15 @@ class SurrogateTrainer:
         # Get current patch (normalized to [0, 1])
         patch_normalized = torch.sigmoid(self.trainer.patch)  # [3, 256, 512]
 
-        # Repeat patch for batch
-        patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1)  # [B, 3, 256, 512]
+        # Repeat patch for batch and move to device
+        patch_batch = patch_normalized.unsqueeze(0).repeat(valid_samples, 1, 1, 1).to(self.device)  # [B, 3, 256, 512]
 
-        # Stack homographies
-        homography_batch = torch.stack(homographies).to(self.device)  # [B, 3, 3]
+        # Stack homographies and convert to float32
+        homography_batch = torch.stack(homographies).to(self.device).float()  # [B, 3, 3]
 
         # Stack ground truth
-        gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device).unsqueeze(1)  # [B, 1]
-        gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device).unsqueeze(1)  # [B, 1]
+        gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
+        gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
 
         # Forward through surrogate
         pred_ocr_loss, pred_confidence = self.surrogate(patch_batch, homography_batch)
