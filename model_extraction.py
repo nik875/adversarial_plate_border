@@ -648,13 +648,19 @@ class SurrogateTrainer:
                 if transform.numel() == 9:
                     transform = transform.reshape(3, 3)
                 else:
-                    # If it's truly [3], it might be missing dimensions
-                    # Try to get the actual [3, 3] matrix from the sample
+                    # Try to compute homography from corners
                     if 'orig_corners' in sample and 'corners' in sample:
-                        # Recompute homography from corners if available
-                        # For now, skip this sample as data is corrupted
-                        skip_reasons['transform_malformed'] += 1
-                        continue
+                        try:
+                            # Use kornia to compute perspective transform from corners
+                            # orig_corners -> corners (original image space to preprocessed space)
+                            src_pts = sample['orig_corners'].float().unsqueeze(0)  # [1, 4, 2]
+                            dst_pts = sample['corners'].float().unsqueeze(0)  # [1, 4, 2]
+                            transform = kornia.geometry.transform.get_perspective_transform(src_pts, dst_pts).squeeze(0)  # [3, 3]
+                        except Exception as e:
+                            if debug_first_batch:
+                                print(f"    Failed to compute homography from corners: {e}")
+                            skip_reasons['transform_malformed'] += 1
+                            continue
                     else:
                         skip_reasons['transform_malformed_no_corners'] += 1
                         continue
