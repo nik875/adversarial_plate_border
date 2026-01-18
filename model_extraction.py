@@ -1243,9 +1243,10 @@ def optimize_patch_bb(
         print('*' * 60)
 
         # Scale learning rate for subsequent cycles based on accuracy MSE improvement
-        if cycle > 0 and initial_accuracy_mse is not None:
+        if cycle > 0 and initial_accuracy_mse is not None and initial_accuracy_mse > 1e-6:
             # Ratio = current_mse / initial_mse; as MSE improves (< 1), lr scales down
             lr_scale = metrics.ocr_loss / initial_accuracy_mse
+            lr_scale = max(0.1, min(lr_scale, 10.0))  # Clamp to [0.1, 10.0] to avoid extreme values
             scaled_lr = surrogate_trainer.learning_rate * lr_scale
             for param_group in surrogate_optimizer.param_groups:
                 param_group['lr'] = scaled_lr
