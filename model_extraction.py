@@ -1160,20 +1160,24 @@ def optimize_patch_bb(
     # Phase 1: Initial setup and blur calibration
     # =========================================================================
     print("\n" + "=" * 60)
-    print("Phase 1: Blur Calibration")
-    print("=" * 60)
-
-    # Calibrate blur level (no initial fine-tuning - adapter trains on patch samples)
-    blur_sigma, _ = calibrate_blur_level(
-        black_box=black_box,
-        dataset_loader=trainer.train_loader,
-        ground_truth_texts=ground_truth_texts,
-        target_correct_rate=blur_target_rate,
-        sigma_init=blur_sigma_init,
-        device=device
-    )
-
-    print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
+    if blur_sigma_init is not None:
+        print("Phase 1: Using provided blur sigma (skipping calibration)")
+        print("=" * 60)
+        blur_sigma = blur_sigma_init
+        print(f"\nUsing blur sigma: {blur_sigma:.2f}")
+    else:
+        print("Phase 1: Blur Calibration")
+        print("=" * 60)
+        # Calibrate blur level (no initial fine-tuning - adapter trains on patch samples)
+        blur_sigma, _ = calibrate_blur_level(
+            black_box=black_box,
+            dataset_loader=trainer.train_loader,
+            ground_truth_texts=ground_truth_texts,
+            target_correct_rate=blur_target_rate,
+            sigma_init=None,
+            device=device
+        )
+        print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
 
     # Create surrogate optimizer (reuse across cycles)
     surrogate_optimizer = optim.Adam(
