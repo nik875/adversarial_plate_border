@@ -684,8 +684,13 @@ class AdversarialPatchTrainer:
                 self.device
             )
 
-        # Calculate baseline losses
-        self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
+        # Calculate baseline losses (only needed for white-box optimization)
+        if self.models is not None:
+            self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
+        else:
+            # Not used when optimizing against surrogate
+            self.detection_baseline = None
+            self.ocr_baseline = None
 
         # Training state
         self._optimizer: Optional[optim.Optimizer] = None
@@ -719,8 +724,9 @@ class AdversarialPatchTrainer:
             blur_sigma: New blur sigma value
         """
         self.config.blur_sigma = blur_sigma
-        # Recalculate baseline losses with new blur level
-        self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
+        # Recalculate baseline losses with new blur level (only if using white-box)
+        if self.models is not None:
+            self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
 
     # -------------------------------------------------------------------------
     # Patch Application
