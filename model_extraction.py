@@ -477,7 +477,7 @@ class SurrogateTrainer:
     def fine_tune(
         self,
         samples: List[Dict],
-        batch_size: int = 32,
+        batch_size: int = 1000,
         verbose: bool = True,
         optimizer: Optional[optim.Optimizer] = None,
         scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
@@ -553,17 +553,19 @@ class SurrogateTrainer:
             # Shuffle samples at start of each epoch
             random.shuffle(samples)
 
+            # Create all batches upfront (enables parallel processing)
+            batch_indices = list(range(0, len(samples), batch_size))
+            batches = [samples[i:i + batch_size] for i in batch_indices]
+
             # Training pass over entire dataset
             epoch_ocr_mse = 0.0
             epoch_conf_mse = 0.0
             samples_processed = 0
 
             desc = f"Surrogate epoch {epoch + 1}/{self.max_epochs}"
-            pbar = tqdm(range(0, len(samples), batch_size), desc=desc,
-                        disable=not verbose, leave=False)
+            pbar = tqdm(batches, desc=desc, disable=not verbose, leave=False)
 
-            for batch_idx, i in enumerate(pbar):
-                batch = samples[i:i + batch_size]
+            for batch_idx, batch in enumerate(pbar):
                 # Debug first batch of first epoch to understand why samples are skipped
                 debug_this_batch = (epoch == 0 and batch_idx == 0 and verbose)
                 ocr_mse, conf_mse, valid_samples = self._train_step(batch, optimizer, debug_first_batch=debug_this_batch)
@@ -576,8 +578,6 @@ class SurrogateTrainer:
                     'ocr_mse': f'{epoch_ocr_mse / max(1, samples_processed):.4f}',
                     'conf_mse': f'{epoch_conf_mse / max(1, samples_processed):.4f}'
                 })
-
-            pbar.close()
 
             # Compute average MSEs
             avg_ocr_mse = epoch_ocr_mse / max(1, samples_processed)
@@ -1470,7 +1470,7 @@ def optimize_patch_bb(
 
         metrics = surrogate_trainer.fine_tune(
             training_samples,
-            batch_size=100,
+            batch_size=1000,
             verbose=verbose,
             optimizer=surrogate_optimizer,
             scheduler=surrogate_scheduler,
