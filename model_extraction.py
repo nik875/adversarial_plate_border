@@ -341,8 +341,8 @@ class SurrogateTrainer:
         device: str,
         ocr_loss_threshold: float = 0.2,
         confidence_mse_threshold: float = 0.1,
-        learning_rate: float = 2.5e-3,
-        max_epochs: int = 100
+        learning_rate: float = 5e-3,
+        max_epochs: int = 150
     ):
         """
         Args:
@@ -410,7 +410,7 @@ class SurrogateTrainer:
         if adapter_scheduler is None:
             adapter_scheduler = LinearWarmupCosineAnnealingLR(
                 adapter_optimizer,
-                warmup_epochs=5,
+                warmup_epochs=10,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
@@ -1118,7 +1118,7 @@ def optimize_patch_bb(
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
         confidence_mse_threshold=confidence_mse_threshold,
-        max_epochs=100
+        max_epochs=150
     )
 
     # Create replay buffer
@@ -1281,7 +1281,7 @@ def optimize_patch_bb(
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
         adapter_scheduler = LinearWarmupCosineAnnealingLR(
             adapter_optimizer,
-            warmup_epochs=5,
+            warmup_epochs=10,
             max_epochs=surrogate_trainer.max_epochs,
             min_lr=1e-6
         )
