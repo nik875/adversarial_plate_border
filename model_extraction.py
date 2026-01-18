@@ -29,6 +29,7 @@ from typing import List, Tuple, Optional, Dict, Any
 import random
 import math
 from collections import deque
+import Levenshtein
 
 import torch
 from torch import nn
@@ -37,7 +38,6 @@ from torch import optim
 import numpy as np
 from tqdm import tqdm
 import kornia
-from difflib import SequenceMatcher
 
 from optimize_patch import (
     ALPRModels,
@@ -68,11 +68,10 @@ class BlackBoxSurrogate(nn.Module):
     Lightweight regression model that predicts black-box ALPR behavior.
 
     Given an adversarial patch and homography transformation, predicts:
-    - OCR accuracy (normalized character-level similarity to ground truth, 0-1)
-    - Detection confidence (0-1)
+    - Normalized edit distance (Levenshtein distance between prediction and ground truth, normalized to [0, 1])
+    - Detection confidence
 
-    This replaces the adapter-based approach with a simple query-based model that
-    directly predicts observables from the black-box.
+    This replaces the adapter-based approach with a simple query-based model.
     """
 
     def __init__(self, patch_height: int = 256, patch_width: int = 512):
@@ -127,15 +126,15 @@ class BlackBoxSurrogate(nn.Module):
             nn.Dropout(0.3),
         )
 
-        # Accuracy head (predicts character-level accuracy in [0, 1])
-        self.accuracy_head = nn.Sequential(
+        # Edit distance head (predicts normalized Levenshtein distance in [0, 1])
+        self.edit_distance_head = nn.Sequential(
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
             nn.Sigmoid()  # Output in [0, 1]
         )
 
-        # Confidence head (predicts detection confidence in [0, 1])
+        # Confidence head (predicts confidence in [0, 1])
         self.confidence_head = nn.Sequential(
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
@@ -156,9 +155,7 @@ class BlackBoxSurrogate(nn.Module):
             homography: Homography matrix [B, 3, 3] or [B, 8] (flattened without last scale)
 
         Returns:
-            Tuple of (accuracy, confidence) predictions, each [B, 1]
-            accuracy: Normalized character-level similarity (0-1)
-            confidence: Detection confidence (0-1)
+            Tuple of (edit_distance, confidence) predictions, each [B, 1]
         """
         # Validate inputs
         assert patch.dim() == 4 and patch.size(1) == 3, \
@@ -201,10 +198,10 @@ class BlackBoxSurrogate(nn.Module):
         fused = self.fc_fusion(combined)  # [B, 256]
 
         # Predictions
-        accuracy = self.accuracy_head(fused)  # [B, 1]
+        edit_distance = self.edit_distance_head(fused)  # [B, 1]
         confidence = self.confidence_head(fused)  # [B, 1]
 
-        return accuracy, confidence
+        return edit_distance, confidence
 
 
 # =============================================================================
@@ -430,18 +427,17 @@ class SurrogateTrainer:
 
     Instead of fine-tuning ALPR models or using adapters, this trains a simple
     regression model that predicts:
-    - OCR accuracy (normalized character-level similarity to ground truth)
+    - Normalized edit distance (Levenshtein distance / max text length, in [0, 1])
     - Detection confidence
 
-    Given a patch and homography, the surrogate predicts these metrics based on
-    what the black-box model observes (text and confidence only).
+    Given a patch and homography, the surrogate directly predicts these metrics.
     """
 
     def __init__(
         self,
         trainer: 'AdversarialPatchTrainer',
         device: str,
-        accuracy_mse_threshold: float = 0.15,
+        edit_distance_threshold: float = 0.3,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 5e-3,
         max_epochs: int = 100
@@ -450,14 +446,14 @@ class SurrogateTrainer:
         Args:
             trainer: AdversarialPatchTrainer instance (for patch application)
             device: Target device
-            accuracy_mse_threshold: Maximum MSE of accuracy predictions for convergence
+            edit_distance_threshold: Maximum MSE of edit distance predictions for convergence
             confidence_mse_threshold: Maximum MSE of confidence predictions for convergence
             learning_rate: Learning rate for surrogate training
             max_epochs: Maximum training epochs before giving up
         """
         self.trainer = trainer
         self.device = device
-        self.accuracy_mse_threshold = accuracy_mse_threshold
+        self.edit_distance_threshold = edit_distance_threshold
         self.confidence_mse_threshold = confidence_mse_threshold
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
@@ -517,7 +513,7 @@ class SurrogateTrainer:
             random.shuffle(samples)
 
             # Training pass over entire dataset
-            epoch_accuracy_mse = 0.0
+            epoch_ocr_mse = 0.0
             epoch_conf_mse = 0.0
             samples_processed = 0
 
@@ -527,42 +523,42 @@ class SurrogateTrainer:
 
             for i in pbar:
                 batch = samples[i:i + batch_size]
-                accuracy_mse, conf_mse, valid_samples = self._train_step(batch, optimizer)
+                ocr_mse, conf_mse, valid_samples = self._train_step(batch, optimizer)
 
-                epoch_accuracy_mse += accuracy_mse
+                epoch_ocr_mse += ocr_mse
                 epoch_conf_mse += conf_mse
                 samples_processed += valid_samples
 
                 pbar.set_postfix({
-                    'acc_mse': f'{epoch_accuracy_mse / max(1, samples_processed):.4f}',
+                    'ocr_mse': f'{epoch_ocr_mse / max(1, samples_processed):.4f}',
                     'conf_mse': f'{epoch_conf_mse / max(1, samples_processed):.4f}'
                 })
 
             pbar.close()
 
             # Compute average MSEs
-            avg_accuracy_mse = epoch_accuracy_mse / max(1, samples_processed)
+            avg_ocr_mse = epoch_ocr_mse / max(1, samples_processed)
             avg_conf_mse = epoch_conf_mse / max(1, samples_processed)
 
             if verbose:
                 lr = optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch + 1}: acc_mse={avg_accuracy_mse:.4f}, "
+                print(f"  Epoch {epoch + 1}: ocr_mse={avg_ocr_mse:.4f}, "
                       f"conf_mse={avg_conf_mse:.4f} | LR={lr:.2e}")
 
             # Step scheduler
             scheduler.step()
 
             # Check convergence
-            if (avg_accuracy_mse <= self.accuracy_mse_threshold and
+            if (avg_ocr_mse <= self.edit_distance_threshold and
                     avg_conf_mse <= self.confidence_mse_threshold):
                 converged = True
                 if verbose:
                     print(f"  Converged at epoch {epoch + 1}")
                 break
 
-        # Return final metrics (use ocr_loss field for accuracy for backward compat)
+        # Return final metrics (note: ocr_loss field now contains edit distance MSE)
         return FinetuneMetrics(
-            ocr_loss=avg_accuracy_mse,
+            ocr_loss=avg_ocr_mse,  # Actually edit distance MSE, kept for compatibility
             confidence_mse=avg_conf_mse,
             num_samples=samples_processed,
             converged=converged
@@ -577,18 +573,18 @@ class SurrogateTrainer:
         Single training step on a batch.
 
         Returns:
-            Tuple of (accuracy_mse_sum, conf_mse_sum, valid_samples)
+            Tuple of (ocr_mse_sum, conf_mse_sum, valid_samples)
         """
         self.surrogate.train()
         optimizer.zero_grad()
 
-        total_accuracy_mse = 0.0
+        total_ocr_mse = 0.0
         total_conf_mse = 0.0
         valid_samples = 0
 
         # Collect batch data
         homographies = []
-        gt_accuracies = []
+        gt_edit_distances = []
         gt_confidences = []
 
         for sample in batch:
@@ -615,13 +611,13 @@ class SurrogateTrainer:
                     else:
                         continue
 
-            # Compute character-level accuracy between bb_result.text and gt_text
-            # Using sequence matching for normalized similarity
-            matcher = SequenceMatcher(None, gt_text, bb_result.text)
-            accuracy = matcher.ratio()  # Returns 0.0 to 1.0
+            # Compute normalized edit distance between bb_result and ground truth
+            edit_dist = Levenshtein.distance(bb_result.text, gt_text)
+            max_len = max(len(bb_result.text), len(gt_text))
+            normalized_edit_dist = edit_dist / max_len if max_len > 0 else 0.0
 
             homographies.append(transform)
-            gt_accuracies.append(accuracy)
+            gt_edit_distances.append(normalized_edit_dist)
             gt_confidences.append(bb_result.confidence)
             valid_samples += 1
 
@@ -657,7 +653,7 @@ class SurrogateTrainer:
 
         # Trim ground truth lists to match actual valid samples
         # (in case some were skipped due to malformed homographies)
-        gt_accuracies = gt_accuracies[:actual_valid_samples]
+        gt_edit_distances = gt_edit_distances[:actual_valid_samples]
         gt_confidences = gt_confidences[:actual_valid_samples]
 
         # Adjust patch batch to match
@@ -670,25 +666,25 @@ class SurrogateTrainer:
             f"Unexpected homography_batch shape: {homography_batch.shape}, expected ({len(processed_homographies)}, 3, 3)"
 
         # Stack ground truth
-        gt_accuracies_tensor = torch.tensor(gt_accuracies, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
+        gt_edit_distances_tensor = torch.tensor(gt_edit_distances, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
         gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device, dtype=torch.float32).unsqueeze(1)  # [B, 1]
 
         # Forward through surrogate
-        pred_accuracy, pred_confidence = self.surrogate(patch_batch, homography_batch)
+        pred_edit_distance, pred_confidence = self.surrogate(patch_batch, homography_batch)
 
         # Compute MSE losses
-        accuracy_mse = F.mse_loss(pred_accuracy, gt_accuracies_tensor)
+        edit_dist_mse = F.mse_loss(pred_edit_distance, gt_edit_distances_tensor)
         conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
 
         # Combined loss
-        total_loss = accuracy_mse + conf_mse
+        total_loss = edit_dist_mse + conf_mse
 
         # Backward and optimize
         total_loss.backward()
         optimizer.step()
 
         return (
-            accuracy_mse.item() * actual_valid_samples,
+            edit_dist_mse.item() * actual_valid_samples,
             conf_mse.item() * actual_valid_samples,
             actual_valid_samples
         )
@@ -1034,7 +1030,7 @@ def optimize_patch_bb(
     learning_rate: float = 0.1,
     blur_target_rate: float = 0.5,
     blur_sigma_init: Optional[float] = None,
-    accuracy_mse_threshold: float = 0.15,
+    edit_distance_threshold: float = 0.2,
     confidence_mse_threshold: float = 0.1,
     patch_epochs_per_cycle: int = 1,
     save_interval: int = 10,
@@ -1053,8 +1049,8 @@ def optimize_patch_bb(
         learning_rate: Learning rate for patch optimization
         blur_target_rate: Target correct rate for blur calibration
         blur_sigma_init: Optional initial blur sigma suggestion (speeds up calibration)
-        accuracy_mse_threshold: Maximum MSE of accuracy predictions for surrogate convergence
-        confidence_mse_threshold: Confidence MSE threshold for surrogate convergence
+        edit_distance_threshold: Maximum MSE of edit distance predictions for surrogate convergence
+        confidence_mse_threshold: Maximum MSE of confidence predictions for surrogate convergence
         patch_epochs_per_cycle: Patch optimization epochs before surrogate training (default: 1)
         save_interval: Save patch every N epochs
         verbose: Whether to print progress
@@ -1096,7 +1092,7 @@ def optimize_patch_bb(
     surrogate_trainer = SurrogateTrainer(
         trainer=trainer,
         device=device,
-        accuracy_mse_threshold=accuracy_mse_threshold,
+        edit_distance_threshold=edit_distance_threshold,
         confidence_mse_threshold=confidence_mse_threshold,
         max_epochs=100
     )
@@ -1141,7 +1137,7 @@ def optimize_patch_bb(
         'patch_loss_ocr': [],
         'patch_loss_tv': [],
         # Surrogate fine-tuning metrics
-        'surrogate_accuracy_mse': [],
+        'surrogate_ocr_loss': [],
         'surrogate_conf_mse': [],
         'surrogate_converged': [],
         # Black-box evaluation
@@ -1161,7 +1157,8 @@ def optimize_patch_bb(
     num_cycles = num_epochs // patch_epochs_per_cycle
 
     total_patch_epoch = 0
-    initial_accuracy_mse = None  # Saved from first fine-tune for adaptive LR scaling
+    initial_edit_dist_mse = None  # Saved from first surrogate training for adaptive LR scaling
+    prev_metrics = None  # Metrics from previous cycle
 
     for cycle in range(num_cycles):
         print(f"\n{'=' * 60}")
@@ -1242,11 +1239,11 @@ def optimize_patch_bb(
         print(f"Training surrogate (after {patch_epochs_per_cycle} patch epoch{'s' if patch_epochs_per_cycle != 1 else ''})...")
         print('*' * 60)
 
-        # Scale learning rate for subsequent cycles based on accuracy MSE improvement
-        if cycle > 0 and initial_accuracy_mse is not None and initial_accuracy_mse > 1e-6:
-            # Ratio = current_mse / initial_mse; as MSE improves (< 1), lr scales down
-            lr_scale = metrics.ocr_loss / initial_accuracy_mse
-            lr_scale = max(0.1, min(lr_scale, 10.0))  # Clamp to [0.1, 10.0] to avoid extreme values
+        # Scale learning rate for subsequent cycles based on edit distance MSE improvement
+        if prev_metrics is not None and initial_edit_dist_mse is not None:
+            # Use previous cycle's performance to scale LR
+            # Ratio = prev_mse / initial_mse; as MSE improves (< 1), lr scales down
+            lr_scale = prev_metrics.ocr_loss / initial_edit_dist_mse  # ocr_loss field contains edit dist MSE
             scaled_lr = surrogate_trainer.learning_rate * lr_scale
             for param_group in surrogate_optimizer.param_groups:
                 param_group['lr'] = scaled_lr
@@ -1271,16 +1268,19 @@ def optimize_patch_bb(
         )
 
         print(f"Surrogate metrics:")
-        print(f"  Accuracy MSE: {metrics.ocr_loss:.4f}")
+        print(f"  Edit Distance MSE: {metrics.ocr_loss:.4f}")  # ocr_loss field contains edit dist MSE
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
         print(f"  Surrogate LR: {surrogate_optimizer.param_groups[0]['lr']:.2e}")
 
-        # Save initial accuracy MSE from first cycle for adaptive LR scaling
+        # Save initial edit distance MSE from first cycle for adaptive LR scaling
         if cycle == 0:
-            initial_accuracy_mse = metrics.ocr_loss
+            initial_edit_dist_mse = metrics.ocr_loss  # ocr_loss field contains edit dist MSE
             if verbose:
-                print(f"Saved initial accuracy MSE: {initial_accuracy_mse:.4f}")
+                print(f"Saved initial edit distance MSE: {initial_edit_dist_mse:.4f}")
+
+        # Save metrics for next cycle's LR scaling
+        prev_metrics = metrics
 
         # Save surrogate model after fine-tuning
         final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1
@@ -1289,7 +1289,7 @@ def optimize_patch_bb(
 
         # Record adapter metrics for all patch epochs in this cycle
         for _ in range(patch_epochs_per_cycle):
-            history['surrogate_accuracy_mse'].append(metrics.ocr_loss)
+            history['surrogate_ocr_loss'].append(metrics.ocr_loss)
             history['surrogate_conf_mse'].append(metrics.confidence_mse)
             history['surrogate_converged'].append(metrics.converged)
 
