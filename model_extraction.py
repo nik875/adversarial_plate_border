@@ -341,7 +341,7 @@ class SurrogateTrainer:
         device: str,
         ocr_loss_threshold: float = 0.2,
         confidence_mse_threshold: float = 0.1,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 2.5e-3,
         max_epochs: int = 100
     ):
         """
