@@ -393,9 +393,11 @@ class ReplayBuffer:
             total_weight = len(weights)
         normalized_weights = [w / total_weight for w in weights]
 
-        # Target total samples (use average dataset size * 3)
-        # This gives reasonable coverage across all patches
-        target_total = 300  # Reasonable default
+        # Scale target samples based on number of patches
+        # Start with 300 for one patch, scale up as we accumulate more patches
+        # This ensures training data diversity increases with replay buffer size
+        num_patches = len(self.patches)
+        target_total = 300 * num_patches  # Scale with number of patches
 
         result = []
 
