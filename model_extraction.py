@@ -1458,7 +1458,16 @@ def optimize_patch_bb(
     }
 
     # Create optimizer for patch
-    patch_optimizer = optim.Adam([trainer.patch], lr=learning_rate)
+    patch_optimizer = optim.Adam([trainer.patch], lr=2.5e-3)
+
+    # Create learning rate scheduler for patch optimization
+    # Warmup to 2.5e-3 over 16 epochs, then cosine anneal to 1e-5
+    patch_scheduler = LinearWarmupCosineAnnealingLR(
+        patch_optimizer,
+        warmup_epochs=16,
+        max_epochs=num_epochs,
+        min_lr=1e-5
+    )
 
     # Threshold for reducing blur (when attack is too effective)
     blur_reduction_threshold = 0.25  # 25% success rate
@@ -1541,6 +1550,9 @@ def optimize_patch_bb(
 
             # Save checkpoint every epoch
             trainer.save_patch(epoch, save_dir="bb_patches")
+
+            # Step learning rate scheduler for patch optimization
+            patch_scheduler.step()
 
             # Models are no longer used (optimizing against surrogate now)
 
