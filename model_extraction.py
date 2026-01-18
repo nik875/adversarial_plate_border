@@ -984,6 +984,7 @@ def optimize_patch_bb(
     blur_sigma_init: Optional[float] = None,
     ocr_loss_threshold: float = 0.2,
     confidence_mse_threshold: float = 0.1,
+    patch_epochs_per_cycle: int = 1,
     save_interval: int = 10,
     verbose: bool = True,
     **trainer_kwargs
@@ -1002,6 +1003,7 @@ def optimize_patch_bb(
         blur_sigma_init: Optional initial blur sigma suggestion (speeds up calibration)
         ocr_loss_threshold: Maximum average OCR loss for surrogate convergence
         confidence_mse_threshold: Confidence MSE threshold for surrogate convergence
+        patch_epochs_per_cycle: Patch optimization epochs before surrogate training (default: 1)
         save_interval: Save patch every N epochs
         verbose: Whether to print progress
         **trainer_kwargs: Additional kwargs for AdversarialPatchTrainer
@@ -1103,8 +1105,7 @@ def optimize_patch_bb(
     blur_reduction_threshold = 0.25  # 25% success rate
     current_blur_sigma = blur_sigma
 
-    # Train 4 patch epochs per adapter training cycle
-    patch_epochs_per_cycle = 4
+    # Calculate number of cycles based on patch_epochs_per_cycle ratio
     num_cycles = num_epochs // patch_epochs_per_cycle
 
     total_patch_epoch = 0
@@ -1184,9 +1185,9 @@ def optimize_patch_bb(
             if (epoch + 1) % save_interval == 0:
                 models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
 
-        # Step 4: Train surrogate after 4 patch epochs
+        # Step 4: Train surrogate after patch optimization cycle
         print(f"\n{'*' * 60}")
-        print(f"Training surrogate (after {patch_epochs_per_cycle} patch epochs)...")
+        print(f"Training surrogate (after {patch_epochs_per_cycle} patch epoch{'s' if patch_epochs_per_cycle != 1 else ''})...")
         print('*' * 60)
 
         # Scale learning rate for subsequent cycles based on OCR MSE improvement
