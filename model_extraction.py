@@ -738,21 +738,34 @@ class SurrogateTrainer:
                 continue
 
             # Compute targets for surrogate training
-            # When either bb_result or gt_text is None, target max error with zero confidence
-            if bb_result.text is None or gt_text is None:
-                # Either patch failed or baseline failed -> treat as maximum error
+            # Cases:
+            # 1. bb_result exists, gt_text is None: patch improved (baseline failed, patch succeeded)
+            # 2. gt_text exists, bb_result is None: patch degraded (baseline succeeded, patch failed)
+            # 3. Both exist: compute actual edit distance
+            # 4. Neither exists: both failed (maximum error)
+
+            if bb_result.text is not None and gt_text is None:
+                # Patch improved performance (baseline failed, patch succeeded)
+                confidence = bb_result.confidence
+                normalized_edit_dist = 0.0
+                skip_reasons['gt_text_none'] += 1
+            elif gt_text is not None and bb_result.text is None:
+                # Patch degraded performance (baseline succeeded, patch failed)
                 confidence = 0.0
                 normalized_edit_dist = 1.0
-                if bb_result.text is None:
-                    skip_reasons['bb_text_none'] += 1
-                if gt_text is None:
-                    skip_reasons['gt_text_none'] += 1
-            else:
+                skip_reasons['bb_text_none'] += 1
+            elif bb_result.text is not None and gt_text is not None:
                 # Both detected -> compute actual edit distance
                 confidence = bb_result.confidence
                 edit_dist = Levenshtein.distance(bb_result.text, gt_text)
                 gt_len = len(gt_text)
                 normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
+            else:
+                # Neither detected -> both failed (maximum error, no confidence)
+                confidence = 0.0
+                normalized_edit_dist = 1.0
+                skip_reasons['bb_text_none'] += 1
+                skip_reasons['gt_text_none'] += 1
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
@@ -885,18 +898,25 @@ class SurrogateTrainer:
             else:
                 continue
 
-            # Compute targets for surrogate training
-            # When either bb_result or gt_text is None, target max error with zero confidence
-            if bb_result.text is None or gt_text is None:
-                # Either patch failed or baseline failed -> treat as maximum error
+            # Compute targets for surrogate training (same logic as _train_step)
+            if bb_result.text is not None and gt_text is None:
+                # Patch improved performance (baseline failed, patch succeeded)
+                confidence = bb_result.confidence
+                normalized_edit_dist = 0.0
+            elif gt_text is not None and bb_result.text is None:
+                # Patch degraded performance (baseline succeeded, patch failed)
                 confidence = 0.0
                 normalized_edit_dist = 1.0
-            else:
+            elif bb_result.text is not None and gt_text is not None:
                 # Both detected -> compute actual edit distance
                 confidence = bb_result.confidence
                 edit_dist = Levenshtein.distance(bb_result.text, gt_text)
                 gt_len = len(gt_text)
                 normalized_edit_dist = min(1.0, edit_dist / gt_len) if gt_len > 0 else 0.0
+            else:
+                # Neither detected -> both failed (maximum error, no confidence)
+                confidence = 0.0
+                normalized_edit_dist = 1.0
 
             homographies.append(transform)
             gt_edit_distances.append(normalized_edit_dist)
