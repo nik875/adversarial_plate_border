@@ -339,7 +339,7 @@ class SurrogateTrainer:
         models: ALPRModels,
         trainer: 'AdversarialPatchTrainer',
         device: str,
-        ocr_loss_threshold: float = 0.2,
+        ocr_loss_threshold: float = 0.3,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 5e-3,
         max_epochs: int = 150
