@@ -237,13 +237,17 @@ class LinearWarmupCosineAnnealingLR(optim.lr_scheduler._LRScheduler):
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        if self.last_epoch < self.warmup_epochs:
-            # Linear warmup
-            alpha = self.last_epoch / max(1, self.warmup_epochs)
+        # Note: last_epoch starts at -1 in PyTorch schedulers, so we add 1 to get actual epoch
+        current_epoch = self.last_epoch + 1
+
+        if current_epoch < self.warmup_epochs:
+            # Linear warmup from 1/warmup_epochs to 1.0
+            # Ensures we have a non-zero LR from epoch 0
+            alpha = (current_epoch + 1) / max(1, self.warmup_epochs)
             return [base_lr * alpha for base_lr in self.base_lrs]
         else:
             # Cosine annealing
-            progress = (self.last_epoch - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
+            progress = (current_epoch - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
             cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
             return [
                 self.min_lr + (base_lr - self.min_lr) * cosine_factor
@@ -524,9 +528,11 @@ class SurrogateTrainer:
             pbar = tqdm(range(0, len(samples), batch_size), desc=desc,
                         disable=not verbose, leave=False)
 
-            for i in pbar:
+            for batch_idx, i in enumerate(pbar):
                 batch = samples[i:i + batch_size]
-                ocr_mse, conf_mse, valid_samples = self._train_step(batch, optimizer)
+                # Debug first batch of first epoch to understand why samples are skipped
+                debug_this_batch = (epoch == 0 and batch_idx == 0 and verbose)
+                ocr_mse, conf_mse, valid_samples = self._train_step(batch, optimizer, debug_first_batch=debug_this_batch)
 
                 epoch_ocr_mse += ocr_mse
                 epoch_conf_mse += conf_mse
@@ -546,12 +552,21 @@ class SurrogateTrainer:
             if verbose:
                 lr = optimizer.param_groups[0]['lr']
                 print(f"  Epoch {epoch + 1}: ocr_mse={avg_ocr_mse:.4f}, "
-                      f"conf_mse={avg_conf_mse:.4f} | LR={lr:.2e}")
+                      f"conf_mse={avg_conf_mse:.4f} | LR={lr:.2e} | samples={samples_processed}")
 
             # Step scheduler
             scheduler.step()
 
-            # Check convergence
+            # Check for no valid samples - this indicates a data problem
+            if samples_processed == 0:
+                if verbose:
+                    print(f"  WARNING: No valid samples processed! Check that:")
+                    print(f"    - ground_truth_texts dict has matching dataset indices")
+                    print(f"    - bb_result.text is not None (black-box detected plates)")
+                # Don't declare convergence with 0 samples - keep training
+                continue
+
+            # Check convergence (only if we have valid samples)
             if (avg_ocr_mse <= self.edit_distance_threshold and
                     avg_conf_mse <= self.confidence_mse_threshold):
                 converged = True
@@ -570,7 +585,8 @@ class SurrogateTrainer:
     def _train_step(
         self,
         batch: List[Dict],
-        optimizer: optim.Optimizer
+        optimizer: optim.Optimizer,
+        debug_first_batch: bool = False
     ) -> Tuple[float, float, int]:
         """
         Single training step on a batch.
@@ -590,12 +606,19 @@ class SurrogateTrainer:
         gt_edit_distances = []
         gt_confidences = []
 
+        # Track skip reasons for debugging
+        skip_reasons = {'bb_text_none': 0, 'gt_text_none': 0, 'transform_malformed': 0, 'transform_malformed_no_corners': 0}
+
         for sample in batch:
             bb_result = sample['bb_result']
             gt_text = sample.get('gt_text', bb_result.text)
             transform = sample['transform']
 
-            if bb_result.text is None or gt_text is None:
+            if bb_result.text is None:
+                skip_reasons['bb_text_none'] += 1
+                continue
+            if gt_text is None:
+                skip_reasons['gt_text_none'] += 1
                 continue
 
             # Ensure transform is a proper [3, 3] homography matrix
@@ -610,8 +633,10 @@ class SurrogateTrainer:
                     if 'orig_corners' in sample and 'corners' in sample:
                         # Recompute homography from corners if available
                         # For now, skip this sample as data is corrupted
+                        skip_reasons['transform_malformed'] += 1
                         continue
                     else:
+                        skip_reasons['transform_malformed_no_corners'] += 1
                         continue
 
             # Compute normalized edit distance between bb_result and ground truth
@@ -627,6 +652,12 @@ class SurrogateTrainer:
             valid_samples += 1
 
         if valid_samples == 0:
+            if debug_first_batch:
+                print(f"\n  DEBUG: All {len(batch)} samples in batch were skipped!")
+                print(f"    - bb_result.text is None: {skip_reasons['bb_text_none']}")
+                print(f"    - gt_text is None: {skip_reasons['gt_text_none']}")
+                print(f"    - transform malformed (with corners): {skip_reasons['transform_malformed']}")
+                print(f"    - transform malformed (no corners): {skip_reasons['transform_malformed_no_corners']}")
             return 0.0, 0.0, 0
 
         # Get current patch (normalized to [0, 1])
@@ -1245,7 +1276,7 @@ def optimize_patch_bb(
         print('*' * 60)
 
         # Scale learning rate for subsequent cycles based on edit distance MSE improvement
-        if prev_metrics is not None and initial_edit_dist_mse is not None:
+        if prev_metrics is not None and initial_edit_dist_mse is not None and initial_edit_dist_mse > 0:
             # Use previous cycle's performance to scale LR
             # Ratio = prev_mse / initial_mse; as MSE improves (< 1), lr scales down
             lr_scale = prev_metrics.ocr_loss / initial_edit_dist_mse  # ocr_loss field contains edit dist MSE
@@ -1254,6 +1285,13 @@ def optimize_patch_bb(
                 param_group['lr'] = scaled_lr
             if verbose:
                 print(f"Scaled learning rate: {scaled_lr:.2e} (ratio: {lr_scale:.3f})")
+        elif prev_metrics is not None and initial_edit_dist_mse == 0:
+            # If initial MSE was 0, this means surrogate training had no valid samples
+            # Reset to base LR and warn
+            for param_group in surrogate_optimizer.param_groups:
+                param_group['lr'] = surrogate_trainer.learning_rate
+            if verbose:
+                print(f"WARNING: initial_edit_dist_mse was 0 (no valid samples in first cycle), using base LR: {surrogate_trainer.learning_rate:.2e}")
 
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
         surrogate_scheduler = LinearWarmupCosineAnnealingLR(
