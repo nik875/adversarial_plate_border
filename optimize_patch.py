@@ -951,7 +951,7 @@ class AdversarialPatchTrainer:
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             ocr_output = self.models.ocr(ocr_input)
-            ocr_loss = self.ocr_loss_fn(self.ocr_target, ocr_output)
+            ocr_loss = torch.sqrt(self.ocr_loss_fn(self.ocr_target, ocr_output))
 
             if use_ocr_baseline:
                 if self.config.impersonation_target:
