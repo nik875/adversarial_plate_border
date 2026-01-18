@@ -587,7 +587,10 @@ class SurrogateTrainer:
             val_ocr_mse = None
             val_conf_mse = None
             if val_samples is not None and len(val_samples) > 0:
-                val_ocr_mse, val_conf_mse, _ = self._eval_step(val_samples)
+                val_ocr_sum, val_conf_sum, val_num_samples = self._eval_step(val_samples)
+                # Average the validation metrics (they come back as sums)
+                val_ocr_mse = val_ocr_sum / max(1, val_num_samples)
+                val_conf_mse = val_conf_sum / max(1, val_num_samples)
                 val_loss = val_ocr_mse + val_conf_mse
 
                 # Early stopping logic
