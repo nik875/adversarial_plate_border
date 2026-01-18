@@ -305,37 +305,27 @@ class BlackBoxModel(ABC):
 
 class ReplayBuffer:
     """
-    Manages fine-tuning dataset with structured sampling.
+    Manages patches and their evaluation samples with exponential decay weighting.
 
-    After initial epochs, maintains:
-    - 33% images with the most recent patch
-    - 67% historical patches with exponential decay favoring recency
+    Uses exponential decay to determine sampling frequency: recent patches appear
+    more often, older patches fade out. Randomly samples homographies/results for
+    each patch to maintain diversity.
     """
 
     def __init__(
         self,
-        original_dataset_size: int,
-        decay_half_life: int = 4,
-        initial_epochs: int = 3
+        decay_half_life: int = 4
     ):
         """
         Args:
-            original_dataset_size: Size of the original training set
             decay_half_life: Half-life for exponential decay (in epochs)
-            initial_epochs: Number of epochs before applying sampling strategy
         """
-        self.original_size = original_dataset_size
-        self.max_size = 4 * original_dataset_size
         self.decay_half_life = decay_half_life
-        self.initial_epochs = initial_epochs
         self.decay_rate = math.log(2) / decay_half_life
 
-        # Storage: lightweight metadata dicts (dataset_idx, corners, transform, bb_result)
-        self.last_patch_samples: List[Dict] = []
-        self.last_patch: Optional[torch.Tensor] = None
-        # Historical: list of (epoch, patch_tensor, samples)
-        self.historical: List[Tuple[int, torch.Tensor, List[Dict]]] = []
-
+        # Storage: list of (epoch, patch_tensor, samples_list)
+        # samples_list contains metadata dicts (corners, transform, bb_result, gt_text)
+        self.patches: List[Tuple[int, torch.Tensor, List[Dict]]] = []
         self.current_epoch = 0
 
     def add_patch_epoch(
@@ -345,107 +335,70 @@ class ReplayBuffer:
         samples: List[Dict]
     ):
         """
-        Add samples from a patch optimization epoch.
+        Add patch and samples from an optimization epoch.
 
         Args:
             epoch: Current epoch number
             patch: The patch tensor used
-            samples: List of metadata dicts (dataset_idx, corners, transform, bb_result)
+            samples: List of metadata dicts (corners, transform, bb_result, gt_text)
         """
         self.current_epoch = epoch
-
-        # Move previous "last patch" to historical (if exists)
-        if self.last_patch_samples and self.last_patch is not None:
-            prev_epoch = epoch - 1
-            self.historical.append((prev_epoch, self.last_patch, self.last_patch_samples))
-
-        # Update last patch samples and store patch for later
-        self.last_patch_samples = samples
-        self.last_patch = patch.clone()
+        self.patches.append((epoch, patch.clone().detach().cpu(), samples))
 
     def get_training_samples(self) -> List[Dict]:
         """
-        Get samples for fine-tuning according to the sampling strategy.
+        Sample from all patches according to exponential decay weights.
+
+        Each patch contributes: count = total_samples * decay_weight / sum(weights)
+        For each contribution, randomly pick one sample from that patch's samples.
 
         Returns:
-            List of metadata dicts (dataset_idx, corners, transform, bb_result)
+            List of metadata dicts for surrogate training
         """
-        if self.current_epoch < self.initial_epochs:
-            # Initial epochs: use all available samples
-            all_samples = list(self.last_patch_samples)
-            for _, _, samples in self.historical:
-                all_samples.extend(samples)
-            return all_samples
-
-        # After initial epochs: apply 33/67 split (recent/historical)
-        target_size = min(self.max_size, len(self.last_patch_samples) * 3)
-
-        last_patch_count = target_size // 3
-        historical_count = target_size - last_patch_count
-
-        result = []
-
-        # 33% last patch samples
-        if self.last_patch_samples:
-            last_indices = self._sample_indices(len(self.last_patch_samples), last_patch_count)
-            result.extend([self.last_patch_samples[i] for i in last_indices])
-
-        # 67% historical with exponential decay
-        if self.historical and historical_count > 0:
-            historical_samples = self._sample_historical(historical_count)
-            result.extend(historical_samples)
-
-        return result
-
-    def _sample_indices(self, pool_size: int, sample_count: int) -> List[int]:
-        """Sample indices with replacement if needed."""
-        if pool_size == 0:
-            return []
-        if sample_count <= pool_size:
-            return random.sample(range(pool_size), sample_count)
-        else:
-            # Sample with replacement
-            return [random.randint(0, pool_size - 1) for _ in range(sample_count)]
-
-    def _sample_historical(self, count: int) -> List[Tuple]:
-        """Sample from historical patches with exponential decay weights."""
-        if not self.historical:
+        if not self.patches:
             return []
 
-        # Calculate weights based on recency
+        # Calculate decay weights for each patch
         weights = []
-        all_samples_with_epoch = []
-
-        for epoch, patch, samples in self.historical:
+        for epoch, _, samples in self.patches:
             age = self.current_epoch - epoch
             weight = math.exp(-self.decay_rate * age)
-            for sample in samples:
-                weights.append(weight)
-                all_samples_with_epoch.append(sample)
-
-        if not all_samples_with_epoch:
-            return []
+            weights.append(weight)
 
         # Normalize weights
         total_weight = sum(weights)
         if total_weight == 0:
             weights = [1.0] * len(weights)
             total_weight = len(weights)
-        probs = [w / total_weight for w in weights]
+        normalized_weights = [w / total_weight for w in weights]
 
-        # Sample according to weights
-        indices = np.random.choice(
-            len(all_samples_with_epoch),
-            size=min(count, len(all_samples_with_epoch)),
-            replace=True,
-            p=probs
-        )
+        # Target total samples (use average dataset size * 3)
+        # This gives reasonable coverage across all patches
+        target_total = 300  # Reasonable default
 
-        return [all_samples_with_epoch[i] for i in indices]
+        result = []
+
+        # For each patch, sample appropriate number based on weight
+        for i, (epoch, patch, samples) in enumerate(self.patches):
+            # How many times should this patch appear?
+            count = int(round(target_total * normalized_weights[i]))
+
+            if count > 0 and samples:
+                # Randomly sample from this patch's samples (with replacement)
+                selected_indices = np.random.choice(
+                    len(samples),
+                    size=count,
+                    replace=True
+                )
+                for idx in selected_indices:
+                    result.append(samples[idx])
+
+        return result
 
     def __len__(self) -> int:
-        total = len(self.last_patch_samples)
-        for _, _, samples in self.historical:
+        """Total number of samples across all patches."""
+        total = 0
+        for _, _, samples in self.patches:
             total += len(samples)
         return total
 
@@ -1094,13 +1047,8 @@ def optimize_patch_bb(
         max_epochs=100
     )
 
-    # Create replay buffer
-    dataset_size = len(trainer.train_loader)
-    replay_buffer = ReplayBuffer(
-        original_dataset_size=dataset_size,
-        decay_half_life=4,
-        initial_epochs=3
-    )
+    # Create replay buffer (uses exponential decay to weight patch frequency)
+    replay_buffer = ReplayBuffer(decay_half_life=4)
 
     # =========================================================================
     # Phase 1: Initial setup and blur calibration
