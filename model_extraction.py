@@ -59,6 +59,109 @@ from optimize_patch import (
 
 
 # =============================================================================
+# Black-Box Surrogate Model
+# =============================================================================
+
+class BlackBoxSurrogate(nn.Module):
+    """
+    Lightweight regression model that predicts black-box ALPR behavior.
+
+    Given a patch-applied image, predicts:
+    - OCR loss (how different the prediction will be from ground truth)
+    - Detection confidence
+
+    This replaces the adapter-based approach with a simple query-based model.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        # Simple CNN encoder
+        # Input: 3x384x384
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1),  # 32x192x192
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 64x96x96
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 128x48x48
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),  # 256x24x24
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, stride=2, padding=1),  # 512x12x12
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # Global average pooling
+        self.gap = nn.AdaptiveAvgPool2d(1)  # 512x1x1
+
+        # Regression heads
+        self.fc_shared = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+        )
+
+        # OCR loss head (predicts focal CCE loss, typically 0-10 range)
+        self.ocr_loss_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Softplus()  # Ensure positive output
+        )
+
+        # Confidence head (predicts confidence in [0, 1])
+        self.confidence_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Output in [0, 1]
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict black-box behavior from patched image.
+
+        Args:
+            x: Patched preprocessed image [B, 3, 384, 384]
+
+        Returns:
+            Tuple of (ocr_loss, confidence) predictions, each [B, 1]
+        """
+        # Convolutional features
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+
+        # Global pooling
+        x = self.gap(x)  # [B, 512, 1, 1]
+        x = x.view(x.size(0), -1)  # [B, 512]
+
+        # Shared features
+        shared = self.fc_shared(x)  # [B, 256]
+
+        # Predictions
+        ocr_loss = self.ocr_loss_head(shared)  # [B, 1]
+        confidence = self.confidence_head(shared)  # [B, 1]
+
+        return ocr_loss, confidence
+
+
+# =============================================================================
 # Learning Rate Schedulers
 # =============================================================================
 
@@ -324,37 +427,35 @@ class ReplayBuffer:
 
 class SurrogateTrainer:
     """
-    Fine-tunes a lightweight adapter to match black-box behavior.
+    Trains a lightweight query-based surrogate to predict black-box behavior.
 
-    Instead of fine-tuning the entire ALPR model, this trains a U-Net adapter
-    that transforms the adversarial patch tensor. The ALPR detector and OCR
-    models remain completely frozen.
+    Instead of fine-tuning ALPR models or using adapters, this trains a simple
+    regression model that predicts:
+    - OCR loss (how different black-box prediction is from ground truth)
+    - Detection confidence
 
-    The adapter learns to transform patches so the surrogate perceives them
-    the same way the black-box does.
+    Given a patched image, the surrogate directly predicts these metrics without
+    running the full ALPR pipeline.
     """
 
     def __init__(
         self,
-        models: ALPRModels,
         trainer: 'AdversarialPatchTrainer',
         device: str,
         ocr_loss_threshold: float = 0.3,
         confidence_mse_threshold: float = 0.1,
         learning_rate: float = 5e-3,
-        max_epochs: int = 150
+        max_epochs: int = 100
     ):
         """
         Args:
-            models: ALPRModels instance containing adapter
             trainer: AdversarialPatchTrainer instance (for patch application)
             device: Target device
-            ocr_loss_threshold: Maximum average OCR loss for convergence
-            confidence_mse_threshold: Maximum confidence MSE for convergence
-            learning_rate: Learning rate for adapter training
+            ocr_loss_threshold: Maximum MSE of OCR loss predictions for convergence
+            confidence_mse_threshold: Maximum MSE of confidence predictions for convergence
+            learning_rate: Learning rate for surrogate training
             max_epochs: Maximum training epochs before giving up
         """
-        self.models = models
         self.trainer = trainer
         self.device = device
         self.ocr_loss_threshold = ocr_loss_threshold
@@ -362,30 +463,32 @@ class SurrogateTrainer:
         self.learning_rate = learning_rate
         self.max_epochs = max_epochs
 
+        # Create surrogate model
+        self.surrogate = BlackBoxSurrogate().to(device)
+
+        # For computing ground truth OCR loss
         self.ocr_loss_fn = create_focal_cce_loss(len(OCR_ALPHABET))
 
     def fine_tune(
         self,
-        samples: List[Tuple],
+        samples: List[Dict],
         batch_size: int = 32,
         verbose: bool = True,
-        adapter_optimizer: Optional[optim.Optimizer] = None,
-        adapter_scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
+        optimizer: Optional[optim.Optimizer] = None,
+        scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
     ) -> FinetuneMetrics:
         """
-        Fine-tune adapter module until convergence or max epochs.
+        Train surrogate model until convergence or max epochs.
 
         Each epoch processes the entire dataset with batched gradient updates.
-        Convergence is checked based on metrics over the whole dataset after each epoch.
-
-        The ALPR detector and OCR models remain frozen - only the adapter is trained.
+        Convergence is checked when MSE of both predictions is below threshold.
 
         Args:
-            samples: List of metadata dicts (dataset_idx, corners, orig_corners, transform, bb_result)
+            samples: List of metadata dicts (dataset_idx, corners, bb_result, gt_text)
             batch_size: Training batch size for gradient updates
             verbose: Whether to show progress bar
-            adapter_optimizer: Optional pre-created adapter optimizer (reuses across epochs)
-            adapter_scheduler: Optional pre-created adapter scheduler
+            optimizer: Optional pre-created optimizer (reuses across epochs)
+            scheduler: Optional pre-created scheduler
 
         Returns:
             FinetuneMetrics with final metrics
@@ -398,326 +501,168 @@ class SurrogateTrainer:
                 converged=False
             )
 
-        # Freeze ALPR models, unfreeze adapter
-        self.models.freeze_all()
-        self.models.unfreeze_adapter()
-
         # Set up optimizer (create if not provided)
-        if adapter_optimizer is None:
-            adapter_optimizer = optim.Adam(self.models.get_adapter_parameters(), lr=self.learning_rate)
+        if optimizer is None:
+            optimizer = optim.Adam(self.surrogate.parameters(), lr=self.learning_rate)
 
         # Learning rate scheduler (create if not provided)
-        if adapter_scheduler is None:
-            adapter_scheduler = LinearWarmupCosineAnnealingLR(
-                adapter_optimizer,
+        if scheduler is None:
+            scheduler = LinearWarmupCosineAnnealingLR(
+                optimizer,
                 warmup_epochs=10,
                 max_epochs=self.max_epochs,
                 min_lr=1e-6
             )
 
         converged = False
-        best_ocr_loss = float('inf')
 
         for epoch in range(self.max_epochs):
             # Shuffle samples at start of each epoch
             random.shuffle(samples)
 
             # Training pass over entire dataset
-            epoch_ocr_loss = 0.0
-            epoch_conf_loss = 0.0
+            epoch_ocr_mse = 0.0
+            epoch_conf_mse = 0.0
             samples_processed = 0
 
-            desc = f"Fine-tune epoch {epoch + 1}/{self.max_epochs}"
+            desc = f"Surrogate epoch {epoch + 1}/{self.max_epochs}"
             pbar = tqdm(range(0, len(samples), batch_size), desc=desc,
                         disable=not verbose, leave=False)
 
             for i in pbar:
                 batch = samples[i:i + batch_size]
-                ocr_loss, conf_loss, _, _, valid_samples = self._train_step(
-                    batch, adapter_optimizer
-                )
-                epoch_ocr_loss += ocr_loss
-                epoch_conf_loss += conf_loss
+                ocr_mse, conf_mse, valid_samples = self._train_step(batch, optimizer)
+
+                epoch_ocr_mse += ocr_mse
+                epoch_conf_mse += conf_mse
                 samples_processed += valid_samples
 
                 pbar.set_postfix({
-                    'ocr_loss': f'{epoch_ocr_loss / max(1, samples_processed):.4f}',
-                    'conf_loss': f'{epoch_conf_loss / max(1, samples_processed):.4f}'
+                    'ocr_mse': f'{epoch_ocr_mse / max(1, samples_processed):.4f}',
+                    'conf_mse': f'{epoch_conf_mse / max(1, samples_processed):.4f}'
                 })
 
             pbar.close()
 
-            # Use training metrics instead of re-evaluating (much faster)
-            avg_ocr_loss = epoch_ocr_loss / max(1, samples_processed)
-            avg_conf_loss = epoch_conf_loss / max(1, samples_processed)
+            # Compute average MSEs
+            avg_ocr_mse = epoch_ocr_mse / max(1, samples_processed)
+            avg_conf_mse = epoch_conf_mse / max(1, samples_processed)
 
             if verbose:
-                adapter_lr = adapter_optimizer.param_groups[0]['lr']
-                print(f"  Epoch {epoch + 1}: ocr_loss={avg_ocr_loss:.4f}, "
-                      f"conf_mse={avg_conf_loss:.4f} | "
-                      f"LR: adapter={adapter_lr:.2e}")
+                lr = optimizer.param_groups[0]['lr']
+                print(f"  Epoch {epoch + 1}: ocr_mse={avg_ocr_mse:.4f}, "
+                      f"conf_mse={avg_conf_mse:.4f} | LR={lr:.2e}")
 
-            # Step scheduler (linear warmup + cosine annealing)
-            adapter_scheduler.step()
+            # Step scheduler
+            scheduler.step()
 
-            # Check convergence based on training metrics
-            if (avg_ocr_loss <= self.ocr_loss_threshold and
-                    avg_conf_loss <= self.confidence_mse_threshold):
+            # Check convergence
+            if (avg_ocr_mse <= self.ocr_loss_threshold and
+                    avg_conf_mse <= self.confidence_mse_threshold):
                 converged = True
                 if verbose:
                     print(f"  Converged at epoch {epoch + 1}")
                 break
 
-        # Freeze models again
-        self.models.freeze_all()
-
-        # Return final metrics from last training epoch
+        # Return final metrics
         return FinetuneMetrics(
-            ocr_loss=avg_ocr_loss,
-            confidence_mse=avg_conf_loss,
+            ocr_loss=avg_ocr_mse,
+            confidence_mse=avg_conf_mse,
             num_samples=samples_processed,
             converged=converged
         )
 
     def _train_step(
         self,
-        batch: List[Tuple],
-        adapter_optimizer: optim.Optimizer
-    ) -> Tuple[float, float, float, float, int]:
-        """Single training step on a batch.
+        batch: List[Dict],
+        optimizer: optim.Optimizer
+    ) -> Tuple[float, float, int]:
+        """
+        Single training step on a batch.
 
         Returns:
-            Tuple of (ocr_loss_sum, conf_loss_sum, match_rate, conf_mse, valid_samples)
-            where valid_samples is the count of samples that produced valid losses
+            Tuple of (ocr_mse_sum, conf_mse_sum, valid_samples)
         """
-        # Keep ALPR models frozen, train adapter
-        self.models.detector.eval()
-        self.models.ocr.eval()
-        self.models.adapter.train()
+        self.surrogate.train()
+        optimizer.zero_grad()
 
-        total_ocr_loss = 0.0
-        total_conf_loss = 0.0
-        correct_matches = 0
+        total_ocr_mse = 0.0
+        total_conf_mse = 0.0
         valid_samples = 0
-        conf_squared_errors = []
 
-        adapter_optimizer.zero_grad()
-
-        # Normalize patch to [0,1] before adapter (once for all samples)
-        patch_normalized = torch.sigmoid(self.trainer.patch)
-
-        # Transform patch through adapter (once for all samples)
-        adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
+        # Collect batch data
+        patched_images = []
+        gt_ocr_losses = []
+        gt_confidences = []
 
         for sample in batch:
-            # Sample is now a dict with metadata
             dataset_idx = sample['dataset_idx']
             corners = sample['corners']
-            orig_corners = sample['orig_corners']
-            transform = sample['transform']
             bb_result = sample['bb_result']
+            gt_text = sample.get('gt_text', bb_result.text)
 
-            if bb_result.text is None:
+            if bb_result.text is None or gt_text is None:
                 continue
 
-            # Load original images from dataset on-the-fly
+            # Load and patch image
             dataset_item = self.trainer.train_loader.dataset[dataset_idx]
             unpatched_prep = dataset_item['prep_image']
-            unpatched_orig = dataset_item['orig_image']
 
-            # Apply adapted patch to prep image
+            # Apply current patch (no adapter, just raw patch)
             patched_prep, _ = self.trainer.apply_patch_to_image(
                 unpatched_prep.to(self.device).unsqueeze(0),
-                corners.to(self.device).unsqueeze(0),
-                patch_override=adapted_patch
+                corners.to(self.device).unsqueeze(0)
             )
             patched_prep = patched_prep.squeeze(0)
 
-            # Run detector on patched image (frozen model, no gradients needed)
-            with torch.no_grad():
-                detector_output = self.models.detector(patched_prep.unsqueeze(0))
-
-            if len(detector_output) == 0:
-                continue
-
-            # Find best detection (highest IoU with target plate region)
-            target_box = corners_to_bbox(corners.to(self.device))
-            best_det = None
-            best_iou = -1.0
-
-            for detection in detector_output:
-                pred_box = detection[1:5]
-                iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
-                if iou > best_iou:
-                    best_iou = iou
-                    best_det = detection
-
-            if best_det is None:
-                continue
-
-            valid_samples += 1
-            pred_conf = best_det[6]
-
-            # Confidence loss
-            target_conf = torch.tensor(bb_result.confidence, device=self.device)
-            conf_loss = F.mse_loss(pred_conf, target_conf)
-            total_conf_loss += conf_loss
-
-            conf_squared_errors.append((pred_conf.item() - bb_result.confidence) ** 2)
-
-            # Apply adapted patch to original image for OCR
-            patched_orig, _ = self.trainer.apply_patch_to_image(
-                unpatched_orig.to(self.device).unsqueeze(0),
-                orig_corners.to(self.device).unsqueeze(0),
-                patch_override=adapted_patch
-            )
-            patched_orig = patched_orig.squeeze(0)
-
-            # Get plate crop for OCR
-            pred_box = best_det[1:5]
-            orig_projection = invert_bbox(pred_box.to('cpu'), transform)
-            corners_box = bbox_to_corners(orig_projection, device='cpu')
-
-            cropped_plate = kornia.geometry.crop_and_resize(
-                patched_orig.unsqueeze(0),
-                corners_box,
-                OCR_INPUT_SHAPE[:2],
-                mode='bilinear',
-                align_corners=True
-            ).to(self.device)
-
-            # OCR forward
-            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            ocr_output = self.models.ocr(ocr_input)
-
-            # OCR loss against black-box text
+            # Compute ground truth OCR loss from black-box result
+            # (How different is bb_result.text from gt_text)
             target_tensor = text_to_target_tensor(
+                gt_text, OCR_MAX_SLOTS, OCR_ALPHABET, self.device
+            )
+            bb_text_tensor = text_to_target_tensor(
                 bb_result.text, OCR_MAX_SLOTS, OCR_ALPHABET, self.device
             )
-            ocr_loss = self.ocr_loss_fn(target_tensor, ocr_output)
-            total_ocr_loss += ocr_loss
 
-            # Check exact match
-            pred_text = logits_to_text(ocr_output)
-            if pred_text == bb_result.text:
-                correct_matches += 1
+            # Convert to one-hot for loss computation
+            with torch.no_grad():
+                # Compute focal CCE between bb prediction and ground truth
+                # This gives us the "ground truth" OCR loss to predict
+                gt_ocr_loss = self.ocr_loss_fn(target_tensor, bb_text_tensor.unsqueeze(0))
 
-        # Backward pass - combine losses and train adapter only
-        total_loss = total_ocr_loss + total_conf_loss
-        if total_loss > 0:
-            total_loss.backward()
-            adapter_optimizer.step()
+            patched_images.append(patched_prep)
+            gt_ocr_losses.append(gt_ocr_loss.item())
+            gt_confidences.append(bb_result.confidence)
+            valid_samples += 1
 
-        self.models.adapter.eval()
+        if valid_samples == 0:
+            return 0.0, 0.0, 0
 
-        n = len(batch)
-        match_rate = correct_matches / n if n > 0 else 0.0
-        conf_mse = np.mean(conf_squared_errors) if conf_squared_errors else float('inf')
+        # Stack batch
+        patched_batch = torch.stack(patched_images)  # [B, 3, 384, 384]
+        gt_ocr_losses_tensor = torch.tensor(gt_ocr_losses, device=self.device).unsqueeze(1)  # [B, 1]
+        gt_confidences_tensor = torch.tensor(gt_confidences, device=self.device).unsqueeze(1)  # [B, 1]
+
+        # Forward through surrogate
+        pred_ocr_loss, pred_confidence = self.surrogate(patched_batch)
+
+        # Compute MSE losses
+        ocr_mse = F.mse_loss(pred_ocr_loss, gt_ocr_losses_tensor)
+        conf_mse = F.mse_loss(pred_confidence, gt_confidences_tensor)
+
+        # Combined loss
+        total_loss = ocr_mse + conf_mse
+
+        # Backward and optimize
+        total_loss.backward()
+        optimizer.step()
 
         return (
-            total_ocr_loss.item() if isinstance(total_ocr_loss, torch.Tensor) else 0.0,
-            total_conf_loss.item() if isinstance(total_conf_loss, torch.Tensor) else 0.0,
-            match_rate,
-            conf_mse,
+            ocr_mse.item() * valid_samples,
+            conf_mse.item() * valid_samples,
             valid_samples
         )
 
-    def _evaluate(self, samples: List[Tuple]) -> FinetuneMetrics:
-        """Evaluate current model on all samples."""
-        ocr_losses = []
-        conf_squared_errors = []
-        valid_samples = 0
-
-        with torch.no_grad():
-            # Normalize patch to [0,1] before adapter (once for all samples)
-            patch_normalized = torch.sigmoid(self.trainer.patch)
-
-            # Transform patch through adapter (once for all samples)
-            adapted_patch = self.models.adapter(patch_normalized.unsqueeze(0)).squeeze(0)
-
-            for sample in samples:
-                unpatched_prep, unpatched_orig, corners, orig_corners, transform, bb_result = sample
-
-                if bb_result.text is None:
-                    continue
-
-                valid_samples += 1
-
-                # Apply adapted patch to unpatched prep image
-                patched_prep, _ = self.trainer.apply_patch_to_image(
-                    unpatched_prep.to(self.device).unsqueeze(0),
-                    corners.to(self.device).unsqueeze(0),
-                    patch_override=adapted_patch
-                )
-                patched_prep = patched_prep.squeeze(0)
-
-                # Run detector on patched image
-                detector_output = self.models.detector(patched_prep.unsqueeze(0))
-
-                if len(detector_output) == 0:
-                    conf_squared_errors.append(bb_result.confidence ** 2)
-                    continue
-
-                # Find best detection (highest IoU with target plate region)
-                target_box = corners_to_bbox(corners).to(self.device)
-                best_det = None
-                best_iou = -1.0
-
-                for detection in detector_output:
-                    pred_box = detection[1:5]
-                    iou = compute_iou(pred_box.unsqueeze(0), target_box.unsqueeze(0)).item()
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_det = detection
-
-                if best_det is None:
-                    conf_squared_errors.append(bb_result.confidence ** 2)
-                    continue
-
-                pred_conf = best_det[6].item()
-
-                conf_squared_errors.append((pred_conf - bb_result.confidence) ** 2)
-
-                # Apply adapted patch to original image for OCR
-                patched_orig, _ = self.trainer.apply_patch_to_image(
-                    unpatched_orig.to(self.device).unsqueeze(0),
-                    orig_corners.to(self.device).unsqueeze(0),
-                    patch_override=adapted_patch
-                )
-                patched_orig = patched_orig.squeeze(0)
-
-                # Get OCR prediction
-                pred_box = best_det[1:5]
-                orig_projection = invert_bbox(pred_box.to('cpu'), transform)
-                corners_box = bbox_to_corners(orig_projection, device='cpu')
-
-                cropped_plate = kornia.geometry.crop_and_resize(
-                    patched_orig.unsqueeze(0),
-                    corners_box,
-                    OCR_INPUT_SHAPE[:2],
-                    mode='bilinear',
-                    align_corners=True
-                ).to(self.device)
-
-                ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-                ocr_output = self.models.ocr(ocr_input)
-
-                # Compute OCR loss against black-box text
-                target_tensor = text_to_target_tensor(
-                    bb_result.text, OCR_MAX_SLOTS, OCR_ALPHABET, self.device
-                )
-                ocr_loss = self.ocr_loss_fn(target_tensor, ocr_output)
-                ocr_losses.append(ocr_loss.item())
-
-        avg_ocr_loss = np.mean(ocr_losses) if ocr_losses else float('inf')
-        conf_mse = np.mean(conf_squared_errors) if conf_squared_errors else float('inf')
-
-        return FinetuneMetrics(
-            ocr_loss=avg_ocr_loss,
-            confidence_mse=conf_mse,
-            num_samples=valid_samples,
-            converged=False
-        )
 
 
 # =============================================================================
@@ -1025,12 +970,16 @@ def collect_patched_samples(
                 # Discard images, store only lightweight metadata
                 del patched_prep, patched_orig
 
+                # Get ground truth text for this sample
+                gt_text = ground_truth_texts.get(idx, None)
+
                 samples.append({
                     'dataset_idx': idx,
                     'corners': corners.cpu(),
                     'orig_corners': orig_corners.cpu(),
                     'transform': transform.cpu(),
-                    'bb_result': bb_result
+                    'bb_result': bb_result,
+                    'gt_text': gt_text
                 })
 
                 # Track success rate against ground truth
@@ -1111,14 +1060,13 @@ def optimize_patch_bb(
         config=config
     )
 
-    # Create surrogate trainer
+    # Create surrogate trainer (query-based, no ALPR models needed)
     surrogate_trainer = SurrogateTrainer(
-        models=models,
         trainer=trainer,
         device=device,
         ocr_loss_threshold=ocr_loss_threshold,
         confidence_mse_threshold=confidence_mse_threshold,
-        max_epochs=150
+        max_epochs=100
     )
 
     # Create replay buffer
@@ -1148,9 +1096,9 @@ def optimize_patch_bb(
 
     print(f"\nCalibrated blur sigma: {blur_sigma:.2f}")
 
-    # Create adapter optimizer (reuse across cycles)
-    adapter_optimizer = optim.Adam(
-        models.get_adapter_parameters(),
+    # Create surrogate optimizer (reuse across cycles)
+    surrogate_optimizer = optim.Adam(
+        surrogate_trainer.surrogate.parameters(),
         lr=surrogate_trainer.learning_rate
     )
 
@@ -1263,24 +1211,24 @@ def optimize_patch_bb(
             if (epoch + 1) % save_interval == 0:
                 models.save_state(f"bb_patches/models_epoch_{epoch + 1:04d}.pt")
 
-        # Step 4: Fine-tune adapter after 4 patch epochs
+        # Step 4: Train surrogate after 4 patch epochs
         print(f"\n{'*' * 60}")
-        print(f"Fine-tuning adapter (after {patch_epochs_per_cycle} patch epochs)...")
+        print(f"Training surrogate (after {patch_epochs_per_cycle} patch epochs)...")
         print('*' * 60)
 
-        # Scale learning rate for subsequent cycles based on OCR loss improvement
+        # Scale learning rate for subsequent cycles based on OCR MSE improvement
         if cycle > 0 and initial_ocr_loss is not None:
-            # Ratio = current_loss / initial_loss; as loss improves (< 1), lr scales down
+            # Ratio = current_mse / initial_mse; as MSE improves (< 1), lr scales down
             lr_scale = metrics.ocr_loss / initial_ocr_loss
             scaled_lr = surrogate_trainer.learning_rate * lr_scale
-            for param_group in adapter_optimizer.param_groups:
+            for param_group in surrogate_optimizer.param_groups:
                 param_group['lr'] = scaled_lr
             if verbose:
                 print(f"Scaled learning rate: {scaled_lr:.2e} (ratio: {lr_scale:.3f})")
 
         # Create fresh scheduler for this cycle (prevents LR oscillation from scheduler state persistence)
-        adapter_scheduler = LinearWarmupCosineAnnealingLR(
-            adapter_optimizer,
+        surrogate_scheduler = LinearWarmupCosineAnnealingLR(
+            surrogate_optimizer,
             warmup_epochs=10,
             max_epochs=surrogate_trainer.max_epochs,
             min_lr=1e-6
@@ -1291,25 +1239,26 @@ def optimize_patch_bb(
             training_samples,
             batch_size=100,
             verbose=verbose,
-            adapter_optimizer=adapter_optimizer,
-            adapter_scheduler=adapter_scheduler
+            optimizer=surrogate_optimizer,
+            scheduler=surrogate_scheduler
         )
 
-        print(f"Adapter metrics:")
-        print(f"  OCR loss: {metrics.ocr_loss:.4f}")
+        print(f"Surrogate metrics:")
+        print(f"  OCR MSE: {metrics.ocr_loss:.4f}")
         print(f"  Confidence MSE: {metrics.confidence_mse:.4f}")
         print(f"  Converged: {metrics.converged}")
-        print(f"  Adapter LR: {adapter_optimizer.param_groups[0]['lr']:.2e}")
+        print(f"  Surrogate LR: {surrogate_optimizer.param_groups[0]['lr']:.2e}")
 
-        # Save initial OCR loss from first cycle for adaptive LR scaling
+        # Save initial OCR MSE from first cycle for adaptive LR scaling
         if cycle == 0:
             initial_ocr_loss = metrics.ocr_loss
             if verbose:
-                print(f"Saved initial OCR loss: {initial_ocr_loss:.4f}")
+                print(f"Saved initial OCR MSE: {initial_ocr_loss:.4f}")
 
-        # Save adapter and models after fine-tuning
+        # Save surrogate model after fine-tuning
         final_patch_epoch = total_patch_epoch + patch_epochs_per_cycle - 1
-        models.save_state(f"bb_patches/models_adapter_epoch_{final_patch_epoch + 1:04d}.pt")
+        torch.save(surrogate_trainer.surrogate.state_dict(),
+                   f"bb_patches/surrogate_epoch_{final_patch_epoch + 1:04d}.pt")
 
         # Record adapter metrics for all patch epochs in this cycle
         for _ in range(patch_epochs_per_cycle):
@@ -1322,6 +1271,7 @@ def optimize_patch_bb(
     # Final save
     trainer.save_patch(num_epochs - 1, save_dir="bb_patches_final")
     models.save_state("bb_patches_final/models_final.pt")
+    torch.save(surrogate_trainer.surrogate.state_dict(), "bb_patches_final/surrogate_final.pt")
 
     print("\n" + "=" * 60)
     print("Optimization Complete")
