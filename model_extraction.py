@@ -1309,7 +1309,7 @@ def optimize_patch_bb(
     surrogate_trainer.surrogate = surrogate
 
     # Create replay buffer (uses exponential decay to weight patch frequency)
-    replay_buffer = ReplayBuffer(decay_half_life=11)
+    replay_buffer = ReplayBuffer(decay_half_life=4)
 
     # =========================================================================
     # Phase 1: Initial setup and blur calibration
