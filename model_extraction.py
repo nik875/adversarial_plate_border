@@ -1161,11 +1161,13 @@ def optimize_patch_bb(
     # Phase 1: Initial setup and blur calibration
     # =========================================================================
     print("\n" + "=" * 60)
-    if blur_sigma_init is not None:
-        print("Phase 1: Using provided blur sigma (skipping calibration)")
+    skip_blur_calibration = blur_sigma_init is not None
+    if skip_blur_calibration:
+        print("Phase 1: Using provided blur sigma (skipping all calibration)")
         print("=" * 60)
         blur_sigma = blur_sigma_init
         print(f"\nUsing blur sigma: {blur_sigma:.2f}")
+        print("Note: Dynamic blur recalibration during training is also disabled")
     else:
         print("Phase 1: Blur Calibration")
         print("=" * 60)
@@ -1248,7 +1250,7 @@ def optimize_patch_bb(
             print(f"Black-box success rate: {bb_success_rate:.1%}")
 
             # Step 2b: Check if we need to reduce blur (attack too effective)
-            if bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
+            if not skip_blur_calibration and bb_success_rate < blur_reduction_threshold and current_blur_sigma > 0:
                 print(
                     f"\n*** Attack very effective (success rate {bb_success_rate:.1%} < {blur_reduction_threshold:.0%})")
                 print("*** Reducing blur to maintain training diversity...")
