@@ -782,10 +782,11 @@ class BasisPatchTrainer:
               warmup_epochs: int = 5, lr_min: float = 1e-5):
         """Main training loop with linear warmup + cosine annealing LR schedule"""
 
-        # Start with small LR for warmup
-        optimizer = optim.AdamW([self.basis_U], lr=1e-6, weight_decay=1e-4)
+        # Set base LR to peak learning rate (5e-3)
+        optimizer = optim.AdamW([self.basis_U], lr=learning_rate, weight_decay=1e-4)
 
-        # Linear warmup scheduler (epochs 0-4: 1e-6 -> learning_rate)
+        # Linear warmup scheduler (epochs 0-4: 1e-6 -> 5e-3)
+        # start_factor scales base_lr: 1e-6 / 5e-3 = 0.0002
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1e-6 / learning_rate,
