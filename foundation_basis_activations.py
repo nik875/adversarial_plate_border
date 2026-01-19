@@ -480,9 +480,9 @@ class FoundationBasisPatchTrainer:
 
         # Handle numerical issues
         if torch.isnan(log_det):
-            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
+            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype, requires_grad=use_grad)
         elif sign <= 0:
-            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
+            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype, requires_grad=use_grad)
 
         return log_det
 
