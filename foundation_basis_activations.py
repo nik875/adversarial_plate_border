@@ -228,13 +228,15 @@ class FoundationBasisPatchTrainer:
                  use_tv_loss: bool = True,
                  use_homography: bool = True,
                  basis_dim: int = 16,
-                 diversity_weight: float = 1.0):
+                 diversity_weight: float = 1.0,
+                 diversity_only: bool = False):
         self.training = training
         self.print_blur = print_blur
         self.use_tv_loss = use_tv_loss
         self.use_homography = use_homography
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
+        self.diversity_only = diversity_only
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -981,11 +983,14 @@ class FoundationBasisPatchTrainer:
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
                     last_diversity_loss = diversity_loss.item()
 
-                    # Compute mean adversarial loss
+                    # Compute mean adversarial loss (always track for metrics)
                     mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
 
-                    # Combined loss
-                    combined_loss = mean_adv_loss + diversity_loss
+                    # Combined loss - only include adversarial if not diversity-only mode
+                    if self.diversity_only:
+                        combined_loss = diversity_loss
+                    else:
+                        combined_loss = mean_adv_loss + diversity_loss
                     combined_loss.backward()
 
                     # Apply accumulated gradients
@@ -1043,11 +1048,14 @@ class FoundationBasisPatchTrainer:
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
 
-                    # Mean adversarial loss
+                    # Mean adversarial loss (always track for metrics)
                     mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
 
-                    # Combined loss
-                    combined_loss = mean_adv_loss + diversity_loss
+                    # Combined loss - only include adversarial if not diversity-only mode
+                    if self.diversity_only:
+                        combined_loss = diversity_loss
+                    else:
+                        combined_loss = mean_adv_loss + diversity_loss
                     combined_loss.backward()
 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
@@ -1250,6 +1258,8 @@ def main():
                         help='Dimensionality of basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
+    parser.add_argument('--diversity-only', action='store_true',
+                        help='Optimize only for diversity, disable adversarial loss (still tracked as metric)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
@@ -1273,7 +1283,8 @@ def main():
         'use_tv_loss': not args.disable_tv_loss,
         'use_homography': not args.disable_homography,
         'basis_dim': args.basis_dim,
-        'diversity_weight': args.diversity_weight
+        'diversity_weight': args.diversity_weight,
+        'diversity_only': args.diversity_only
     }
 
     # Training mode
