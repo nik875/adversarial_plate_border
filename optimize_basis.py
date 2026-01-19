@@ -707,8 +707,10 @@ class BasisPatchTrainer:
                         torch.mps.empty_cache()
 
                 else:
-                    # Show accumulation progress
+                    # Show accumulation progress with current average loss
+                    current_batch_avg = sum(accumulated_losses) / len(accumulated_losses) if accumulated_losses else 0
                     pbar.set_postfix({
+                        'AccumLoss': f"{current_batch_avg.item():.4f}" if hasattr(current_batch_avg, 'item') else f"{current_batch_avg:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
