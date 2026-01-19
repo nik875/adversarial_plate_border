@@ -623,17 +623,17 @@ class BasisPatchTrainer:
     def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Train for one epoch with gradient accumulation and diversity loss"""
         total_loss = 0.0
-        accumulation_loss = 0.0
         step_count = 0
         num_updates = 0
 
         # Determine update frequency
         update_every = len(
             self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
-        effective_batch_size = update_every
 
-        # Storage for patches in current accumulation window
+        # Storage for patches and losses in current accumulation window
+        # We accumulate everything and call backward ONCE to preserve the computation graph
         accumulated_patches = []
+        accumulated_losses = []
 
         desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
@@ -644,100 +644,90 @@ class BasisPatchTrainer:
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                # Store patch for diversity loss
+                # Store patch for diversity loss (keep in computation graph)
                 accumulated_patches.append(patch)
 
-                # Compute adversarial loss
+                # Compute adversarial loss (keep in computation graph, don't backward yet)
                 adv_loss = self.compute_loss_full_image(batch, patch)
+                accumulated_losses.append(adv_loss)
 
-                # Scale by accumulation steps
-                scaled_loss = adv_loss / effective_batch_size
-
-                # Backward pass (accumulate gradients)
-                scaled_loss.backward()
-
-                # Track losses
-                accumulation_loss += adv_loss.item()
                 step_count += 1
 
                 # Update model every update_every steps
                 if step_count % update_every == 0:
+                    # Compute mean adversarial loss
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
+
                     # Compute diversity loss from accumulated patches
                     patches_tensor = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
                     diversity_score = self.compute_diversity_loss(patches_tensor)
 
-                    # Add diversity loss term: -diversity_weight * (1/batch_size) * logdet
+                    # Diversity loss term: -diversity_weight * (1/batch_size) * logdet
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Backward for diversity loss
-                    diversity_loss.backward()
+                    # Combine all losses and backward ONCE
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
                     # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Add accumulated loss to total (including diversity)
-                    total_batch_loss = accumulation_loss + diversity_loss.item()
-                    total_loss += total_batch_loss
+                    # Track total loss
+                    total_loss += combined_loss.item()
                     num_updates += 1
 
+                    # Update progress bar
+                    avg_loss = total_loss / num_updates
+                    pbar.set_postfix({
+                        'Loss': f"{avg_loss:.4f}",
+                        'AdvLoss': f"{mean_adv_loss.item():.4f}",
+                        'DivLoss': f"{diversity_loss.item():.4f}",
+                        'Updates': num_updates
+                    })
+
                     # Memory cleanup after update
-                    del adv_loss, scaled_loss, patches_tensor, diversity_score, diversity_loss
+                    del combined_loss, mean_adv_loss, patches_tensor, diversity_score, diversity_loss
                     accumulated_patches = []
+                    accumulated_losses = []
 
                     if self.device == 'cuda':
                         torch.cuda.empty_cache()
                     elif self.device == 'mps':
                         torch.mps.empty_cache()
 
-                    # Update progress bar
-                    if self.grad_accumulate is None:
-                        avg_loss = total_loss / (num_updates * update_every)
-                        pbar.set_postfix({'Loss': f"{avg_loss:.4f}", 'Mode': 'End-Update'})
-                    else:
-                        avg_loss = total_loss / (num_updates * self.grad_accumulate)
-                        pbar.set_postfix({'Loss': f"{avg_loss:.4f}", 'Updates': num_updates})
-
-                    accumulation_loss = 0.0
                 else:
-                    # Just cleanup current tensors, keep gradients
-                    del adv_loss, scaled_loss
-
                     # Show accumulation progress
-                    current_batch_avg = accumulation_loss / (step_count % update_every)
                     pbar.set_postfix({
-                        'AccumLoss': f"{current_batch_avg:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
-            # Handle remaining accumulated gradients
+            # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_patches) > 0:
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
                     patches_tensor = torch.stack(accumulated_patches, dim=0)
                     diversity_score = self.compute_diversity_loss(patches_tensor)
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-                    diversity_loss.backward()
 
-                torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
-                if len(accumulated_patches) > 0:
-                    total_loss += accumulation_loss + diversity_loss.item()
-                else:
-                    total_loss += accumulation_loss
-                num_updates += 1
+                    torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    total_loss += combined_loss.item()
+                    num_updates += 1
 
                 if self.device == 'cuda':
                     torch.cuda.empty_cache()
                 elif self.device == 'mps':
                     torch.mps.empty_cache()
 
-        # Return average loss per batch
-        total_batches_processed = num_updates * \
-            update_every if self.grad_accumulate else len(self.train_loader)
-        return total_loss / total_batches_processed
+        # Return average loss per update
+        return total_loss / max(num_updates, 1)
 
     def validate(self) -> float:
         """Validation pass on held-out data"""
