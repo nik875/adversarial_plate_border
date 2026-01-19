@@ -780,7 +780,7 @@ class NeuralBasisPatchTrainer:
                     # Update progress bar
                     avg_loss = total_loss / num_updates
                     # Display diversity loss scaled by batch size to have consistent magnitude
-                    div_loss_scaled = last_diversity_loss * len(accumulated_patches)
+                    div_loss_scaled = last_diversity_loss * (update_every / len(accumulated_patches))
                     pbar.set_postfix({
                         'Loss': f"{avg_loss:.4f}",
                         'AdvLoss': f"{mean_adv_loss.item():.4f}",
@@ -811,7 +811,7 @@ class NeuralBasisPatchTrainer:
                             last_diversity_loss = current_div_loss.item()
 
                     # Display diversity loss scaled by batch size to have consistent magnitude
-                    div_loss_scaled = last_diversity_loss * len(accumulated_patches)
+                    div_loss_scaled = last_diversity_loss * (update_every / len(accumulated_patches))
                     pbar.set_postfix({
                         'AccumLoss': f"{current_batch_avg.item():.4f}" if hasattr(current_batch_avg, 'item') else f"{current_batch_avg:.4f}",
                         'DivLoss': f"{div_loss_scaled:.4f}",
