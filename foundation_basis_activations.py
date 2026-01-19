@@ -369,7 +369,7 @@ class FoundationBasisPatchTrainer:
         return patches
 
     def _get_activations_for_patch_image(self, batch: dict, patch: torch.Tensor,
-                                          use_grad: bool = False) -> torch.Tensor:
+                                          use_grad: bool = False, skip_detection: bool = False) -> torch.Tensor:
         """
         Apply patch to a single image and return OCR activations from that forward pass.
 
@@ -377,6 +377,7 @@ class FoundationBasisPatchTrainer:
             batch: Single unbatched batch item from dataloader
             patch: [3, H, W] patch tensor
             use_grad: If True, compute with gradients (needed for diversity-only mode)
+            skip_detection: If True, use known plate corners instead of running YOLO detection
 
         Returns:
             activations: [8, 16, 384] or zeros if detection fails
@@ -384,33 +385,38 @@ class FoundationBasisPatchTrainer:
         # Use context manager conditionally
         context = torch.no_grad() if not use_grad else torch.enable_grad()
         with context:
-            # Apply patch to preprocessed image
+            # Apply patch to original image
             patched_image, _ = self.apply_patch_to_image(
-                batch['prep_image'].to(self.device).unsqueeze(0),
-                batch['new_corners'].to(self.device).unsqueeze(0),
+                batch['orig_image'].to(self.device).unsqueeze(0),
+                batch['orig_corners'].to(self.device).unsqueeze(0),
                 patch
             )
 
-            # Run YOLO detection on patched image
-            model_output = self.model(patched_image)
-
-            if len(model_output) == 0:
-                return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
-
-            # Get first detection (simplified - could rank by confidence)
-            best_detection = model_output[0]
-
-            # Crop plate and run OCR
-            pred_box = best_detection[1:5]
-            orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
-            corners_box = self.bbox_to_corners(orig_projection, device='cpu')
-
             orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-            corners_box_device = corners_box.to(self.device)
 
+            if skip_detection:
+                # Use known plate corners directly - no YOLO detection needed
+                # This is faster and cleaner for diversity-only mode
+                corners_box = batch['orig_corners'].to(self.device)
+            else:
+                # Run YOLO detection on patched image (original behavior)
+                model_output = self.model(patched_image)
+
+                if len(model_output) == 0:
+                    return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
+
+                # Get first detection (simplified - could rank by confidence)
+                best_detection = model_output[0]
+
+                # Crop plate and run OCR
+                pred_box = best_detection[1:5]
+                orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
+                corners_box = self.bbox_to_corners(orig_projection, device='cpu').to(self.device)
+
+            # Crop plate from patched image and run OCR
             cropped_plate = K.crop_and_resize(
-                orig_image,
-                corners_box_device,
+                patched_image,
+                corners_box,
                 self.ocr_input_shape[:2]
             )
 
@@ -459,7 +465,7 @@ class FoundationBasisPatchTrainer:
                     activations = diagonal_activations[patch_idx]  # [8, 16, 384]
                 else:
                     # Only compute off-diagonal (patch_i on image_j where i != j)
-                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad)  # [8, 16, 384]
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [8, 16, 384]
 
                 baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
                 delta = activations - baseline  # [8, 16, 384]
