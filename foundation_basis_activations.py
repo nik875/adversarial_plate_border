@@ -426,6 +426,7 @@ class FoundationBasisPatchTrainer:
     def compute_activation_diversity(self, patches_list: List[torch.Tensor],
                                       batches_list: List[dict],
                                       baseline_indices: List[int],
+                                      diagonal_activations: List[torch.Tensor],
                                       use_grad: bool = False) -> torch.Tensor:
         """
         Compute diversity via average activation impact across all images.
@@ -437,6 +438,7 @@ class FoundationBasisPatchTrainer:
             patches_list: List of [3, H, W] patches (one per image)
             batches_list: List of batch dicts (one per image)
             baseline_indices: List of dataset indices for baseline activations
+            diagonal_activations: List of [8, 16, 384] activations from (patch_i, image_i) pairs
             use_grad: If True, compute with gradients (needed for diversity-only mode)
 
         Returns:
@@ -451,9 +453,14 @@ class FoundationBasisPatchTrainer:
             activation_deltas = []
 
             # Evaluate this patch on all images in the batch
-            for batch, baseline_idx in zip(batches_list, baseline_indices):
-                # Get OCR activations for this (patch, image) pair
-                activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad)  # [8, 16, 384]
+            for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
+                # Reuse diagonal activations (patch_i on image_i)
+                if patch_idx == img_idx:
+                    activations = diagonal_activations[patch_idx]  # [8, 16, 384]
+                else:
+                    # Only compute off-diagonal (patch_i on image_j where i != j)
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad)  # [8, 16, 384]
+
                 baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
                 delta = activations - baseline  # [8, 16, 384]
                 activation_deltas.append(delta)
@@ -974,9 +981,12 @@ class FoundationBasisPatchTrainer:
                 accumulated_batches.append({k: v[0] for k, v in batch.items()})
 
                 # Capture activations (automatically populated by forward hook)
-                # These are detached since we don't need gradients through them
+                # Don't detach if diversity_only - we need gradients for the diagonal entries
                 if self.ocr_activations is not None:
-                    accumulated_activations.append(self.ocr_activations.detach().clone())
+                    if self.diversity_only:
+                        accumulated_activations.append(self.ocr_activations.clone())
+                    else:
+                        accumulated_activations.append(self.ocr_activations.detach().clone())
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
@@ -986,11 +996,12 @@ class FoundationBasisPatchTrainer:
                 # Update model every update_every steps
                 if step_count % update_every == 0:
                     # Compute activation-based diversity score
-                    # Evaluate every patch on every image in the batch
+                    # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
                         accumulated_patches,
                         accumulated_batches,
                         accumulated_indices,
+                        accumulated_activations,
                         use_grad=self.diversity_only
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
@@ -1053,11 +1064,12 @@ class FoundationBasisPatchTrainer:
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_losses) > 0:
                     # Compute activation-based diversity score
-                    # Evaluate every patch on every image in the batch
+                    # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
                         accumulated_patches,
                         accumulated_batches,
                         accumulated_indices,
+                        accumulated_activations,
                         use_grad=self.diversity_only
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
