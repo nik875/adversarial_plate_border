@@ -970,7 +970,10 @@ class FoundationBasisPatchTrainer:
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Latent dimensions: {self.basis_dim}")
-        print(f"   Generator architecture: {self.basis_dim} -> [256, 512, 1024] -> {self.patch_dim}")
+        vae_latent_dim = self.generator.vae_latent_dim
+        print(f"   Generator architecture:")
+        print(f"     Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
+        print(f"     VAE decoder (frozen): latent[4×32×64] -> patch[3×{self.patch_height}×{self.patch_width}]")
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
