@@ -452,6 +452,10 @@ class FoundationBasisPatchTrainer:
         """
         batch_size = len(patches_list)
 
+        # Clear cache before starting diversity computation if using gradients
+        if use_grad and self.device == 'cuda':
+            torch.cuda.empty_cache()
+
         # For each patch, compute average activation delta across all images
         patch_avg_deltas = []
 
@@ -474,6 +478,10 @@ class FoundationBasisPatchTrainer:
             # Average deltas for this patch over all images
             avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [8, 16, 384]
             patch_avg_deltas.append(avg_delta)
+
+            # Clear cache after each patch to prevent OOM
+            if use_grad and self.device == 'cuda':
+                torch.cuda.empty_cache()
 
         # Stack averaged deltas: [batch_size, 8, 16, 384]
         avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
