@@ -736,7 +736,7 @@ class NeuralBasisPatchTrainer:
         model_output = self.model(prep_image.unsqueeze(0))
 
         best_detection = None
-        det_loss = 0.0
+        det_loss = torch.tensor(0.0, device=self.device)
 
         for detection in model_output:
             pred_box = detection[1:5]
@@ -757,7 +757,7 @@ class NeuralBasisPatchTrainer:
                     det_loss = this_det_loss
                     best_detection = detection
 
-        ocr_loss = 0.0
+        ocr_loss = torch.tensor(0.0, device=self.device)
         if best_detection is not None:
             pred_box = best_detection[1:5]
             orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
@@ -874,7 +874,7 @@ class NeuralBasisPatchTrainer:
         if self.use_tv_loss:
             reg_loss = self.patch_reg_loss(patch)
         else:
-            reg_loss = 0.0
+            reg_loss = torch.tensor(0.0, device=self.device)
 
         # Combine losses with conditional sqrt on OCR loss
         # Apply sqrt only if ocr_loss > 1 (compress large values)
