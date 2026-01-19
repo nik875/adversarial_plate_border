@@ -219,6 +219,152 @@ class NeuralBasisPatchTrainer:
 
         return result
 
+    def _bilinear_grid_sample(self, input_tensor, grid, padding_mode='zeros'):
+        """
+        Pure PyTorch implementation of bilinear grid sampling.
+        Supports double backprop since it only uses basic operations.
+
+        Args:
+            input_tensor: [B, C, H, W]
+            grid: [B, H_out, W_out, 2] - normalized coordinates in [-1, 1]
+            padding_mode: 'zeros' or 'border'
+
+        Returns:
+            sampled: [B, C, H_out, W_out]
+        """
+        B, C, H, W = input_tensor.shape
+        _, H_out, W_out, _ = grid.shape
+
+        # Denormalize grid from [-1, 1] to pixel coordinates
+        grid_x = (grid[..., 0] + 1) * (W - 1) / 2
+        grid_y = (grid[..., 1] + 1) * (H - 1) / 2
+
+        # Get integer coordinates and weights
+        x0 = torch.floor(grid_x).long()
+        x1 = x0 + 1
+        y0 = torch.floor(grid_y).long()
+        y1 = y0 + 1
+
+        # Bilinear weights
+        wx = grid_x - x0.float()
+        wy = grid_y - y0.float()
+
+        # Clamp coordinates to valid range
+        x0 = torch.clamp(x0, 0, W - 1)
+        x1 = torch.clamp(x1, 0, W - 1)
+        y0 = torch.clamp(y0, 0, H - 1)
+        y1 = torch.clamp(y1, 0, H - 1)
+
+        # Create mask for out-of-bounds pixels
+        valid_mask = ((grid_x >= 0) & (grid_x <= W - 1) &
+                      (grid_y >= 0) & (grid_y <= H - 1)).float()
+
+        # Gather and interpolate pixel values
+        output = torch.zeros(B, C, H_out, W_out, device=input_tensor.device, dtype=input_tensor.dtype)
+
+        for b in range(B):
+            for c in range(C):
+                p00 = input_tensor[b, c, y0[b], x0[b]]
+                p01 = input_tensor[b, c, y0[b], x1[b]]
+                p10 = input_tensor[b, c, y1[b], x0[b]]
+                p11 = input_tensor[b, c, y1[b], x1[b]]
+
+                interp = (1 - wx[b]) * (1 - wy[b]) * p00 + \
+                         wx[b] * (1 - wy[b]) * p01 + \
+                         (1 - wx[b]) * wy[b] * p10 + \
+                         wx[b] * wy[b] * p11
+
+                if padding_mode == 'zeros':
+                    interp = interp * valid_mask[b]
+
+                output[b, c] = interp
+
+        return output
+
+    def _manual_warp_perspective(self, input_tensor, M, dsize):
+        """
+        Pure PyTorch warp perspective using manual grid generation and bilinear sampling.
+        Supports double backprop.
+
+        Args:
+            input_tensor: [B, C, H, W]
+            M: [B, 3, 3] - perspective transformation matrices
+            dsize: (H_out, W_out) - output size
+
+        Returns:
+            warped: [B, C, H_out, W_out]
+        """
+        B, C, H, W = input_tensor.shape
+        H_out, W_out = dsize
+
+        # Create output pixel grid
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(H_out, device=input_tensor.device, dtype=torch.float32),
+            torch.arange(W_out, device=input_tensor.device, dtype=torch.float32),
+            indexing='ij'
+        )
+
+        # Homogeneous coordinates
+        ones = torch.ones_like(x_coords)
+        grid_homo = torch.stack([x_coords, y_coords, ones], dim=-1)
+
+        # Apply inverse perspective transform for each batch
+        grid_list = []
+        for b in range(B):
+            grid_flat = grid_homo.reshape(-1, 3).t()
+            M_inv = torch.inverse(M[b])
+            src_homo = M_inv @ grid_flat
+
+            # Normalize by homogeneous coordinate
+            src_x = src_homo[0] / src_homo[2]
+            src_y = src_homo[1] / src_homo[2]
+
+            # Normalize to [-1, 1] for grid_sample convention
+            src_x_norm = 2 * src_x / (W - 1) - 1
+            src_y_norm = 2 * src_y / (H - 1) - 1
+
+            grid_b = torch.stack([src_x_norm, src_y_norm], dim=-1).reshape(H_out, W_out, 2)
+            grid_list.append(grid_b)
+
+        grid = torch.stack(grid_list, dim=0)
+
+        return self._bilinear_grid_sample(input_tensor, grid, padding_mode='zeros')
+
+    def _manual_crop_and_resize(self, input_tensor, boxes, crop_size):
+        """
+        Pure PyTorch implementation of crop_and_resize.
+        Supports double backprop by using _manual_warp_perspective.
+
+        Args:
+            input_tensor: [B, C, H, W]
+            boxes: [B, 4, 2] - 4 corner points (x, y) defining quadrilateral
+            crop_size: (H_out, W_out) - output size
+
+        Returns:
+            cropped: [B, C, H_out, W_out]
+        """
+        B, C, H, W = input_tensor.shape
+        H_out, W_out = crop_size
+
+        # Define destination rectangle
+        dst_corners = torch.tensor([
+            [0, 0],
+            [W_out - 1, 0],
+            [W_out - 1, H_out - 1],
+            [0, H_out - 1]
+        ], dtype=torch.float32, device=input_tensor.device)
+
+        # Compute perspective transform for each batch element
+        M_list = []
+        for b in range(B):
+            src_corners = boxes[b]
+            M = K.get_perspective_transform(src_corners.unsqueeze(0), dst_corners.unsqueeze(0))
+            M_list.append(M[0])
+
+        M_batch = torch.stack(M_list, dim=0)
+
+        return self._manual_warp_perspective(input_tensor, M_batch, dsize=crop_size)
+
     def compute_diversity_loss(self, patch_gradients: torch.Tensor) -> torch.Tensor:
         """
         Compute diversity loss via log determinant of Gram matrix using GRADIENTS
@@ -465,24 +611,16 @@ class NeuralBasisPatchTrainer:
         # Create and warp patch using dynamic image size
         patch_batch = patch.unsqueeze(0).repeat(batch_size, 1, 1, 1)
 
-        warped_patch = K.warp_perspective(
-            patch_batch, M_border, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
+        # Use manual warp_perspective for double backprop support
+        warped_patch = self._manual_warp_perspective(patch_batch, M_border, dsize=dsize)
 
         # Create masks using dynamic image size
         patch_mask = torch.ones(batch_size, 1, self.patch_height, self.patch_width,
                                 dtype=torch.float32, device=self.device)
 
-        warped_border_mask = K.warp_perspective(
-            patch_mask, M_border, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
-
-        warped_plate_mask = K.warp_perspective(
-            patch_mask, M_plate, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
+        # Use manual warp_perspective for masks
+        warped_border_mask = self._manual_warp_perspective(patch_mask, M_border, dsize=dsize)
+        warped_plate_mask = self._manual_warp_perspective(patch_mask, M_plate, dsize=dsize)
 
         # Final mask: border area minus license plate area
         final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1)
@@ -625,13 +763,16 @@ class NeuralBasisPatchTrainer:
             orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
             corners_box = self.bbox_to_corners(orig_projection, device='cpu')
 
-            cropped_plate = kornia.geometry.crop_and_resize(
-                batch['orig_image'].unsqueeze(0),
-                corners_box,
-                self.ocr_input_shape[:2],
-                mode='bilinear',
-                align_corners=True
-            ).to(self.device)
+            # Use manual crop_and_resize for double backprop support
+            # Move image and corners to device
+            orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+            corners_box_device = corners_box.to(self.device)
+
+            cropped_plate = self._manual_crop_and_resize(
+                orig_image,
+                corners_box_device,
+                self.ocr_input_shape[:2]
+            )
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             ocr_output = self.ocr(ocr_input)
