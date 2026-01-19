@@ -707,7 +707,7 @@ class BasisPatchTrainer:
                     pbar.set_postfix({
                         'Loss': f"{avg_loss:.4f}",
                         'AdvLoss': f"{mean_adv_loss.item():.4f}",
-                        'DivLoss': f"{last_diversity_loss:.4f}",
+                        'DivLoss': f"{-last_diversity_loss:.4f}",
                         'Updates': num_updates
                     })
 
@@ -735,7 +735,7 @@ class BasisPatchTrainer:
 
                     pbar.set_postfix({
                         'AccumLoss': f"{current_batch_avg.item():.4f}" if hasattr(current_batch_avg, 'item') else f"{current_batch_avg:.4f}",
-                        'DivLoss': f"{last_diversity_loss:.4f}",
+                        'DivLoss': f"{-last_diversity_loss:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
