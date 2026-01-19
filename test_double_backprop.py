@@ -26,46 +26,57 @@ def test_case(name, test_fn):
 
 def test_simple_ops():
     """Test that simple ops support double backprop"""
-    x = torch.randn(1, 3, 64, 64, device=device, requires_grad=True)
-    y = x * 2 + 1
+    # Simulate: parameter -> generator -> patch -> operation -> loss -> grad -> diversity_loss
+    param = torch.randn(10, device=device, requires_grad=True)
+    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous() * 2 + 1
+
+    # Operation on patch
+    y = patch * 2 + 1
     loss = y.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch (not param)
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient (through grad)
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+
+    # Backprop diversity loss to param (second-order)
+    diversity_loss.backward()
 
 def test_gaussian_blur():
     """Test if Gaussian blur supports double backprop"""
-    x = torch.randn(1, 3, 64, 64, device=device, requires_grad=True)
-    blurred = kornia.filters.gaussian_blur2d(x, (17, 17), (4.0, 4.0))
+    param = torch.randn(10, device=device, requires_grad=True)
+    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous()
+
+    blurred = kornia.filters.gaussian_blur2d(patch, (17, 17), (4.0, 4.0))
     loss = blurred.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
 
 def test_interpolate():
     """Test if F.interpolate supports double backprop"""
-    x = torch.randn(1, 3, 256, 512, device=device, requires_grad=True)
-    downsampled = F.interpolate(x, size=(32, 64), mode='bilinear', align_corners=True)
+    param = torch.randn(100, device=device, requires_grad=True)
+    patch = param.view(1, 1, 10, 10).expand(1, 3, 256, 512).contiguous()
+
+    downsampled = F.interpolate(patch, size=(32, 64), mode='bilinear', align_corners=True)
     loss = downsampled.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
 
 def test_warp_perspective():
     """Test if kornia.warp_perspective supports double backprop"""
-    x = torch.randn(1, 3, 256, 512, device=device, requires_grad=True)
+    param = torch.randn(100, device=device, requires_grad=True)
+    patch = param.view(1, 1, 10, 10).expand(1, 3, 256, 512).contiguous()
 
     # Create a simple perspective transform
     src = torch.tensor([[
@@ -76,52 +87,54 @@ def test_warp_perspective():
     ]], dtype=torch.float32, device=device)
 
     M = K.get_perspective_transform(src, dst)
-    warped = K.warp_perspective(x, M, dsize=(256, 512))
+    warped = K.warp_perspective(patch, M, dsize=(256, 512))
     loss = warped.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
 
 def test_crop_and_resize():
     """Test if kornia.crop_and_resize supports double backprop"""
-    x = torch.randn(1, 3, 384, 384, device=device, requires_grad=True)
+    param = torch.randn(100, device=device, requires_grad=True)
+    patch = param.view(1, 1, 10, 10).expand(1, 3, 384, 384).contiguous()
 
-    # Create crop box
+    # Create crop box - shape should be [B, 4, 2]
     boxes = torch.tensor([[
         [100, 100],
         [300, 100],
         [300, 200],
         [100, 200]
-    ]], dtype=torch.float32, device=device).unsqueeze(0)
+    ]], dtype=torch.float32, device=device)
 
-    cropped = kornia.geometry.crop_and_resize(x, boxes, (64, 128))
+    cropped = kornia.geometry.crop_and_resize(patch, boxes, (64, 128))
     loss = cropped.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
 
 def test_pad_and_slice():
     """Test if pad + slicing supports double backprop"""
-    x = torch.randn(1, 3, 64, 64, device=device, requires_grad=True)
+    param = torch.randn(10, device=device, requires_grad=True)
+    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous()
 
     # Shift using pad + slice (our jitter implementation)
-    shifted = F.pad(x[:, :, :, :-2], (2, 0, 0, 0))
+    shifted = F.pad(patch[:, :, :, :-2], (2, 0, 0, 0))
     loss = shifted.sum()
 
-    # First-order gradient
-    grad = torch.autograd.grad(loss, x, create_graph=True)[0]
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
 
-    # Second-order gradient
-    grad_loss = grad.sum()
-    grad_loss.backward()
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
 
 if __name__ == "__main__":
     print("="*60)
