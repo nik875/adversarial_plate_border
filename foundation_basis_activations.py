@@ -395,9 +395,11 @@ class FoundationBasisPatchTrainer:
             orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
 
             if skip_detection:
-                # Use known plate corners directly - no YOLO detection needed
-                # This is faster and cleaner for diversity-only mode
-                corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
+                # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
+                # Plate corners would miss the patch since it's applied as a border
+                plate_corners = batch['orig_corners'].to(self.device)
+                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
             else:
                 # Run YOLO detection on patched image (original behavior)
                 model_output = self.model(patched_image)
@@ -586,17 +588,23 @@ class FoundationBasisPatchTrainer:
 
         return result_image, final_mask
 
-    def get_patch_bounding_box(self, corners: torch.Tensor,
-                               border_scale: float = 1.4) -> torch.Tensor:
-        """Calculate bounding box of the patch area (border around license plate)"""
+    def get_border_corners(self, corners: torch.Tensor,
+                            border_scale: float = 1.4) -> torch.Tensor:
+        """Calculate the 4 corners of the border area (scaled from plate corners)"""
         plate_corners = corners  # [4, 2]
 
         # Calculate center and create larger border quad
         center_x = plate_corners[:, 0].mean()
         center_y = plate_corners[:, 1].mean()
-        center = torch.tensor([center_x, center_y], device=self.device)
+        center = torch.tensor([center_x, center_y], device=plate_corners.device)
 
         border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
+        return border_corners  # [4, 2]
+
+    def get_patch_bounding_box(self, corners: torch.Tensor,
+                               border_scale: float = 1.4) -> torch.Tensor:
+        """Calculate bounding box of the patch area (border around license plate)"""
+        border_corners = self.get_border_corners(corners, border_scale)
 
         # Calculate bounding box of the border corners
         min_x = torch.min(border_corners[:, 0])
@@ -925,8 +933,11 @@ class FoundationBasisPatchTrainer:
             patch
         )
 
-        # Crop plate from patched image using known corners
-        corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
+        # Crop using BORDER corners (1.4x scaled) to capture the patch
+        # Plate corners would miss the patch since it's applied as a border
+        plate_corners = batch['orig_corners'].to(self.device)
+        border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+        corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
         cropped_plate = K.crop_and_resize(
             patched_image,
             corners_box,
