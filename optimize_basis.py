@@ -204,22 +204,27 @@ class BasisPatchTrainer:
         )  # [batch_size, 3, 32, 64]
 
         # Mask out center region (covered by license plate)
-        # Keep only the border regions that actually affect adversarial performance
-        # Approximate plate coverage: center 60% width, center 40% height
-        h, w = downsampled.shape[2], downsampled.shape[3]  # [batch, 3, H, W]
-        mask = torch.ones(1, 1, h, w, device=self.device)
-
-        # Mask center region
-        center_h_start = int(h * 0.3)   # Leave 30% margin top
-        center_h_end = int(h * 0.7)     # Leave 30% margin bottom
-        center_w_start = int(w * 0.2)   # Leave 20% margin left
-        center_w_end = int(w * 0.8)     # Leave 20% margin right
-
-        mask[:, :, center_h_start:center_h_end, center_w_start:center_w_end] = 0.0
-
+        # The patch at full resolution represents the border region at border_scale=1.4
+        # So the plate region is 1/border_scale of the patch dimensions
+        border_scale = 1.4
+        plate_h = int(downsampled.shape[2] / border_scale)  # Height of plate in downsampled space
+        plate_w = int(downsampled.shape[3] / border_scale)  # Width of plate in downsampled space
+        
+        # Center the plate region
+        h_total = downsampled.shape[2]
+        w_total = downsampled.shape[3]
+        h_start = (h_total - plate_h) // 2
+        h_end = h_start + plate_h
+        w_start = (w_total - plate_w) // 2
+        w_end = w_start + plate_w
+        
+        # Create mask (1 for regions to keep, 0 for plate center)
+        mask = torch.ones(1, 1, h_total, w_total, device=self.device)
+        mask[:, :, h_start:h_end, w_start:w_end] = 0.0
+        
         # Apply mask to downsampled patches
         downsampled_masked = downsampled * mask  # [batch_size, 3, H, W]
-
+        
         # Flatten and L2 normalize the masked patches
         flat = downsampled_masked.reshape(batch_size, -1)  # [batch_size, 3*32*64]
         normalized = F.normalize(flat, p=2, dim=1)  # [batch_size, d']
