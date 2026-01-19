@@ -326,27 +326,27 @@ class FoundationBasisPatchTrainer:
             param.requires_grad = False
 
     def setup_activation_hook(self):
-        """Register forward hook to capture patch_extractor activations"""
-        # Find the patch_extractor convolution layer
+        """Register forward hook to capture conv stem activations"""
+        # Find the second conv layer in the stem (conv2d_1_2)
         target_layer = None
         for name, module in self.ocr.named_modules():
-            if name == "CCT_OCR_1/patch_extractor_1/convolution":
+            if name == "CCT_OCR_1/conv_stem_1/conv2d_1_2/BiasAdd":
                 target_layer = module
                 break
 
         if target_layer is None:
-            raise RuntimeError("Could not find patch_extractor convolution layer!")
+            raise RuntimeError("Could not find conv_stem_1/conv2d_1_2 layer!")
 
         # Define hook function that captures activations
         def hook_fn(module, input, output):
-            # output shape: [batch, 384, 8, 16] (after conv, before transpose/reshape)
-            # Store in [batch, 8, 16, 384] format for consistency with sequence layout
+            # output shape: [batch, 48, H, W] (after second conv in stem)
+            # Store in [batch, H, W, 48] format for spatial-feature layout
             # Don't detach here - let caller decide based on use_grad
-            self.ocr_activations = output.permute(0, 2, 3, 1)  # [batch, 8, 16, 384]
+            self.ocr_activations = output.permute(0, 2, 3, 1)  # [batch, H, W, 48]
 
         # Register the hook
         self.activation_hook = target_layer.register_forward_hook(hook_fn)
-        print(f"✓ Registered activation hook on patch_extractor convolution layer")
+        print(f"✓ Registered activation hook on conv_stem_1/conv2d_1_2 layer")
 
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
         """Sample z ~ N(0, I) for generating patches"""
@@ -380,7 +380,7 @@ class FoundationBasisPatchTrainer:
             skip_detection: If True, use known plate corners instead of running YOLO detection
 
         Returns:
-            activations: [8, 16, 384] or zeros if detection fails
+            activations: [H, W, C] from conv stem (shape depends on input size)
         """
         # Use context manager conditionally
         context = torch.no_grad() if not use_grad else torch.enable_grad()
@@ -403,7 +403,12 @@ class FoundationBasisPatchTrainer:
                 model_output = self.model(patched_image)
 
                 if len(model_output) == 0:
-                    return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
+                    # Use baseline to infer shape if available, otherwise use zeros
+                    if hasattr(self, 'activation_shape'):
+                        return torch.zeros(self.activation_shape, device=self.device, requires_grad=use_grad)
+                    else:
+                        # Fallback: run OCR once to get shape
+                        return torch.zeros(1, 1, 48, device=self.device, requires_grad=use_grad)
 
                 # Get first detection (simplified - could rank by confidence)
                 best_detection = model_output[0]
@@ -424,10 +429,14 @@ class FoundationBasisPatchTrainer:
             self.ocr(ocr_input)  # Forward pass captures activations via hook
 
             if self.ocr_activations is not None:
-                result = self.ocr_activations.squeeze(0)  # [8, 16, 384]
+                result = self.ocr_activations.squeeze(0)  # [H, W, C]
                 return result if use_grad else result.detach()
 
-            return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
+            # Fallback if OCR didn't produce activations
+            if hasattr(self, 'activation_shape'):
+                return torch.zeros(self.activation_shape, device=self.device, requires_grad=use_grad)
+            else:
+                return torch.zeros(1, 1, 48, device=self.device, requires_grad=use_grad)
 
     def compute_activation_diversity(self, patches_list: List[torch.Tensor],
                                       batches_list: List[dict],
@@ -444,7 +453,7 @@ class FoundationBasisPatchTrainer:
             patches_list: List of [3, H, W] patches (one per image)
             batches_list: List of batch dicts (one per image)
             baseline_indices: List of dataset indices for baseline activations
-            diagonal_activations: List of [8, 16, 384] activations from (patch_i, image_i) pairs
+            diagonal_activations: List of [H, W, C] activations from (patch_i, image_i) pairs
             use_grad: If True, compute with gradients (needed for diversity-only mode)
 
         Returns:
@@ -462,33 +471,25 @@ class FoundationBasisPatchTrainer:
             for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
                 # Reuse diagonal activations (patch_i on image_i)
                 if patch_idx == img_idx:
-                    activations = diagonal_activations[patch_idx]  # [8, 16, 384]
+                    activations = diagonal_activations[patch_idx]  # [H, W, C]
                 else:
-                    # Off-diagonal: use gradient checkpointing to trade compute for memory
-                    if use_grad:
-                        # Checkpoint recomputes forward pass during backward, freeing intermediate tensors
-                        activations = torch.utils.checkpoint.checkpoint(
-                            self._get_activations_for_patch_image,
-                            batch, patch, use_grad, use_grad,  # skip_detection=use_grad
-                            use_reentrant=False
-                        )
-                    else:
-                        activations = self._get_activations_for_patch_image(batch, patch, use_grad=False, skip_detection=False)
+                    # Only compute off-diagonal (patch_i on image_j where i != j)
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [H, W, C]
 
-                baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
-                delta = activations - baseline  # [8, 16, 384]
+                baseline = self.baseline_ocr_activations[baseline_idx]  # [H, W, C]
+                delta = activations - baseline  # [H, W, C]
                 activation_deltas.append(delta)
 
             # Average deltas for this patch over all images
-            avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [8, 16, 384]
+            avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [H, W, C]
             patch_avg_deltas.append(avg_delta)
 
-        # Stack averaged deltas: [batch_size, 8, 16, 384]
+        # Stack averaged deltas: [batch_size, H, W, C]
         avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
-        avg_deltas_flat = avg_deltas_stacked.reshape(batch_size, -1)  # [batch_size, 49152]
+        avg_deltas_flat = avg_deltas_stacked.reshape(batch_size, -1)  # [batch_size, H*W*C]
 
         # L2 normalize each patch's average delta vector
-        normalized = F.normalize(avg_deltas_flat, p=2, dim=1)  # [batch_size, 49152]
+        normalized = F.normalize(avg_deltas_flat, p=2, dim=1)  # [batch_size, H*W*C]
 
         # Compute Gram matrix: [batch_size, batch_size]
         gram = normalized @ normalized.t()
@@ -891,8 +892,13 @@ class FoundationBasisPatchTrainer:
 
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
-                        # Store per-image baseline: [8, 16, 384]
-                        self.baseline_ocr_activations[idx] = self.ocr_activations.squeeze(0).detach().clone()
+                        # Store per-image baseline: [H, W, C]
+                        baseline_act = self.ocr_activations.squeeze(0).detach().clone()
+                        self.baseline_ocr_activations[idx] = baseline_act
+
+                        # Store activation shape from first sample for fallback zeros
+                        if not hasattr(self, 'activation_shape'):
+                            self.activation_shape = baseline_act.shape
 
                     total_det_loss += det_loss
                     total_ocr_loss += ocr_loss
