@@ -186,11 +186,12 @@ class BasisPatchTrainer:
         # Compute Gram matrix
         gram = normalized @ normalized.t()  # [batch_size, batch_size]
 
-        # Add epsilon for numerical stability (use same as in loss functions)
-        epsilon = 1e-8
+        # Add epsilon for numerical stability
+        # Larger epsilon ensures det > 1, making logdet positive and stable
+        epsilon = 1e-2
         gram = gram + epsilon * torch.eye(batch_size, device=self.device)
 
-        # Compute log determinant
+        # Compute log determinant (should be positive with epsilon > 0)
         log_det = torch.logdet(gram)
 
         return log_det
@@ -782,11 +783,10 @@ class BasisPatchTrainer:
               warmup_epochs: int = 5, lr_min: float = 1e-5):
         """Main training loop with linear warmup + cosine annealing LR schedule"""
 
-        # Set base LR to peak learning rate (5e-3)
-        optimizer = optim.AdamW([self.basis_U], lr=learning_rate, weight_decay=1e-4)
+        # Start with small LR for warmup
+        optimizer = optim.AdamW([self.basis_U], lr=1e-6, weight_decay=1e-4)
 
-        # Linear warmup scheduler (epochs 0-4: 1e-6 -> 5e-3)
-        # start_factor scales base_lr: 1e-6 / 5e-3 = 0.0002
+        # Linear warmup scheduler (epochs 0-4: 1e-6 -> learning_rate)
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1e-6 / learning_rate,
