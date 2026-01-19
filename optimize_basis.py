@@ -623,21 +623,28 @@ class BasisPatchTrainer:
     def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Train for one epoch with gradient accumulation and diversity loss
 
-        Memory-efficient approach matching offensive_patch.py:
-        - Adversarial loss: backward immediately per image (accumulates gradients, frees graph)
-        - Diversity loss: computed on fresh patches sampled at end of accumulation window
+        Unlike offensive_patch.py which optimizes a single patch parameter,
+        basis optimization generates different patches per image (p = Uz).
 
-        This decouples the two losses but still optimizes U for both objectives.
+        The diversity loss requires ALL patches from the accumulation window
+        to compute the Gram matrix, so we must keep all patches in the
+        computational graph until we compute combined loss and call backward() once.
+
+        Memory requirements: Higher than offensive_patch.py because we keep
+        batch_size full computational graphs in memory. If OOM, reduce grad_accumulate.
         """
         total_loss = 0.0
-        accumulation_loss = 0.0
         step_count = 0
         num_updates = 0
 
         # Determine update frequency
         update_every = len(
             self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
-        effective_batch_size = update_every
+
+        # Storage for patches and losses in current accumulation window
+        # Must keep in computational graph to compute diversity on same patches as adversarial
+        accumulated_patches = []
+        accumulated_losses = []
 
         desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
@@ -648,31 +655,28 @@ class BasisPatchTrainer:
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                # Compute adversarial loss
+                # Store patch for diversity loss - MUST keep in graph
+                accumulated_patches.append(patch)
+
+                # Compute adversarial loss - MUST keep in graph
                 adv_loss = self.compute_loss_full_image(batch, patch)
+                accumulated_losses.append(adv_loss)
 
-                # Scale by accumulation steps and backward immediately
-                # This accumulates gradients but frees the computation graph (memory efficient)
-                scaled_loss = adv_loss / effective_batch_size
-                scaled_loss.backward()
-
-                # Track losses
-                accumulation_loss += adv_loss.item()
                 step_count += 1
 
                 # Update model every update_every steps
                 if step_count % update_every == 0:
-                    # Sample FRESH patches just for diversity loss
-                    # This is decoupled from adversarial patches but still optimizes U for diversity
-                    z_diversity = self.sample_coefficients(effective_batch_size)
-                    diversity_patches = self.generate_patches(z_diversity)
-                    diversity_score = self.compute_diversity_loss(diversity_patches)
+                    # Compute mean adversarial loss over batch
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
 
-                    # Diversity loss term: -diversity_weight * (1/batch_size) * logdet
-                    diversity_loss = -self.diversity_weight * (1.0 / effective_batch_size) * diversity_score
+                    # Compute diversity loss on SAME patches used for adversarial loss
+                    patches_tensor = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+                    diversity_score = self.compute_diversity_loss(patches_tensor)
+                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Backward diversity loss (adds gradients to U)
-                    diversity_loss.backward()
+                    # Combine losses and backward ONCE through entire graph
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
                     # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
@@ -680,21 +684,22 @@ class BasisPatchTrainer:
                     optimizer.zero_grad()
 
                     # Track total loss
-                    avg_adv_loss = accumulation_loss / effective_batch_size
-                    total_loss += avg_adv_loss + diversity_loss.item()
+                    total_loss += combined_loss.item()
                     num_updates += 1
 
                     # Update progress bar
+                    avg_loss = total_loss / num_updates
                     pbar.set_postfix({
-                        'Loss': f"{total_loss / num_updates:.4f}",
-                        'AdvLoss': f"{avg_adv_loss:.4f}",
+                        'Loss': f"{avg_loss:.4f}",
+                        'AdvLoss': f"{mean_adv_loss.item():.4f}",
                         'DivLoss': f"{diversity_loss.item():.4f}",
                         'Updates': num_updates
                     })
 
-                    # Memory cleanup after update
-                    del adv_loss, scaled_loss, z_diversity, diversity_patches, diversity_score, diversity_loss
-                    accumulation_loss = 0.0
+                    # Memory cleanup after update - NOW graphs are freed
+                    del combined_loss, mean_adv_loss, patches_tensor, diversity_score, diversity_loss
+                    accumulated_patches = []
+                    accumulated_losses = []
 
                     if self.device == 'cuda':
                         torch.cuda.empty_cache()
@@ -702,34 +707,28 @@ class BasisPatchTrainer:
                         torch.mps.empty_cache()
 
                 else:
-                    # Just cleanup current tensors, keep gradients
-                    del adv_loss, scaled_loss
-
                     # Show accumulation progress
-                    current_batch_avg = accumulation_loss / (step_count % update_every)
                     pbar.set_postfix({
-                        'AccumLoss': f"{current_batch_avg:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
-            # Handle remaining accumulated gradients
+            # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
-                remaining_steps = step_count % update_every
+                if len(accumulated_patches) > 0:
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
+                    patches_tensor = torch.stack(accumulated_patches, dim=0)
+                    diversity_score = self.compute_diversity_loss(patches_tensor)
+                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                # Sample fresh patches for diversity
-                z_diversity = self.sample_coefficients(remaining_steps)
-                diversity_patches = self.generate_patches(z_diversity)
-                diversity_score = self.compute_diversity_loss(diversity_patches)
-                diversity_loss = -self.diversity_weight * (1.0 / remaining_steps) * diversity_score
-                diversity_loss.backward()
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
-                torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                    torch.nn.utils.clip_grad_norm_([self.basis_U], max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                avg_adv_loss = accumulation_loss / remaining_steps
-                total_loss += avg_adv_loss + diversity_loss.item()
-                num_updates += 1
+                    total_loss += combined_loss.item()
+                    num_updates += 1
 
                 if self.device == 'cuda':
                     torch.cuda.empty_cache()
@@ -879,6 +878,9 @@ def main():
                         help='Dimensionality of basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
+    parser.add_argument('--batch-size', type=int, default=16,
+                        help='Gradient accumulation steps / effective batch size (default: 16). '
+                        'Reduce if OOM, increase if you have more VRAM.')
     args = parser.parse_args()
 
     # Configuration
@@ -889,7 +891,7 @@ def main():
     # Trainer kwargs
     trainer_kwargs = {
         'device': 'cuda',
-        'grad_accumulate': 64,
+        'grad_accumulate': args.batch_size,
         'match_detection': args.match_detection,
         'impersonation_target': args.impersonation_target,
         'use_tv_loss': not args.disable_tv_loss,
