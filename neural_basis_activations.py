@@ -716,6 +716,7 @@ class NeuralBasisPatchTrainer:
         OCR internal representations (at the patch_extractor layer) compared to baseline.
         """
         total_loss = 0.0
+        total_diversity_loss = 0.0
         step_count = 0
         num_updates = 0
 
@@ -774,8 +775,9 @@ class NeuralBasisPatchTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Track total loss
+                    # Track total loss and diversity loss
                     total_loss += combined_loss.item()
+                    total_diversity_loss += diversity_loss.item()
                     num_updates += 1
 
                     # Update progress bar
@@ -831,6 +833,7 @@ class NeuralBasisPatchTrainer:
                     optimizer.zero_grad()
 
                     total_loss += combined_loss.item()
+                    total_diversity_loss += diversity_loss.item()
                     num_updates += 1
 
                 if self.device == 'cuda':
@@ -838,8 +841,10 @@ class NeuralBasisPatchTrainer:
                 elif self.device == 'mps':
                     torch.mps.empty_cache()
 
-        # Return average loss per update
-        return total_loss / max(num_updates, 1)
+        # Return average loss per update and average diversity loss
+        avg_loss = total_loss / max(num_updates, 1)
+        avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
+        return avg_loss, avg_diversity_loss
 
     def validate(self) -> float:
         """Validation pass on held-out data"""
@@ -934,7 +939,7 @@ class NeuralBasisPatchTrainer:
 
         for epoch in range(num_epochs):
             # Training and validation
-            train_loss = self.train_epoch(optimizer, epoch)
+            train_loss, train_diversity_loss = self.train_epoch(optimizer, epoch)
             val_detection_score = self.validate()
 
             # Learning rate scheduling (step at end of each epoch)
@@ -953,6 +958,7 @@ class NeuralBasisPatchTrainer:
             # Print epoch summary
             print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                   f"Loss: {train_loss:.4f} | "
+                  f"DivLoss: {train_diversity_loss:.4f} | "
                   f"Val Loss: {val_detection_score:.3f} | "
                   f"Change: {loss_change:+.1f}% | "
                   f"LR: {current_lr:.2e} | ")
