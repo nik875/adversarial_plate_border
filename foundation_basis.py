@@ -441,14 +441,18 @@ class FoundationBasisPatchTrainer:
         # Use slogdet for numerical stability (returns sign and log|det|)
         sign, log_det = torch.slogdet(gram)
 
-        # Handle numerical issues: take absolute value of log_det
-        # When matrix is near-singular, sign may flip to -1 due to floating point errors
-        # Using abs(log_det) preserves gradient signal for diversity loss even when det ≈ 0
-        # (patches similar → det → 0 → log_det → -∞ → abs → ∞ → diversity loss penalizes)
+        # Handle numerical issues without clamping to zero
+        # When patches are diverse: det is large → log_det is positive → diversity loss is negative (rewards)
+        # When patches are similar: det ≈ 0 → log_det → -∞ → diversity loss is positive (penalizes)
+        # We must preserve the sign of log_det for correct gradient direction!
         if torch.isnan(log_det):
+            # NaN case: treat as singular matrix (similar patches)
             log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
-        else:
-            log_det = torch.abs(log_det)
+        elif sign <= 0:
+            # Singular or negative determinant: use large negative value
+            # This will make diversity_loss positive, penalizing similarity
+            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
+        # else: use log_det as-is (no abs!)
 
         return log_det
 
