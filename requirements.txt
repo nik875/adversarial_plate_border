@@ -14,3 +14,6 @@ onnx2torch
 pillow_heif
 seaborn
 python-Levenshtein
+diffusers
+transformers
+accelerate
