@@ -186,12 +186,18 @@ class BasisPatchTrainer:
         # Compute Gram matrix
         gram = normalized @ normalized.t()  # [batch_size, batch_size]
 
-        # Add epsilon for numerical stability (use same as in loss functions)
-        epsilon = 1e-8
+        # Add larger epsilon for numerical stability
+        # Use scale-dependent epsilon to handle different batch sizes
+        epsilon = max(1e-6, 1e-2 / batch_size)
         gram = gram + epsilon * torch.eye(batch_size, device=self.device)
 
-        # Compute log determinant
-        log_det = torch.logdet(gram)
+        # Use slogdet for numerical stability (returns sign and log|det|)
+        sign, log_det = torch.slogdet(gram)
+
+        # If determinant is negative or NaN, clamp log_det to avoid NaN propagation
+        # This should rarely happen with positive-definite Gram matrix
+        if sign <= 0 or torch.isnan(log_det):
+            log_det = torch.tensor(0.0, device=self.device, dtype=log_det.dtype)
 
         return log_det
 
