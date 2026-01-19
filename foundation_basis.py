@@ -29,7 +29,7 @@ PATCH_HEIGHT = 256
 
 
 class FoundationPatchGenerator(nn.Module):
-    """Patch generator using Stable Diffusion VAE decoder with trainable adapter"""
+    """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512):
         super().__init__()
 
@@ -78,6 +78,50 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+        # Skip connection projection: z → spatial feature map
+        # Project z to a feature map that can be concatenated with VAE output
+        self.skip_projection = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, patch_height * patch_width),
+            nn.ReLU(inplace=True)
+        )
+
+        # CNN refinement module
+        # Input: VAE output (3 channels) + skip connection (1 channel) = 4 channels
+        # Output: Final patch (3 channels)
+        self.cnn_refiner = nn.Sequential(
+            # Initial convolution to increase channels
+            nn.Conv2d(4, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            # Residual-like blocks for refinement
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+
+            # Final layer to produce 3-channel output
+            nn.Conv2d(32, 3, kernel_size=3, padding=1),
+            nn.Sigmoid()  # Ensure output is in [0, 1]
+        )
+
+        # Initialize CNN weights
+        for m in self.cnn_refiner.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        print(f"CNN refiner initialized: 4 → 64 → 64 → 32 → 3 channels")
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -87,6 +131,7 @@ class FoundationPatchGenerator(nn.Module):
         """
         batch_size = z.shape[0]
 
+        # Main path: z → adapter → VAE decoder
         # Adapter: z → VAE latent
         vae_latent_flat = self.adapter(z)  # [B, vae_latent_dim]
 
@@ -99,19 +144,31 @@ class FoundationPatchGenerator(nn.Module):
         )  # [B, 4, 32, 64]
 
         # Decode using VAE (gradients flow through for fine-tuning)
-        patches = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
+        vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
 
         # Clamp to [0, 1] and ensure correct size
-        patches = torch.clamp(patches, 0.0, 1.0)
+        vae_output = torch.clamp(vae_output, 0.0, 1.0)
 
         # Ensure exact output size (in case VAE produces slightly different dimensions)
-        if patches.shape[2] != self.patch_height or patches.shape[3] != self.patch_width:
-            patches = F.interpolate(
-                patches,
+        if vae_output.shape[2] != self.patch_height or vae_output.shape[3] != self.patch_width:
+            vae_output = F.interpolate(
+                vae_output,
                 size=(self.patch_height, self.patch_width),
                 mode='bilinear',
                 align_corners=True
             )
+
+        # Skip connection: z → spatial feature map
+        skip_features = self.skip_projection(z)  # [B, H*W]
+        skip_features = skip_features.view(
+            batch_size, 1, self.patch_height, self.patch_width
+        )  # [B, 1, H, W]
+
+        # Concatenate VAE output with skip connection
+        cnn_input = torch.cat([vae_output, skip_features], dim=1)  # [B, 4, H, W]
+
+        # Refine through CNN
+        patches = self.cnn_refiner(cnn_input)  # [B, 3, H, W]
 
         return patches
 
@@ -969,8 +1026,12 @@ class FoundationBasisPatchTrainer:
         print(f"   Latent dimensions: {self.basis_dim}")
         vae_latent_dim = self.generator.vae_latent_dim
         print(f"   Generator architecture:")
-        print(f"     Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-        print(f"     VAE decoder (trainable): latent[4×32×64] -> patch[3×{self.patch_height}×{self.patch_width}]")
+        print(f"     Main path:")
+        print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
+        print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
+        print(f"     Skip connection:")
+        print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
+        print(f"     CNN refiner (trainable): concat(VAE output, skip)[4 channels] -> patch[3×{self.patch_height}×{self.patch_width}]")
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
