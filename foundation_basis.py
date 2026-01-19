@@ -89,71 +89,60 @@ class FoundationPatchGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # CNN refinement module with dense layers
+        # CNN refinement module - deeper conv architecture
         # Input: VAE output (3 channels) + skip connection (1 channel) = 4 channels
-        # Output: Feature maps (32 channels)
-        self.cnn_conv1 = nn.Sequential(
+        # Output: Feature maps (64 channels)
+        self.cnn_refiner = nn.Sequential(
+            # Block 1
             nn.Conv2d(4, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-        )
-
-        # Dense layer after first conv
-        self.cnn_dense1 = nn.Sequential(
-            nn.Linear(64 * patch_height * patch_width, 2048),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Linear(2048, 64 * patch_height * patch_width),
-            nn.ReLU(inplace=True)
-        )
 
-        self.cnn_conv2 = nn.Sequential(
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            # Block 3
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
 
-        # Dense layer after second conv
-        self.cnn_dense2 = nn.Sequential(
-            nn.Linear(64 * patch_height * patch_width, 2048),
-            nn.ReLU(inplace=True),
-            nn.Linear(2048, 32 * patch_height * patch_width),
-            nn.ReLU(inplace=True)
-        )
-
-        self.cnn_conv3 = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-        )
-
         # Initialize CNN weights
-        for module in [self.cnn_conv1, self.cnn_dense1, self.cnn_conv2, self.cnn_dense2, self.cnn_conv3]:
-            for m in module.modules():
-                if isinstance(m, nn.Conv2d):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                elif isinstance(m, nn.BatchNorm2d):
-                    nn.init.constant_(m.weight, 1)
+        for m in self.cnn_refiner.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-                elif isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-        # DNN block: combines CNN output (32 channels) + skip features (1 channel) = 33 channels
-        # Flattens spatial dimensions and processes through dense layers
-        self.dnn_input_dim = 33 * patch_height * patch_width
+        # DNN block: combines CNN output (64 channels) + skip features (1 channel) = 65 channels
+        # Uses global average pooling to reduce spatial dimensions before dense layers
+        self.global_pool = nn.AdaptiveAvgPool2d((8, 16))  # Downsample to 8x16 spatial
+        self.dnn_input_dim = 65 * 8 * 16  # 8320
+
         self.dnn_block = nn.Sequential(
-            nn.Linear(self.dnn_input_dim, 4096),
+            nn.Linear(self.dnn_input_dim, 2048),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(4096, 4096),
+            nn.Dropout(0.3),
+            nn.Linear(2048, 2048),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(4096, 2048),
+            nn.Dropout(0.3),
+            nn.Linear(2048, 1024),
             nn.ReLU(inplace=True),
-            nn.Linear(2048, 3 * patch_height * patch_width),
+            nn.Linear(1024, 3 * patch_height * patch_width),
             nn.Sigmoid()  # Ensure output is in [0, 1]
         )
 
@@ -164,8 +153,8 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        print(f"CNN refiner initialized: 4 → 64 (+ dense) → 64 (+ dense) → 32 channels")
-        print(f"DNN block initialized: {self.dnn_input_dim} → 4096 → 4096 → 2048 → {3 * patch_height * patch_width}")
+        print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
+        print(f"DNN block (with global pooling): {self.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * patch_height * patch_width}")
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -213,27 +202,15 @@ class FoundationPatchGenerator(nn.Module):
         # Concatenate VAE output with skip connection for CNN input
         cnn_input = torch.cat([vae_output, skip_features], dim=1)  # [B, 4, H, W]
 
-        # Process through CNN with interleaved dense layers
-        # Conv1
-        x = self.cnn_conv1(cnn_input)  # [B, 64, H, W]
-        # Dense1
-        x_flat = x.view(batch_size, -1)  # [B, 64*H*W]
-        x_flat = self.cnn_dense1(x_flat)  # [B, 64*H*W]
-        x = x_flat.view(batch_size, 64, self.patch_height, self.patch_width)  # [B, 64, H, W]
-
-        # Conv2
-        x = self.cnn_conv2(x)  # [B, 64, H, W]
-        # Dense2
-        x_flat = x.view(batch_size, -1)  # [B, 64*H*W]
-        x_flat = self.cnn_dense2(x_flat)  # [B, 32*H*W]
-        x = x_flat.view(batch_size, 32, self.patch_height, self.patch_width)  # [B, 32, H, W]
-
-        # Conv3
-        cnn_output = self.cnn_conv3(x)  # [B, 32, H, W]
+        # Process through CNN refiner
+        cnn_output = self.cnn_refiner(cnn_input)  # [B, 64, H, W]
 
         # Concatenate CNN output with skip features for DNN input
-        dnn_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 33, H, W]
-        dnn_input_flat = dnn_input.view(batch_size, -1)  # [B, 33*H*W]
+        dnn_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 65, H, W]
+
+        # Apply global pooling to reduce spatial dimensions
+        dnn_input_pooled = self.global_pool(dnn_input)  # [B, 65, 8, 16]
+        dnn_input_flat = dnn_input_pooled.view(batch_size, -1)  # [B, 65*8*16]
 
         # Process through DNN block
         patch_flat = self.dnn_block(dnn_input_flat)  # [B, 3*H*W]
@@ -347,7 +324,7 @@ class FoundationBasisPatchTrainer:
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
         Generate patches from latent codes using foundation model:
-        z → adapter → frozen VAE decoder → CNN (with dense layers) → DNN block → patch
+        z → adapter → frozen VAE decoder → CNN refiner → DNN block (with pooling) → patch
 
         Args:
             z: Latent codes [batch_size, basis_dim]
@@ -1111,12 +1088,14 @@ class FoundationBasisPatchTrainer:
         print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
         print(f"     CNN refiner (trainable):")
         print(f"       Input: concat(VAE output, skip)[4 channels]")
-        print(f"       Conv1[4→64] -> Dense[64*H*W → 2048 → 64*H*W]")
-        print(f"       Conv2[64→64] -> Dense[64*H*W → 2048 → 32*H*W]")
-        print(f"       Conv3[32→32] -> output[32 channels]")
+        print(f"       Block1: Conv[4→64] + Conv[64→64]")
+        print(f"       Block2: Conv[64→128] + Conv[128→128]")
+        print(f"       Block3: Conv[128→64] + Conv[64→64]")
+        print(f"       Output: [64 channels]")
         print(f"     DNN block (trainable):")
-        print(f"       Input: concat(CNN output, skip)[33 channels, flattened]")
-        print(f"       {self.generator.dnn_input_dim} -> 4096 -> 4096 -> 2048 -> {3 * self.patch_height * self.patch_width}")
+        print(f"       Input: concat(CNN output[64], skip[1])[65 channels]")
+        print(f"       Global pool: 65×{self.patch_height}×{self.patch_width} → 65×8×16")
+        print(f"       Dense: {self.generator.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * self.patch_height * self.patch_width}")
         print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
