@@ -982,11 +982,12 @@ class FoundationBasisPatchTrainer:
 
                 # Capture activations (automatically populated by forward hook)
                 # Don't detach if diversity_only - we need gradients for the diagonal entries
+                # Squeeze to match format from _get_activations_for_patch_image
                 if self.ocr_activations is not None:
                     if self.diversity_only:
-                        accumulated_activations.append(self.ocr_activations.clone())
+                        accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
                     else:
-                        accumulated_activations.append(self.ocr_activations.detach().clone())
+                        accumulated_activations.append(self.ocr_activations.squeeze(0).detach().clone())
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
