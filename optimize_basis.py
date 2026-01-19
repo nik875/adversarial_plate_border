@@ -658,6 +658,7 @@ class BasisPatchTrainer:
         # Must keep in computational graph to compute diversity on same patches as adversarial
         accumulated_patches = []
         accumulated_losses = []
+        last_diversity_loss = 0.0  # Track for display during accumulation
 
         desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
@@ -686,6 +687,7 @@ class BasisPatchTrainer:
                     patches_tensor = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
                     diversity_score = self.compute_diversity_loss(patches_tensor)
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
+                    last_diversity_loss = diversity_loss.item()
 
                     # Combine losses and backward ONCE through entire graph
                     combined_loss = mean_adv_loss + diversity_loss
@@ -705,7 +707,7 @@ class BasisPatchTrainer:
                     pbar.set_postfix({
                         'Loss': f"{avg_loss:.4f}",
                         'AdvLoss': f"{mean_adv_loss.item():.4f}",
-                        'DivLoss': f"{diversity_loss.item():.4f}",
+                        'DivLoss': f"{last_diversity_loss:.4f}",
                         'Updates': num_updates
                     })
 
@@ -722,8 +724,18 @@ class BasisPatchTrainer:
                 else:
                     # Show accumulation progress with current average loss
                     current_batch_avg = sum(accumulated_losses) / len(accumulated_losses) if accumulated_losses else 0
+
+                    # Compute diversity loss on patches accumulated so far (for display only)
+                    if len(accumulated_patches) > 1:  # Need at least 2 patches for meaningful diversity
+                        with torch.no_grad():
+                            patches_tensor = torch.stack(accumulated_patches, dim=0)
+                            diversity_score = self.compute_diversity_loss(patches_tensor)
+                            current_div_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
+                            last_diversity_loss = current_div_loss.item()
+
                     pbar.set_postfix({
                         'AccumLoss': f"{current_batch_avg.item():.4f}" if hasattr(current_batch_avg, 'item') else f"{current_batch_avg:.4f}",
+                        'DivLoss': f"{last_diversity_loss:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
