@@ -900,6 +900,40 @@ class FoundationBasisPatchTrainer:
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
         return total_det_loss / total_plates, total_ocr_loss / total_plates
 
+    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
+        """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
+        batch = {k: v[0] for k, v in batch.items()}
+
+        # Apply patch to original image
+        patched_image, _ = self.apply_patch_to_image(
+            batch['orig_image'].to(self.device).unsqueeze(0),
+            batch['orig_corners'].to(self.device).unsqueeze(0),
+            patch
+        )
+
+        # Crop plate from patched image using known corners
+        corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
+        cropped_plate = K.crop_and_resize(
+            patched_image,
+            corners_box,
+            self.ocr_input_shape[:2]
+        )
+
+        ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+        ocr_output = self.ocr(ocr_input)
+        ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
+
+        if use_ocr_baseline:
+            if not hasattr(self, 'ocr_baseline'):
+                raise ValueError('Must call calculate_baseline_loss before using!')
+
+            if self.impersonation_target:
+                ocr_loss = ocr_loss / self.ocr_baseline
+            else:
+                ocr_loss = self.ocr_baseline / ocr_loss
+
+        return ocr_loss
+
     def compute_loss_full_image(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
         """Compute loss for full image detection"""
 
@@ -974,9 +1008,14 @@ class FoundationBasisPatchTrainer:
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                # Compute adversarial loss - keeps computational graph
-                adv_loss = self.compute_loss_full_image(batch, patch)
-                accumulated_losses.append(adv_loss)
+                # In diversity-only mode, skip YOLO detection and only compute OCR loss for metrics
+                if self.diversity_only:
+                    ocr_loss = self.compute_ocr_loss_only(batch, patch)
+                    accumulated_losses.append(ocr_loss)
+                else:
+                    # Compute full adversarial loss (detection + OCR)
+                    adv_loss = self.compute_loss_full_image(batch, patch)
+                    accumulated_losses.append(adv_loss)
 
                 # Store patch and batch for diversity evaluation
                 # Don't detach if diversity_only - we need gradients back to generator
