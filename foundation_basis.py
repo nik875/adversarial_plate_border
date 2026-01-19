@@ -44,17 +44,19 @@ class FoundationPatchGenerator(nn.Module):
         self.vae_latent_channels = 4
         self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
 
-        # Load SD VAE decoder (trainable)
+        # Load SD VAE decoder (frozen)
         print("Loading Stable Diffusion VAE decoder...")
         self.vae = AutoencoderKL.from_pretrained(
             "madebyollin/sdxl-vae-fp16-fix",  # Smaller, optimized VAE
             torch_dtype=torch.float32
         )
 
-        # VAE parameters are trainable (fine-tune pretrained weights)
-        self.vae.train()
+        # Freeze VAE parameters
+        self.vae.eval()
+        for param in self.vae.parameters():
+            param.requires_grad = False
 
-        print(f"VAE loaded (trainable). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
+        print(f"VAE loaded (frozen). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
         # Using deeper network for better expressiveness
@@ -87,40 +89,83 @@ class FoundationPatchGenerator(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # CNN refinement module
+        # CNN refinement module with dense layers
         # Input: VAE output (3 channels) + skip connection (1 channel) = 4 channels
-        # Output: Final patch (3 channels)
-        self.cnn_refiner = nn.Sequential(
-            # Initial convolution to increase channels
+        # Output: Feature maps (32 channels)
+        self.cnn_conv1 = nn.Sequential(
             nn.Conv2d(4, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+        )
 
-            # Residual-like blocks for refinement
+        # Dense layer after first conv
+        self.cnn_dense1 = nn.Sequential(
+            nn.Linear(64 * patch_height * patch_width, 2048),
+            nn.ReLU(inplace=True),
+            nn.Linear(2048, 64 * patch_height * patch_width),
+            nn.ReLU(inplace=True)
+        )
+
+        self.cnn_conv2 = nn.Sequential(
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+        )
 
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+        # Dense layer after second conv
+        self.cnn_dense2 = nn.Sequential(
+            nn.Linear(64 * patch_height * patch_width, 2048),
+            nn.ReLU(inplace=True),
+            nn.Linear(2048, 32 * patch_height * patch_width),
+            nn.ReLU(inplace=True)
+        )
+
+        self.cnn_conv3 = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-
-            # Final layer to produce 3-channel output
-            nn.Conv2d(32, 3, kernel_size=3, padding=1),
-            nn.Sigmoid()  # Ensure output is in [0, 1]
         )
 
         # Initialize CNN weights
-        for m in self.cnn_refiner.modules():
-            if isinstance(m, nn.Conv2d):
+        for module in [self.cnn_conv1, self.cnn_dense1, self.cnn_conv2, self.cnn_dense2, self.cnn_conv3]:
+            for m in module.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+
+        # DNN block: combines CNN output (32 channels) + skip features (1 channel) = 33 channels
+        # Flattens spatial dimensions and processes through dense layers
+        self.dnn_input_dim = 33 * patch_height * patch_width
+        self.dnn_block = nn.Sequential(
+            nn.Linear(self.dnn_input_dim, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(4096, 2048),
+            nn.ReLU(inplace=True),
+            nn.Linear(2048, 3 * patch_height * patch_width),
+            nn.Sigmoid()  # Ensure output is in [0, 1]
+        )
+
+        # Initialize DNN weights
+        for m in self.dnn_block.modules():
+            if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
-        print(f"CNN refiner initialized: 4 → 64 → 64 → 32 → 3 channels")
+        print(f"CNN refiner initialized: 4 → 64 (+ dense) → 64 (+ dense) → 32 channels")
+        print(f"DNN block initialized: {self.dnn_input_dim} → 4096 → 4096 → 2048 → {3 * patch_height * patch_width}")
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -131,7 +176,7 @@ class FoundationPatchGenerator(nn.Module):
         """
         batch_size = z.shape[0]
 
-        # Main path: z → adapter → VAE decoder
+        # Main path: z → adapter → VAE decoder (frozen)
         # Adapter: z → VAE latent
         vae_latent_flat = self.adapter(z)  # [B, vae_latent_dim]
 
@@ -143,8 +188,9 @@ class FoundationPatchGenerator(nn.Module):
             self.vae_latent_w
         )  # [B, 4, 32, 64]
 
-        # Decode using VAE (gradients flow through for fine-tuning)
-        vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
+        # Decode using frozen VAE
+        with torch.no_grad():
+            vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
 
         # Clamp to [0, 1] and ensure correct size
         vae_output = torch.clamp(vae_output, 0.0, 1.0)
@@ -164,11 +210,34 @@ class FoundationPatchGenerator(nn.Module):
             batch_size, 1, self.patch_height, self.patch_width
         )  # [B, 1, H, W]
 
-        # Concatenate VAE output with skip connection
+        # Concatenate VAE output with skip connection for CNN input
         cnn_input = torch.cat([vae_output, skip_features], dim=1)  # [B, 4, H, W]
 
-        # Refine through CNN
-        patches = self.cnn_refiner(cnn_input)  # [B, 3, H, W]
+        # Process through CNN with interleaved dense layers
+        # Conv1
+        x = self.cnn_conv1(cnn_input)  # [B, 64, H, W]
+        # Dense1
+        x_flat = x.view(batch_size, -1)  # [B, 64*H*W]
+        x_flat = self.cnn_dense1(x_flat)  # [B, 64*H*W]
+        x = x_flat.view(batch_size, 64, self.patch_height, self.patch_width)  # [B, 64, H, W]
+
+        # Conv2
+        x = self.cnn_conv2(x)  # [B, 64, H, W]
+        # Dense2
+        x_flat = x.view(batch_size, -1)  # [B, 64*H*W]
+        x_flat = self.cnn_dense2(x_flat)  # [B, 32*H*W]
+        x = x_flat.view(batch_size, 32, self.patch_height, self.patch_width)  # [B, 32, H, W]
+
+        # Conv3
+        cnn_output = self.cnn_conv3(x)  # [B, 32, H, W]
+
+        # Concatenate CNN output with skip features for DNN input
+        dnn_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 33, H, W]
+        dnn_input_flat = dnn_input.view(batch_size, -1)  # [B, 33*H*W]
+
+        # Process through DNN block
+        patch_flat = self.dnn_block(dnn_input_flat)  # [B, 3*H*W]
+        patches = patch_flat.view(batch_size, 3, self.patch_height, self.patch_width)  # [B, 3, H, W]
 
         return patches
 
@@ -277,7 +346,8 @@ class FoundationBasisPatchTrainer:
 
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Generate patches from latent codes using foundation model: z → adapter → VAE decoder
+        Generate patches from latent codes using foundation model:
+        z → adapter → frozen VAE decoder → CNN (with dense layers) → DNN block → patch
 
         Args:
             z: Latent codes [batch_size, basis_dim]
@@ -285,7 +355,7 @@ class FoundationBasisPatchTrainer:
         Returns:
             patches: [batch_size, 3, H, W] in [0, 1]
         """
-        # Pass through adapter + frozen VAE decoder
+        # Pass through full generator pipeline
         patches = self.generator(z)  # [batch_size, 3, H, W], already in [0, 1]
 
         return patches
@@ -1032,10 +1102,18 @@ class FoundationBasisPatchTrainer:
         print(f"   Generator architecture:")
         print(f"     Main path:")
         print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-        print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
+        print(f"       VAE decoder (FROZEN): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
         print(f"     Skip connection:")
         print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
-        print(f"     CNN refiner (trainable): concat(VAE output, skip)[4 channels] -> patch[3×{self.patch_height}×{self.patch_width}]")
+        print(f"     CNN refiner (trainable):")
+        print(f"       Input: concat(VAE output, skip)[4 channels]")
+        print(f"       Conv1[4→64] -> Dense[64*H*W → 2048 → 64*H*W]")
+        print(f"       Conv2[64→64] -> Dense[64*H*W → 2048 → 32*H*W]")
+        print(f"       Conv3[32→32] -> output[32 channels]")
+        print(f"     DNN block (trainable):")
+        print(f"       Input: concat(CNN output, skip)[33 channels, flattened]")
+        print(f"       {self.generator.dnn_input_dim} -> 4096 -> 4096 -> 2048 -> {3 * self.patch_height * self.patch_width}")
+        print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
