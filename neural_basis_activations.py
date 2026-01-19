@@ -583,7 +583,7 @@ class NeuralBasisPatchTrainer:
 
             cropped_plate = K.crop_and_resize(
                 orig_image,
-                corners_box_device.unsqueeze(0),
+                corners_box_device,
                 self.ocr_input_shape[:2]
             )
 
