@@ -241,7 +241,7 @@ class NeuralBasisPatchTrainer:
             # Run YOLO detection on patched image
             model_output = self.model(patched_image)
 
-            if not model_output:
+            if len(model_output) == 0:
                 return torch.zeros(8, 16, 384, device=self.device)
 
             # Get first detection (simplified - could rank by confidence)
