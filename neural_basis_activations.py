@@ -193,7 +193,8 @@ class NeuralBasisPatchTrainer:
         def hook_fn(module, input, output):
             # output shape: [batch, 384, 8, 16] (after conv, before transpose/reshape)
             # Store in [batch, 8, 16, 384] format for consistency with sequence layout
-            self.ocr_activations = output.permute(0, 2, 3, 1).detach()  # [batch, 8, 16, 384]
+            # Don't detach here - let caller decide based on use_grad
+            self.ocr_activations = output.permute(0, 2, 3, 1)  # [batch, 8, 16, 384]
 
         # Register the hook
         self.activation_hook = target_layer.register_forward_hook(hook_fn)
@@ -222,7 +223,7 @@ class NeuralBasisPatchTrainer:
         return patches
 
     def _get_activations_for_patch_image(self, batch: dict, patch: torch.Tensor,
-                                          use_grad: bool = False) -> torch.Tensor:
+                                          use_grad: bool = False, skip_detection: bool = False) -> torch.Tensor:
         """
         Apply patch to a single image and return OCR activations from that forward pass.
 
@@ -230,6 +231,7 @@ class NeuralBasisPatchTrainer:
             batch: Single unbatched batch item from dataloader
             patch: [3, H, W] patch tensor
             use_grad: If True, compute with gradients (needed for diversity-only mode)
+            skip_detection: If True, use known plate corners instead of running YOLO detection
 
         Returns:
             activations: [8, 16, 384] or zeros if detection fails
@@ -237,33 +239,38 @@ class NeuralBasisPatchTrainer:
         # Use context manager conditionally
         context = torch.no_grad() if not use_grad else torch.enable_grad()
         with context:
-            # Apply patch to preprocessed image
+            # Apply patch to original image
             patched_image, _ = self.apply_patch_to_image(
-                batch['prep_image'].to(self.device).unsqueeze(0),
-                batch['new_corners'].to(self.device).unsqueeze(0),
+                batch['orig_image'].to(self.device).unsqueeze(0),
+                batch['orig_corners'].to(self.device).unsqueeze(0),
                 patch
             )
 
-            # Run YOLO detection on patched image
-            model_output = self.model(patched_image)
-
-            if len(model_output) == 0:
-                return torch.zeros(8, 16, 384, device=self.device)
-
-            # Get first detection (simplified - could rank by confidence)
-            best_detection = model_output[0]
-
-            # Crop plate and run OCR
-            pred_box = best_detection[1:5]
-            orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
-            corners_box = self.bbox_to_corners(orig_projection, device='cpu')
-
             orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-            corners_box_device = corners_box.to(self.device)
 
+            if skip_detection:
+                # Use known plate corners directly - no YOLO detection needed
+                # This is faster and cleaner for diversity-only mode
+                corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
+            else:
+                # Run YOLO detection on patched image (original behavior)
+                model_output = self.model(patched_image)
+
+                if len(model_output) == 0:
+                    return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
+
+                # Get first detection (simplified - could rank by confidence)
+                best_detection = model_output[0]
+
+                # Crop plate and run OCR
+                pred_box = best_detection[1:5]
+                orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
+                corners_box = self.bbox_to_corners(orig_projection, device='cpu').to(self.device)
+
+            # Crop plate from patched image and run OCR
             cropped_plate = K.crop_and_resize(
-                orig_image,
-                corners_box_device,
+                patched_image,
+                corners_box,
                 self.ocr_input_shape[:2]
             )
 
@@ -274,11 +281,12 @@ class NeuralBasisPatchTrainer:
                 result = self.ocr_activations.squeeze(0)  # [8, 16, 384]
                 return result if use_grad else result.detach()
 
-            return torch.zeros(8, 16, 384, device=self.device)
+            return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
 
     def compute_activation_diversity(self, patches_list: List[torch.Tensor],
                                       batches_list: List[dict],
                                       baseline_indices: List[int],
+                                      diagonal_activations: List[torch.Tensor],
                                       use_grad: bool = False) -> torch.Tensor:
         """
         Compute diversity via average activation impact across all images.
@@ -290,6 +298,7 @@ class NeuralBasisPatchTrainer:
             patches_list: List of [3, H, W] patches (one per image)
             batches_list: List of batch dicts (one per image)
             baseline_indices: List of dataset indices for baseline activations
+            diagonal_activations: List of [8, 16, 384] activations from (patch_i, image_i) pairs
             use_grad: If True, compute with gradients (needed for diversity-only mode)
 
         Returns:
@@ -304,9 +313,14 @@ class NeuralBasisPatchTrainer:
             activation_deltas = []
 
             # Evaluate this patch on all images in the batch
-            for batch, baseline_idx in zip(batches_list, baseline_indices):
-                # Get OCR activations for this (patch, image) pair
-                activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad)  # [8, 16, 384]
+            for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
+                # Reuse diagonal activations (patch_i on image_i)
+                if patch_idx == img_idx:
+                    activations = diagonal_activations[patch_idx]  # [8, 16, 384]
+                else:
+                    # Only compute off-diagonal (patch_i on image_j where i != j)
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [8, 16, 384]
+
                 baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
                 delta = activations - baseline  # [8, 16, 384]
                 activation_deltas.append(delta)
@@ -334,9 +348,9 @@ class NeuralBasisPatchTrainer:
 
         # Handle numerical issues
         if torch.isnan(log_det):
-            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
+            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype, requires_grad=use_grad)
         elif sign <= 0:
-            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
+            log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype, requires_grad=use_grad)
 
         return log_det
 
@@ -719,7 +733,7 @@ class NeuralBasisPatchTrainer:
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
                         # Store per-image baseline: [8, 16, 384]
-                        self.baseline_ocr_activations[idx] = self.ocr_activations.squeeze(0).clone()
+                        self.baseline_ocr_activations[idx] = self.ocr_activations.squeeze(0).detach().clone()
 
                     total_det_loss += det_loss
                     total_ocr_loss += ocr_loss
@@ -734,6 +748,40 @@ class NeuralBasisPatchTrainer:
 
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
         return total_det_loss / total_plates, total_ocr_loss / total_plates
+
+    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
+        """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
+        batch = {k: v[0] for k, v in batch.items()}
+
+        # Apply patch to original image
+        patched_image, _ = self.apply_patch_to_image(
+            batch['orig_image'].to(self.device).unsqueeze(0),
+            batch['orig_corners'].to(self.device).unsqueeze(0),
+            patch
+        )
+
+        # Crop plate from patched image using known corners
+        corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
+        cropped_plate = K.crop_and_resize(
+            patched_image,
+            corners_box,
+            self.ocr_input_shape[:2]
+        )
+
+        ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+        ocr_output = self.ocr(ocr_input)
+        ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
+
+        if use_ocr_baseline:
+            if not hasattr(self, 'ocr_baseline'):
+                raise ValueError('Must call calculate_baseline_loss before using!')
+
+            if self.impersonation_target:
+                ocr_loss = ocr_loss / self.ocr_baseline
+            else:
+                ocr_loss = self.ocr_baseline / ocr_loss
+
+        return ocr_loss
 
     def compute_loss_full_image(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
         """Compute loss for full image detection"""
@@ -809,9 +857,14 @@ class NeuralBasisPatchTrainer:
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]  # [3, H, W] - connected to generator
 
-                # Compute adversarial loss - keeps computational graph
-                adv_loss = self.compute_loss_full_image(batch, patch)
-                accumulated_losses.append(adv_loss)
+                # In diversity-only mode, skip YOLO detection and only compute OCR loss for metrics
+                if self.diversity_only:
+                    ocr_loss = self.compute_ocr_loss_only(batch, patch)
+                    accumulated_losses.append(ocr_loss)
+                else:
+                    # Compute full adversarial loss (detection + OCR)
+                    adv_loss = self.compute_loss_full_image(batch, patch)
+                    accumulated_losses.append(adv_loss)
 
                 # Store patch and batch for diversity evaluation
                 # Don't detach if diversity_only - we need gradients back to generator
@@ -822,9 +875,13 @@ class NeuralBasisPatchTrainer:
                 accumulated_batches.append({k: v[0] for k, v in batch.items()})
 
                 # Capture activations (automatically populated by forward hook)
-                # These are detached since we don't need gradients through them
+                # Don't detach if diversity_only - we need gradients for the diagonal entries
+                # Squeeze to match format from _get_activations_for_patch_image
                 if self.ocr_activations is not None:
-                    accumulated_activations.append(self.ocr_activations.clone())
+                    if self.diversity_only:
+                        accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
+                    else:
+                        accumulated_activations.append(self.ocr_activations.squeeze(0).detach().clone())
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
@@ -834,11 +891,12 @@ class NeuralBasisPatchTrainer:
                 # Update model every update_every steps
                 if step_count % update_every == 0:
                     # Compute activation-based diversity score
-                    # Evaluate every patch on every image in the batch
+                    # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
                         accumulated_patches,
                         accumulated_batches,
                         accumulated_indices,
+                        accumulated_activations,
                         use_grad=self.diversity_only
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
@@ -901,11 +959,12 @@ class NeuralBasisPatchTrainer:
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_losses) > 0:
                     # Compute activation-based diversity score
-                    # Evaluate every patch on every image in the batch
+                    # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
                         accumulated_patches,
                         accumulated_batches,
                         accumulated_indices,
+                        accumulated_activations,
                         use_grad=self.diversity_only
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
