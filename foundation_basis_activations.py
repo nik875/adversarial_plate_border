@@ -1186,11 +1186,12 @@ def main():
                         help='Number of training epochs (default: 100)')
     parser.add_argument('--early-stop-patience', type=int, default=20,
                         help='Early stopping patience: number of epochs without improvement before stopping (default: 20)')
+    parser.add_argument('--learning-rate', type=float, default=5e-3,
+                        help='Peak learning rate after warmup (default: 5e-3)')
     args = parser.parse_args()
 
     # Configuration
     CSV_PATH = "preproc_labels.csv"
-    LEARNING_RATE = 5e-3  # Peak LR after warmup
 
     # Trainer kwargs
     trainer_kwargs = {
@@ -1210,7 +1211,7 @@ def main():
 
         history = trainer.train(
             num_epochs=args.num_epochs,
-            learning_rate=LEARNING_RATE,
+            learning_rate=args.learning_rate,
             save_interval=1,
             early_stop_patience=args.early_stop_patience
         )
