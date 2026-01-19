@@ -191,6 +191,9 @@ class NeuralBasisPatchTrainer:
     def compute_diversity_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
         Compute diversity loss via log determinant of Gram matrix
+        
+        Applies jitter → blur → downsample to prevent gaming the metric with
+        pixel-level variations while preserving high-level structure.
 
         Args:
             patches: [batch_size, 3, H, W]
@@ -200,9 +203,30 @@ class NeuralBasisPatchTrainer:
         """
         batch_size = patches.shape[0]
 
-        # Downsample from 512x256 to 64x32
+        # Apply random jitter (±2 pixels) to each patch independently
+        jittered_patches = []
+        for i in range(batch_size):
+            jitter_x = torch.randint(-2, 3, (1,), device=self.device).float()
+            jitter_y = torch.randint(-2, 3, (1,), device=self.device).float()
+            jittered = kornia.geometry.transform.translate(
+                patches[i:i+1], 
+                torch.tensor([[jitter_x.item(), jitter_y.item()]], device=self.device, dtype=torch.float32)
+            )
+            jittered_patches.append(jittered)
+        
+        patches_jittered = torch.cat(jittered_patches, dim=0)  # [batch_size, 3, H, W]
+        
+        # Apply Gaussian blur (sigma=4px) to remove high-frequency noise
+        kernel_size = 17  # ~4 sigma
+        patches_blurred = kornia.filters.gaussian_blur2d(
+            patches_jittered, 
+            (kernel_size, kernel_size), 
+            (4.0, 4.0)
+        )  # [batch_size, 3, H, W]
+
+        # Downsample from 512x256 to 32x64
         downsampled = F.interpolate(
-            patches,
+            patches_blurred,
             size=(32, 64),  # (H, W)
             mode='bilinear',
             align_corners=True
