@@ -617,8 +617,15 @@ class BasisPatchTrainer:
         else:
             reg_loss = 0.0
 
-        # Combine losses (sqrt on OCR loss to prevent dominance)
-        return (det_loss + torch.sqrt(ocr_loss)) / 2 + reg_loss
+        # Combine losses with conditional sqrt on OCR loss
+        # Apply sqrt only if ocr_loss > 1 (compress large values)
+        # Below 1, use linear (don't deprioritize reasonable losses)
+        ocr_term = torch.where(
+            ocr_loss > 1.0,
+            torch.sqrt(ocr_loss),
+            ocr_loss
+        )
+        return (det_loss + ocr_term) / 2 + reg_loss
 
     def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
         """Train for one epoch with gradient accumulation and diversity loss
