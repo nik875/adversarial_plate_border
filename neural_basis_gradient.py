@@ -749,12 +749,9 @@ class NeuralBasisPatchTrainer:
             for idx, batch in pbar:
                 # Sample coefficients and generate patch for this image
                 z = self.sample_coefficients(1)
-                patch = self.generate_patches(z)[0]  # [3, H, W]
+                patch = self.generate_patches(z)[0]  # [3, H, W] - connected to generator
 
-                # Make patch require gradients so we can extract them
-                patch = patch.detach().requires_grad_(True)
-
-                # Store patch for diversity loss - MUST keep in graph
+                # Store patch for diversity loss - MUST keep in graph (don't detach!)
                 accumulated_patches.append(patch)
 
                 # Compute adversarial loss - MUST keep in graph
@@ -765,39 +762,39 @@ class NeuralBasisPatchTrainer:
 
                 # Update model every update_every steps
                 if step_count % update_every == 0:
-                    # Compute mean adversarial loss over batch
-                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
-
-                    # Backward on adversarial loss to get gradients for each patch
-                    mean_adv_loss.backward(retain_graph=True)
-
-                    # Extract gradients for each patch
+                    # Compute gradients of each adversarial loss w.r.t. its patch
+                    # Using create_graph=True to allow backprop through the gradient computation
                     patch_gradients = []
-                    for patch in accumulated_patches:
-                        if patch.grad is not None:
-                            patch_gradients.append(patch.grad.detach().clone())
-                        else:
-                            # If no gradient, use zeros
-                            patch_gradients.append(torch.zeros_like(patch))
+                    for p, loss in zip(accumulated_patches, accumulated_losses):
+                        grad = torch.autograd.grad(
+                            outputs=loss,
+                            inputs=p,
+                            retain_graph=True,
+                            create_graph=True  # Critical: allows backprop through gradient
+                        )[0]
+                        patch_gradients.append(grad)
 
                     patch_gradients_tensor = torch.stack(patch_gradients, dim=0)  # [batch_size, 3, H, W]
 
-                    # Compute diversity loss using gradients
+                    # Compute diversity loss using gradients (connected to generator via create_graph)
                     diversity_score = self.compute_diversity_loss(patch_gradients_tensor)
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
                     last_diversity_loss = diversity_loss.item()
 
-                    # Backward on diversity loss
-                    diversity_loss.backward()
+                    # Compute mean adversarial loss
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
+
+                    # Combined loss - both terms connected to generator
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
                     # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Track total loss (adv + div)
-                    combined_loss_value = mean_adv_loss.item() + diversity_loss.item()
-                    total_loss += combined_loss_value
+                    # Track total loss
+                    total_loss += combined_loss.item()
                     num_updates += 1
 
                     # Update progress bar
@@ -812,7 +809,7 @@ class NeuralBasisPatchTrainer:
                     })
 
                     # Memory cleanup after update - NOW graphs are freed
-                    del mean_adv_loss, patch_gradients_tensor, diversity_score, diversity_loss
+                    del combined_loss, mean_adv_loss, patch_gradients_tensor, diversity_score, diversity_loss
                     accumulated_patches = []
                     accumulated_losses = []
 
@@ -837,18 +834,16 @@ class NeuralBasisPatchTrainer:
             # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_patches) > 0:
-                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
-
-                    # Backward on adversarial loss to get gradients for each patch
-                    mean_adv_loss.backward(retain_graph=True)
-
-                    # Extract gradients for each patch
+                    # Compute gradients with create_graph=True
                     patch_gradients = []
-                    for patch in accumulated_patches:
-                        if patch.grad is not None:
-                            patch_gradients.append(patch.grad.detach().clone())
-                        else:
-                            patch_gradients.append(torch.zeros_like(patch))
+                    for p, loss in zip(accumulated_patches, accumulated_losses):
+                        grad = torch.autograd.grad(
+                            outputs=loss,
+                            inputs=p,
+                            retain_graph=True,
+                            create_graph=True
+                        )[0]
+                        patch_gradients.append(grad)
 
                     patch_gradients_tensor = torch.stack(patch_gradients, dim=0)
 
@@ -856,15 +851,18 @@ class NeuralBasisPatchTrainer:
                     diversity_score = self.compute_diversity_loss(patch_gradients_tensor)
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Backward on diversity loss
-                    diversity_loss.backward()
+                    # Mean adversarial loss
+                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
+
+                    # Combined loss
+                    combined_loss = mean_adv_loss + diversity_loss
+                    combined_loss.backward()
 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    combined_loss_value = mean_adv_loss.item() + diversity_loss.item()
-                    total_loss += combined_loss_value
+                    total_loss += combined_loss.item()
                     num_updates += 1
 
                 if self.device == 'cuda':
