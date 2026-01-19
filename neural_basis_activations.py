@@ -219,55 +219,114 @@ class NeuralBasisPatchTrainer:
 
         return patches
 
-    def compute_activation_diversity(self, patch_activations_list: List[torch.Tensor],
-                                      baseline_indices: List[int]) -> torch.Tensor:
+    def _get_activations_for_patch_image(self, batch: dict, patch: torch.Tensor) -> torch.Tensor:
         """
-        Compute diversity loss via log determinant of Gram matrix using ACTIVATION DELTAS
-
-        Measures how differently each patch affects the OCR's internal representations
-        at the patch_extractor layer (visual → sequence tokenization point).
+        Apply patch to a single image and return OCR activations from that forward pass.
 
         Args:
-            patch_activations_list: List of [1, 8, 16, 384] tensors - one per patched image
-            baseline_indices: List of dataset indices to look up baseline activations
+            batch: Single unbatched batch item from dataloader
+            patch: [3, H, W] patch tensor
+
+        Returns:
+            activations: [8, 16, 384] or zeros if detection fails
+        """
+        with torch.no_grad():
+            # Apply patch to preprocessed image
+            patched_image, _ = self.apply_patch_to_image(
+                batch['prep_image'].to(self.device).unsqueeze(0),
+                batch['new_corners'].to(self.device).unsqueeze(0),
+                patch
+            )
+
+            # Run YOLO detection on patched image
+            model_output = self.model(patched_image)
+
+            if not model_output:
+                return torch.zeros(8, 16, 384, device=self.device)
+
+            # Get first detection (simplified - could rank by confidence)
+            best_detection = model_output[0]
+
+            # Crop plate and run OCR
+            pred_box = best_detection[1:5]
+            orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
+            corners_box = self.bbox_to_corners(orig_projection, device='cpu')
+
+            orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+            corners_box_device = corners_box.to(self.device)
+
+            cropped_plate = K.crop_and_resize(
+                orig_image,
+                corners_box_device,
+                self.ocr_input_shape[:2]
+            )
+
+            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+            self.ocr(ocr_input)  # Forward pass captures activations via hook
+
+            if self.ocr_activations is not None:
+                return self.ocr_activations.squeeze(0).detach()  # [8, 16, 384]
+
+            return torch.zeros(8, 16, 384, device=self.device)
+
+    def compute_activation_diversity(self, patches_list: List[torch.Tensor],
+                                      batches_list: List[dict],
+                                      baseline_indices: List[int]) -> torch.Tensor:
+        """
+        Compute diversity via average activation impact across all images.
+
+        For each patch, evaluate it on ALL images in the batch and compute
+        the average activation delta. This reduces noise compared to patch-image pairs.
+
+        Args:
+            patches_list: List of [3, H, W] patches (one per image)
+            batches_list: List of batch dicts (one per image)
+            baseline_indices: List of dataset indices for baseline activations
 
         Returns:
             log_det: scalar diversity score
         """
-        batch_size = len(patch_activations_list)
+        batch_size = len(patches_list)
 
-        # Compute deltas from baseline for each image
-        deltas = []
-        for patch_act, idx in zip(patch_activations_list, baseline_indices):
-            baseline_act = self.baseline_ocr_activations[idx]  # [8, 16, 384]
-            delta = patch_act.squeeze(0) - baseline_act  # [8, 16, 384]
-            deltas.append(delta)
+        # For each patch, compute average activation delta across all images
+        patch_avg_deltas = []
 
-        # Stack and flatten: [batch_size, 8*16*384] = [batch_size, 49152]
-        deltas_stacked = torch.stack(deltas, dim=0)  # [batch_size, 8, 16, 384]
-        deltas_flat = deltas_stacked.reshape(batch_size, -1)  # [batch_size, 49152]
+        for patch_idx, patch in enumerate(patches_list):
+            activation_deltas = []
 
-        # L2 normalize each delta vector
-        normalized = F.normalize(deltas_flat, p=2, dim=1)  # [batch_size, 49152]
+            # Evaluate this patch on all images in the batch
+            for batch, baseline_idx in zip(batches_list, baseline_indices):
+                # Get OCR activations for this (patch, image) pair
+                activations = self._get_activations_for_patch_image(batch, patch)  # [8, 16, 384]
+                baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
+                delta = activations - baseline  # [8, 16, 384]
+                activation_deltas.append(delta)
 
-        # Compute Gram matrix: [batch_size, batch_size] - measures pairwise similarity
-        gram = normalized @ normalized.t()  # [batch_size, batch_size]
+            # Average deltas for this patch over all images
+            avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [8, 16, 384]
+            patch_avg_deltas.append(avg_delta)
+
+        # Stack averaged deltas: [batch_size, 8, 16, 384]
+        avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
+        avg_deltas_flat = avg_deltas_stacked.reshape(batch_size, -1)  # [batch_size, 49152]
+
+        # L2 normalize each patch's average delta vector
+        normalized = F.normalize(avg_deltas_flat, p=2, dim=1)  # [batch_size, 49152]
+
+        # Compute Gram matrix: [batch_size, batch_size]
+        gram = normalized @ normalized.t()
 
         # Add epsilon for numerical stability
         epsilon = max(1e-6, 1e-2 / batch_size)
         gram = gram + epsilon * torch.eye(batch_size, device=self.device)
 
-        # Use slogdet for numerical stability (returns sign and log|det|)
+        # Use slogdet for numerical stability
         sign, log_det = torch.slogdet(gram)
 
         # Handle numerical issues
-        # When activations are diverse: det is large → log_det is positive → diversity loss is negative (rewards)
-        # When activations are similar: det ≈ 0 → log_det → -∞ → diversity loss is positive (penalizes)
         if torch.isnan(log_det):
-            # NaN case: treat as singular matrix (similar activations)
             log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
         elif sign <= 0:
-            # Singular or negative determinant: use large negative value
             log_det = torch.tensor(-20.0, device=self.device, dtype=log_det.dtype)
 
         return log_det
@@ -726,6 +785,8 @@ class NeuralBasisPatchTrainer:
 
         # Storage for losses and activations in current accumulation window
         accumulated_losses = []
+        accumulated_patches = []
+        accumulated_batches = []
         accumulated_activations = []
         accumulated_indices = []
         last_diversity_loss = 0.0  # Track for display during accumulation
@@ -743,6 +804,10 @@ class NeuralBasisPatchTrainer:
                 adv_loss = self.compute_loss_full_image(batch, patch)
                 accumulated_losses.append(adv_loss)
 
+                # Store patch and batch for diversity evaluation
+                accumulated_patches.append(patch.detach())
+                accumulated_batches.append({k: v[0] for k, v in batch.items()})
+
                 # Capture activations (automatically populated by forward hook)
                 # These are detached since we don't need gradients through them
                 if self.ocr_activations is not None:
@@ -756,8 +821,10 @@ class NeuralBasisPatchTrainer:
                 # Update model every update_every steps
                 if step_count % update_every == 0:
                     # Compute activation-based diversity score
+                    # Evaluate every patch on every image in the batch
                     diversity_score = self.compute_activation_diversity(
-                        accumulated_activations,
+                        accumulated_patches,
+                        accumulated_batches,
                         accumulated_indices
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
@@ -792,6 +859,8 @@ class NeuralBasisPatchTrainer:
                     # Memory cleanup after update
                     del combined_loss, mean_adv_loss, diversity_score, diversity_loss
                     accumulated_losses = []
+                    accumulated_patches = []
+                    accumulated_batches = []
                     accumulated_activations = []
                     accumulated_indices = []
 
@@ -815,8 +884,10 @@ class NeuralBasisPatchTrainer:
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_losses) > 0:
                     # Compute activation-based diversity score
+                    # Evaluate every patch on every image in the batch
                     diversity_score = self.compute_activation_diversity(
-                        accumulated_activations,
+                        accumulated_patches,
+                        accumulated_batches,
                         accumulated_indices
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
