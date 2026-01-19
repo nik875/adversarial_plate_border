@@ -717,17 +717,6 @@ class NeuralBasisPatchTrainer:
                     diversity_score = self.compute_diversity_loss(patches_tensor)
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
                     last_diversity_loss = diversity_loss.item()
-                    # DEBUG: Print diversity loss components
-                    if num_updates % 10 == 0:
-                        print(f"\n[DEBUG Update {num_updates}]")
-                        print(f"  Batch size: {len(accumulated_patches)}")
-                        print(f"  diversity_score (log_det): {diversity_score.item():.6f}")
-                        print(f"  diversity_weight: {self.diversity_weight}")
-                        print(f"  diversity_loss (raw): {diversity_loss.item():.6f}")
-                        print(f"  -diversity_loss (displayed): {-last_diversity_loss:.6f}")
-                        print(f"  mean_adv_loss: {mean_adv_loss.item():.6f}")
-                        print(f"  combined_loss: {(mean_adv_loss + diversity_loss).item():.6f}")
-
 
                     # Combine losses and backward ONCE through entire graph
                     combined_loss = mean_adv_loss + diversity_loss
