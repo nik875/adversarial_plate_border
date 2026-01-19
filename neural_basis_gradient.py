@@ -188,6 +188,37 @@ class NeuralBasisPatchTrainer:
 
         return patches
 
+    def _simple_jitter(self, tensor: torch.Tensor, jx: int, jy: int) -> torch.Tensor:
+        """
+        Apply jitter using slicing and padding (supports double backprop).
+
+        Unlike kornia.translate which uses grid_sample (no double backprop support),
+        this uses basic tensor operations that fully support second-order gradients.
+
+        Args:
+            tensor: [B, C, H, W]
+            jx: horizontal shift (positive = right)
+            jy: vertical shift (positive = down)
+        """
+        if jx == 0 and jy == 0:
+            return tensor
+
+        result = tensor
+
+        # Handle x shift (width dimension, last dim)
+        if jx > 0:  # Shift right: remove from right, pad on left
+            result = F.pad(result[:, :, :, :-jx], (jx, 0, 0, 0), mode='constant', value=0)
+        elif jx < 0:  # Shift left: remove from left, pad on right
+            result = F.pad(result[:, :, :, -jx:], (0, -jx, 0, 0), mode='constant', value=0)
+
+        # Handle y shift (height dimension, second to last dim)
+        if jy > 0:  # Shift down: remove from bottom, pad on top
+            result = F.pad(result[:, :, :-jy, :], (0, 0, jy, 0), mode='constant', value=0)
+        elif jy < 0:  # Shift up: remove from top, pad on bottom
+            result = F.pad(result[:, :, -jy:, :], (0, 0, 0, -jy), mode='constant', value=0)
+
+        return result
+
     def compute_diversity_loss(self, patch_gradients: torch.Tensor) -> torch.Tensor:
         """
         Compute diversity loss via log determinant of Gram matrix using GRADIENTS
@@ -196,6 +227,7 @@ class NeuralBasisPatchTrainer:
         w.r.t. each patch. This measures diversity in the optimization landscape.
 
         Applies same preprocessing (jitter → blur → downsample) to gradients.
+        Uses simple slicing/padding for jitter to support double backprop.
 
         Args:
             patch_gradients: [batch_size, 3, H, W] - gradients of adv loss w.r.t. patches
@@ -206,14 +238,12 @@ class NeuralBasisPatchTrainer:
         batch_size = patch_gradients.shape[0]
 
         # Apply random jitter (±2 pixels) to each gradient independently
+        # Using simple slicing/padding instead of grid_sample for double backprop support
         jittered_grads = []
         for i in range(batch_size):
-            jitter_x = torch.randint(-2, 3, (1,), device=self.device).float()
-            jitter_y = torch.randint(-2, 3, (1,), device=self.device).float()
-            jittered = kornia.geometry.transform.translate(
-                patch_gradients[i:i+1],
-                torch.tensor([[jitter_x.item(), jitter_y.item()]], device=self.device, dtype=torch.float32)
-            )
+            jx = torch.randint(-2, 3, (1,)).item()
+            jy = torch.randint(-2, 3, (1,)).item()
+            jittered = self._simple_jitter(patch_gradients[i:i+1], jx, jy)
             jittered_grads.append(jittered)
 
         grads_jittered = torch.cat(jittered_grads, dim=0)  # [batch_size, 3, H, W]
