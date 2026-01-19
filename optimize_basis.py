@@ -778,12 +778,33 @@ class BasisPatchTrainer:
                 patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
     def train(self, num_epochs: int = 100, learning_rate: float = 0.01,
-              save_interval: int = 10, early_stop_patience: int = 15):
-        """Main training loop"""
+              save_interval: int = 10, early_stop_patience: int = 15,
+              warmup_epochs: int = 5, lr_min: float = 1e-5):
+        """Main training loop with linear warmup + cosine annealing LR schedule"""
 
-        optimizer = optim.AdamW([self.basis_U], lr=learning_rate, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=5, factor=0.5
+        # Start with small LR for warmup
+        optimizer = optim.AdamW([self.basis_U], lr=1e-6, weight_decay=1e-4)
+
+        # Linear warmup scheduler (epochs 0-4: 1e-6 -> learning_rate)
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-6 / learning_rate,
+            end_factor=1.0,
+            total_iters=warmup_epochs
+        )
+
+        # Cosine annealing scheduler (epochs 5-99: learning_rate -> lr_min)
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=num_epochs - warmup_epochs,
+            eta_min=lr_min
+        )
+
+        # Sequential scheduler: warmup then cosine
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs]
         )
 
         history = {'loss': [], 'val_score': [], 'learning_rate': []}
@@ -798,7 +819,7 @@ class BasisPatchTrainer:
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
-        print(f"   Initial LR: {learning_rate}")
+        print(f"   LR schedule: Warmup to {learning_rate} over {warmup_epochs} epochs, then cosine anneal to {lr_min}")
         print(f"   Match detection: {self.match_detection}")
         print(
             f"   Impersonation target: {self.impersonation_target or 'None (penalize correct reading)'}")
@@ -812,8 +833,8 @@ class BasisPatchTrainer:
             train_loss = self.train_epoch(optimizer, epoch)
             val_detection_score = self.validate()
 
-            # Learning rate scheduling
-            scheduler.step(train_loss)
+            # Learning rate scheduling (step at end of each epoch)
+            scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
 
             # Record history
@@ -888,7 +909,7 @@ def main():
     # Configuration
     CSV_PATH = "preproc_labels.csv"
     NUM_EPOCHS = 100
-    LEARNING_RATE = 0.1
+    LEARNING_RATE = 5e-3  # Peak LR after warmup
 
     # Trainer kwargs
     trainer_kwargs = {
