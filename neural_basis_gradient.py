@@ -890,7 +890,7 @@ class NeuralBasisPatchTrainer:
 
         return np.mean(losses)
 
-    def save_basis(self, epoch: int, save_dir: str = "neural_basis_patches"):
+    def save_basis(self, epoch: int, save_dir: str = "neural_basis_gradient_patches"):
         """Save current generator state and sample patches"""
         Path(save_dir).mkdir(exist_ok=True)
 
@@ -995,14 +995,14 @@ class NeuralBasisPatchTrainer:
             if val_detection_score < best_loss:
                 best_loss = val_detection_score
                 patience_counter = 0
-                self.save_basis(epoch, "best_neural_patches")
+                self.save_basis(epoch, "best_neural_basis_gradient")
                 print(f"   New best loss: {best_loss:.4f}")
             else:
                 patience_counter += 1
 
             # Periodic saves
             if (epoch + 1) % save_interval == 0:
-                self.save_basis(epoch, "checkpoint_neural_patches")
+                self.save_basis(epoch, "checkpoint_neural_basis_gradient")
 
             # Early stopping
             if patience_counter >= early_stop_patience:
@@ -1079,8 +1079,8 @@ def main():
         import pandas as pd
         history_df = pd.DataFrame(history)
         history_df.insert(0, 'epoch', range(1, len(history_df) + 1))
-        history_df.to_csv('neural_basis_training_history.csv', index=False)
-        print(f"\nTraining history saved to: neural_basis_training_history.csv")
+        history_df.to_csv('neural_basis_gradient_training_history.csv', index=False)
+        print(f"\nTraining history saved to: neural_basis_gradient_training_history.csv")
 
         # Plot training results
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -1103,7 +1103,7 @@ def main():
         ax2.legend()
 
         plt.tight_layout()
-        plt.savefig('neural_basis_training_curves.png', dpi=300, bbox_inches='tight')
+        plt.savefig('neural_basis_gradient_training_curves.png', dpi=300, bbox_inches='tight')
 
         # Create separate figure for sample patches
         fig2 = plt.figure(figsize=(12, 12))
@@ -1119,10 +1119,10 @@ def main():
                 ax.axis('off')
 
         plt.tight_layout()
-        plt.savefig('neural_basis_sample_patches.png', dpi=300, bbox_inches='tight')
+        plt.savefig('neural_basis_gradient_sample_patches.png', dpi=300, bbox_inches='tight')
 
-        print("\nResults saved to 'neural_basis_training_curves.png' and 'neural_basis_sample_patches.png'")
-        print("Generator checkpoints saved in 'neural_basis_patches/' directory")
+        print("\nResults saved to 'neural_basis_gradient_training_curves.png' and 'neural_basis_gradient_sample_patches.png'")
+        print("Generator checkpoints saved in 'neural_basis_gradient_patches/' directory")
 
     except Exception as e:
         print(f"Training failed: {e}")
