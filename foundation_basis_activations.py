@@ -341,7 +341,8 @@ class FoundationBasisPatchTrainer:
         def hook_fn(module, input, output):
             # output shape: [batch, 384, 8, 16] (after conv, before transpose/reshape)
             # Store in [batch, 8, 16, 384] format for consistency with sequence layout
-            self.ocr_activations = output.permute(0, 2, 3, 1).detach()  # [batch, 8, 16, 384]
+            # Don't detach here - let caller decide based on use_grad
+            self.ocr_activations = output.permute(0, 2, 3, 1)  # [batch, 8, 16, 384]
 
         # Register the hook
         self.activation_hook = target_layer.register_forward_hook(hook_fn)
@@ -870,7 +871,7 @@ class FoundationBasisPatchTrainer:
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
                         # Store per-image baseline: [8, 16, 384]
-                        self.baseline_ocr_activations[idx] = self.ocr_activations.squeeze(0).clone()
+                        self.baseline_ocr_activations[idx] = self.ocr_activations.squeeze(0).detach().clone()
 
                     total_det_loss += det_loss
                     total_ocr_loss += ocr_loss
@@ -975,7 +976,7 @@ class FoundationBasisPatchTrainer:
                 # Capture activations (automatically populated by forward hook)
                 # These are detached since we don't need gradients through them
                 if self.ocr_activations is not None:
-                    accumulated_activations.append(self.ocr_activations.clone())
+                    accumulated_activations.append(self.ocr_activations.detach().clone())
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
