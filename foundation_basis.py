@@ -44,19 +44,17 @@ class FoundationPatchGenerator(nn.Module):
         self.vae_latent_channels = 4
         self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
 
-        # Load SD VAE decoder (frozen)
+        # Load SD VAE decoder (trainable)
         print("Loading Stable Diffusion VAE decoder...")
         self.vae = AutoencoderKL.from_pretrained(
             "madebyollin/sdxl-vae-fp16-fix",  # Smaller, optimized VAE
             torch_dtype=torch.float32
         )
 
-        # Freeze VAE parameters
-        self.vae.eval()
-        for param in self.vae.parameters():
-            param.requires_grad = False
+        # VAE parameters are trainable (fine-tune pretrained weights)
+        self.vae.train()
 
-        print(f"VAE loaded (frozen). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
+        print(f"VAE loaded (trainable). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
         # Using deeper network for better expressiveness
@@ -177,9 +175,8 @@ class FoundationPatchGenerator(nn.Module):
             self.vae_latent_w
         )  # [B, 4, 32, 64]
 
-        # Decode using frozen VAE
-        with torch.no_grad():
-            vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
+        # Decode using trainable VAE (gradients flow through for fine-tuning)
+        vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
 
         # Clamp to [0, 1] and ensure correct size
         vae_output = torch.clamp(vae_output, 0.0, 1.0)
@@ -262,8 +259,8 @@ class FoundationBasisPatchTrainer:
                                                                 preload=True, batch_size=1,
                                                                 n_jobs=0)
 
-        # Initialize foundation model generator with frozen VAE decoder
-        # Create generator with trainable adapter + frozen SD VAE decoder
+        # Initialize foundation model generator with trainable VAE
+        # Create generator with trainable adapter + trainable SD VAE decoder
         self.generator = FoundationPatchGenerator(
             latent_dim=basis_dim,
             patch_height=self.patch_height,
@@ -1083,7 +1080,7 @@ class FoundationBasisPatchTrainer:
         print(f"   Generator architecture:")
         print(f"     Main path:")
         print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-        print(f"       VAE decoder (FROZEN): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
+        print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
         print(f"     Skip connection:")
         print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
         print(f"     CNN refiner (trainable):")
