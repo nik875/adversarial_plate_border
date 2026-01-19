@@ -29,7 +29,7 @@ PATCH_HEIGHT = 256
 
 
 class FoundationPatchGenerator(nn.Module):
-    """Patch generator using frozen Stable Diffusion VAE decoder with trainable adapter"""
+    """Patch generator using Stable Diffusion VAE decoder with trainable adapter"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512):
         super().__init__()
 
@@ -44,19 +44,17 @@ class FoundationPatchGenerator(nn.Module):
         self.vae_latent_channels = 4
         self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
 
-        # Load frozen SD VAE decoder (smallest available)
+        # Load SD VAE decoder (trainable)
         print("Loading Stable Diffusion VAE decoder...")
         self.vae = AutoencoderKL.from_pretrained(
             "madebyollin/sdxl-vae-fp16-fix",  # Smaller, optimized VAE
             torch_dtype=torch.float32
         )
 
-        # Freeze VAE decoder
-        for param in self.vae.parameters():
-            param.requires_grad = False
-        self.vae.eval()
+        # VAE parameters are trainable (fine-tune pretrained weights)
+        self.vae.train()
 
-        print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
+        print(f"VAE loaded (trainable). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
         # Using deeper network for better expressiveness
@@ -100,9 +98,8 @@ class FoundationPatchGenerator(nn.Module):
             self.vae_latent_w
         )  # [B, 4, 32, 64]
 
-        # Decode using frozen VAE
-        with torch.no_grad():
-            patches = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
+        # Decode using VAE (gradients flow through for fine-tuning)
+        patches = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
 
         # Clamp to [0, 1] and ensure correct size
         patches = torch.clamp(patches, 0.0, 1.0)
@@ -973,7 +970,7 @@ class FoundationBasisPatchTrainer:
         vae_latent_dim = self.generator.vae_latent_dim
         print(f"   Generator architecture:")
         print(f"     Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-        print(f"     VAE decoder (frozen): latent[4×32×64] -> patch[3×{self.patch_height}×{self.patch_width}]")
+        print(f"     VAE decoder (trainable): latent[4×32×64] -> patch[3×{self.patch_height}×{self.patch_width}]")
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
