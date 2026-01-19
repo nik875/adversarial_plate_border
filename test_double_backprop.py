@@ -283,6 +283,70 @@ def test_manual_warp_perspective():
     diversity_loss = (grad ** 2).sum()
     diversity_loss.backward()
 
+def manual_crop_and_resize(input_tensor, boxes, crop_size):
+    """
+    Pure PyTorch implementation of crop_and_resize.
+    Supports double backprop by using manual_warp_perspective.
+
+    Args:
+        input_tensor: [B, C, H, W]
+        boxes: [B, 4, 2] - 4 corner points (x, y) defining quadrilateral
+        crop_size: (H_out, W_out) - output size
+
+    Returns:
+        cropped: [B, C, H_out, W_out]
+    """
+    B, C, H, W = input_tensor.shape
+    H_out, W_out = crop_size
+
+    # Define destination rectangle (axis-aligned)
+    # Top-left: (0, 0), Top-right: (W_out-1, 0), Bottom-right: (W_out-1, H_out-1), Bottom-left: (0, H_out-1)
+    dst_corners = torch.tensor([
+        [0, 0],
+        [W_out - 1, 0],
+        [W_out - 1, H_out - 1],
+        [0, H_out - 1]
+    ], dtype=torch.float32, device=input_tensor.device)
+
+    # Compute perspective transform for each batch element
+    M_list = []
+    for b in range(B):
+        # Source corners from input boxes [4, 2]
+        src_corners = boxes[b]  # [4, 2]
+
+        # Compute transform from src (input quad) to dst (output rectangle)
+        M = K.get_perspective_transform(src_corners.unsqueeze(0), dst_corners.unsqueeze(0))
+        M_list.append(M[0])
+
+    M_batch = torch.stack(M_list, dim=0)  # [B, 3, 3]
+
+    # Use manual warp perspective
+    return manual_warp_perspective(input_tensor, M_batch, dsize=crop_size)
+
+def test_manual_crop_and_resize():
+    """Test if our manual crop_and_resize supports double backprop"""
+    param = torch.randn(3 * 384 * 384, device=device, requires_grad=True)
+    patch = param.view(1, 3, 384, 384)
+
+    # Create crop box - shape should be [B, 4, 2]
+    boxes = torch.tensor([[
+        [100, 100],
+        [300, 100],
+        [300, 200],
+        [100, 200]
+    ]], dtype=torch.float32, device=device)
+
+    # Use our manual implementation
+    cropped = manual_crop_and_resize(patch, boxes, (64, 128))
+    loss = cropped.sum()
+
+    # First-order gradient w.r.t. patch
+    grad = torch.autograd.grad(loss, patch, create_graph=True)[0]
+
+    # Use gradient in diversity loss
+    diversity_loss = (grad ** 2).sum()
+    diversity_loss.backward()
+
 if __name__ == "__main__":
     print("="*60)
     print("Testing which operations support double backprop")
@@ -295,7 +359,8 @@ if __name__ == "__main__":
     results['Gaussian blur'] = test_case('Gaussian blur', test_gaussian_blur)
     results['Warp perspective (Kornia)'] = test_case('Warp perspective (Kornia)', test_warp_perspective)
     results['Warp perspective (Manual)'] = test_case('Warp perspective (Manual)', test_manual_warp_perspective)
-    results['Crop and resize'] = test_case('Crop and resize', test_crop_and_resize)
+    results['Crop and resize (Kornia)'] = test_case('Crop and resize (Kornia)', test_crop_and_resize)
+    results['Crop and resize (Manual)'] = test_case('Crop and resize (Manual)', test_manual_crop_and_resize)
 
     print("\n" + "="*60)
     print("SUMMARY")
@@ -310,16 +375,25 @@ if __name__ == "__main__":
 
     failing = [name for name, passed in results.items() if not passed]
     if failing:
-        print("The following operations are used in your pipeline and don't")
-        print("support double backprop:")
+        print("The following operations don't support double backprop:")
         for name in failing:
             print(f"  - {name}")
-        print("\nThese are likely called in:")
-        if 'Warp perspective' in failing:
+
+        # Check if manual versions passed
+        manual_passed = [name for name, passed in results.items() if passed and 'Manual' in name]
+        if manual_passed:
+            print("\n✓ Manual implementations passed! These can replace Kornia ops:")
+            for name in manual_passed:
+                print(f"  - {name}")
+
+        print("\nKornia operations used in pipeline:")
+        if any('Warp perspective' in name and 'Kornia' in name for name in failing):
             print("  - apply_patch_to_image() → K.warp_perspective()")
-        if 'Crop and resize' in failing:
+            print("    → Replace with manual_warp_perspective()")
+        if any('Crop and resize' in name and 'Kornia' in name for name in failing):
             print("  - partial_loss() → OCR cropping → kornia.geometry.crop_and_resize()")
-        if 'Gaussian blur' in failing:
+            print("    → Replace with manual_crop_and_resize()")
+        if any('Gaussian blur' in name for name in failing):
             print("  - compute_diversity_loss() → kornia.filters.gaussian_blur2d()")
     else:
-        print("All operations passed! The issue must be elsewhere.")
+        print("All operations passed! Ready for gradient-based diversity training.")
