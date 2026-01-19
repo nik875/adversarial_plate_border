@@ -397,7 +397,7 @@ class FoundationBasisPatchTrainer:
             if skip_detection:
                 # Use known plate corners directly - no YOLO detection needed
                 # This is faster and cleaner for diversity-only mode
-                corners_box = batch['orig_corners'].to(self.device)
+                corners_box = batch['orig_corners'].to(self.device).unsqueeze(0)  # [1, 4, 2]
             else:
                 # Run YOLO detection on patched image (original behavior)
                 model_output = self.model(patched_image)
