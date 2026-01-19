@@ -460,13 +460,20 @@ class FoundationBasisPatchTrainer:
 
             # Evaluate this patch on all images in the batch
             for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
-                # Reuse diagonal activations (patch_i on image_i) - these have gradients
+                # Reuse diagonal activations (patch_i on image_i)
                 if patch_idx == img_idx:
                     activations = diagonal_activations[patch_idx]  # [8, 16, 384]
                 else:
-                    # Off-diagonal: compute WITHOUT gradients to save memory
-                    # Gradient signal comes from diagonal activations only
-                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=False, skip_detection=use_grad)  # [8, 16, 384]
+                    # Off-diagonal: use gradient checkpointing to trade compute for memory
+                    if use_grad:
+                        # Checkpoint recomputes forward pass during backward, freeing intermediate tensors
+                        activations = torch.utils.checkpoint.checkpoint(
+                            self._get_activations_for_patch_image,
+                            batch, patch, use_grad, use_grad,  # skip_detection=use_grad
+                            use_reentrant=False
+                        )
+                    else:
+                        activations = self._get_activations_for_patch_image(batch, patch, use_grad=False, skip_detection=False)
 
                 baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
                 delta = activations - baseline  # [8, 16, 384]
