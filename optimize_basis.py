@@ -931,11 +931,14 @@ def main():
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
+    parser.add_argument('--num-epochs', type=int, default=100,
+                        help='Number of training epochs (default: 100)')
+    parser.add_argument('--early-stop-patience', type=int, default=20,
+                        help='Early stopping patience: number of epochs without improvement before stopping (default: 20)')
     args = parser.parse_args()
 
     # Configuration
     CSV_PATH = "preproc_labels.csv"
-    NUM_EPOCHS = 100
     LEARNING_RATE = 5e-3  # Peak LR after warmup
 
     # Trainer kwargs
@@ -955,10 +958,10 @@ def main():
         trainer = BasisPatchTrainer(CSV_PATH, training=True, **trainer_kwargs)
 
         history = trainer.train(
-            num_epochs=NUM_EPOCHS,
+            num_epochs=args.num_epochs,
             learning_rate=LEARNING_RATE,
             save_interval=1,
-            early_stop_patience=20
+            early_stop_patience=args.early_stop_patience
         )
 
         # Save training history as CSV
