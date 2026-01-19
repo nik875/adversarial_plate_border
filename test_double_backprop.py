@@ -27,8 +27,8 @@ def test_case(name, test_fn):
 def test_simple_ops():
     """Test that simple ops support double backprop"""
     # Simulate: parameter -> generator -> patch -> operation -> loss -> grad -> diversity_loss
-    param = torch.randn(10, device=device, requires_grad=True)
-    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous() * 2 + 1
+    param = torch.randn(3 * 64 * 64, device=device, requires_grad=True)
+    patch = param.view(1, 3, 64, 64)
 
     # Operation on patch
     y = patch * 2 + 1
@@ -45,8 +45,8 @@ def test_simple_ops():
 
 def test_gaussian_blur():
     """Test if Gaussian blur supports double backprop"""
-    param = torch.randn(10, device=device, requires_grad=True)
-    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous()
+    param = torch.randn(3 * 64 * 64, device=device, requires_grad=True)
+    patch = param.view(1, 3, 64, 64)
 
     blurred = kornia.filters.gaussian_blur2d(patch, (17, 17), (4.0, 4.0))
     loss = blurred.sum()
@@ -60,8 +60,8 @@ def test_gaussian_blur():
 
 def test_interpolate():
     """Test if F.interpolate supports double backprop"""
-    param = torch.randn(100, device=device, requires_grad=True)
-    patch = param.view(1, 1, 10, 10).expand(1, 3, 256, 512).contiguous()
+    param = torch.randn(3 * 256 * 512, device=device, requires_grad=True)
+    patch = param.view(1, 3, 256, 512)
 
     downsampled = F.interpolate(patch, size=(32, 64), mode='bilinear', align_corners=True)
     loss = downsampled.sum()
@@ -75,8 +75,8 @@ def test_interpolate():
 
 def test_warp_perspective():
     """Test if kornia.warp_perspective supports double backprop"""
-    param = torch.randn(100, device=device, requires_grad=True)
-    patch = param.view(1, 1, 10, 10).expand(1, 3, 256, 512).contiguous()
+    param = torch.randn(3 * 256 * 512, device=device, requires_grad=True)
+    patch = param.view(1, 3, 256, 512)
 
     # Create a simple perspective transform
     src = torch.tensor([[
@@ -99,8 +99,8 @@ def test_warp_perspective():
 
 def test_crop_and_resize():
     """Test if kornia.crop_and_resize supports double backprop"""
-    param = torch.randn(100, device=device, requires_grad=True)
-    patch = param.view(1, 1, 10, 10).expand(1, 3, 384, 384).contiguous()
+    param = torch.randn(3 * 384 * 384, device=device, requires_grad=True)
+    patch = param.view(1, 3, 384, 384)
 
     # Create crop box - shape should be [B, 4, 2]
     boxes = torch.tensor([[
@@ -122,8 +122,8 @@ def test_crop_and_resize():
 
 def test_pad_and_slice():
     """Test if pad + slicing supports double backprop"""
-    param = torch.randn(10, device=device, requires_grad=True)
-    patch = param.view(1, 1, 1, 10).expand(1, 3, 64, 64).contiguous()
+    param = torch.randn(3 * 64 * 64, device=device, requires_grad=True)
+    patch = param.view(1, 3, 64, 64)
 
     # Shift using pad + slice (our jitter implementation)
     shifted = F.pad(patch[:, :, :, :-2], (2, 0, 0, 0))
