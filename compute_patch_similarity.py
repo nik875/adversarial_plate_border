@@ -73,7 +73,11 @@ def compute_similarity(patch1_tensor, patch2_tensor):
         align_corners=True
     ).squeeze(0)  # [3, 32, 64]
 
-    # Upsample downsampled back to original size for difference computation
+    # Compute differences between patches
+    # Original resolution: p1_original - p2_original
+    diff_original = torch.abs(p1_original - p2_original).mean(dim=0)  # [512, 256], grayscale
+
+    # Downsampled: upsample back to original size for visualization
     p1_down_upsampled = F.interpolate(
         p1_down.unsqueeze(0),
         size=(p1_original.shape[1], p1_original.shape[2]),
@@ -88,9 +92,8 @@ def compute_similarity(patch1_tensor, patch2_tensor):
         align_corners=True
     ).squeeze(0)  # [3, 512, 256]
 
-    # Compute absolute differences (take mean across channels for grayscale)
-    p1_diff = torch.abs(p1_original - p1_down_upsampled).mean(dim=0)  # [512, 256]
-    p2_diff = torch.abs(p2_original - p2_down_upsampled).mean(dim=0)  # [512, 256]
+    # Downsampled resolution difference
+    diff_downsampled = torch.abs(p1_down_upsampled - p2_down_upsampled).mean(dim=0)  # [512, 256], grayscale
 
     # Normalize
     p1_norm = normalize_patch(p1_down)  # [1, 6144]
@@ -99,7 +102,7 @@ def compute_similarity(patch1_tensor, patch2_tensor):
     # Compute cosine similarity (dot product of normalized vectors)
     similarity = torch.mm(p1_norm, p2_norm.t()).item()  # scalar
 
-    return similarity, p1_down, p2_down, p1_jitter.squeeze(0), p2_jitter.squeeze(0), p1_blur.squeeze(0), p2_blur.squeeze(0), p1_diff, p2_diff
+    return similarity, p1_down, p2_down, p1_jitter.squeeze(0), p2_jitter.squeeze(0), p1_blur.squeeze(0), p2_blur.squeeze(0), diff_original, diff_downsampled
 
 
 def load_patch(image_path):
@@ -126,7 +129,7 @@ def main():
     print(f"Patch 2 shape: {p2.shape}")
     
     # Compute similarity
-    similarity, p1_down, p2_down, p1_jitter, p2_jitter, p1_blur, p2_blur, p1_diff, p2_diff = compute_similarity(p1, p2)
+    similarity, p1_down, p2_down, p1_jitter, p2_jitter, p1_blur, p2_blur, diff_original, diff_downsampled = compute_similarity(p1, p2)
 
     print(f"\n{'='*60}")
     print(f"Cosine Similarity: {similarity:.4f}")
@@ -142,8 +145,8 @@ def main():
     p2_blur_np = p2_blur.permute(1, 2, 0).numpy()
     p1_down_np = p1_down.permute(1, 2, 0).numpy()
     p2_down_np = p2_down.permute(1, 2, 0).numpy()
-    p1_diff_np = p1_diff.numpy()
-    p2_diff_np = p2_diff.numpy()
+    diff_original_np = diff_original.numpy()
+    diff_downsampled_np = diff_downsampled.numpy()
 
     # Create figure with 5 rows
     fig, axes = plt.subplots(5, 2, figsize=(12, 20))
@@ -181,12 +184,14 @@ def main():
     axes[3, 1].axis('off')
 
     # Difference images (grayscale, white = high magnitude)
-    axes[4, 0].imshow(p1_diff_np, cmap='hot', vmin=0, vmax=p1_diff_np.max())
-    axes[4, 0].set_title(f'Patch 1 (Difference)\nOriginal vs Downsampled', fontsize=12, fontweight='bold')
+    # Left: patch1 - patch2 at original resolution
+    axes[4, 0].imshow(diff_original_np, cmap='hot', vmin=0, vmax=max(diff_original_np.max(), diff_downsampled_np.max()))
+    axes[4, 0].set_title(f'Patch1 - Patch2\n(Original Resolution)', fontsize=12, fontweight='bold')
     axes[4, 0].axis('off')
 
-    axes[4, 1].imshow(p2_diff_np, cmap='hot', vmin=0, vmax=p2_diff_np.max())
-    axes[4, 1].set_title(f'Patch 2 (Difference)\nOriginal vs Downsampled', fontsize=12, fontweight='bold')
+    # Right: patch1 - patch2 at downsampled resolution (upsampled for display)
+    axes[4, 1].imshow(diff_downsampled_np, cmap='hot', vmin=0, vmax=max(diff_original_np.max(), diff_downsampled_np.max()))
+    axes[4, 1].set_title(f'Patch1 - Patch2\n(Downsampled Resolution)', fontsize=12, fontweight='bold')
     axes[4, 1].axis('off')
 
     # Add similarity info
