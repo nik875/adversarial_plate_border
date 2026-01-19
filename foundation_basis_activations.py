@@ -394,7 +394,7 @@ class FoundationBasisPatchTrainer:
             model_output = self.model(patched_image)
 
             if len(model_output) == 0:
-                return torch.zeros(8, 16, 384, device=self.device)
+                return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
 
             # Get first detection (simplified - could rank by confidence)
             best_detection = model_output[0]
@@ -420,7 +420,7 @@ class FoundationBasisPatchTrainer:
                 result = self.ocr_activations.squeeze(0)  # [8, 16, 384]
                 return result if use_grad else result.detach()
 
-            return torch.zeros(8, 16, 384, device=self.device)
+            return torch.zeros(8, 16, 384, device=self.device, requires_grad=use_grad)
 
     def compute_activation_diversity(self, patches_list: List[torch.Tensor],
                                       batches_list: List[dict],
