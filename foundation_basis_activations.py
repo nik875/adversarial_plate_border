@@ -452,10 +452,6 @@ class FoundationBasisPatchTrainer:
         """
         batch_size = len(patches_list)
 
-        # Clear cache before starting diversity computation if using gradients
-        if use_grad and self.device == 'cuda':
-            torch.cuda.empty_cache()
-
         # For each patch, compute average activation delta across all images
         patch_avg_deltas = []
 
@@ -464,12 +460,13 @@ class FoundationBasisPatchTrainer:
 
             # Evaluate this patch on all images in the batch
             for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
-                # Reuse diagonal activations (patch_i on image_i)
+                # Reuse diagonal activations (patch_i on image_i) - these have gradients
                 if patch_idx == img_idx:
                     activations = diagonal_activations[patch_idx]  # [8, 16, 384]
                 else:
-                    # Only compute off-diagonal (patch_i on image_j where i != j)
-                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [8, 16, 384]
+                    # Off-diagonal: compute WITHOUT gradients to save memory
+                    # Gradient signal comes from diagonal activations only
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=False, skip_detection=use_grad)  # [8, 16, 384]
 
                 baseline = self.baseline_ocr_activations[baseline_idx]  # [8, 16, 384]
                 delta = activations - baseline  # [8, 16, 384]
@@ -478,10 +475,6 @@ class FoundationBasisPatchTrainer:
             # Average deltas for this patch over all images
             avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [8, 16, 384]
             patch_avg_deltas.append(avg_delta)
-
-            # Clear cache after each patch to prevent OOM
-            if use_grad and self.device == 'cuda':
-                torch.cuda.empty_cache()
 
         # Stack averaged deltas: [batch_size, 8, 16, 384]
         avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
