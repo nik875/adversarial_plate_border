@@ -1378,6 +1378,10 @@ class ProgressivePatchTrainer:
                 print(f"(Final layer - convergence threshold disabled, will train full {current_config.max_epochs} epochs)")
             print(f"{'='*80}\n")
 
+            # Reset optimizer learning rate for this layer (scheduler will start from this value)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = learning_rate
+
             # Create schedulers for this layer
             if warmup_epochs > 0:
                 # Warmup + Cosine annealing
