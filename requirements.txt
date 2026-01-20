@@ -17,3 +17,4 @@ python-Levenshtein
 diffusers
 transformers
 accelerate
+b2
