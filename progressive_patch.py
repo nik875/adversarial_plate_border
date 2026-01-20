@@ -20,6 +20,7 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
+from kornia.metrics import ssim
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -398,6 +399,7 @@ class ProgressivePatchTrainer:
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
                  tv_weight: float = 2.5,
+                 ssim_weight: float = 1.0,
                  max_epochs_per_layer = 50,
                  final_layer_epochs: Optional[int] = None,
                  convergence_threshold = 1.0,
@@ -409,6 +411,7 @@ class ProgressivePatchTrainer:
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
+        self.ssim_weight = ssim_weight
         self.max_epochs_per_layer = max_epochs_per_layer
         self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
@@ -611,42 +614,45 @@ class ProgressivePatchTrainer:
 
         return patches
 
-    def normalize_brightness(self, patches: List[torch.Tensor]) -> List[torch.Tensor]:
+    def compute_ssim_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Normalize all patches in a batch to have the same average brightness.
+        Compute SSIM-based structural similarity penalty to prevent patches from
+        having the same structure with different intensity mappings.
 
-        This prevents the model from exploiting brightness variations as a way
-        to create "diversity" - forcing it to generate truly different visual
-        patterns instead of just varying intensity.
+        SSIM (Structural Similarity Index) measures similarity based on luminance,
+        contrast, and structure. High SSIM = similar structures even if brightness/
+        contrast differs. We penalize high SSIM to force genuinely different structures.
 
         Args:
-            patches: List of [3, H, W] patch tensors
+            patches: [batch_size, 3, H, W] patch tensor
 
         Returns:
-            List of brightness-normalized patches with gradients preserved
+            torch.Tensor: Scalar SSIM penalty (mean pairwise SSIM, higher = more similar)
         """
-        if len(patches) == 0:
-            return patches
+        batch_size = patches.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
-        # Stack patches for batch processing
-        patches_stacked = torch.stack(patches, dim=0)  # [batch_size, 3, H, W]
+        # Compute pairwise SSIM between all patches
+        ssim_sum = 0.0
+        pair_count = 0
 
-        # Compute per-patch mean brightness (average across all pixels and channels)
-        per_patch_brightness = patches_stacked.mean(dim=(1, 2, 3), keepdim=True)  # [batch_size, 1, 1, 1]
+        for i in range(batch_size):
+            for j in range(i + 1, batch_size):
+                # SSIM expects [B, C, H, W], so add batch dim to each patch
+                patch_i = patches[i:i+1]  # [1, 3, H, W]
+                patch_j = patches[j:j+1]  # [1, 3, H, W]
 
-        # Compute global mean brightness across all patches
-        global_mean_brightness = per_patch_brightness.mean()  # scalar
+                # Compute SSIM (returns value in [0, 1], 1 = identical structure)
+                ssim_val = ssim(patch_i, patch_j, window_size=11)
 
-        # Normalize each patch: scale to match global mean brightness
-        # new_patch = old_patch * (global_mean / patch_mean)
-        # This preserves relative structure while normalizing overall brightness
-        normalized_patches = patches_stacked * (global_mean_brightness / (per_patch_brightness + 1e-8))
+                ssim_sum += ssim_val
+                pair_count += 1
 
-        # Clamp to valid range [0, 1]
-        normalized_patches = torch.clamp(normalized_patches, 0.0, 1.0)
+        # Average SSIM across all pairs
+        avg_ssim = ssim_sum / pair_count if pair_count > 0 else 0.0
 
-        # Return as list to match input format
-        return [normalized_patches[i] for i in range(len(patches))]
+        return avg_ssim
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
@@ -1093,6 +1099,7 @@ class ProgressivePatchTrainer:
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
+        total_ssim_loss = 0.0
         step_count = 0
         num_updates = 0
 
@@ -1107,6 +1114,7 @@ class ProgressivePatchTrainer:
         accumulated_indices = []
         last_diversity_loss = 0.0  # Track for display during accumulation
         last_tv_loss = 0.0  # Track for display during accumulation
+        last_ssim_loss = 0.0  # Track for display during accumulation
 
         desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
@@ -1131,11 +1139,7 @@ class ProgressivePatchTrainer:
 
                 # Update model every update_every steps
                 if step_count % update_every == 0:
-                    # Normalize brightness across all patches in this batch
-                    # Prevents model from cheating by varying intensity instead of visual content
-                    accumulated_patches = self.normalize_brightness(accumulated_patches)
-
-                    # Recompute diagonal activations with normalized patches
+                    # Compute diagonal activations for diversity metric
                     accumulated_activations = []
                     for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
                         diagonal_activation = self._get_activations_for_patch_image(
@@ -1154,15 +1158,22 @@ class ProgressivePatchTrainer:
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Compute total variation loss on generated patches
+                    # Stack patches for batch operations
                     patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+
+                    # Compute total variation loss on generated patches
                     tv_loss = self.total_variation_loss(patches_stacked)
                     tv_loss_weighted = self.tv_weight * tv_loss
 
+                    # Compute SSIM penalty (penalize structurally similar patches)
+                    ssim_loss = self.compute_ssim_loss(patches_stacked)
+                    ssim_loss_weighted = self.ssim_weight * ssim_loss
+
                     # Combined loss
-                    total_loss = diversity_loss + tv_loss_weighted
+                    total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
                     last_diversity_loss = diversity_loss.item()
                     last_tv_loss = tv_loss_weighted.item()  # Display weighted version
+                    last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
 
                     # Train on combined loss
                     total_loss.backward()
@@ -1175,19 +1186,22 @@ class ProgressivePatchTrainer:
                     # Track losses (store weighted version for display)
                     total_diversity_loss += diversity_loss.item()
                     total_tv_loss += tv_loss_weighted.item()
+                    total_ssim_loss += ssim_loss_weighted.item()
                     num_updates += 1
 
                     # Update progress bar
                     avg_diversity_loss = total_diversity_loss / num_updates
                     avg_tv_loss = total_tv_loss / num_updates
+                    avg_ssim_loss = total_ssim_loss / num_updates
                     pbar.set_postfix({
                         'DivLoss': f"{avg_diversity_loss:.4f}",
                         'TVLoss': f"{avg_tv_loss:.4f}",
+                        'SSIMLoss': f"{avg_ssim_loss:.4f}",
                         'Updates': num_updates
                     })
 
                     # Memory cleanup after update
-                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, total_loss, patches_stacked
+                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
                     # Clear accumulated lists and their contents
                     for patch in accumulated_patches:
                         del patch
@@ -1210,16 +1224,14 @@ class ProgressivePatchTrainer:
                     pbar.set_postfix({
                         'DivLoss': f"{last_diversity_loss:.4f}",
                         'TVLoss': f"{last_tv_loss:.4f}",
+                        'SSIMLoss': f"{last_ssim_loss:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
             # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_patches) > 0:
-                    # Normalize brightness across all patches in this batch
-                    accumulated_patches = self.normalize_brightness(accumulated_patches)
-
-                    # Recompute diagonal activations with normalized patches
+                    # Compute diagonal activations for diversity metric
                     accumulated_activations = []
                     for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
                         diagonal_activation = self._get_activations_for_patch_image(
@@ -1238,13 +1250,19 @@ class ProgressivePatchTrainer:
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Compute total variation loss on generated patches
+                    # Stack patches for batch operations
                     patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+
+                    # Compute total variation loss on generated patches
                     tv_loss = self.total_variation_loss(patches_stacked)
                     tv_loss_weighted = self.tv_weight * tv_loss
 
+                    # Compute SSIM penalty (penalize structurally similar patches)
+                    ssim_loss = self.compute_ssim_loss(patches_stacked)
+                    ssim_loss_weighted = self.ssim_weight * ssim_loss
+
                     # Combined loss
-                    total_loss = diversity_loss + tv_loss_weighted
+                    total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
                     total_loss.backward()
 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
@@ -1253,10 +1271,11 @@ class ProgressivePatchTrainer:
 
                     total_diversity_loss += diversity_loss.item()
                     total_tv_loss += tv_loss_weighted.item()
+                    total_ssim_loss += ssim_loss_weighted.item()
                     num_updates += 1
 
                     # Memory cleanup for remaining samples
-                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, total_loss, patches_stacked
+                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
                     for patch in accumulated_patches:
                         del patch
                     for act in accumulated_activations:
@@ -1271,7 +1290,8 @@ class ProgressivePatchTrainer:
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
         avg_tv_loss = total_tv_loss / max(num_updates, 1)
-        return avg_diversity_loss, avg_tv_loss
+        avg_ssim_loss = total_ssim_loss / max(num_updates, 1)
+        return avg_diversity_loss, avg_tv_loss, avg_ssim_loss
 
     def validate(self) -> float:
         """Validation pass using diversity score"""
@@ -1296,14 +1316,9 @@ class ProgressivePatchTrainer:
                 batches.append({k: v[0] for k, v in batch.items()})
                 indices.append(idx)
 
-            # Normalize brightness across all patches
-            if len(patches) > 1:
-                patches = self.normalize_brightness(patches)
-
-            # Compute activations with normalized patches
-            for i, (patch, batch_dict) in enumerate(zip(patches, batches)):
+                # Compute activations
                 act = self._get_activations_for_patch_image(
-                    batch_dict, patch, use_grad=False, skip_detection=True
+                    {k: v[0] for k, v in batch.items()}, patch, use_grad=False, skip_detection=True
                 )
                 activations.append(act)
 
@@ -1341,12 +1356,7 @@ class ProgressivePatchTrainer:
             z_samples = self.sample_coefficients(num_samples)
             sample_patches = self.generate_patches(z_samples)
 
-            # Normalize brightness (same as during training/validation)
-            # Convert from batch tensor to list for normalize_brightness
-            patches_list = [sample_patches[i] for i in range(num_samples)]
-            normalized_patches = self.normalize_brightness(patches_list)
-
-            for i, patch in enumerate(normalized_patches):
+            for i, patch in enumerate(sample_patches):
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
@@ -1374,6 +1384,7 @@ class ProgressivePatchTrainer:
             'epoch': [],
             'diversity_loss': [],
             'tv_loss': [],
+            'ssim_loss': [],
             'val_diversity': [],
             'learning_rate': []
         }
@@ -1418,6 +1429,7 @@ class ProgressivePatchTrainer:
 
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   TV weight: {self.tv_weight}")
+        print(f"   SSIM weight: {self.ssim_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
 
@@ -1481,7 +1493,7 @@ class ProgressivePatchTrainer:
                 current_lr = optimizer.param_groups[0]['lr']
 
                 # Training
-                train_diversity_loss, train_tv_loss = self.train_epoch(optimizer, global_epoch)
+                train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, global_epoch)
 
                 # Validation (skip if using all data for training)
                 if self.use_all_for_train:
@@ -1498,13 +1510,15 @@ class ProgressivePatchTrainer:
                 global_history['epoch'].append(global_epoch)
                 global_history['diversity_loss'].append(train_diversity_loss)
                 global_history['tv_loss'].append(train_tv_loss)
+                global_history['ssim_loss'].append(train_ssim_loss)
                 global_history['val_diversity'].append(val_diversity_score)
                 global_history['learning_rate'].append(current_lr)
 
                 # Print epoch summary
                 epoch_summary = (f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
                                 f"DivLoss: {train_diversity_loss:.4f} | "
-                                f"TVLoss: {train_tv_loss:.4f}")
+                                f"TVLoss: {train_tv_loss:.4f} | "
+                                f"SSIMLoss: {train_ssim_loss:.4f}")
                 if not self.use_all_for_train:
                     epoch_summary += f" | Val: {val_diversity_score:.3f}"
                 epoch_summary += f" | LR: {current_lr:.2e}"
@@ -1557,6 +1571,8 @@ def main():
                         help='Weight for diversity loss (default: 1.0)')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
+    parser.add_argument('--ssim-weight', type=float, default=1.0,
+                        help='Weight for SSIM penalty to prevent structural similarity (default: 1.0)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
@@ -1635,6 +1651,7 @@ def main():
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
         'tv_weight': args.tv_weight,
+        'ssim_weight': args.ssim_weight,
         'max_epochs_per_layer': max_epochs_per_layer,
         'final_layer_epochs': args.final_layer_epochs,
         'convergence_threshold': convergence_threshold,
@@ -1706,13 +1723,9 @@ def main():
             z_samples = trainer.sample_coefficients(9)
             sample_patches = trainer.generate_patches(z_samples)
 
-            # Normalize brightness (same as during training/validation)
-            patches_list = [sample_patches[i] for i in range(9)]
-            normalized_patches = trainer.normalize_brightness(patches_list)
-
             for i in range(9):
                 ax = plt.subplot(3, 3, i + 1)
-                patch_np = normalized_patches[i].detach().cpu().permute(1, 2, 0).numpy()
+                patch_np = sample_patches[i].detach().cpu().permute(1, 2, 0).numpy()
                 ax.imshow(patch_np)
                 ax.set_title(f'Sample {i+1}')
                 ax.axis('off')
