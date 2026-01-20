@@ -46,7 +46,8 @@ class LayerConfig:
         return f"{self.description} ({self.name})"
 
 
-def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float = 1.0) -> List[LayerConfig]:
+def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float = 1.0,
+                              final_layer_epochs: Optional[int] = None) -> List[LayerConfig]:
     """
     Define the layer progression for the OCR model.
 
@@ -59,12 +60,14 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
     Args:
         max_epochs: Maximum epochs per layer (default 50)
         convergence_threshold: Diversity threshold for convergence. Use 0 or negative to disable (default 1.0)
+        final_layer_epochs: Maximum epochs for final layer. If None, defaults to 2x max_epochs (default None)
 
     Returns:
         List of LayerConfig objects defining the attack progression
     """
     # Final layer gets more epochs and stricter convergence if convergence is enabled
-    final_layer_epochs = max_epochs * 2 if max_epochs < 100 else max_epochs
+    if final_layer_epochs is None:
+        final_layer_epochs = max_epochs * 2 if max_epochs < 100 else max_epochs
     final_convergence = convergence_threshold * 0.5 if convergence_threshold > 0 else convergence_threshold
 
     return [
@@ -395,31 +398,44 @@ class ProgressivePatchTrainer:
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
                  max_epochs_per_layer: int = 50,
+                 final_layer_epochs: Optional[int] = None,
                  convergence_threshold: float = 1.0,
-                 target_layer: Optional[int] = None,
+                 target_layer: Optional[List[int]] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.max_epochs_per_layer = max_epochs_per_layer
+        self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
         self.eval_depth = eval_depth
         self.use_simple_generator = use_simple_generator
 
         # Progressive layer configuration
-        self.layer_configs = layer_configs or get_ocr_layer_progression(
+        all_layer_configs = layer_configs or get_ocr_layer_progression(
             max_epochs=max_epochs_per_layer,
-            convergence_threshold=convergence_threshold
+            convergence_threshold=convergence_threshold,
+            final_layer_epochs=final_layer_epochs
         )
 
-        # If target_layer specified, validate it and set as starting point
+        # If target_layer specified, filter to only those layers
         if target_layer is not None:
-            if target_layer < 0 or target_layer >= len(self.layer_configs):
-                raise ValueError(f"target_layer must be 0-{len(self.layer_configs)-1}, got {target_layer}")
-            self.current_layer_idx = target_layer
+            # Validate all indices
+            for idx in target_layer:
+                if idx < 0 or idx >= len(all_layer_configs):
+                    raise ValueError(f"target_layer index {idx} out of range (must be 0-{len(all_layer_configs)-1})")
+
+            # Filter layer configs to only specified indices (in order)
+            sorted_indices = sorted(target_layer)
+            self.layer_configs = [all_layer_configs[i] for i in sorted_indices]
+            self.original_layer_indices = sorted_indices  # Track original indices for display
+            self.current_layer_idx = 0
+            print(f"Progressive training queued for {len(self.layer_configs)} layers: {sorted_indices}")
         else:
+            self.layer_configs = all_layer_configs
+            self.original_layer_indices = None  # All layers, use natural indices
             self.current_layer_idx = 0
 
         self.current_layer_epoch = 0
@@ -835,17 +851,22 @@ class ProgressivePatchTrainer:
 
         # Record completion of current layer
         current_config = self.layer_configs[self.current_layer_idx]
+        # Get original layer index if using queued layers
+        original_idx = (self.original_layer_indices[self.current_layer_idx]
+                       if self.original_layer_indices is not None
+                       else self.current_layer_idx)
         self.layer_history.append({
             'layer_idx': self.current_layer_idx,
+            'original_layer_idx': original_idx,
             'layer_name': current_config.name,
             'description': current_config.description,
             'epochs_trained': self.current_layer_epoch
         })
 
         # Save checkpoint after completing this layer (with 10 sample patches)
-        layer_checkpoint_name = f"layer{self.current_layer_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
+        layer_checkpoint_name = f"layer{original_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
         self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10)
-        print(f"\n✓ Saved checkpoint after layer {self.current_layer_idx + 1} completion (with 10 sample patches)")
+        print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion (with 10 sample patches)")
 
         # Move to next layer
         self.current_layer_idx += 1
@@ -1146,11 +1167,10 @@ class ProgressivePatchTrainer:
 
         print("\n" + "="*80)
         if self.target_layer is not None:
-            print("SINGLE LAYER ATTACK")
-            target_config = self.layer_configs[self.target_layer]
-            print(f"Target: Layer {self.target_layer + 1} - {target_config.description}")
+            print("PROGRESSIVE LAYER ATTACK (QUEUED LAYERS)")
+            print(f"Training layers: {self.target_layer}")
         else:
-            print("PROGRESSIVE LAYER ATTACK")
+            print("PROGRESSIVE LAYER ATTACK (ALL LAYERS)")
         print("="*80)
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
@@ -1193,9 +1213,13 @@ class ProgressivePatchTrainer:
         # Progressive layer training loop
         while self.current_layer_idx < len(self.layer_configs):
             current_config = self.layer_configs[self.current_layer_idx]
+            # Get original layer index for display
+            display_layer_idx = (self.original_layer_indices[self.current_layer_idx]
+                                if self.original_layer_indices is not None
+                                else self.current_layer_idx)
 
             print(f"\n{'='*80}")
-            print(f"LAYER {self.current_layer_idx + 1}/{len(self.layer_configs)}: {current_config.description}")
+            print(f"LAYER {display_layer_idx + 1}/{len(self.layer_configs)} ({self.current_layer_idx + 1}/{len(self.layer_configs)} in queue): {current_config.description}")
             if self.current_layer_idx == len(self.layer_configs) - 1:
                 print(f"(Final layer - convergence threshold disabled, will train full {current_config.max_epochs} epochs)")
             print(f"{'='*80}\n")
@@ -1240,7 +1264,7 @@ class ProgressivePatchTrainer:
                 global_history['learning_rate'].append(current_lr)
 
                 # Print epoch summary
-                print(f"[L{self.current_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
+                print(f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
                       f"DivLoss: {train_diversity_loss:.4f} | "
                       f"Val: {val_diversity_score:.3f} | "
                       f"LR: {current_lr:.2e}")
@@ -1256,31 +1280,23 @@ class ProgressivePatchTrainer:
                     break
 
             # Advance to next layer (or finish if at final layer)
-            # If in single-layer mode, stop here
-            if self.target_layer is not None:
-                print(f"\n✓ Single layer training complete on layer {self.target_layer + 1}")
-                # Save final checkpoint for single-layer mode
-                layer_checkpoint_name = f"single_layer{self.target_layer + 1}_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
-                self.save_basis(global_epoch, layer_checkpoint_name, num_samples=10)
-                print(f"✓ Saved final checkpoint (with 10 sample patches)")
-                break
-
             if not self.advance_to_next_layer():
                 break
 
         print("\n" + "="*80)
         if self.target_layer is not None:
-            print("SINGLE LAYER TRAINING COMPLETED!")
+            print("PROGRESSIVE TRAINING COMPLETED (QUEUED LAYERS)!")
         else:
-            print("PROGRESSIVE TRAINING COMPLETED!")
+            print("PROGRESSIVE TRAINING COMPLETED (ALL LAYERS)!")
         print("="*80)
-        print(f"   Best loss: {best_loss:.4f}")
+        print(f"   Best diversity: {best_diversity:.4f}")
         print(f"   Total epochs: {global_epoch}")
 
-        if self.target_layer is None and len(self.layer_history) > 0:
+        if len(self.layer_history) > 0:
             print(f"\nLayer progression summary:")
             for record in self.layer_history:
-                print(f"   {record['layer_idx']+1}. {record['description']:35s} - {record['epochs_trained']} epochs")
+                layer_num = record['original_layer_idx'] + 1
+                print(f"   Layer {layer_num:2d}: {record['description']:35s} - {record['epochs_trained']} epochs")
         print("="*80 + "\n")
 
         return global_history
@@ -1305,14 +1321,18 @@ def main():
     parser.add_argument('--max-epochs-per-layer', type=int, default=50,
                         help='Maximum epochs to train on each layer (default: 50). '
                         'Set to high value like 1000 to disable max epoch stopping.')
+    parser.add_argument('--final-layer-epochs', type=int, default=None,
+                        help='Maximum epochs for the final layer in the progression (default: 2x max-epochs-per-layer). '
+                        'The final layer typically gets more training time for refinement.')
     parser.add_argument('--convergence-threshold', type=float, default=1.0,
                         help='Diversity score threshold for convergence. Training on a layer stops when diversity < threshold. '
                         '(default: 1.0). Set to 0 or negative to disable convergence checking and train full max-epochs.')
-    parser.add_argument('--target-layer', type=int, default=None,
-                        help='Target a specific layer only (0-10), disabling progressive training. '
+    parser.add_argument('--target-layer', type=str, default=None,
+                        help='Queue specific layers for progressive training (comma-separated, e.g., "0,3,5,10"). '
+                        'Training will progress through only these layers. '
                         '0=Conv1(32ch), 1=Conv2(48ch), 2=Conv3(64ch), 3=Conv4(80ch), 4=Conv5(96ch), '
                         '5=PatchExtractor(384ch), 6=Transformer1, 7=Transformer2, 8=Transformer3, '
-                        '9=Transformer4, 10=FinalOutput. If not specified, uses progressive training.')
+                        '9=Transformer4, 10=FinalOutput. If not specified, trains all layers progressively.')
     parser.add_argument('--eval-depth', type=int, default=None,
                         help='Maximum number of (patch, image) evaluations for diversity computation. '
                         'Default: batch_size^2 (evaluate all pairs). '
@@ -1328,6 +1348,14 @@ def main():
     # Configuration
     CSV_PATH = "preproc_labels.csv"
 
+    # Parse target layers if specified
+    target_layers = None
+    if args.target_layer is not None:
+        try:
+            target_layers = [int(x.strip()) for x in args.target_layer.split(',')]
+        except ValueError:
+            raise ValueError(f"Invalid target-layer format: '{args.target_layer}'. Expected comma-separated integers (e.g., '0,3,5,10')")
+
     # Trainer kwargs
     trainer_kwargs = {
         'device': 'cuda',
@@ -1335,8 +1363,9 @@ def main():
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
         'max_epochs_per_layer': args.max_epochs_per_layer,
+        'final_layer_epochs': args.final_layer_epochs,
         'convergence_threshold': args.convergence_threshold,
-        'target_layer': args.target_layer,
+        'target_layer': target_layers,
         'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator
     }
@@ -1456,6 +1485,24 @@ Memory-efficient training with simple generator (reduces model size):
     # Combine with eval_depth for maximum memory efficiency:
     python progressive_patch.py --simple-generator --batch-size 64 --eval-depth 512
 
+Queue specific layers for progressive training:
+    python progressive_patch.py --target-layer "0,5,10"
+    # Train progressively through only layers 0 (Conv1), 5 (PatchExtractor), and 10 (FinalOutput)
+    # Skips intermediate layers 1-4, 6-9
+
+    python progressive_patch.py --target-layer "5,6,7,8,9,10"
+    # Start from PatchExtractor and train through all remaining layers
+
+    python progressive_patch.py --target-layer "10"
+    # Train only the final output layer (single layer, no progression)
+
+Custom final layer training epochs:
+    python progressive_patch.py --final-layer-epochs 200
+    # Give the final layer more training time (default: 2x max-epochs-per-layer)
+
+    python progressive_patch.py --target-layer "0,5,10" --max-epochs-per-layer 30 --final-layer-epochs 150
+    # Train layers 0 and 5 for max 30 epochs each, but train layer 10 for up to 150 epochs
+
 Custom layer progression:
     You can define your own layer progression by modifying get_ocr_layer_progression()
     or passing a custom list of LayerConfig objects to ProgressivePatchTrainer.
@@ -1471,7 +1518,6 @@ Example custom layer configuration:
 
     trainer = ProgressivePatchTrainer(
         "preproc_labels.csv",
-        training=True,
         device='cuda',
         layer_configs=custom_layers
     )
