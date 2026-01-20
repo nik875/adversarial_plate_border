@@ -393,28 +393,16 @@ class ProgressivePatchTrainer:
                  csv_path: str,
                  device: str = None,
                  grad_accumulate: int = None,
-                 match_detection: bool = False,
-                 impersonation_target: str = None,
-                 print_blur=0,
-                 training=False,
-                 use_tv_loss: bool = True,
-                 use_homography: bool = True,
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
-                 diversity_only: bool = False,
                  max_epochs_per_layer: int = 50,
                  convergence_threshold: float = 1.0,
                  target_layer: Optional[int] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False):
-        self.training = training
-        self.print_blur = print_blur
-        self.use_tv_loss = use_tv_loss
-        self.use_homography = use_homography
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
-        self.diversity_only = diversity_only
         self.max_epochs_per_layer = max_epochs_per_layer
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
@@ -442,8 +430,6 @@ class ProgressivePatchTrainer:
         self.transform = T.Compose([T.ToTensor()])
 
         self.grad_accumulate = grad_accumulate
-        self.match_detection = match_detection
-        self.impersonation_target = impersonation_target
 
         if device is None:
             if torch.cuda.is_available():
@@ -483,56 +469,35 @@ class ProgressivePatchTrainer:
         self.baseline_ocr_activations = {}  # Dict mapping image index to baseline activations
         self.activation_hook = None  # Handle for the forward hook
 
-        # Load YOLO model
-        self.load_yolo_model()
+        # Load OCR model for diversity computation
+        self.load_ocr_model()
 
         # Track statistics
         self.epoch_stats = []
 
-    def load_yolo_model(self):
-        """Load and convert YOLO model to PyTorch"""
-        print("Loading YOLO model...")
-        LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+    def load_ocr_model(self):
+        """Load OCR model for diversity computation only"""
+        print("Loading OCR model for diversity computation...")
+        ocr_path = Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
-        # Get ONNX model path
-        model_cache_dir = \
-            Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
-        onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
-        ocr_path = \
-            Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
-
-        if not onnx_path.exists():
-            raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
-
-        onnx_model = onnx.load(str(onnx_path))
-        self.model = onnx2torch.convert(onnx_model)
-        self.model.to(self.device)
-        self.model.eval()
+        if not ocr_path.exists():
+            raise FileNotFoundError(f"OCR model not found at: {ocr_path}")
 
         ocr_model = onnx.load(str(ocr_path))
         self.ocr_input_shape = (64, 128, 3)
-        alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
-
-        # Set OCR target based on mode
-        if self.impersonation_target:
-            # For impersonation: target is the text we want OCR to read
-            self.ocr_target = self.text_to_target_tensor(self.impersonation_target, 9, alphabet)
-        else:
-            # Original behavior: target is the text we want to prevent OCR from reading
-            self.ocr_target = self.text_to_target_tensor('VRJ7774', 9, alphabet)
 
         self.ocr = onnx2torch.convert(ocr_model).to(self.device)
-        self.ocr_loss = self.focal_cce_loss(len(alphabet))
-
-        # Setup activation capture BEFORE baseline calculation
-        self.setup_activation_hook()
-
-        self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
         self.ocr.eval()
 
-        # Disable gradients for model parameters to save memory
-        for param in self.model.parameters():
+        # Disable gradients for OCR model parameters to save memory
+        for param in self.ocr.parameters():
             param.requires_grad = False
+
+        # Setup activation capture
+        self.setup_activation_hook()
+
+        # Calculate baseline activations for diversity computation
+        self.calculate_baseline_activations()
 
     def setup_activation_hook(self, layer_name: Optional[str] = None):
         """
@@ -1154,24 +1119,31 @@ class ProgressivePatchTrainer:
 
         return loss
 
-    def calculate_baseline_loss(self) -> float:
+    def calculate_baseline_activations(self):
         """
-        Calculate baseline OCR loss and capture baseline activations for each image.
+        Capture baseline activations for each image (without patches).
         """
-        total_ocr_loss = 0.0
-        total_det_loss = 0.0
-        total_plates = 0
-
-        # Sample a single patch for baseline calculation
-        z = self.sample_coefficients(1)
-        patch = self.generate_patches(z)[0]  # [3, H, W]
-
-        desc = "Calculating baseline OCR loss and activations"
+        desc = "Calculating baseline activations"
         with tqdm(self.train_loader, desc=desc, leave=False) as pbar:
             with torch.no_grad():
                 for idx, batch in enumerate(pbar):
                     batch = {k: v[0] for k, v in batch.items()}
-                    det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=False)
+
+                    # Use BORDER corners (1.4x scaled) to match where patches will be applied
+                    plate_corners = batch['orig_corners'].to(self.device)
+                    border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+                    corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
+
+                    # Crop plate area from original image (no patch)
+                    orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+                    cropped_plate = K.crop_and_resize(
+                        orig_image,
+                        corners_box,
+                        self.ocr_input_shape[:2]
+                    )
+
+                    ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+                    self.ocr(ocr_input)  # Forward pass captures activations via hook
 
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
@@ -1183,19 +1155,10 @@ class ProgressivePatchTrainer:
                         if not hasattr(self, 'activation_shape'):
                             self.activation_shape = baseline_act.shape
 
-                    total_det_loss += det_loss
-                    total_ocr_loss += ocr_loss
-                    total_plates += 1
-
-                    avg_ocr = total_ocr_loss / total_plates
-                    avg_det = total_det_loss / total_plates
-                    pbar.set_postfix({
-                        'Avg_Detection_Loss': f'{avg_det.item():.4f}',
-                        'Avg_OCR_Loss': f'{avg_ocr.item():.4f}'
-                    })
+                        # Clear hook reference
+                        self.ocr_activations = None
 
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
-        return total_det_loss / total_plates, total_ocr_loss / total_plates
 
     def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
         """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
@@ -1376,7 +1339,6 @@ class ProgressivePatchTrainer:
         Activation-based diversity: measures how differently each patch affects
         OCR internal representations (at the patch_extractor layer) compared to baseline.
         """
-        total_loss = 0.0
         total_diversity_loss = 0.0
         step_count = 0
         num_updates = 0
@@ -1385,8 +1347,7 @@ class ProgressivePatchTrainer:
         update_every = len(
             self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
 
-        # Storage for losses and activations in current accumulation window
-        accumulated_losses = []
+        # Storage for patches and activations in current accumulation window
         accumulated_patches = []
         accumulated_batches = []
         accumulated_activations = []
@@ -1402,33 +1363,18 @@ class ProgressivePatchTrainer:
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                # In diversity-only mode, skip YOLO detection and only compute OCR loss for metrics
-                if self.diversity_only:
-                    ocr_loss = self.compute_ocr_loss_only(batch, patch)
-                    accumulated_losses.append(ocr_loss)
-                else:
-                    # Compute full adversarial loss (detection + OCR)
-                    adv_loss = self.compute_loss_full_image(batch, patch)
-                    accumulated_losses.append(adv_loss)
-
                 # Store patch and batch for diversity evaluation
-                # Don't detach if diversity_only - we need gradients back to generator
-                if self.diversity_only:
-                    accumulated_patches.append(patch)
-                else:
-                    accumulated_patches.append(patch.detach())
+                # Keep gradients for diversity computation
+                accumulated_patches.append(patch)
                 # Detach and clone batch tensors to prevent holding references to dataloader tensors
                 accumulated_batches.append({k: v[0].detach().clone() if torch.is_tensor(v[0]) else v[0]
                                            for k, v in batch.items()})
 
                 # Capture activations (automatically populated by forward hook)
-                # Don't detach if diversity_only - we need gradients for the diagonal entries
+                # Keep gradients for the diagonal entries
                 # Squeeze to match format from _get_activations_for_patch_image
                 if self.ocr_activations is not None:
-                    if self.diversity_only:
-                        accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
-                    else:
-                        accumulated_activations.append(self.ocr_activations.squeeze(0).detach().clone())
+                    accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
                     # Clear hook reference to allow garbage collection
                     self.ocr_activations = None
 
@@ -1446,50 +1392,37 @@ class ProgressivePatchTrainer:
                         accumulated_batches,
                         accumulated_indices,
                         accumulated_activations,
-                        use_grad=self.diversity_only
+                        use_grad=True
                     )
-                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
+                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
                     last_diversity_loss = diversity_loss.item()
 
-                    # Compute mean adversarial loss (always track for metrics)
-                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
-
-                    # Combined loss - only include adversarial if not diversity-only mode
-                    if self.diversity_only:
-                        combined_loss = diversity_loss
-                    else:
-                        combined_loss = mean_adv_loss + diversity_loss
-                    combined_loss.backward()
+                    # Train only on diversity loss
+                    diversity_loss.backward()
 
                     # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Track total loss and diversity loss
-                    total_loss += combined_loss.item()
+                    # Track diversity loss
                     total_diversity_loss += diversity_loss.item()
                     num_updates += 1
 
                     # Update progress bar
-                    avg_loss = total_loss / num_updates
+                    avg_diversity_loss = total_diversity_loss / num_updates
                     pbar.set_postfix({
-                        'Loss': f"{avg_loss:.4f}",
-                        'AdvLoss': f"{mean_adv_loss.item():.4f}",
-                        'DivLoss': f"{last_diversity_loss:.4f}",
+                        'DivLoss': f"{avg_diversity_loss:.4f}",
                         'Updates': num_updates
                     })
 
                     # Memory cleanup after update
-                    del combined_loss, mean_adv_loss, diversity_score, diversity_loss
+                    del diversity_score, diversity_loss
                     # Clear accumulated lists and their contents
-                    for loss in accumulated_losses:
-                        del loss
                     for patch in accumulated_patches:
                         del patch
                     for act in accumulated_activations:
                         del act
-                    accumulated_losses = []
                     accumulated_patches = []
                     accumulated_batches = []
                     accumulated_activations = []
@@ -1503,19 +1436,15 @@ class ProgressivePatchTrainer:
                         torch.mps.empty_cache()
 
                 else:
-                    # Show accumulation progress with current average loss
-                    current_batch_avg = sum(accumulated_losses) / len(accumulated_losses) if accumulated_losses else 0
-
-                    # Note: Can't compute diversity until batch is complete, so display from last update
+                    # Show accumulation progress
                     pbar.set_postfix({
-                        'AccumLoss': f"{current_batch_avg.item():.4f}" if hasattr(current_batch_avg, 'item') else f"{current_batch_avg:.4f}",
                         'DivLoss': f"{last_diversity_loss:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
             # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
-                if len(accumulated_losses) > 0:
+                if len(accumulated_patches) > 0:
                     # Compute activation-based diversity score
                     # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
@@ -1523,32 +1452,20 @@ class ProgressivePatchTrainer:
                         accumulated_batches,
                         accumulated_indices,
                         accumulated_activations,
-                        use_grad=self.diversity_only
+                        use_grad=True
                     )
-                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_losses)) * diversity_score
-
-                    # Mean adversarial loss (always track for metrics)
-                    mean_adv_loss = sum(accumulated_losses) / len(accumulated_losses)
-
-                    # Combined loss - only include adversarial if not diversity-only mode
-                    if self.diversity_only:
-                        combined_loss = diversity_loss
-                    else:
-                        combined_loss = mean_adv_loss + diversity_loss
-                    combined_loss.backward()
+                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
+                    diversity_loss.backward()
 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    total_loss += combined_loss.item()
                     total_diversity_loss += diversity_loss.item()
                     num_updates += 1
 
                     # Memory cleanup for remaining samples
-                    del combined_loss, mean_adv_loss, diversity_score, diversity_loss
-                    for loss in accumulated_losses:
-                        del loss
+                    del diversity_score, diversity_loss
                     for patch in accumulated_patches:
                         del patch
                     for act in accumulated_activations:
@@ -1560,25 +1477,47 @@ class ProgressivePatchTrainer:
                 elif self.device == 'mps':
                     torch.mps.empty_cache()
 
-        # Return average loss per update and average diversity loss
-        avg_loss = total_loss / max(num_updates, 1)
+        # Return average diversity loss per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
-        return avg_loss, avg_diversity_loss
+        return avg_diversity_loss
 
     def validate(self) -> float:
-        """Validation pass on held-out data"""
-        losses = []
+        """Validation pass using diversity score"""
+        diversity_scores = []
 
         with torch.no_grad():
-            for batch in self.val_loader:
+            # Sample multiple patches for validation diversity
+            num_val_samples = min(16, len(self.val_loader))
+            patches = []
+            batches = []
+            activations = []
+            indices = []
+
+            for idx, batch in enumerate(self.val_loader):
+                if idx >= num_val_samples:
+                    break
+
                 # Sample a patch for validation
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]
+                patches.append(patch)
+                batches.append({k: v[0] for k, v in batch.items()})
 
-                loss = self.compute_loss_full_image(batch, patch)
-                losses.append(loss.detach().cpu().item())
+                # Get activations
+                act = self._get_activations_for_patch_image(
+                    {k: v[0] for k, v in batch.items()}, patch, use_grad=False, skip_detection=True
+                )
+                activations.append(act)
+                indices.append(idx)
 
-        return np.mean(losses)
+            # Compute diversity score
+            if len(patches) > 1:
+                diversity_score = self.compute_activation_diversity(
+                    patches, batches, indices, activations, use_grad=False
+                )
+                return diversity_score.item()
+            else:
+                return 0.0
 
     def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5):
         """Save current generator state and sample patches
@@ -1629,13 +1568,12 @@ class ProgressivePatchTrainer:
             'layer_idx': [],
             'layer_name': [],
             'epoch': [],
-            'loss': [],
             'diversity_loss': [],
-            'val_score': [],
+            'val_diversity': [],
             'learning_rate': []
         }
 
-        best_loss = float('inf')
+        best_diversity = -float('inf')  # Higher diversity is better
         global_epoch = 0
 
         print("\n" + "="*80)
@@ -1718,8 +1656,8 @@ class ProgressivePatchTrainer:
                 global_epoch += 1
 
                 # Training and validation
-                train_loss, train_diversity_loss = self.train_epoch(optimizer, global_epoch)
-                val_detection_score = self.validate()
+                train_diversity_loss = self.train_epoch(optimizer, global_epoch)
+                val_diversity_score = self.validate()
 
                 # Learning rate scheduling
                 scheduler.step()
@@ -1729,23 +1667,21 @@ class ProgressivePatchTrainer:
                 global_history['layer_idx'].append(self.current_layer_idx)
                 global_history['layer_name'].append(current_config.name)
                 global_history['epoch'].append(global_epoch)
-                global_history['loss'].append(train_loss)
                 global_history['diversity_loss'].append(train_diversity_loss)
-                global_history['val_score'].append(val_detection_score)
+                global_history['val_diversity'].append(val_diversity_score)
                 global_history['learning_rate'].append(current_lr)
 
                 # Print epoch summary
                 print(f"[L{self.current_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
-                      f"Loss: {train_loss:.4f} | "
-                      f"Div: {train_diversity_loss:.4f} | "
-                      f"Val: {val_detection_score:.3f} | "
+                      f"DivLoss: {train_diversity_loss:.4f} | "
+                      f"Val: {val_diversity_score:.3f} | "
                       f"LR: {current_lr:.2e}")
 
-                # Save best model globally
-                if val_detection_score < best_loss:
-                    best_loss = val_detection_score
+                # Save best model globally (higher diversity is better)
+                if val_diversity_score > best_diversity:
+                    best_diversity = val_diversity_score
                     self.save_basis(global_epoch, "best_progressive_patch")
-                    print(f"   ✓ New best loss: {best_loss:.4f}")
+                    print(f"   ✓ New best diversity: {best_diversity:.4f}")
 
                 # Check if should continue on current layer
                 if not self.should_continue_current_layer(train_diversity_loss):
