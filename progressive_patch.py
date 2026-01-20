@@ -1472,6 +1472,9 @@ class ProgressivePatchTrainer:
                 self.current_layer_epoch += 1
                 global_epoch += 1
 
+                # Get current LR before training (before scheduler updates it)
+                current_lr = optimizer.param_groups[0]['lr']
+
                 # Training
                 train_diversity_loss, train_tv_loss = self.train_epoch(optimizer, global_epoch)
 
@@ -1481,9 +1484,8 @@ class ProgressivePatchTrainer:
                 else:
                     val_diversity_score = self.validate()
 
-                # Learning rate scheduling
+                # Learning rate scheduling (after training, updates LR for next epoch)
                 scheduler.step()
-                current_lr = optimizer.param_groups[0]['lr']
 
                 # Record history
                 global_history['layer_idx'].append(self.current_layer_idx)
