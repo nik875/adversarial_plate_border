@@ -1198,6 +1198,11 @@ class ProgressivePatchTrainer:
             'epochs_trained': self.current_layer_epoch
         })
 
+        # Save checkpoint after completing this layer
+        layer_checkpoint_name = f"layer{self.current_layer_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
+        self.save_basis(self.current_layer_epoch, layer_checkpoint_name)
+        print(f"\n✓ Saved checkpoint after layer {self.current_layer_idx + 1} completion")
+
         # Move to next layer
         self.current_layer_idx += 1
         self.current_layer_epoch = 0
@@ -1725,7 +1730,10 @@ def main():
         print("  - progressive_patch_training_curves.png")
         print("  - progressive_patch_sample_patches.png")
         print("  - progressive_patch_training_history.csv")
-        print("Generator checkpoints saved with 'best_progressive_patch' and 'checkpoint_layer*' prefixes")
+        print("\nGenerator checkpoints saved:")
+        print("  - best_progressive_patch.tar - Best model across all layers")
+        print("  - checkpoint_layer*.tar - Periodic checkpoints during layer training")
+        print("  - layer*_complete_*.tar - Checkpoint after completing each layer")
 
     except Exception as e:
         print(f"Training failed: {e}")
@@ -1773,10 +1781,19 @@ The progressive attack strategy:
 - Ends with final output (direct optimization of predictions)
 - Each layer is trained until convergence or max epochs
 - Generator weights are preserved across layer transitions
+- Saves checkpoints at each layer transition
 
 Convergence criteria:
-- Diversity score falls below threshold, OR
+- Diversity score falls below threshold (unless disabled), OR
 - Maximum epochs reached for current layer
 
 Then automatically advances to next layer in progression.
+
+Checkpoint structure:
+- best_progressive_patch.tar: Best loss across all training
+- checkpoint_layer*.tar: Periodic saves during training (every N epochs)
+- layer*_complete_*.tar: Model state after completing each layer
+  (e.g., layer1_complete_Conv_Layer_1_32ch.tar)
+
+You can resume from any checkpoint by loading it with the trainer's load_basis() method.
 """
