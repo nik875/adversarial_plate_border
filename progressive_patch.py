@@ -144,14 +144,12 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
 
 class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
-    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512,
-                 use_gradient_checkpointing: bool = False):
+    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
-        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # SD VAE expects latents of shape [B, 4, H/8, W/8]
         # For 256×512 output, latent is [B, 4, 32, 64]
@@ -270,21 +268,6 @@ class FoundationPatchGenerator(nn.Module):
         print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
         print(f"DNN block (with global pooling): {self.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * patch_height * patch_width}")
 
-        if use_gradient_checkpointing:
-            print(f"Gradient checkpointing: ENABLED (reduces memory usage by ~50-70%)")
-
-    def _checkpoint_vae_decode(self, vae_latent):
-        """Wrapper for VAE decode to enable checkpointing"""
-        return self.vae.decode(vae_latent).sample
-
-    def _checkpoint_cnn_refine(self, cnn_input):
-        """Wrapper for CNN refiner to enable checkpointing"""
-        return self.cnn_refiner(cnn_input)
-
-    def _checkpoint_dnn_block(self, dnn_input_flat):
-        """Wrapper for DNN block to enable checkpointing"""
-        return self.dnn_block(dnn_input_flat)
-
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -294,8 +277,8 @@ class FoundationPatchGenerator(nn.Module):
         """
         batch_size = z.shape[0]
 
-        # Main path: z → adapter → VAE decoder
-        # Adapter: z → VAE latent (cheap, don't checkpoint)
+        # Main path: z → adapter → VAE decoder (frozen)
+        # Adapter: z → VAE latent
         vae_latent_flat = self.adapter(z)  # [B, vae_latent_dim]
 
         # Reshape to VAE's expected latent format
@@ -306,11 +289,8 @@ class FoundationPatchGenerator(nn.Module):
             self.vae_latent_w
         )  # [B, 4, 32, 64]
 
-        # Decode using trainable VAE (EXPENSIVE - checkpoint this!)
-        if self.use_gradient_checkpointing and self.training:
-            vae_output = checkpoint(self._checkpoint_vae_decode, vae_latent, use_reentrant=False)
-        else:
-            vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
+        # Decode using trainable VAE (gradients flow through for fine-tuning)
+        vae_output = self.vae.decode(vae_latent).sample  # [B, 3, 256, 512]
 
         # Clamp to [0, 1] and ensure correct size
         vae_output = torch.clamp(vae_output, 0.0, 1.0)
@@ -324,7 +304,7 @@ class FoundationPatchGenerator(nn.Module):
                 align_corners=True
             )
 
-        # Skip connection: z → spatial feature map (cheap, don't checkpoint)
+        # Skip connection: z → spatial feature map
         skip_features = self.skip_projection(z)  # [B, H*W]
         skip_features = skip_features.view(
             batch_size, 1, self.patch_height, self.patch_width
@@ -333,11 +313,8 @@ class FoundationPatchGenerator(nn.Module):
         # Concatenate VAE output with skip connection for CNN input
         cnn_input = torch.cat([vae_output, skip_features], dim=1)  # [B, 4, H, W]
 
-        # Process through CNN refiner (moderate cost - checkpoint if needed)
-        if self.use_gradient_checkpointing and self.training:
-            cnn_output = checkpoint(self._checkpoint_cnn_refine, cnn_input, use_reentrant=False)
-        else:
-            cnn_output = self.cnn_refiner(cnn_input)  # [B, 64, H, W]
+        # Process through CNN refiner
+        cnn_output = self.cnn_refiner(cnn_input)  # [B, 64, H, W]
 
         # Concatenate CNN output with skip features for DNN input
         dnn_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 65, H, W]
@@ -346,12 +323,8 @@ class FoundationPatchGenerator(nn.Module):
         dnn_input_pooled = self.global_pool(dnn_input)  # [B, 65, 8, 16]
         dnn_input_flat = dnn_input_pooled.view(batch_size, -1)  # [B, 65*8*16]
 
-        # Process through DNN block (moderate cost - checkpoint if needed)
-        if self.use_gradient_checkpointing and self.training:
-            patch_flat = checkpoint(self._checkpoint_dnn_block, dnn_input_flat, use_reentrant=False)
-        else:
-            patch_flat = self.dnn_block(dnn_input_flat)  # [B, 3*H*W]
-
+        # Process through DNN block
+        patch_flat = self.dnn_block(dnn_input_flat)  # [B, 3*H*W]
         patches = patch_flat.view(batch_size, 3, self.patch_height, self.patch_width)  # [B, 3, H, W]
 
         return patches
@@ -381,7 +354,7 @@ class ProgressivePatchTrainer:
                  convergence_threshold: float = 1.0,
                  target_layer: Optional[int] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
-                 use_gradient_checkpointing: bool = False):
+                 eval_depth: Optional[int] = None):
         self.training = training
         self.print_blur = print_blur
         self.use_tv_loss = use_tv_loss
@@ -392,6 +365,7 @@ class ProgressivePatchTrainer:
         self.max_epochs_per_layer = max_epochs_per_layer
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
+        self.eval_depth = eval_depth
 
         # Progressive layer configuration
         self.layer_configs = layer_configs or get_ocr_layer_progression(
@@ -438,8 +412,7 @@ class ProgressivePatchTrainer:
         self.generator = FoundationPatchGenerator(
             latent_dim=basis_dim,
             patch_height=self.patch_height,
-            patch_width=self.patch_width,
-            use_gradient_checkpointing=use_gradient_checkpointing
+            patch_width=self.patch_width
         ).to(self.device)
 
         # Activation capture for diversity metric
@@ -454,36 +427,24 @@ class ProgressivePatchTrainer:
         self.epoch_stats = []
 
     def load_yolo_model(self):
-        """Load and convert YOLO and OCR models to PyTorch"""
-        # Load YOLO only if not in diversity-only mode
-        if not self.diversity_only:
-            print("Loading YOLO model...")
-            LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+        """Load and convert YOLO model to PyTorch"""
+        print("Loading YOLO model...")
+        LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
 
-            # Get ONNX model path
-            model_cache_dir = \
-                Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
-            onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
-
-            if not onnx_path.exists():
-                raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
-
-            onnx_model = onnx.load(str(onnx_path))
-            self.model = onnx2torch.convert(onnx_model)
-            self.model.to(self.device)
-            self.model.eval()
-
-            # Disable gradients for model parameters to save memory
-            for param in self.model.parameters():
-                param.requires_grad = False
-        else:
-            print("Skipping YOLO model (diversity-only mode)...")
-            self.model = None
-
-        # Always load OCR model (needed for activations and OCR loss)
-        print("Loading OCR model...")
+        # Get ONNX model path
+        model_cache_dir = \
+            Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
+        onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
         ocr_path = \
             Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
+
+        if not onnx_path.exists():
+            raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
+
+        onnx_model = onnx.load(str(onnx_path))
+        self.model = onnx2torch.convert(onnx_model)
+        self.model.to(self.device)
+        self.model.eval()
 
         ocr_model = onnx.load(str(ocr_path))
         self.ocr_input_shape = (64, 128, 3)
@@ -497,15 +458,18 @@ class ProgressivePatchTrainer:
             # Original behavior: target is the text we want to prevent OCR from reading
             self.ocr_target = self.text_to_target_tensor('VRJ7774', 9, alphabet)
 
-        # Load OCR and move to GPU
         self.ocr = onnx2torch.convert(ocr_model).to(self.device)
-        self.ocr.eval()
         self.ocr_loss = self.focal_cce_loss(len(alphabet))
 
         # Setup activation capture BEFORE baseline calculation
         self.setup_activation_hook()
 
         self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
+        self.ocr.eval()
+
+        # Disable gradients for model parameters to save memory
+        for param in self.model.parameters():
+            param.requires_grad = False
 
     def setup_activation_hook(self, layer_name: Optional[str] = None):
         """
@@ -558,10 +522,6 @@ class ProgressivePatchTrainer:
         self.activation_hook = target_layer.register_forward_hook(hook_fn)
         layer_desc = self.layer_configs[self.current_layer_idx].description
         print(f"✓ Registered activation hook on: {layer_desc} ({layer_name})")
-
-    def _checkpoint_ocr_forward(self, ocr_input):
-        """Wrapper for OCR forward pass to enable checkpointing"""
-        return self.ocr(ocr_input)
 
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
         """Sample z ~ N(0, I) for generating patches"""
@@ -643,11 +603,7 @@ class ProgressivePatchTrainer:
             )
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            # Use checkpointing for OCR to save memory (activations still captured via hook)
-            if hasattr(self, 'generator') and self.generator.use_gradient_checkpointing and self.training:
-                checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
-            else:
-                self.ocr(ocr_input)  # Forward pass captures activations via hook
+            self.ocr(ocr_input)  # Forward pass captures activations via hook
 
             if self.ocr_activations is not None:
                 result = self.ocr_activations.squeeze(0)  # [H, W, C]
@@ -665,10 +621,14 @@ class ProgressivePatchTrainer:
                                       diagonal_activations: List[torch.Tensor],
                                       use_grad: bool = False) -> torch.Tensor:
         """
-        Compute diversity via average activation impact across all images.
+        Compute diversity via average activation impact across sampled images.
 
-        For each patch, evaluate it on ALL images in the batch and compute
-        the average activation delta. This reduces noise compared to patch-image pairs.
+        For each patch, evaluate it on a subset of images (always diagonal,
+        randomly sample off-diagonal) and compute the average activation delta.
+
+        The eval_depth parameter controls the total number of (patch, image)
+        evaluations: always includes batch_size diagonal, randomly samples
+        remaining off-diagonal pairs from the budget.
 
         Args:
             patches_list: List of [3, H, W] patches (one per image)
@@ -682,26 +642,51 @@ class ProgressivePatchTrainer:
         """
         batch_size = len(patches_list)
 
-        # For each patch, compute average activation delta across all images
+        # Determine actual eval_depth (default to full matrix if not specified)
+        actual_eval_depth = self.eval_depth if self.eval_depth is not None else batch_size ** 2
+        actual_eval_depth = min(actual_eval_depth, batch_size ** 2)  # Cap at max possible
+
+        # Build set of off-diagonal pairs
+        off_diag_pairs = []
+        for patch_idx in range(batch_size):
+            for img_idx in range(batch_size):
+                if patch_idx != img_idx:
+                    off_diag_pairs.append((patch_idx, img_idx))
+
+        # Calculate off-diagonal budget (eval_depth - diagonal evaluations)
+        diagonal_count = batch_size
+        off_diag_budget = max(0, actual_eval_depth - diagonal_count)
+
+        # Randomly sample off-diagonal pairs
+        if off_diag_budget > 0 and len(off_diag_pairs) > 0:
+            num_to_sample = min(off_diag_budget, len(off_diag_pairs))
+            sampled_indices = np.random.choice(len(off_diag_pairs), size=num_to_sample, replace=False)
+            sampled_pairs = set((off_diag_pairs[i][0], off_diag_pairs[i][1]) for i in sampled_indices)
+        else:
+            sampled_pairs = set()
+
+        # For each patch, compute average activation delta across sampled images
         patch_avg_deltas = []
 
         for patch_idx, patch in enumerate(patches_list):
             activation_deltas = []
 
-            # Evaluate this patch on all images in the batch
-            for img_idx, (batch, baseline_idx) in enumerate(zip(batches_list, baseline_indices)):
-                # Reuse diagonal activations (patch_i on image_i)
-                if patch_idx == img_idx:
-                    activations = diagonal_activations[patch_idx]  # [H, W, C]
-                else:
-                    # Only compute off-diagonal (patch_i on image_j where i != j)
+            # Always include diagonal (patch_i on image_i)
+            activations = diagonal_activations[patch_idx]  # [H, W, C]
+            baseline = self.baseline_ocr_activations[baseline_indices[patch_idx]]  # [H, W, C]
+            delta = activations - baseline  # [H, W, C]
+            activation_deltas.append(delta)
+
+            # Include sampled off-diagonal pairs involving this patch
+            for img_idx in range(batch_size):
+                if img_idx != patch_idx and (patch_idx, img_idx) in sampled_pairs:
+                    batch = batches_list[img_idx]
                     activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [H, W, C]
+                    baseline = self.baseline_ocr_activations[baseline_indices[img_idx]]  # [H, W, C]
+                    delta = activations - baseline  # [H, W, C]
+                    activation_deltas.append(delta)
 
-                baseline = self.baseline_ocr_activations[baseline_idx]  # [H, W, C]
-                delta = activations - baseline  # [H, W, C]
-                activation_deltas.append(delta)
-
-            # Average deltas for this patch over all images
+            # Average deltas for this patch over sampled images
             avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [H, W, C]
             patch_avg_deltas.append(avg_delta)
 
@@ -1057,11 +1042,7 @@ class ProgressivePatchTrainer:
             ).to(self.device)
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            # Use checkpointing for OCR to save memory
-            if self.generator.use_gradient_checkpointing and self.training:
-                ocr_output = checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
-            else:
-                ocr_output = self.ocr(ocr_input)
+            ocr_output = self.ocr(ocr_input)
             ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
 
             if use_ocr_baseline:
@@ -1105,7 +1086,6 @@ class ProgressivePatchTrainer:
     def calculate_baseline_loss(self) -> float:
         """
         Calculate baseline OCR loss and capture baseline activations for each image.
-        In diversity-only mode, skips detection baseline calculation (YOLO not loaded).
         """
         total_ocr_loss = 0.0
         total_det_loss = 0.0
@@ -1120,15 +1100,7 @@ class ProgressivePatchTrainer:
             with torch.no_grad():
                 for idx, batch in enumerate(pbar):
                     batch = {k: v[0] for k, v in batch.items()}
-
-                    # In diversity-only mode, skip YOLO detection loss (model is None)
-                    if self.diversity_only:
-                        # Only compute OCR loss, no detection loss
-                        ocr_loss = self.compute_ocr_loss_only(batch, patch, use_ocr_baseline=False, already_unbatched=True)
-                        det_loss = torch.tensor(0.0, device=self.device)
-                    else:
-                        # Normal mode: compute both detection and OCR loss
-                        det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=False)
+                    det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=False)
 
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
@@ -1154,17 +1126,9 @@ class ProgressivePatchTrainer:
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
         return total_det_loss / total_plates, total_ocr_loss / total_plates
 
-    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True, already_unbatched: bool = False) -> torch.Tensor:
-        """Compute OCR loss only without YOLO detection (for diversity-only mode)
-
-        Args:
-            batch: Batch dict (either batched from dataloader or pre-unbatched)
-            patch: Adversarial patch [3, H, W]
-            use_ocr_baseline: Whether to normalize by baseline OCR loss
-            already_unbatched: If True, batch is already unbatched (single image)
-        """
-        if not already_unbatched:
-            batch = {k: v[0] for k, v in batch.items()}
+    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
+        """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
+        batch = {k: v[0] for k, v in batch.items()}
 
         # Apply patch to original image
         patched_image, _ = self.apply_patch_to_image(
@@ -1185,11 +1149,7 @@ class ProgressivePatchTrainer:
         )
 
         ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-        # Use checkpointing for OCR to save memory
-        if self.generator.use_gradient_checkpointing and self.training:
-            ocr_output = checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
-        else:
-            ocr_output = self.ocr(ocr_input)
+        ocr_output = self.ocr(ocr_input)
         ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
 
         if use_ocr_baseline:
@@ -1759,9 +1719,11 @@ def main():
                         '0=Conv1(32ch), 1=Conv2(48ch), 2=Conv3(64ch), 3=Conv4(80ch), 4=Conv5(96ch), '
                         '5=PatchExtractor(384ch), 6=Transformer1, 7=Transformer2, 8=Transformer3, '
                         '9=Transformer4, 10=FinalOutput. If not specified, uses progressive training.')
-    parser.add_argument('--gradient-checkpointing', action='store_true',
-                        help='Enable gradient checkpointing to reduce memory usage by ~50-70%% at the cost of '
-                        '~30-40%% slower training. Useful for fitting larger batch sizes on limited VRAM.')
+    parser.add_argument('--eval-depth', type=int, default=None,
+                        help='Maximum number of (patch, image) evaluations for diversity computation. '
+                        'Default: batch_size^2 (evaluate all pairs). '
+                        'Always includes batch_size diagonal evaluations, randomly samples remaining off-diagonal. '
+                        'Upper bound: batch_size^2. Use to reduce memory usage with large batch sizes.')
     args = parser.parse_args()
 
     # Configuration
@@ -1781,7 +1743,7 @@ def main():
         'max_epochs_per_layer': args.max_epochs_per_layer,
         'convergence_threshold': args.convergence_threshold,
         'target_layer': args.target_layer,
-        'use_gradient_checkpointing': args.gradient_checkpointing
+        'eval_depth': args.eval_depth
     }
 
     # Training mode
@@ -1883,13 +1845,13 @@ Basic usage:
 With custom settings:
     python progressive_patch.py --learning-rate 0.01 --diversity-weight 2.0 --basis-dim 32
 
-Memory optimization with gradient checkpointing:
-    python progressive_patch.py --gradient-checkpointing --batch-size 32
+Memory-efficient training with eval_depth (reduces diversity computation):
+    python progressive_patch.py --batch-size 32 --eval-depth 256
+    # Evaluates up to 256 (patch, image) pairs instead of 32^2=1024
+    # Always includes 32 diagonal evaluations, randomly samples 224 off-diagonal
 
-    Gradient checkpointing reduces memory usage by ~50-70% at the cost of ~30-40% slower training.
-    This allows you to use larger batch sizes on limited VRAM. Trade-off:
-    - Without checkpointing: batch-size 16 on 24GB VRAM, faster training
-    - With checkpointing: batch-size 32+ on 16GB VRAM, slower training but better optimization
+    python progressive_patch.py --batch-size 64 --eval-depth 512
+    # Evaluates up to 512 pairs instead of 64^2=4096 (8x memory reduction)
 
 Custom layer progression:
     You can define your own layer progression by modifying get_ocr_layer_progression()
@@ -1925,6 +1887,15 @@ Convergence criteria:
 - Maximum epochs reached for current layer
 
 Then automatically advances to next layer in progression.
+
+Diversity computation and memory:
+- eval_depth controls the total number of (patch, image) evaluations for diversity:
+  * Default (None): Evaluates all batch_size^2 pairs (full matrix)
+  * Specified value: Evaluates up to eval_depth pairs total
+  * Always includes batch_size diagonal evaluations (patch_i on image_i)
+  * Randomly samples off-diagonal pairs from budget (eval_depth - batch_size)
+- Benefits: Reduces memory without sacrificing diversity quality, enables larger batch sizes
+- Example: batch_size=32, eval_depth=256 reduces evals from 1024 to 256 (75% reduction)
 
 Checkpoint structure:
 - best_progressive_patch.tar: Best loss across all training
