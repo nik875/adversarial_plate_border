@@ -397,7 +397,7 @@ class ProgressivePatchTrainer:
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
-                 tv_weight: float = 250,
+                 tv_weight: float = 2.5,
                  max_epochs_per_layer = 50,
                  final_layer_epochs: Optional[int] = None,
                  convergence_threshold = 1.0,
@@ -1486,8 +1486,8 @@ def main():
                         help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
-    parser.add_argument('--tv-weight', type=float, default=250,
-                        help='Weight for total variation loss to encourage spatial smoothness (default: 250)')
+    parser.add_argument('--tv-weight', type=float, default=2.5,
+                        help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
