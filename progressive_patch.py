@@ -1378,9 +1378,14 @@ class ProgressivePatchTrainer:
                 self.current_layer_epoch += 1
                 global_epoch += 1
 
-                # Training and validation
+                # Training
                 train_diversity_loss, train_tv_loss = self.train_epoch(optimizer, global_epoch)
-                val_diversity_score = self.validate()
+
+                # Validation (skip if using all data for training)
+                if self.use_all_for_train:
+                    val_diversity_score = 0.0
+                else:
+                    val_diversity_score = self.validate()
 
                 # Learning rate scheduling
                 scheduler.step()
@@ -1396,11 +1401,13 @@ class ProgressivePatchTrainer:
                 global_history['learning_rate'].append(current_lr)
 
                 # Print epoch summary
-                print(f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
-                      f"DivLoss: {train_diversity_loss:.4f} | "
-                      f"TVLoss: {train_tv_loss:.4f} | "
-                      f"Val: {val_diversity_score:.3f} | "
-                      f"LR: {current_lr:.2e}")
+                epoch_summary = (f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
+                                f"DivLoss: {train_diversity_loss:.4f} | "
+                                f"TVLoss: {train_tv_loss:.4f}")
+                if not self.use_all_for_train:
+                    epoch_summary += f" | Val: {val_diversity_score:.3f}"
+                epoch_summary += f" | LR: {current_lr:.2e}"
+                print(epoch_summary)
 
                 # Save example patches every epoch for final layer
                 is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
@@ -1408,8 +1415,8 @@ class ProgressivePatchTrainer:
                     final_layer_save_dir = f"final_layer_patches_epoch_{self.current_layer_epoch:04d}"
                     self.save_basis(global_epoch, final_layer_save_dir, num_samples=10)
 
-                # Save best model globally (higher diversity is better)
-                if val_diversity_score > best_diversity:
+                # Save best model globally (higher diversity is better, only if validation enabled)
+                if not self.use_all_for_train and val_diversity_score > best_diversity:
                     best_diversity = val_diversity_score
                     self.save_basis(global_epoch, "best_progressive_patch")
                     print(f"   ✓ New best diversity: {best_diversity:.4f}")
