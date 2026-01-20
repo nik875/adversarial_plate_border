@@ -1079,10 +1079,10 @@ class ProgressivePatchTrainer:
             'epochs_trained': self.current_layer_epoch
         })
 
-        # Save checkpoint after completing this layer (with 10 sample patches)
+        # Save checkpoint after completing this layer (with sample patches for visualization)
         layer_checkpoint_name = f"layer{original_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
-        self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10)
-        print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion (with 10 sample patches)")
+        self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10, keep_only_latest=True)
+        print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion")
 
         # Check if at final layer
         if self.current_layer_idx >= len(self.layer_configs) - 1:
@@ -1385,34 +1385,47 @@ class ProgressivePatchTrainer:
             else:
                 return 0.0
 
-    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True):
+    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True, keep_only_latest: bool = False):
         """Save current generator state and sample patches
 
         Args:
             epoch: Current epoch for naming
             save_dir: Directory to save to
-            num_samples: Number of sample patches to generate and save (default 5)
+            num_samples: Number of sample patches to generate and save (default 5). Set to 0 to skip samples.
             save_generator: Whether to save the generator model (default True). Set to False to save only sample patches.
+            keep_only_latest: If True, delete old generator files when saving a new one (default False)
         """
         Path(save_dir).mkdir(exist_ok=True)
 
         with torch.no_grad():
             # Save generator network (if requested)
             if save_generator:
+                new_path = f"{save_dir}/generator_epoch_{epoch:04d}.pt"
                 torch.save({
                     'generator_state_dict': self.generator.state_dict(),
                     'epoch': epoch,
                     'basis_dim': self.basis_dim,
                     'patch_size': (self.patch_height, self.patch_width)
-                }, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
+                }, new_path)
 
-            # Sample and save example patches
-            z_samples = self.sample_coefficients(num_samples)
-            sample_patches = self.generate_patches(z_samples)
+                # Delete old generator files if keeping only latest
+                if keep_only_latest:
+                    import glob
+                    for old_file in glob.glob(f"{save_dir}/generator_epoch_*.pt"):
+                        if old_file != new_path:
+                            try:
+                                Path(old_file).unlink()
+                            except:
+                                pass
 
-            for i, patch in enumerate(sample_patches):
-                patch_pil = T.ToPILImage()(patch.cpu())
-                patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
+            # Sample and save example patches (skip if num_samples is 0)
+            if num_samples > 0:
+                z_samples = self.sample_coefficients(num_samples)
+                sample_patches = self.generate_patches(z_samples)
+
+                for i, patch in enumerate(sample_patches):
+                    patch_pil = T.ToPILImage()(patch.cpu())
+                    patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
     def train(self, learning_rate: float = 0.01,
               warmup_epochs: int = 5, lr_min: float = 1e-5):
@@ -1423,8 +1436,9 @@ class ProgressivePatchTrainer:
         features and moving towards final outputs. Each layer is trained until
         convergence or max epochs.
 
-        Saves:
-        - best_progressive_patch/: Best model across all training
+        Saves (only latest model per directory, old epoch files removed):
+        - best_progressive_patch/: Best model by validation diversity
+        - final_progressive_patch/: Final model after all layers
         - layer*_complete_*/: Model after completing each layer
         """
 
@@ -1587,7 +1601,7 @@ class ProgressivePatchTrainer:
                 # Save best model globally (higher diversity is better, only if validation enabled)
                 if not self.use_all_for_train and val_diversity_score > best_diversity:
                     best_diversity = val_diversity_score
-                    self.save_basis(global_epoch, "best_progressive_patch")
+                    self.save_basis(global_epoch, "best_progressive_patch", num_samples=5, keep_only_latest=True)
                     print(f"   ✓ New best diversity: {best_diversity:.4f}")
 
                 # Check if should continue on current layer
@@ -1615,7 +1629,7 @@ class ProgressivePatchTrainer:
         print("="*80 + "\n")
 
         # Always save final checkpoint (especially important when validation is disabled)
-        self.save_basis(global_epoch, "final_progressive_patch")
+        self.save_basis(global_epoch, "final_progressive_patch", num_samples=10, keep_only_latest=True)
         print(f"✓ Final checkpoint saved to: final_progressive_patch/")
 
         return global_history
@@ -1797,9 +1811,9 @@ def main():
         print("  - progressive_patch_sample_patches.png")
         print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
-        print("  - final_progressive_patch/ - Final model after all layers (always saved)")
-        print("  - best_progressive_patch/ - Best model by validation diversity (only if validation enabled)")
-        print("  - layer*_complete_*/ - Checkpoint after completing each layer")
+        print("  - final_progressive_patch/ - Final model after all layers (1 generator + 10 samples)")
+        print("  - best_progressive_patch/ - Best model by validation diversity (1 generator + 5 samples, only if validation enabled)")
+        print("  - layer*_complete_*/ - Checkpoint after each layer (1 generator + 10 samples per layer)")
 
     except Exception as e:
         print(f"Training failed: {e}")
@@ -1920,9 +1934,11 @@ Diversity computation and memory:
 - Combine with --simple-generator for maximum memory efficiency
 
 Checkpoint structure:
-- best_progressive_patch/: Best loss across all training (contains generator_epoch_XXXX.pt and sample patches)
-- layer*_complete_*/: Model state after completing each layer
+- best_progressive_patch/: Best model by validation diversity (1 generator_epoch_XXXX.pt + 5 sample patches)
+- final_progressive_patch/: Final model after all layers (1 generator_epoch_XXXX.pt + 10 sample patches)
+- layer*_complete_*/: Model after completing each layer (1 generator_epoch_XXXX.pt + 10 samples)
   (e.g., layer1_complete_Conv_Layer_1_32ch/, layer2_complete_Conv_Layer_2_48ch/, etc.)
 
+Each checkpoint directory contains only the latest generator model (old epoch files are automatically removed).
 You can resume from any checkpoint by loading the generator_epoch_XXXX.pt file inside these directories.
 """
