@@ -1423,8 +1423,9 @@ class ProgressivePatchTrainer:
         convergence or max epochs.
 
         Saves:
+        - training_complete_final_model/: Final model after all training (20 samples)
         - best_progressive_patch/: Best model across all training
-        - layer*_complete_*/: Model after completing each layer
+        - layer*_complete_*/: Model after completing each layer (10 samples each)
         """
 
         # Initialize optimizer
@@ -1625,6 +1626,17 @@ class ProgressivePatchTrainer:
                 print(f"   Layer {layer_num:2d}: {record['description']:35s} - {record['epochs_trained']} epochs")
         print("="*80 + "\n")
 
+        # Save final model after all training is complete
+        print("Saving final trained model...")
+        final_save_dir = "training_complete_final_model"
+        self.save_basis(global_epoch, final_save_dir, num_samples=20, save_generator=True)
+        print(f"\n{'='*80}")
+        print(f"FINAL MODEL SAVED TO: {final_save_dir}/")
+        print(f"{'='*80}")
+        print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{global_epoch:04d}.pt")
+        print(f"  Sample patches: 20 PNG files in {final_save_dir}/")
+        print(f"{'='*80}\n")
+
         return global_history
 
 
@@ -1804,7 +1816,8 @@ def main():
         print("  - progressive_patch_sample_patches.png")
         print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
-        print("  - best_progressive_patch/ - Best model across all layers")
+        print("  - training_complete_final_model/ - FINAL trained model with 20 sample patches")
+        print("  - best_progressive_patch/ - Best model during training (by loss or diversity)")
         print("  - layer*_complete_*/ - Checkpoint after completing each layer")
 
     except Exception as e:
@@ -1926,9 +1939,11 @@ Diversity computation and memory:
 - Combine with --simple-generator for maximum memory efficiency
 
 Checkpoint structure:
-- best_progressive_patch/: Best loss across all training (contains generator_epoch_XXXX.pt and sample patches)
-- layer*_complete_*/: Model state after completing each layer
+- training_complete_final_model/: FINAL model after all training (generator + 20 sample patches)
+- best_progressive_patch/: Best model during training by loss/diversity (generator + sample patches)
+- layer*_complete_*/: Model state after completing each layer (generator + 10 sample patches)
   (e.g., layer1_complete_Conv_Layer_1_32ch/, layer2_complete_Conv_Layer_2_48ch/, etc.)
 
 You can resume from any checkpoint by loading the generator_epoch_XXXX.pt file inside these directories.
+Use load_and_generate_samples.py to generate patches from any saved checkpoint.
 """
