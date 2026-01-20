@@ -1425,6 +1425,7 @@ class ProgressivePatchTrainer:
         Saves:
         - training_complete_final_model/: Final model after all training (20 samples)
         - best_progressive_patch/: Best model across all training
+        - final_layer_checkpoint_epoch_*/: Checkpoint every 25 epochs on final layer
         - layer*_complete_*/: Model after completing each layer (10 samples each)
         """
 
@@ -1584,6 +1585,12 @@ class ProgressivePatchTrainer:
                 if is_final_layer:
                     final_layer_save_dir = f"final_layer_patches_epoch_{self.current_layer_epoch:04d}"
                     self.save_basis(global_epoch, final_layer_save_dir, num_samples=10, save_generator=False)
+
+                    # Save full checkpoint every 25 epochs on final layer
+                    if self.current_layer_epoch > 0 and self.current_layer_epoch % 25 == 0:
+                        checkpoint_dir = f"final_layer_checkpoint_epoch_{self.current_layer_epoch:04d}"
+                        self.save_basis(global_epoch, checkpoint_dir, num_samples=10, save_generator=True)
+                        print(f"   ✓ Saved final layer checkpoint at epoch {self.current_layer_epoch}")
 
                 # Save best model globally
                 if self.use_all_for_train:
@@ -1818,6 +1825,7 @@ def main():
         print("\nGenerator checkpoints saved:")
         print("  - training_complete_final_model/ - FINAL trained model with 20 sample patches")
         print("  - best_progressive_patch/ - Best model during training (by loss or diversity)")
+        print("  - final_layer_checkpoint_epoch_*/ - Checkpoints every 25 epochs on final layer")
         print("  - layer*_complete_*/ - Checkpoint after completing each layer")
 
     except Exception as e:
@@ -1941,6 +1949,8 @@ Diversity computation and memory:
 Checkpoint structure:
 - training_complete_final_model/: FINAL model after all training (generator + 20 sample patches)
 - best_progressive_patch/: Best model during training by loss/diversity (generator + sample patches)
+- final_layer_checkpoint_epoch_*/: Checkpoints every 25 epochs on final layer (generator + 10 samples)
+  (e.g., final_layer_checkpoint_epoch_0025/, final_layer_checkpoint_epoch_0050/, etc.)
 - layer*_complete_*/: Model state after completing each layer (generator + 10 sample patches)
   (e.g., layer1_complete_Conv_Layer_1_32ch/, layer2_complete_Conv_Layer_2_48ch/, etc.)
 
