@@ -1108,6 +1108,7 @@ class ProgressivePatchTrainer:
     def calculate_baseline_loss(self) -> float:
         """
         Calculate baseline OCR loss and capture baseline activations for each image.
+        In diversity-only mode, skips detection baseline calculation (YOLO not loaded).
         """
         total_ocr_loss = 0.0
         total_det_loss = 0.0
@@ -1122,7 +1123,15 @@ class ProgressivePatchTrainer:
             with torch.no_grad():
                 for idx, batch in enumerate(pbar):
                     batch = {k: v[0] for k, v in batch.items()}
-                    det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=False)
+
+                    # In diversity-only mode, skip YOLO detection loss (model is None)
+                    if self.diversity_only:
+                        # Only compute OCR loss, no detection loss
+                        ocr_loss = self.compute_ocr_loss_only(batch, patch, use_ocr_baseline=False, already_unbatched=True)
+                        det_loss = torch.tensor(0.0, device=self.device)
+                    else:
+                        # Normal mode: compute both detection and OCR loss
+                        det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=False)
 
                     # Capture the baseline activations from this forward pass
                     if self.ocr_activations is not None:
@@ -1148,9 +1157,17 @@ class ProgressivePatchTrainer:
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
         return total_det_loss / total_plates, total_ocr_loss / total_plates
 
-    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
-        """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
-        batch = {k: v[0] for k, v in batch.items()}
+    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True, already_unbatched: bool = False) -> torch.Tensor:
+        """Compute OCR loss only without YOLO detection (for diversity-only mode)
+
+        Args:
+            batch: Batch dict (either batched from dataloader or pre-unbatched)
+            patch: Adversarial patch [3, H, W]
+            use_ocr_baseline: Whether to normalize by baseline OCR loss
+            already_unbatched: If True, batch is already unbatched (single image)
+        """
+        if not already_unbatched:
+            batch = {k: v[0] for k, v in batch.items()}
 
         # Apply patch to original image
         patched_image, _ = self.apply_patch_to_image(
