@@ -1402,6 +1402,12 @@ class ProgressivePatchTrainer:
                       f"Val: {val_diversity_score:.3f} | "
                       f"LR: {current_lr:.2e}")
 
+                # Save example patches every epoch for final layer
+                is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
+                if is_final_layer:
+                    final_layer_save_dir = f"final_layer_patches_epoch_{self.current_layer_epoch:04d}"
+                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10)
+
                 # Save best model globally (higher diversity is better)
                 if val_diversity_score > best_diversity:
                     best_diversity = val_diversity_score
