@@ -1246,13 +1246,18 @@ class ProgressivePatchTrainer:
             True if should continue, False if should advance to next layer
         """
         current_config = self.layer_configs[self.current_layer_idx]
+        is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
 
         # Check max epochs
         if self.current_layer_epoch >= current_config.max_epochs:
             print(f"\n→ Reached max epochs ({current_config.max_epochs}) for {current_config.description}")
             return False
 
-        # Check convergence
+        # For final layer, ignore convergence threshold and always train full epochs
+        if is_final_layer:
+            return True
+
+        # Check convergence (skipped for final layer)
         if self.check_convergence(diversity_score):
             print(f"\n→ Converged (diversity={diversity_score:.4f} < {current_config.convergence_threshold:.2f}) on {current_config.description}")
             return False
@@ -1552,6 +1557,8 @@ class ProgressivePatchTrainer:
 
             print(f"\n{'='*80}")
             print(f"LAYER {self.current_layer_idx + 1}/{len(self.layer_configs)}: {current_config.description}")
+            if self.current_layer_idx == len(self.layer_configs) - 1:
+                print(f"(Final layer - convergence threshold disabled, will train full {current_config.max_epochs} epochs)")
             print(f"{'='*80}\n")
 
             # Create schedulers for this layer
