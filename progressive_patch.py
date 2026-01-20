@@ -1198,10 +1198,10 @@ class ProgressivePatchTrainer:
             'epochs_trained': self.current_layer_epoch
         })
 
-        # Save checkpoint after completing this layer
+        # Save checkpoint after completing this layer (with 10 sample patches)
         layer_checkpoint_name = f"layer{self.current_layer_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
-        self.save_basis(self.current_layer_epoch, layer_checkpoint_name)
-        print(f"\n✓ Saved checkpoint after layer {self.current_layer_idx + 1} completion")
+        self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10)
+        print(f"\n✓ Saved checkpoint after layer {self.current_layer_idx + 1} completion (with 10 sample patches)")
 
         # Move to next layer
         self.current_layer_idx += 1
@@ -1439,8 +1439,14 @@ class ProgressivePatchTrainer:
 
         return np.mean(losses)
 
-    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches"):
-        """Save current generator state and sample patches"""
+    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5):
+        """Save current generator state and sample patches
+
+        Args:
+            epoch: Current epoch for naming
+            save_dir: Directory to save to
+            num_samples: Number of sample patches to generate and save (default 5)
+        """
         Path(save_dir).mkdir(exist_ok=True)
 
         with torch.no_grad():
@@ -1452,8 +1458,7 @@ class ProgressivePatchTrainer:
                 'patch_size': (self.patch_height, self.patch_width)
             }, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 
-            # Sample and save a few example patches
-            num_samples = 5
+            # Sample and save example patches
             z_samples = self.sample_coefficients(num_samples)
             sample_patches = self.generate_patches(z_samples)
 
