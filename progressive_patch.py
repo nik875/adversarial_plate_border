@@ -571,8 +571,8 @@ class ProgressivePatchTrainer:
         print(f"✓ Registered activation hook on: {layer_desc} ({layer_name})")
 
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
-        """Sample z ~ N(0, I) for generating patches"""
-        return torch.randn(batch_size, self.basis_dim, device=self.device)
+        """Sample z ~ Uniform(0, 1) for generating patches"""
+        return torch.rand(batch_size, self.basis_dim, device=self.device)
 
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
