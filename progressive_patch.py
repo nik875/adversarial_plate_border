@@ -688,31 +688,12 @@ class ProgressivePatchTrainer:
 
             orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
 
-            if skip_detection:
-                # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
-                # Plate corners would miss the patch since it's applied as a border
-                plate_corners = batch['orig_corners'].to(self.device)
-                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
-            else:
-                # Run YOLO detection on patched image (original behavior)
-                model_output = self.model(patched_image)
-
-                if len(model_output) == 0:
-                    # Use baseline to infer shape if available, otherwise use zeros
-                    if hasattr(self, 'activation_shape'):
-                        return torch.zeros(self.activation_shape, device=self.device, requires_grad=use_grad)
-                    else:
-                        # Fallback: run OCR once to get shape
-                        return torch.zeros(1, 1, 48, device=self.device, requires_grad=use_grad)
-
-                # Get first detection (simplified - could rank by confidence)
-                best_detection = model_output[0]
-
-                # Crop plate and run OCR
-                pred_box = best_detection[1:5]
-                orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
-                corners_box = self.bbox_to_corners(orig_projection, device='cpu').to(self.device)
+            # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
+            # Plate corners would miss the patch since it's applied as a border
+            # Note: skip_detection parameter is kept for API compatibility but always uses corners
+            plate_corners = batch['orig_corners'].to(self.device)
+            border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+            corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
 
             # Crop plate from patched image and run OCR
             cropped_plate = K.crop_and_resize(
@@ -803,7 +784,7 @@ class ProgressivePatchTrainer:
             for img_idx in range(batch_size):
                 if img_idx != patch_idx and (patch_idx, img_idx) in sampled_pairs:
                     batch = batches_list[img_idx]
-                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=use_grad)  # [H, W, C]
+                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=True)  # [H, W, C]
                     baseline = self.baseline_ocr_activations[baseline_indices[img_idx]]  # [H, W, C]
                     delta = activations - baseline  # [H, W, C]
                     activation_deltas.append(delta)
