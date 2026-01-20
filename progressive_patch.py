@@ -351,6 +351,7 @@ class ProgressivePatchTrainer:
                  diversity_only: bool = False,
                  max_epochs_per_layer: int = 50,
                  convergence_threshold: float = 1.0,
+                 target_layer: Optional[int] = None,
                  layer_configs: Optional[List[LayerConfig]] = None):
         self.training = training
         self.print_blur = print_blur
@@ -361,13 +362,22 @@ class ProgressivePatchTrainer:
         self.diversity_only = diversity_only
         self.max_epochs_per_layer = max_epochs_per_layer
         self.convergence_threshold = convergence_threshold
+        self.target_layer = target_layer
 
         # Progressive layer configuration
         self.layer_configs = layer_configs or get_ocr_layer_progression(
             max_epochs=max_epochs_per_layer,
             convergence_threshold=convergence_threshold
         )
-        self.current_layer_idx = 0
+
+        # If target_layer specified, validate it and set as starting point
+        if target_layer is not None:
+            if target_layer < 0 or target_layer >= len(self.layer_configs):
+                raise ValueError(f"target_layer must be 0-{len(self.layer_configs)-1}, got {target_layer}")
+            self.current_layer_idx = target_layer
+        else:
+            self.current_layer_idx = 0
+
         self.current_layer_epoch = 0
         self.layer_history = []  # Track training history for each layer
 
@@ -1498,7 +1508,12 @@ class ProgressivePatchTrainer:
         global_epoch = 0
 
         print("\n" + "="*80)
-        print("PROGRESSIVE LAYER ATTACK")
+        if self.target_layer is not None:
+            print("SINGLE LAYER ATTACK")
+            target_config = self.layer_configs[self.target_layer]
+            print(f"Target: Layer {self.target_layer + 1} - {target_config.description}")
+        else:
+            print("PROGRESSIVE LAYER ATTACK")
         print("="*80)
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
@@ -1524,9 +1539,11 @@ class ProgressivePatchTrainer:
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
-        print(f"\nLayer Progression ({len(self.layer_configs)} layers total):")
-        for i, config in enumerate(self.layer_configs, 1):
-            print(f"   {i:2d}. {config.description:35s} (max {config.max_epochs} epochs)")
+
+        if self.target_layer is None:
+            print(f"\nLayer Progression ({len(self.layer_configs)} layers total):")
+            for i, config in enumerate(self.layer_configs, 1):
+                print(f"   {i:2d}. {config.description:35s} (max {config.max_epochs} epochs)")
         print("="*80 + "\n")
 
         # Progressive layer training loop
@@ -1595,17 +1612,31 @@ class ProgressivePatchTrainer:
                     break
 
             # Advance to next layer (or finish if at final layer)
+            # If in single-layer mode, stop here
+            if self.target_layer is not None:
+                print(f"\n✓ Single layer training complete on layer {self.target_layer + 1}")
+                # Save final checkpoint for single-layer mode
+                layer_checkpoint_name = f"single_layer{self.target_layer + 1}_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
+                self.save_basis(global_epoch, layer_checkpoint_name, num_samples=10)
+                print(f"✓ Saved final checkpoint (with 10 sample patches)")
+                break
+
             if not self.advance_to_next_layer():
                 break
 
         print("\n" + "="*80)
-        print("PROGRESSIVE TRAINING COMPLETED!")
+        if self.target_layer is not None:
+            print("SINGLE LAYER TRAINING COMPLETED!")
+        else:
+            print("PROGRESSIVE TRAINING COMPLETED!")
         print("="*80)
         print(f"   Best loss: {best_loss:.4f}")
         print(f"   Total epochs: {global_epoch}")
-        print(f"\nLayer progression summary:")
-        for record in self.layer_history:
-            print(f"   {record['layer_idx']+1}. {record['description']:35s} - {record['epochs_trained']} epochs")
+
+        if self.target_layer is None and len(self.layer_history) > 0:
+            print(f"\nLayer progression summary:")
+            for record in self.layer_history:
+                print(f"   {record['layer_idx']+1}. {record['description']:35s} - {record['epochs_trained']} epochs")
         print("="*80 + "\n")
 
         return global_history
@@ -1639,6 +1670,11 @@ def main():
     parser.add_argument('--convergence-threshold', type=float, default=1.0,
                         help='Diversity score threshold for convergence. Training on a layer stops when diversity < threshold. '
                         '(default: 1.0). Set to 0 or negative to disable convergence checking and train full max-epochs.')
+    parser.add_argument('--target-layer', type=int, default=None,
+                        help='Target a specific layer only (0-10), disabling progressive training. '
+                        '0=Conv1(32ch), 1=Conv2(48ch), 2=Conv3(64ch), 3=Conv4(80ch), 4=Conv5(96ch), '
+                        '5=PatchExtractor(384ch), 6=Transformer1, 7=Transformer2, 8=Transformer3, '
+                        '9=Transformer4, 10=FinalOutput. If not specified, uses progressive training.')
     args = parser.parse_args()
 
     # Configuration
@@ -1656,7 +1692,8 @@ def main():
         'diversity_weight': args.diversity_weight,
         'diversity_only': args.diversity_only,
         'max_epochs_per_layer': args.max_epochs_per_layer,
-        'convergence_threshold': args.convergence_threshold
+        'convergence_threshold': args.convergence_threshold,
+        'target_layer': args.target_layer
     }
 
     # Training mode
