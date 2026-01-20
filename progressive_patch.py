@@ -1613,6 +1613,10 @@ class ProgressivePatchTrainer:
                 print(f"   Layer {layer_num:2d}: {record['description']:35s} - {record['epochs_trained']} epochs")
         print("="*80 + "\n")
 
+        # Always save final checkpoint (especially important when validation is disabled)
+        self.save_basis(global_epoch, "final_progressive_patch")
+        print(f"✓ Final checkpoint saved to: final_progressive_patch/")
+
         return global_history
 
 
@@ -1792,7 +1796,8 @@ def main():
         print("  - progressive_patch_sample_patches.png")
         print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
-        print("  - best_progressive_patch/ - Best model across all layers")
+        print("  - final_progressive_patch/ - Final model after all layers (always saved)")
+        print("  - best_progressive_patch/ - Best model by validation diversity (only if validation enabled)")
         print("  - layer*_complete_*/ - Checkpoint after completing each layer")
 
     except Exception as e:
