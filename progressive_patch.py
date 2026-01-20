@@ -1379,22 +1379,31 @@ class ProgressivePatchTrainer:
             print(f"{'='*80}\n")
 
             # Create schedulers for this layer
-            warmup_scheduler = optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=lr_min / learning_rate,
-                end_factor=1.0,
-                total_iters=warmup_epochs
-            )
-            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=current_config.max_epochs - warmup_epochs,
-                eta_min=lr_min
-            )
-            scheduler = optim.lr_scheduler.SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs]
-            )
+            if warmup_epochs > 0:
+                # Warmup + Cosine annealing
+                warmup_scheduler = optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=lr_min / learning_rate,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs
+                )
+                cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=current_config.max_epochs - warmup_epochs,
+                    eta_min=lr_min
+                )
+                scheduler = optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs]
+                )
+            else:
+                # No warmup: start directly at learning_rate, cosine down to lr_min
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=current_config.max_epochs,
+                    eta_min=lr_min
+                )
 
             # Train on current layer until convergence or max epochs
             while True:
