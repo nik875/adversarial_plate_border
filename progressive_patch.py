@@ -1341,7 +1341,12 @@ class ProgressivePatchTrainer:
             z_samples = self.sample_coefficients(num_samples)
             sample_patches = self.generate_patches(z_samples)
 
-            for i, patch in enumerate(sample_patches):
+            # Normalize brightness (same as during training/validation)
+            # Convert from batch tensor to list for normalize_brightness
+            patches_list = [sample_patches[i] for i in range(num_samples)]
+            normalized_patches = self.normalize_brightness(patches_list)
+
+            for i, patch in enumerate(normalized_patches):
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
@@ -1701,9 +1706,13 @@ def main():
             z_samples = trainer.sample_coefficients(9)
             sample_patches = trainer.generate_patches(z_samples)
 
+            # Normalize brightness (same as during training/validation)
+            patches_list = [sample_patches[i] for i in range(9)]
+            normalized_patches = trainer.normalize_brightness(patches_list)
+
             for i in range(9):
                 ax = plt.subplot(3, 3, i + 1)
-                patch_np = sample_patches[i].detach().cpu().permute(1, 2, 0).numpy()
+                patch_np = normalized_patches[i].detach().cpu().permute(1, 2, 0).numpy()
                 ax.imshow(patch_np)
                 ax.set_title(f'Sample {i+1}')
                 ax.axis('off')
