@@ -991,7 +991,7 @@ class ProgressivePatchTrainer:
         print("Recalculating baseline activations for new layer...")
         self.baseline_ocr_activations.clear()
         self.activation_shape = None  # Reset shape tracking
-        self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
+        self.calculate_baseline_activations()
 
         return True
 
