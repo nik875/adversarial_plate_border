@@ -614,6 +614,43 @@ class ProgressivePatchTrainer:
 
         return patches
 
+    def create_border_mask(self, height: int, width: int, border_scale: float = 1.4) -> torch.Tensor:
+        """
+        Create a mask for the visible border region of the patch.
+
+        When applied, the patch fills a border_scale region (1.4x) around the plate,
+        but the center plate region (1.0x) gets cut out. This mask identifies which
+        parts of the patch are actually visible (border) vs obscured (center plate).
+
+        Args:
+            height: Patch height
+            width: Patch width
+            border_scale: Scale factor for border (default 1.4)
+
+        Returns:
+            mask: [1, 1, H, W] tensor, 1 = visible border, 0 = obscured plate region
+        """
+        # The center region (1.0x / border_scale of the patch) is obscured
+        plate_scale_ratio = 1.0 / border_scale  # ~0.714 for border_scale=1.4
+
+        # Calculate the size of the obscured center region
+        center_h = int(height * plate_scale_ratio)
+        center_w = int(width * plate_scale_ratio)
+
+        # Create mask: all ones (visible) except center region (obscured)
+        mask = torch.ones(1, 1, height, width)
+
+        # Calculate bounds of center region to mask out
+        h_start = (height - center_h) // 2
+        h_end = h_start + center_h
+        w_start = (width - center_w) // 2
+        w_end = w_start + center_w
+
+        # Set center region to 0 (obscured by plate)
+        mask[:, :, h_start:h_end, w_start:w_end] = 0.0
+
+        return mask
+
     def compute_ssim_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
         Compute SSIM-based structural similarity penalty to prevent patches from
@@ -622,6 +659,9 @@ class ProgressivePatchTrainer:
         SSIM (Structural Similarity Index) measures similarity based on luminance,
         contrast, and structure. High SSIM = similar structures even if brightness/
         contrast differs. We penalize high SSIM to force genuinely different structures.
+
+        Only compares the visible border region (excludes center plate region that
+        gets obscured when patch is applied).
 
         Args:
             patches: [batch_size, 3, H, W] patch tensor
@@ -633,6 +673,10 @@ class ProgressivePatchTrainer:
         if batch_size < 2:
             return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
+        # Create border mask (same for all patches)
+        _, _, H, W = patches.shape
+        border_mask = self.create_border_mask(H, W, border_scale=1.4).to(patches.device)  # [1, 1, H, W]
+
         # Compute pairwise SSIM between all patches
         ssim_sum = 0.0
         pair_count = 0
@@ -643,9 +687,17 @@ class ProgressivePatchTrainer:
                 patch_i = patches[i:i+1]  # [1, 3, H, W]
                 patch_j = patches[j:j+1]  # [1, 3, H, W]
 
-                # Compute SSIM (returns per-pixel map, take mean to get scalar)
-                ssim_map = ssim(patch_i, patch_j, window_size=11)
-                ssim_val = ssim_map.mean()  # Average over spatial dimensions
+                # Compute SSIM (returns per-pixel map)
+                ssim_map = ssim(patch_i, patch_j, window_size=11)  # [1, 3, H, W]
+
+                # Apply border mask: only consider visible regions
+                # Average across channels first, then apply spatial mask
+                ssim_map_avg = ssim_map.mean(dim=1, keepdim=True)  # [1, 1, H, W]
+                masked_ssim = ssim_map_avg * border_mask  # [1, 1, H, W]
+
+                # Compute mean only over visible border region
+                num_visible_pixels = border_mask.sum()
+                ssim_val = masked_ssim.sum() / num_visible_pixels if num_visible_pixels > 0 else 0.0
 
                 ssim_sum += ssim_val
                 pair_count += 1
