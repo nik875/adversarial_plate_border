@@ -1108,7 +1108,7 @@ class ProgressivePatchTrainer:
         last_diversity_loss = 0.0  # Track for display during accumulation
         last_tv_loss = 0.0  # Track for display during accumulation
 
-        desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
+        desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
                   total=len(self.train_loader)) as pbar:
 
