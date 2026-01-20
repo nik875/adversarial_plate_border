@@ -454,24 +454,36 @@ class ProgressivePatchTrainer:
         self.epoch_stats = []
 
     def load_yolo_model(self):
-        """Load and convert YOLO model to PyTorch"""
-        print("Loading YOLO model...")
-        LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+        """Load and convert YOLO and OCR models to PyTorch"""
+        # Load YOLO only if not in diversity-only mode
+        if not self.diversity_only:
+            print("Loading YOLO model...")
+            LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
 
-        # Get ONNX model path
-        model_cache_dir = \
-            Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
-        onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
+            # Get ONNX model path
+            model_cache_dir = \
+                Path.home() / ".cache/open-image-models/yolo-v9-t-384-license-plate-end2end"
+            onnx_path = model_cache_dir / "yolo-v9-t-384-license-plates-end2end.onnx"
+
+            if not onnx_path.exists():
+                raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
+
+            onnx_model = onnx.load(str(onnx_path))
+            self.model = onnx2torch.convert(onnx_model)
+            self.model.to(self.device)
+            self.model.eval()
+
+            # Disable gradients for model parameters to save memory
+            for param in self.model.parameters():
+                param.requires_grad = False
+        else:
+            print("Skipping YOLO model (diversity-only mode)...")
+            self.model = None
+
+        # Always load OCR model (needed for activations and OCR loss)
+        print("Loading OCR model...")
         ocr_path = \
             Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
-
-        if not onnx_path.exists():
-            raise FileNotFoundError(f"ONNX model not found at: {onnx_path}")
-
-        onnx_model = onnx.load(str(onnx_path))
-        self.model = onnx2torch.convert(onnx_model)
-        self.model.to(self.device)
-        self.model.eval()
 
         ocr_model = onnx.load(str(ocr_path))
         self.ocr_input_shape = (64, 128, 3)
@@ -485,18 +497,18 @@ class ProgressivePatchTrainer:
             # Original behavior: target is the text we want to prevent OCR from reading
             self.ocr_target = self.text_to_target_tensor('VRJ7774', 9, alphabet)
 
-        self.ocr = onnx2torch.convert(ocr_model).to(self.device)
+        # Load OCR and keep on CPU by default (move to GPU only when needed)
+        self.ocr = onnx2torch.convert(ocr_model)
+        self.ocr.eval()
         self.ocr_loss = self.focal_cce_loss(len(alphabet))
 
         # Setup activation capture BEFORE baseline calculation
         self.setup_activation_hook()
 
         self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
-        self.ocr.eval()
 
-        # Disable gradients for model parameters to save memory
-        for param in self.model.parameters():
-            param.requires_grad = False
+        # Move OCR to GPU after baseline calculation
+        self.ocr.to(self.device)
 
     def setup_activation_hook(self, layer_name: Optional[str] = None):
         """
@@ -549,6 +561,10 @@ class ProgressivePatchTrainer:
         self.activation_hook = target_layer.register_forward_hook(hook_fn)
         layer_desc = self.layer_configs[self.current_layer_idx].description
         print(f"✓ Registered activation hook on: {layer_desc} ({layer_name})")
+
+    def _checkpoint_ocr_forward(self, ocr_input):
+        """Wrapper for OCR forward pass to enable checkpointing"""
+        return self.ocr(ocr_input)
 
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
         """Sample z ~ N(0, I) for generating patches"""
@@ -630,7 +646,11 @@ class ProgressivePatchTrainer:
             )
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            self.ocr(ocr_input)  # Forward pass captures activations via hook
+            # Use checkpointing for OCR to save memory (activations still captured via hook)
+            if hasattr(self, 'generator') and self.generator.use_gradient_checkpointing and self.training:
+                checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
+            else:
+                self.ocr(ocr_input)  # Forward pass captures activations via hook
 
             if self.ocr_activations is not None:
                 result = self.ocr_activations.squeeze(0)  # [H, W, C]
@@ -1040,7 +1060,11 @@ class ProgressivePatchTrainer:
             ).to(self.device)
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            ocr_output = self.ocr(ocr_input)
+            # Use checkpointing for OCR to save memory
+            if self.generator.use_gradient_checkpointing and self.training:
+                ocr_output = checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
+            else:
+                ocr_output = self.ocr(ocr_input)
             ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
 
             if use_ocr_baseline:
@@ -1147,7 +1171,11 @@ class ProgressivePatchTrainer:
         )
 
         ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-        ocr_output = self.ocr(ocr_input)
+        # Use checkpointing for OCR to save memory
+        if self.generator.use_gradient_checkpointing and self.training:
+            ocr_output = checkpoint(self._checkpoint_ocr_forward, ocr_input, use_reentrant=False)
+        else:
+            ocr_output = self.ocr(ocr_input)
         ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
 
         if use_ocr_baseline:
