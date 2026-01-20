@@ -1462,7 +1462,6 @@ class ProgressivePatchTrainer:
                 patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
     def train(self, learning_rate: float = 0.01,
-              save_interval: int = 10,
               warmup_epochs: int = 5, lr_min: float = 1e-5):
         """
         Progressive layer training loop.
@@ -1470,6 +1469,10 @@ class ProgressivePatchTrainer:
         Trains by progressively targeting deeper layers, starting from early CNN
         features and moving towards final outputs. Each layer is trained until
         convergence or max epochs.
+
+        Saves:
+        - best_progressive_patch.tar: Best model across all training
+        - layer*_complete_*.tar: Model after completing each layer
         """
 
         # Initialize optimizer
@@ -1582,10 +1585,6 @@ class ProgressivePatchTrainer:
                     self.save_basis(global_epoch, "best_progressive_patch")
                     print(f"   ✓ New best loss: {best_loss:.4f}")
 
-                # Periodic saves
-                if global_epoch % save_interval == 0:
-                    self.save_basis(global_epoch, f"checkpoint_layer{self.current_layer_idx}")
-
                 # Check if should continue on current layer
                 if not self.should_continue_current_layer(train_diversity_loss):
                     break
@@ -1660,8 +1659,7 @@ def main():
         trainer = ProgressivePatchTrainer(CSV_PATH, training=True, **trainer_kwargs)
 
         history = trainer.train(
-            learning_rate=args.learning_rate,
-            save_interval=1
+            learning_rate=args.learning_rate
         )
 
         # Save training history as CSV
@@ -1732,7 +1730,6 @@ def main():
         print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
         print("  - best_progressive_patch.tar - Best model across all layers")
-        print("  - checkpoint_layer*.tar - Periodic checkpoints during layer training")
         print("  - layer*_complete_*.tar - Checkpoint after completing each layer")
 
     except Exception as e:
@@ -1791,9 +1788,8 @@ Then automatically advances to next layer in progression.
 
 Checkpoint structure:
 - best_progressive_patch.tar: Best loss across all training
-- checkpoint_layer*.tar: Periodic saves during training (every N epochs)
 - layer*_complete_*.tar: Model state after completing each layer
-  (e.g., layer1_complete_Conv_Layer_1_32ch.tar)
+  (e.g., layer1_complete_Conv_Layer_1_32ch.tar, layer2_complete_Conv_Layer_2_48ch.tar, etc.)
 
 You can resume from any checkpoint by loading it with the trainer's load_basis() method.
 """
