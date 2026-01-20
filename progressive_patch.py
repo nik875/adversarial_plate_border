@@ -611,6 +611,43 @@ class ProgressivePatchTrainer:
 
         return patches
 
+    def normalize_brightness(self, patches: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Normalize all patches in a batch to have the same average brightness.
+
+        This prevents the model from exploiting brightness variations as a way
+        to create "diversity" - forcing it to generate truly different visual
+        patterns instead of just varying intensity.
+
+        Args:
+            patches: List of [3, H, W] patch tensors
+
+        Returns:
+            List of brightness-normalized patches with gradients preserved
+        """
+        if len(patches) == 0:
+            return patches
+
+        # Stack patches for batch processing
+        patches_stacked = torch.stack(patches, dim=0)  # [batch_size, 3, H, W]
+
+        # Compute per-patch mean brightness (average across all pixels and channels)
+        per_patch_brightness = patches_stacked.mean(dim=(1, 2, 3), keepdim=True)  # [batch_size, 1, 1, 1]
+
+        # Compute global mean brightness across all patches
+        global_mean_brightness = per_patch_brightness.mean()  # scalar
+
+        # Normalize each patch: scale to match global mean brightness
+        # new_patch = old_patch * (global_mean / patch_mean)
+        # This preserves relative structure while normalizing overall brightness
+        normalized_patches = patches_stacked * (global_mean_brightness / (per_patch_brightness + 1e-8))
+
+        # Clamp to valid range [0, 1]
+        normalized_patches = torch.clamp(normalized_patches, 0.0, 1.0)
+
+        # Return as list to match input format
+        return [normalized_patches[i] for i in range(len(patches))]
+
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
         Compute total variation (TV) regularization loss for the adversarial patches.
@@ -1087,13 +1124,6 @@ class ProgressivePatchTrainer:
                 accumulated_batches.append({k: v[0].detach().clone() if torch.is_tensor(v[0]) else v[0]
                                            for k, v in batch.items()})
 
-                # Compute diagonal activation (patch_i on image_i) with gradients
-                batch_unbatched = {k: v[0] for k, v in batch.items()}
-                diagonal_activation = self._get_activations_for_patch_image(
-                    batch_unbatched, patch, use_grad=True, skip_detection=True
-                )  # [H, W, C]
-                accumulated_activations.append(diagonal_activation)
-
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
 
@@ -1101,6 +1131,18 @@ class ProgressivePatchTrainer:
 
                 # Update model every update_every steps
                 if step_count % update_every == 0:
+                    # Normalize brightness across all patches in this batch
+                    # Prevents model from cheating by varying intensity instead of visual content
+                    accumulated_patches = self.normalize_brightness(accumulated_patches)
+
+                    # Recompute diagonal activations with normalized patches
+                    accumulated_activations = []
+                    for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
+                        diagonal_activation = self._get_activations_for_patch_image(
+                            batch_dict, patch, use_grad=True, skip_detection=True
+                        )
+                        accumulated_activations.append(diagonal_activation)
+
                     # Compute activation-based diversity score
                     # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
@@ -1174,6 +1216,17 @@ class ProgressivePatchTrainer:
             # Handle remaining accumulated samples
             if step_count % update_every != 0 and self.grad_accumulate is not None:
                 if len(accumulated_patches) > 0:
+                    # Normalize brightness across all patches in this batch
+                    accumulated_patches = self.normalize_brightness(accumulated_patches)
+
+                    # Recompute diagonal activations with normalized patches
+                    accumulated_activations = []
+                    for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
+                        diagonal_activation = self._get_activations_for_patch_image(
+                            batch_dict, patch, use_grad=True, skip_detection=True
+                        )
+                        accumulated_activations.append(diagonal_activation)
+
                     # Compute activation-based diversity score
                     # Reuse diagonal activations, only compute off-diagonal
                     diversity_score = self.compute_activation_diversity(
@@ -1241,13 +1294,18 @@ class ProgressivePatchTrainer:
                 patch = self.generate_patches(z)[0]
                 patches.append(patch)
                 batches.append({k: v[0] for k, v in batch.items()})
+                indices.append(idx)
 
-                # Get activations
+            # Normalize brightness across all patches
+            if len(patches) > 1:
+                patches = self.normalize_brightness(patches)
+
+            # Compute activations with normalized patches
+            for i, (patch, batch_dict) in enumerate(zip(patches, batches)):
                 act = self._get_activations_for_patch_image(
-                    {k: v[0] for k, v in batch.items()}, patch, use_grad=False, skip_detection=True
+                    batch_dict, patch, use_grad=False, skip_detection=True
                 )
                 activations.append(act)
-                indices.append(idx)
 
             # Compute diversity score
             if len(patches) > 1:
