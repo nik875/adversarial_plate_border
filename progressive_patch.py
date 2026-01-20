@@ -590,31 +590,47 @@ class ProgressivePatchTrainer:
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute total variation loss to encourage spatial smoothness.
+        Compute total variation (TV) regularization loss for the adversarial patches.
 
-        TV loss penalizes differences between neighboring pixels, encouraging
-        smoother, more natural-looking patches.
+        Encourages smooth, natural-looking patches by penalizing large differences
+        between adjacent pixels. Uses L2 norm of gradients in both horizontal and
+        vertical directions.
 
         Args:
             patches: [batch_size, 3, H, W] patch tensor
 
         Returns:
-            tv_loss: scalar total variation loss
+            torch.Tensor: Scalar regularization loss (normalized)
         """
-        # Compute differences between adjacent pixels
-        # Horizontal differences: |patch[:, :, :, 1:] - patch[:, :, :, :-1]|
-        diff_h = torch.abs(patches[:, :, :, 1:] - patches[:, :, :, :-1])
-        # Vertical differences: |patch[:, :, 1:, :] - patch[:, :, :-1, :]|
-        diff_v = torch.abs(patches[:, :, 1:, :] - patches[:, :, :-1, :])
-
-        # Sum over all dimensions
-        tv_loss = diff_h.sum() + diff_v.sum()
-
-        # Normalize by number of elements
+        # Average over batch dimension: compute TV for each patch and then average
         batch_size = patches.shape[0]
-        tv_loss = tv_loss / batch_size
+        total_tv_loss = 0.0
 
-        return tv_loss
+        for i in range(batch_size):
+            patch = patches[i]  # [3, H, W]
+            C, H, W = patch.shape
+
+            # Horizontal total variation: differences along width dimension
+            tv_h = torch.pow(patch[:, :, 1:] - patch[:, :, :-1], 2).sum()
+
+            # Vertical total variation: differences along height dimension
+            tv_v = torch.pow(patch[:, 1:, :] - patch[:, :-1, :], 2).sum()
+
+            # Number of comparisons: C × (H×(W-1) + (H-1)×W)
+            num_comparisons = C * (H * (W - 1) + (H - 1) * W)
+
+            # Normalize by number of comparisons
+            patch_tv_loss = (tv_h + tv_v) / num_comparisons
+
+            # Scale by 2.5x to keep loss in reasonable range
+            patch_tv_loss = patch_tv_loss * 2.5
+
+            total_tv_loss += patch_tv_loss
+
+        # Average over batch
+        avg_tv_loss = total_tv_loss / batch_size
+
+        return avg_tv_loss
 
     def apply_patch_to_image(self, image: torch.Tensor,
                              corners: torch.Tensor,
@@ -1081,7 +1097,7 @@ class ProgressivePatchTrainer:
                     # Combined loss
                     total_loss = diversity_loss + tv_loss_weighted
                     last_diversity_loss = diversity_loss.item()
-                    last_tv_loss = tv_loss.item()
+                    last_tv_loss = tv_loss_weighted.item()  # Display weighted version
 
                     # Train on combined loss
                     total_loss.backward()
@@ -1091,9 +1107,9 @@ class ProgressivePatchTrainer:
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Track losses
+                    # Track losses (store weighted version for display)
                     total_diversity_loss += diversity_loss.item()
-                    total_tv_loss += tv_loss.item()
+                    total_tv_loss += tv_loss_weighted.item()
                     num_updates += 1
 
                     # Update progress bar
@@ -1160,7 +1176,7 @@ class ProgressivePatchTrainer:
                     optimizer.zero_grad()
 
                     total_diversity_loss += diversity_loss.item()
-                    total_tv_loss += tv_loss.item()
+                    total_tv_loss += tv_loss_weighted.item()
                     num_updates += 1
 
                     # Memory cleanup for remaining samples
