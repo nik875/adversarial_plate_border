@@ -1423,8 +1423,8 @@ class ProgressivePatchTrainer:
         convergence or max epochs.
 
         Saves:
-        - best_progressive_patch.tar: Best model across all training
-        - layer*_complete_*.tar: Model after completing each layer
+        - best_progressive_patch/: Best model across all training
+        - layer*_complete_*/: Model after completing each layer
         """
 
         # Initialize optimizer
@@ -1733,29 +1733,30 @@ def main():
         # Plot training results
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
-        # Loss curve
-        ax1.plot(history['epoch'], history['loss'], 'b-', label='Training Loss', alpha=0.7)
-        ax1.plot(history['epoch'], history['val_score'], 'r-', label='Validation Loss', alpha=0.7)
+        # Diversity loss (training vs validation)
+        ax1.plot(history['epoch'], history['diversity_loss'], 'b-', label='Train Diversity Loss', alpha=0.7)
+        ax1.plot(history['epoch'], history['val_diversity'], 'r-', label='Val Diversity', alpha=0.7)
         # Add vertical lines for layer transitions
         for i, record in enumerate(trainer.layer_history):
             if i > 0:  # Skip first layer (starts at epoch 0)
                 transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
                 ax1.axvline(x=transition_epoch, color='gray', linestyle='--', alpha=0.5)
-        ax1.set_title('Loss Over Time (Progressive Layers)')
+        ax1.set_title('Diversity Over Time (Progressive Layers)')
         ax1.set_xlabel('Global Epoch')
-        ax1.set_ylabel('Loss')
+        ax1.set_ylabel('Diversity Loss')
         ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        # Diversity loss
-        ax2.plot(history['epoch'], history['diversity_loss'], 'g-', label='Diversity Loss')
+        # TV and SSIM regularization losses
+        ax2.plot(history['epoch'], history['tv_loss'], 'g-', label='TV Loss', alpha=0.7)
+        ax2.plot(history['epoch'], history['ssim_loss'], 'orange', label='SSIM Loss', alpha=0.7)
         for i, record in enumerate(trainer.layer_history):
             if i > 0:
                 transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
                 ax2.axvline(x=transition_epoch, color='gray', linestyle='--', alpha=0.5)
-        ax2.set_title('Diversity Loss (Progressive Layers)')
+        ax2.set_title('Regularization Losses (Progressive Layers)')
         ax2.set_xlabel('Global Epoch')
-        ax2.set_ylabel('Diversity')
+        ax2.set_ylabel('Loss')
         ax2.grid(True, alpha=0.3)
         ax2.legend()
 
@@ -1791,8 +1792,8 @@ def main():
         print("  - progressive_patch_sample_patches.png")
         print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
-        print("  - best_progressive_patch.tar - Best model across all layers")
-        print("  - layer*_complete_*.tar - Checkpoint after completing each layer")
+        print("  - best_progressive_patch/ - Best model across all layers")
+        print("  - layer*_complete_*/ - Checkpoint after completing each layer")
 
     except Exception as e:
         print(f"Training failed: {e}")
@@ -1913,9 +1914,9 @@ Diversity computation and memory:
 - Combine with --simple-generator for maximum memory efficiency
 
 Checkpoint structure:
-- best_progressive_patch.tar: Best loss across all training
-- layer*_complete_*.tar: Model state after completing each layer
-  (e.g., layer1_complete_Conv_Layer_1_32ch.tar, layer2_complete_Conv_Layer_2_48ch.tar, etc.)
+- best_progressive_patch/: Best loss across all training (contains generator_epoch_XXXX.pt and sample patches)
+- layer*_complete_*/: Model state after completing each layer
+  (e.g., layer1_complete_Conv_Layer_1_32ch/, layer2_complete_Conv_Layer_2_48ch/, etc.)
 
-You can resume from any checkpoint by loading it with the trainer's load_basis() method.
+You can resume from any checkpoint by loading the generator_epoch_XXXX.pt file inside these directories.
 """
