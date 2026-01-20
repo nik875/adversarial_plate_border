@@ -398,9 +398,9 @@ class ProgressivePatchTrainer:
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
                  tv_weight: float = 250,
-                 max_epochs_per_layer: int = 50,
+                 max_epochs_per_layer = 50,
                  final_layer_epochs: Optional[int] = None,
-                 convergence_threshold: float = 1.0,
+                 convergence_threshold = 1.0,
                  target_layer: Optional[List[int]] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
@@ -418,9 +418,15 @@ class ProgressivePatchTrainer:
         self.use_all_for_train = use_all_for_train
 
         # Progressive layer configuration
+        # Handle single values or lists for max_epochs and convergence_threshold
+        if not isinstance(max_epochs_per_layer, list):
+            max_epochs_per_layer = [max_epochs_per_layer]
+        if not isinstance(convergence_threshold, list):
+            convergence_threshold = [convergence_threshold]
+
         all_layer_configs = layer_configs or get_ocr_layer_progression(
-            max_epochs=max_epochs_per_layer,
-            convergence_threshold=convergence_threshold,
+            max_epochs=max_epochs_per_layer[0],
+            convergence_threshold=convergence_threshold[0],
             final_layer_epochs=final_layer_epochs
         )
 
@@ -434,6 +440,21 @@ class ProgressivePatchTrainer:
             # Filter layer configs to only specified indices (in order)
             sorted_indices = sorted(target_layer)
             self.layer_configs = [all_layer_configs[i] for i in sorted_indices]
+
+            # Update max_epochs and convergence_threshold for queued layers if lists provided
+            num_queued = len(self.layer_configs)
+            if len(max_epochs_per_layer) > 1:
+                if len(max_epochs_per_layer) != num_queued:
+                    raise ValueError(f"max_epochs_per_layer list length ({len(max_epochs_per_layer)}) must match number of queued layers ({num_queued})")
+                for i, config in enumerate(self.layer_configs):
+                    config.max_epochs = max_epochs_per_layer[i]
+
+            if len(convergence_threshold) > 1:
+                if len(convergence_threshold) != num_queued:
+                    raise ValueError(f"convergence_threshold list length ({len(convergence_threshold)}) must match number of queued layers ({num_queued})")
+                for i, config in enumerate(self.layer_configs):
+                    config.convergence_threshold = convergence_threshold[i]
+
             self.original_layer_indices = sorted_indices  # Track original indices for display
             self.current_layer_idx = 0
             print(f"Progressive training queued for {len(self.layer_configs)} layers: {sorted_indices}")
@@ -1466,15 +1487,17 @@ def main():
                         'Used as start of warmup and end of cosine annealing.')
     parser.add_argument('--warmup-epochs', type=int, default=5,
                         help='Number of epochs for linear warmup (default: 5)')
-    parser.add_argument('--max-epochs-per-layer', type=int, default=50,
+    parser.add_argument('--max-epochs-per-layer', type=str, default='50',
                         help='Maximum epochs to train on each layer (default: 50). '
+                        'Can be a single value or comma-separated list (e.g., "30,50,100" for queued layers). '
                         'Set to high value like 1000 to disable max epoch stopping.')
     parser.add_argument('--final-layer-epochs', type=int, default=None,
                         help='Maximum epochs for the final layer in the progression (default: 2x max-epochs-per-layer). '
                         'The final layer typically gets more training time for refinement.')
-    parser.add_argument('--convergence-threshold', type=float, default=1.0,
+    parser.add_argument('--convergence-threshold', type=str, default='1.0',
                         help='Diversity score threshold for convergence. Training on a layer stops when diversity < threshold. '
-                        '(default: 1.0). Set to 0 or negative to disable convergence checking and train full max-epochs.')
+                        '(default: 1.0). Can be a single value or comma-separated list (e.g., "1.0,0.5,0.0" for queued layers). '
+                        'Set to 0 or negative to disable convergence checking and train full max-epochs.')
     parser.add_argument('--target-layer', type=str, default=None,
                         help='Queue specific layers for progressive training (comma-separated, e.g., "0,3,5,10"). '
                         'Training will progress through only these layers. '
@@ -1507,6 +1530,24 @@ def main():
         except ValueError:
             raise ValueError(f"Invalid target-layer format: '{args.target_layer}'. Expected comma-separated integers (e.g., '0,3,5,10')")
 
+    # Parse max_epochs_per_layer (can be single value or comma-separated list)
+    try:
+        if ',' in args.max_epochs_per_layer:
+            max_epochs_per_layer = [int(x.strip()) for x in args.max_epochs_per_layer.split(',')]
+        else:
+            max_epochs_per_layer = int(args.max_epochs_per_layer)
+    except ValueError:
+        raise ValueError(f"Invalid max-epochs-per-layer format: '{args.max_epochs_per_layer}'. Expected integer or comma-separated integers (e.g., '30,50,100')")
+
+    # Parse convergence_threshold (can be single value or comma-separated list)
+    try:
+        if ',' in args.convergence_threshold:
+            convergence_threshold = [float(x.strip()) for x in args.convergence_threshold.split(',')]
+        else:
+            convergence_threshold = float(args.convergence_threshold)
+    except ValueError:
+        raise ValueError(f"Invalid convergence-threshold format: '{args.convergence_threshold}'. Expected float or comma-separated floats (e.g., '1.0,0.5,0.0')")
+
     # Trainer kwargs
     trainer_kwargs = {
         'device': 'cuda',
@@ -1514,9 +1555,9 @@ def main():
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
         'tv_weight': args.tv_weight,
-        'max_epochs_per_layer': args.max_epochs_per_layer,
+        'max_epochs_per_layer': max_epochs_per_layer,
         'final_layer_epochs': args.final_layer_epochs,
-        'convergence_threshold': args.convergence_threshold,
+        'convergence_threshold': convergence_threshold,
         'target_layer': target_layers,
         'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator,
@@ -1653,8 +1694,14 @@ Custom final layer training epochs:
     python progressive_patch.py --final-layer-epochs 200
     # Give the final layer more training time (default: 2x max-epochs-per-layer)
 
-    python progressive_patch.py --target-layer "0,5,10" --max-epochs-per-layer 30 --final-layer-epochs 150
-    # Train layers 0 and 5 for max 30 epochs each, but train layer 10 for up to 150 epochs
+    python progressive_patch.py --target-layer "0,5,10" --max-epochs-per-layer "30,50,100"
+    # Train layer 0 for max 30 epochs, layer 5 for 50 epochs, layer 10 for 100 epochs
+
+    python progressive_patch.py --target-layer "0,5,10" --convergence-threshold "1.0,0.5,0.0"
+    # Layer 0 stops when diversity < 1.0, layer 5 when < 0.5, layer 10 trains full epochs
+
+    python progressive_patch.py --target-layer "0,5,10" --max-epochs-per-layer "30,50,100" --convergence-threshold "1.0,0.5,0.0"
+    # Combine both: different max epochs and convergence thresholds per layer
 
 Custom layer progression:
     You can define your own layer progression by modifying get_ocr_layer_progression()
