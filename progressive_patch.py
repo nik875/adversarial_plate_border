@@ -397,6 +397,7 @@ class ProgressivePatchTrainer:
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
+                 tv_weight: float = 2.5,
                  max_epochs_per_layer: int = 50,
                  final_layer_epochs: Optional[int] = None,
                  convergence_threshold: float = 1.0,
@@ -406,6 +407,7 @@ class ProgressivePatchTrainer:
                  use_simple_generator: bool = False):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
+        self.tv_weight = tv_weight
         self.max_epochs_per_layer = max_epochs_per_layer
         self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
@@ -585,6 +587,34 @@ class ProgressivePatchTrainer:
         patches = self.generator(z)  # [batch_size, 3, H, W], already in [0, 1]
 
         return patches
+
+    def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
+        """
+        Compute total variation loss to encourage spatial smoothness.
+
+        TV loss penalizes differences between neighboring pixels, encouraging
+        smoother, more natural-looking patches.
+
+        Args:
+            patches: [batch_size, 3, H, W] patch tensor
+
+        Returns:
+            tv_loss: scalar total variation loss
+        """
+        # Compute differences between adjacent pixels
+        # Horizontal differences: |patch[:, :, :, 1:] - patch[:, :, :, :-1]|
+        diff_h = torch.abs(patches[:, :, :, 1:] - patches[:, :, :, :-1])
+        # Vertical differences: |patch[:, :, 1:, :] - patch[:, :, :-1, :]|
+        diff_v = torch.abs(patches[:, :, 1:, :] - patches[:, :, :-1, :])
+
+        # Sum over all dimensions
+        tv_loss = diff_h.sum() + diff_v.sum()
+
+        # Normalize by number of elements
+        batch_size = patches.shape[0]
+        tv_loss = tv_loss / batch_size
+
+        return tv_loss
 
     def apply_patch_to_image(self, image: torch.Tensor,
                              corners: torch.Tensor,
@@ -986,6 +1016,7 @@ class ProgressivePatchTrainer:
         OCR internal representations (at the patch_extractor layer) compared to baseline.
         """
         total_diversity_loss = 0.0
+        total_tv_loss = 0.0
         step_count = 0
         num_updates = 0
 
@@ -999,6 +1030,7 @@ class ProgressivePatchTrainer:
         accumulated_activations = []
         accumulated_indices = []
         last_diversity_loss = 0.0  # Track for display during accumulation
+        last_tv_loss = 0.0  # Track for display during accumulation
 
         desc = f"Epoch {epoch+1} - Training (AccumSteps={update_every})"
         with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
@@ -1040,29 +1072,41 @@ class ProgressivePatchTrainer:
                         use_grad=True
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-                    last_diversity_loss = diversity_loss.item()
 
-                    # Train only on diversity loss
-                    diversity_loss.backward()
+                    # Compute total variation loss on generated patches
+                    patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+                    tv_loss = self.total_variation_loss(patches_stacked)
+                    tv_loss_weighted = self.tv_weight * tv_loss
+
+                    # Combined loss
+                    total_loss = diversity_loss + tv_loss_weighted
+                    last_diversity_loss = diversity_loss.item()
+                    last_tv_loss = tv_loss.item()
+
+                    # Train on combined loss
+                    total_loss.backward()
 
                     # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    # Track diversity loss
+                    # Track losses
                     total_diversity_loss += diversity_loss.item()
+                    total_tv_loss += tv_loss.item()
                     num_updates += 1
 
                     # Update progress bar
                     avg_diversity_loss = total_diversity_loss / num_updates
+                    avg_tv_loss = total_tv_loss / num_updates
                     pbar.set_postfix({
                         'DivLoss': f"{avg_diversity_loss:.4f}",
+                        'TVLoss': f"{avg_tv_loss:.4f}",
                         'Updates': num_updates
                     })
 
                     # Memory cleanup after update
-                    del diversity_score, diversity_loss
+                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, total_loss, patches_stacked
                     # Clear accumulated lists and their contents
                     for patch in accumulated_patches:
                         del patch
@@ -1084,6 +1128,7 @@ class ProgressivePatchTrainer:
                     # Show accumulation progress
                     pbar.set_postfix({
                         'DivLoss': f"{last_diversity_loss:.4f}",
+                        'TVLoss': f"{last_tv_loss:.4f}",
                         'Progress': f"{step_count % update_every}/{update_every}"
                     })
 
@@ -1100,17 +1145,26 @@ class ProgressivePatchTrainer:
                         use_grad=True
                     )
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-                    diversity_loss.backward()
+
+                    # Compute total variation loss on generated patches
+                    patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+                    tv_loss = self.total_variation_loss(patches_stacked)
+                    tv_loss_weighted = self.tv_weight * tv_loss
+
+                    # Combined loss
+                    total_loss = diversity_loss + tv_loss_weighted
+                    total_loss.backward()
 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
                     total_diversity_loss += diversity_loss.item()
+                    total_tv_loss += tv_loss.item()
                     num_updates += 1
 
                     # Memory cleanup for remaining samples
-                    del diversity_score, diversity_loss
+                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, total_loss, patches_stacked
                     for patch in accumulated_patches:
                         del patch
                     for act in accumulated_activations:
@@ -1122,9 +1176,10 @@ class ProgressivePatchTrainer:
                 elif self.device == 'mps':
                     torch.mps.empty_cache()
 
-        # Return average diversity loss per update
+        # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
-        return avg_diversity_loss
+        avg_tv_loss = total_tv_loss / max(num_updates, 1)
+        return avg_diversity_loss, avg_tv_loss
 
     def validate(self) -> float:
         """Validation pass using diversity score"""
@@ -1214,6 +1269,7 @@ class ProgressivePatchTrainer:
             'layer_name': [],
             'epoch': [],
             'diversity_loss': [],
+            'tv_loss': [],
             'val_diversity': [],
             'learning_rate': []
         }
@@ -1257,6 +1313,7 @@ class ProgressivePatchTrainer:
             print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
 
         print(f"   Diversity weight: {self.diversity_weight}")
+        print(f"   TV weight: {self.tv_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
 
@@ -1304,7 +1361,7 @@ class ProgressivePatchTrainer:
                 global_epoch += 1
 
                 # Training and validation
-                train_diversity_loss = self.train_epoch(optimizer, global_epoch)
+                train_diversity_loss, train_tv_loss = self.train_epoch(optimizer, global_epoch)
                 val_diversity_score = self.validate()
 
                 # Learning rate scheduling
@@ -1316,12 +1373,14 @@ class ProgressivePatchTrainer:
                 global_history['layer_name'].append(current_config.name)
                 global_history['epoch'].append(global_epoch)
                 global_history['diversity_loss'].append(train_diversity_loss)
+                global_history['tv_loss'].append(train_tv_loss)
                 global_history['val_diversity'].append(val_diversity_score)
                 global_history['learning_rate'].append(current_lr)
 
                 # Print epoch summary
                 print(f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
                       f"DivLoss: {train_diversity_loss:.4f} | "
+                      f"TVLoss: {train_tv_loss:.4f} | "
                       f"Val: {val_diversity_score:.3f} | "
                       f"LR: {current_lr:.2e}")
 
@@ -1364,6 +1423,8 @@ def main():
                         help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
+    parser.add_argument('--tv-weight', type=float, default=2.5,
+                        help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
@@ -1418,6 +1479,7 @@ def main():
         'grad_accumulate': args.batch_size,
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
+        'tv_weight': args.tv_weight,
         'max_epochs_per_layer': args.max_epochs_per_layer,
         'final_layer_epochs': args.final_layer_epochs,
         'convergence_threshold': args.convergence_threshold,
