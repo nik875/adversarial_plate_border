@@ -142,6 +142,58 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
     ]
 
 
+class SimplePatchGenerator(nn.Module):
+    """Simple MLP patch generator (memory-efficient alternative to FoundationPatchGenerator)"""
+    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512,
+                 hidden_dims: List[int] = None):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+        self.patch_dim = 3 * patch_height * patch_width
+
+        # Default hidden dimensions if not specified
+        if hidden_dims is None:
+            hidden_dims = [256, 512, 1024]
+
+        layers = []
+        prev_dim = latent_dim
+
+        # Build hidden layers
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            prev_dim = hidden_dim
+
+        # Output layer
+        layers.append(nn.Linear(prev_dim, self.patch_dim))
+        layers.append(nn.Sigmoid())  # Output in [0, 1]
+
+        self.network = nn.Sequential(*layers)
+
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        print(f"Simple generator initialized: {latent_dim} → {' → '.join(map(str, hidden_dims))} → {self.patch_dim}")
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [batch_size, latent_dim]
+        Returns:
+            patches: [batch_size, 3, patch_height, patch_width]
+        """
+        patches_flat = self.network(z)  # [batch_size, patch_dim]
+        patches = patches_flat.view(-1, 3, self.patch_height, self.patch_width)
+        return patches
+
+
 class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512):
@@ -354,7 +406,8 @@ class ProgressivePatchTrainer:
                  convergence_threshold: float = 1.0,
                  target_layer: Optional[int] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
-                 eval_depth: Optional[int] = None):
+                 eval_depth: Optional[int] = None,
+                 use_simple_generator: bool = False):
         self.training = training
         self.print_blur = print_blur
         self.use_tv_loss = use_tv_loss
@@ -366,6 +419,7 @@ class ProgressivePatchTrainer:
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
         self.eval_depth = eval_depth
+        self.use_simple_generator = use_simple_generator
 
         # Progressive layer configuration
         self.layer_configs = layer_configs or get_ocr_layer_progression(
@@ -407,13 +461,22 @@ class ProgressivePatchTrainer:
                                                                 preload=True, batch_size=1,
                                                                 n_jobs=0)
 
-        # Initialize foundation model generator with trainable VAE
-        # Create generator with trainable adapter + trainable SD VAE decoder
-        self.generator = FoundationPatchGenerator(
-            latent_dim=basis_dim,
-            patch_height=self.patch_height,
-            patch_width=self.patch_width
-        ).to(self.device)
+        # Initialize generator (simple or foundation model)
+        if use_simple_generator:
+            # Simple MLP generator (memory-efficient)
+            self.generator = SimplePatchGenerator(
+                latent_dim=basis_dim,
+                patch_height=self.patch_height,
+                patch_width=self.patch_width
+            ).to(self.device)
+        else:
+            # Foundation model generator with trainable VAE
+            # Create generator with trainable adapter + trainable SD VAE decoder
+            self.generator = FoundationPatchGenerator(
+                latent_dim=basis_dim,
+                patch_height=self.patch_height,
+                patch_width=self.patch_width
+            ).to(self.device)
 
         # Activation capture for diversity metric
         self.ocr_activations = None  # Current activations from forward hook
@@ -1555,24 +1618,31 @@ class ProgressivePatchTrainer:
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Latent dimensions: {self.basis_dim}")
-        vae_latent_dim = self.generator.vae_latent_dim
-        print(f"   Generator architecture:")
-        print(f"     Main path:")
-        print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-        print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
-        print(f"     Skip connection:")
-        print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
-        print(f"     CNN refiner (trainable):")
-        print(f"       Input: concat(VAE output, skip)[4 channels]")
-        print(f"       Block1: Conv[4→64] + Conv[64→64]")
-        print(f"       Block2: Conv[64→128] + Conv[128→128]")
-        print(f"       Block3: Conv[128→64] + Conv[64→64]")
-        print(f"       Output: [64 channels]")
-        print(f"     DNN block (trainable):")
-        print(f"       Input: concat(CNN output[64], skip[1])[65 channels]")
-        print(f"       Global pool: 65×{self.patch_height}×{self.patch_width} → 65×8×16")
-        print(f"       Dense: {self.generator.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * self.patch_height * self.patch_width}")
-        print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
+
+        # Print generator architecture based on type
+        if self.use_simple_generator:
+            print(f"   Generator: SimplePatchGenerator (MLP-based, memory-efficient)")
+            print(f"     Architecture: z[{self.basis_dim}] → 256 → 512 → 1024 → {3 * self.patch_height * self.patch_width} → patch[3×{self.patch_height}×{self.patch_width}]")
+        else:
+            vae_latent_dim = self.generator.vae_latent_dim
+            print(f"   Generator: FoundationPatchGenerator (VAE-based, high quality)")
+            print(f"     Main path:")
+            print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
+            print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
+            print(f"     Skip connection:")
+            print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
+            print(f"     CNN refiner (trainable):")
+            print(f"       Input: concat(VAE output, skip)[4 channels]")
+            print(f"       Block1: Conv[4→64] + Conv[64→64]")
+            print(f"       Block2: Conv[64→128] + Conv[128→128]")
+            print(f"       Block3: Conv[128→64] + Conv[64→64]")
+            print(f"       Output: [64 channels]")
+            print(f"     DNN block (trainable):")
+            print(f"       Input: concat(CNN output[64], skip[1])[65 channels]")
+            print(f"       Global pool: 65×{self.patch_height}×{self.patch_width} → 65×8×16")
+            print(f"       Dense: {self.generator.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * self.patch_height * self.patch_width}")
+            print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
+
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
@@ -1724,6 +1794,11 @@ def main():
                         'Default: batch_size^2 (evaluate all pairs). '
                         'Always includes batch_size diagonal evaluations, randomly samples remaining off-diagonal. '
                         'Upper bound: batch_size^2. Use to reduce memory usage with large batch sizes.')
+    parser.add_argument('--simple-generator', action='store_true',
+                        help='Use simple MLP generator instead of foundation model (VAE-based). '
+                        'Simple generator: z → MLP[256→512→1024] → patch. '
+                        'Foundation model: z → adapter → VAE decoder → CNN refiner → DNN → patch. '
+                        'Simple generator uses ~10x less memory but may produce lower quality patches.')
     args = parser.parse_args()
 
     # Configuration
@@ -1743,7 +1818,8 @@ def main():
         'max_epochs_per_layer': args.max_epochs_per_layer,
         'convergence_threshold': args.convergence_threshold,
         'target_layer': args.target_layer,
-        'eval_depth': args.eval_depth
+        'eval_depth': args.eval_depth,
+        'use_simple_generator': args.simple_generator
     }
 
     # Training mode
@@ -1853,6 +1929,14 @@ Memory-efficient training with eval_depth (reduces diversity computation):
     python progressive_patch.py --batch-size 64 --eval-depth 512
     # Evaluates up to 512 pairs instead of 64^2=4096 (8x memory reduction)
 
+Memory-efficient training with simple generator (reduces model size):
+    python progressive_patch.py --simple-generator
+    # Uses SimplePatchGenerator (MLP) instead of FoundationPatchGenerator (VAE-based)
+    # ~10x less memory usage, faster training, but potentially lower quality patches
+
+    # Combine with eval_depth for maximum memory efficiency:
+    python progressive_patch.py --simple-generator --batch-size 64 --eval-depth 512
+
 Custom layer progression:
     You can define your own layer progression by modifying get_ocr_layer_progression()
     or passing a custom list of LayerConfig objects to ProgressivePatchTrainer.
@@ -1888,6 +1972,21 @@ Convergence criteria:
 
 Then automatically advances to next layer in progression.
 
+Generator architectures:
+- SimplePatchGenerator (--simple-generator flag):
+  * Simple MLP: z[basis_dim] → 256 → 512 → 1024 → patch
+  * Memory: ~10x less than FoundationPatchGenerator
+  * Speed: Faster forward/backward passes
+  * Quality: Lower quality patches, less realistic textures
+  * Use case: Quick prototyping, limited GPU memory, faster iterations
+
+- FoundationPatchGenerator (default):
+  * Complex architecture: Adapter → VAE decoder → CNN refiner → DNN block
+  * Memory: High (requires SD VAE decoder with many parameters)
+  * Speed: Slower due to VAE and multiple refinement stages
+  * Quality: Higher quality, more realistic patches
+  * Use case: Final runs, high-quality patch generation
+
 Diversity computation and memory:
 - eval_depth controls the total number of (patch, image) evaluations for diversity:
   * Default (None): Evaluates all batch_size^2 pairs (full matrix)
@@ -1896,6 +1995,7 @@ Diversity computation and memory:
   * Randomly samples off-diagonal pairs from budget (eval_depth - batch_size)
 - Benefits: Reduces memory without sacrificing diversity quality, enables larger batch sizes
 - Example: batch_size=32, eval_depth=256 reduces evals from 1024 to 256 (75% reduction)
+- Combine with --simple-generator for maximum memory efficiency
 
 Checkpoint structure:
 - best_progressive_patch.tar: Best loss across all training
