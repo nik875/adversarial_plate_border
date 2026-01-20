@@ -959,13 +959,12 @@ class ProgressivePatchTrainer:
                 accumulated_batches.append({k: v[0].detach().clone() if torch.is_tensor(v[0]) else v[0]
                                            for k, v in batch.items()})
 
-                # Capture activations (automatically populated by forward hook)
-                # Keep gradients for the diagonal entries
-                # Squeeze to match format from _get_activations_for_patch_image
-                if self.ocr_activations is not None:
-                    accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
-                    # Clear hook reference to allow garbage collection
-                    self.ocr_activations = None
+                # Compute diagonal activation (patch_i on image_i) with gradients
+                batch_unbatched = {k: v[0] for k, v in batch.items()}
+                diagonal_activation = self._get_activations_for_patch_image(
+                    batch_unbatched, patch, use_grad=True, skip_detection=True
+                )  # [H, W, C]
+                accumulated_activations.append(diagonal_activation)
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
