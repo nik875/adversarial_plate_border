@@ -404,7 +404,8 @@ class ProgressivePatchTrainer:
                  target_layer: Optional[List[int]] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
-                 use_simple_generator: bool = False):
+                 use_simple_generator: bool = False,
+                 use_all_for_train: bool = False):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -414,6 +415,7 @@ class ProgressivePatchTrainer:
         self.target_layer = target_layer
         self.eval_depth = eval_depth
         self.use_simple_generator = use_simple_generator
+        self.use_all_for_train = use_all_for_train
 
         # Progressive layer configuration
         all_layer_configs = layer_configs or get_ocr_layer_progression(
@@ -462,7 +464,7 @@ class ProgressivePatchTrainer:
 
         self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
                                                                 preload=True, batch_size=1,
-                                                                n_jobs=0)
+                                                                n_jobs=0, use_all_for_train=use_all_for_train)
 
         # Initialize generator (simple or foundation model)
         if use_simple_generator:
@@ -1471,6 +1473,9 @@ def main():
                         'Default: batch_size^2 (evaluate all pairs). '
                         'Always includes batch_size diagonal evaluations, randomly samples remaining off-diagonal. '
                         'Upper bound: batch_size^2. Use to reduce memory usage with large batch sizes.')
+    parser.add_argument('--use-all-for-train', action='store_true',
+                        help='Use all data for training (disable validation set). '
+                        'Default: uses 80%% train / 20%% validation split.')
     parser.add_argument('--simple-generator', action='store_true',
                         help='Use simple MLP generator instead of foundation model (VAE-based). '
                         'Simple generator: z → MLP[256→512→1024] → patch. '
@@ -1501,7 +1506,8 @@ def main():
         'convergence_threshold': args.convergence_threshold,
         'target_layer': target_layers,
         'eval_depth': args.eval_depth,
-        'use_simple_generator': args.simple_generator
+        'use_simple_generator': args.simple_generator,
+        'use_all_for_train': args.use_all_for_train
     }
 
     # Training mode
