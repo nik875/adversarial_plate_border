@@ -1065,13 +1065,7 @@ class ProgressivePatchTrainer:
         Returns:
             True if advanced successfully, False if already at final layer
         """
-        if self.current_layer_idx >= len(self.layer_configs) - 1:
-            print("\n" + "="*80)
-            print("✓ Reached final layer - training complete!")
-            print("="*80 + "\n")
-            return False
-
-        # Record completion of current layer
+        # Record completion of current layer and save checkpoint (before checking if final)
         current_config = self.layer_configs[self.current_layer_idx]
         # Get original layer index if using queued layers
         original_idx = (self.original_layer_indices[self.current_layer_idx]
@@ -1089,6 +1083,13 @@ class ProgressivePatchTrainer:
         layer_checkpoint_name = f"layer{original_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
         self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10)
         print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion (with 10 sample patches)")
+
+        # Check if at final layer
+        if self.current_layer_idx >= len(self.layer_configs) - 1:
+            print("\n" + "="*80)
+            print("✓ Reached final layer - training complete!")
+            print("="*80 + "\n")
+            return False
 
         # Move to next layer
         self.current_layer_idx += 1
