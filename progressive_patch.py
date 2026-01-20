@@ -643,8 +643,9 @@ class ProgressivePatchTrainer:
                 patch_i = patches[i:i+1]  # [1, 3, H, W]
                 patch_j = patches[j:j+1]  # [1, 3, H, W]
 
-                # Compute SSIM (returns value in [0, 1], 1 = identical structure)
-                ssim_val = ssim(patch_i, patch_j, window_size=11)
+                # Compute SSIM (returns per-pixel map, take mean to get scalar)
+                ssim_map = ssim(patch_i, patch_j, window_size=11)
+                ssim_val = ssim_map.mean()  # Average over spatial dimensions
 
                 ssim_sum += ssim_val
                 pair_count += 1
