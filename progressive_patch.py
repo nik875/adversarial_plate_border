@@ -25,7 +25,6 @@ import matplotlib.pyplot as plt
 from matplotlib import patches
 import onnx
 import onnx2torch
-from open_image_models import LicensePlateDetector
 from dataset import create_dataloaders
 from diffusers import AutoencoderKL
 warnings.filterwarnings("ignore")
@@ -751,83 +750,6 @@ class ProgressivePatchTrainer:
 
         return log_det
 
-    def text_to_target_tensor(self, plate_text: str, max_slots: int, alphabet: str):
-        """Convert 'ABC123' -> one-hot tensor [batch, seq_len, vocab_size]"""
-        # Pad with '_' to max_slots
-        padded = (plate_text + '_' * max_slots)[:max_slots]
-
-        # Convert to indices
-        indices = [alphabet.index(char) for char in padded]
-
-        # One-hot encode
-        target = torch.zeros(1, max_slots, len(alphabet))
-        for i, idx in enumerate(indices):
-            target[0, i, idx] = 1.0
-
-        return target.to(self.device)
-
-    def _apply_patch_simple(self, image: torch.Tensor, corners: torch.Tensor,
-                            patch: torch.Tensor, border_scale: float = 1.4) \
-            -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply patch as simple rectangular overlay without homography transformation"""
-        batch_size = image.shape[0]
-        image_height, image_width = image.shape[2], image.shape[3]
-
-        # Get the 4 corners of the license plate
-        plate_corners = corners[0]  # [4, 2]
-
-        # Calculate center and create larger border box
-        center_x = plate_corners[:, 0].mean()
-        center_y = plate_corners[:, 1].mean()
-        center = torch.tensor([center_x, center_y], device=self.device)
-
-        border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
-
-        # Calculate bounding boxes for border and plate
-        border_min_x = torch.clamp(torch.min(border_corners[:, 0]), 0, image_width).int()
-        border_max_x = torch.clamp(torch.max(border_corners[:, 0]), 0, image_width).int()
-        border_min_y = torch.clamp(torch.min(border_corners[:, 1]), 0, image_height).int()
-        border_max_y = torch.clamp(torch.max(border_corners[:, 1]), 0, image_height).int()
-
-        plate_min_x = torch.clamp(torch.min(plate_corners[:, 0]), 0, image_width).int()
-        plate_max_x = torch.clamp(torch.max(plate_corners[:, 0]), 0, image_width).int()
-        plate_min_y = torch.clamp(torch.min(plate_corners[:, 1]), 0, image_height).int()
-        plate_max_y = torch.clamp(torch.max(plate_corners[:, 1]), 0, image_height).int()
-
-        # Create result image and mask
-        result_image = image.clone()
-        final_mask = torch.zeros(batch_size, 3, image_height, image_width,
-                                device=self.device, dtype=torch.float32)
-
-        # Resize patch to border area
-        border_h = border_max_y - border_min_y
-        border_w = border_max_x - border_min_x
-
-        if border_h > 0 and border_w > 0:
-            # Resize patch to fit border area (patch is already [3, H, W])
-            patch_resized = F.interpolate(
-                patch.unsqueeze(0),
-                size=(border_h, border_w),
-                mode='bilinear',
-                align_corners=True
-            )
-
-            # Apply to all batches
-            for b in range(batch_size):
-                # Fill border area with patch
-                result_image[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = patch_resized[0]
-                final_mask[b, :, border_min_y:border_max_y, border_min_x:border_max_x] = 1.0
-
-                # Cut out plate area (restore original image)
-                if plate_max_y > plate_min_y and plate_max_x > plate_min_x:
-                    result_image[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x] = \
-                        image[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x]
-                    final_mask[b, :, plate_min_y:plate_max_y, plate_min_x:plate_max_x] = 0.0
-
-        result_image = torch.clamp(result_image, 0, 1)
-
-        return result_image, final_mask
-
     def get_border_corners(self, corners: torch.Tensor,
                             border_scale: float = 1.4) -> torch.Tensor:
         """Calculate the 4 corners of the border area (scaled from plate corners)"""
@@ -840,284 +762,6 @@ class ProgressivePatchTrainer:
 
         border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
         return border_corners  # [4, 2]
-
-    def get_patch_bounding_box(self, corners: torch.Tensor,
-                               border_scale: float = 1.4) -> torch.Tensor:
-        """Calculate bounding box of the patch area (border around license plate)"""
-        border_corners = self.get_border_corners(corners, border_scale)
-
-        # Calculate bounding box of the border corners
-        min_x = torch.min(border_corners[:, 0])
-        max_x = torch.max(border_corners[:, 0])
-        min_y = torch.min(border_corners[:, 1])
-        max_y = torch.max(border_corners[:, 1])
-
-        return torch.stack([min_x, min_y, max_x, max_y])
-
-    def apply_patch_to_image(self, image: torch.Tensor,
-                             corners: torch.Tensor,
-                             patch: torch.Tensor,
-                             border_scale: float = 1.4) \
-            -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Apply adversarial patch as border around license plate using homography or simple overlay"""
-        batch_size = image.shape[0]
-
-        # Extract image dimensions dynamically
-        image_height, image_width = image.shape[2], image.shape[3]
-        dsize = (image_height, image_width)
-
-        # Patch is already in [0, 1] range (no tanh normalization)
-
-        # Very light Gaussian blur
-        if self.print_blur > 0:
-            patch = kornia.filters.gaussian_blur2d(
-                patch.unsqueeze(0),
-                kernel_size=(3, 3),
-                sigma=(self.print_blur, self.print_blur)
-            ).squeeze(0)
-
-        if self.training:
-            darkening_factor = torch.rand(1, device=self.device) * 0.2
-            patch = patch * (1.0 - darkening_factor)
-
-        # If homography is disabled, use simple rectangle overlay
-        if not self.use_homography:
-            return self._apply_patch_simple(image, corners, patch, border_scale)
-
-        # Get the 4 corners of the license plate
-        plate_corners = corners[0]  # [4, 2]
-
-        # Calculate center and create larger border quad
-        center_x = plate_corners[:, 0].mean()
-        center_y = plate_corners[:, 1].mean()
-        center = torch.tensor([center_x, center_y], device=self.device)
-
-        border_corners = center.unsqueeze(
-            0) + (plate_corners - center.unsqueeze(0)) * border_scale
-        border_corners = border_corners.unsqueeze(0)  # [1, 4, 2]
-
-        # Create patch corner coordinates in patch space
-        patch_h, patch_w = self.patch_height, self.patch_width
-        src_corners = torch.tensor([
-            [0, 0], [patch_w, 0], [patch_w, patch_h], [0, patch_h]
-        ], dtype=torch.float32, device=self.device).unsqueeze(0)
-
-        # Compute perspective transformation matrices
-        M_border = K.get_perspective_transform(src_corners, border_corners)
-        M_plate = K.get_perspective_transform(src_corners, corners)
-
-        # Create and warp patch using dynamic image size
-        patch_batch = patch.unsqueeze(0).repeat(batch_size, 1, 1, 1)
-
-        warped_patch = K.warp_perspective(
-            patch_batch, M_border, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
-
-        # Create masks using dynamic image size
-        patch_mask = torch.ones(batch_size, 1, self.patch_height, self.patch_width,
-                                dtype=torch.float32, device=self.device)
-
-        warped_border_mask = K.warp_perspective(
-            patch_mask, M_border, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
-
-        warped_plate_mask = K.warp_perspective(
-            patch_mask, M_plate, dsize=dsize,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
-
-        # Final mask: border area minus license plate area
-        final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1)
-        final_mask = final_mask.expand(-1, 3, -1, -1)
-
-        # Validate all tensors have matching spatial dimensions
-        if image.shape[2:] != final_mask.shape[2:]:
-            raise RuntimeError(
-                f"Image spatial dims {image.shape[2:]} != mask spatial dims {final_mask.shape[2:]}")
-        if image.shape[2:] != warped_patch.shape[2:]:
-            raise RuntimeError(
-                f"Image spatial dims {image.shape[2:]} != warped patch spatial dims {warped_patch.shape[2:]}")
-
-        # Apply patch with cutout
-        result_image = image * (1 - final_mask) + warped_patch * final_mask
-        result_image = torch.clamp(result_image, 0, 1)
-
-        return result_image, final_mask
-
-    def focal_cce_loss(
-        self,
-        vocabulary_size: int,
-        alpha: float = 0.25,
-        gamma: float = 2.0,
-        label_smoothing: float = 0.01,
-    ):
-        """
-        Categorical focal cross-entropy loss - exact PyTorch replica of Keras version.
-        """
-        def cce(y_true, y_pred):
-            # Exact replica: flatten both inputs to (-1, vocabulary_size)
-            y_true = y_true.reshape(-1, vocabulary_size)
-            y_pred = y_pred.reshape(-1, vocabulary_size)
-
-            # Ensure y_pred are probabilities (Keras uses from_logits=False)
-            if y_pred.max() > 1.0 or y_pred.min() < 0.0:
-                y_pred = F.softmax(y_pred, dim=-1)
-
-            # Apply label smoothing to y_true (if specified)
-            if label_smoothing > 0.0:
-                y_true = y_true * (1.0 - label_smoothing) + label_smoothing / vocabulary_size
-
-            # Compute focal loss
-            p_t = torch.sum(y_true * y_pred, dim=-1)  # [batch*seq]
-            focal_weight = (1.0 - p_t) ** gamma
-            ce_loss = -torch.log(p_t + 1e-8)
-            focal_loss = alpha * focal_weight * ce_loss
-
-            return torch.mean(focal_loss)
-
-        return cce
-
-    def invert_bbox(self, corners, transform):
-        """Invert the given transformation to bring the corners back to original image"""
-        r, dw, dh = transform
-        corners = corners.clone()
-        corners[::2] = corners[::2] - dw
-        corners[1::2] = corners[1::2] - dh
-        corners = corners / r
-        return corners
-
-    def bbox_to_corners(self, bbox, device=None):
-        x1, y1, x2, y2 = bbox
-        corners = torch.tensor([[
-            [x1, y1],  # top-left
-            [x2, y1],  # top-right
-            [x2, y2],  # bottom-right
-            [x1, y2]   # bottom-left
-        ]], device=device or self.device)
-        return corners
-
-    def corners_to_bbox(self, corners):
-        min_x = torch.min(corners[:, 0])
-        max_x = torch.max(corners[:, 0])
-        min_y = torch.min(corners[:, 1])
-        max_y = torch.max(corners[:, 1])
-        return torch.stack([min_x, min_y, max_x, max_y])
-
-    def boxes_IoU(self, boxes1, boxes2):
-        area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
-        area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
-
-        boxes1 = boxes1.unsqueeze(1)  # [N, 1, 4]
-        boxes2 = boxes2.unsqueeze(0)  # [1, M, 4]
-
-        # Intersection coordinates
-        inter_x1 = torch.max(boxes1[..., 0], boxes2[..., 0])
-        inter_y1 = torch.max(boxes1[..., 1], boxes2[..., 1])
-        inter_x2 = torch.min(boxes1[..., 2], boxes2[..., 2])
-        inter_y2 = torch.min(boxes1[..., 3], boxes2[..., 3])
-
-        # Intersection area
-        inter_width = torch.clamp(inter_x2 - inter_x1, min=0)
-        inter_height = torch.clamp(inter_y2 - inter_y1, min=0)
-        inter_area = inter_width * inter_height
-
-        # Union area
-        union_area = area1 + area2 - inter_area
-
-        return inter_area / (union_area + 1e-8)
-
-    def partial_loss(self, batch, patch, use_ocr_baseline=True):
-        # Load original image (no patch)
-        prep_image = batch['prep_image'].to(self.device)
-        corners = batch['new_corners'].to(self.device)
-
-        if self.match_detection:
-            target_box = self.get_patch_bounding_box(corners)
-        else:
-            target_box = self.corners_to_bbox(corners)
-
-        # Run YOLO detection on full patched image
-        model_output = self.model(prep_image.unsqueeze(0))
-
-        best_detection = None
-        det_loss = 0.0
-
-        for detection in model_output:
-            pred_box = detection[1:5]
-            conf = detection[6]
-            IoU = self.boxes_IoU(pred_box.unsqueeze(0), target_box.unsqueeze(0))
-
-            if self.match_detection:
-                this_det_loss = -IoU * conf
-            else:
-                this_det_loss = IoU * conf
-
-            if self.match_detection:
-                if -this_det_loss > -det_loss:
-                    det_loss = this_det_loss
-                    best_detection = detection
-            else:
-                if this_det_loss > det_loss:
-                    det_loss = this_det_loss
-                    best_detection = detection
-
-        ocr_loss = 0.0
-        if best_detection is not None:
-            pred_box = best_detection[1:5]
-            orig_projection = self.invert_bbox(pred_box.to('cpu'), batch['transform'])
-            corners_box = self.bbox_to_corners(orig_projection, device='cpu')
-
-            cropped_plate = kornia.geometry.crop_and_resize(
-                batch['orig_image'].unsqueeze(0),
-                corners_box,
-                self.ocr_input_shape[:2],
-                mode='bilinear',
-                align_corners=True
-            ).to(self.device)
-
-            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-            ocr_output = self.ocr(ocr_input)
-            ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
-
-            if use_ocr_baseline:
-                if not hasattr(self, 'ocr_baseline'):
-                    raise ValueError('Must call calculate_baseline_loss before using!')
-
-                if self.impersonation_target:
-                    ocr_loss = ocr_loss / self.ocr_baseline
-                else:
-                    ocr_loss = self.ocr_baseline / ocr_loss
-
-        return det_loss, ocr_loss
-
-    def patch_reg_loss(self, patch: torch.Tensor):
-        """
-        Compute total variation (TV) regularization loss for the adversarial patch.
-
-        Args:
-            patch: [3, H, W]
-
-        Returns:
-            torch.Tensor: Scalar regularization loss
-        """
-        C, H, W = patch.shape
-
-        # Horizontal total variation
-        tv_h = torch.pow(patch[:, :, 1:] - patch[:, :, :-1], 2).sum()
-
-        # Vertical total variation
-        tv_v = torch.pow(patch[:, 1:, :] - patch[:, :-1, :], 2).sum()
-
-        # Number of comparisons
-        num_comparisons = C * (H * (W - 1) + (H - 1) * W)
-
-        # Normalize and scale
-        loss = (tv_h + tv_v) / num_comparisons
-        loss = loss * 2.5
-
-        return loss
 
     def calculate_baseline_activations(self):
         """
@@ -1159,82 +803,6 @@ class ProgressivePatchTrainer:
                         self.ocr_activations = None
 
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
-
-    def compute_ocr_loss_only(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
-        """Compute OCR loss only without YOLO detection (for diversity-only mode)"""
-        batch = {k: v[0] for k, v in batch.items()}
-
-        # Apply patch to original image
-        patched_image, _ = self.apply_patch_to_image(
-            batch['orig_image'].to(self.device).unsqueeze(0),
-            batch['orig_corners'].to(self.device).unsqueeze(0),
-            patch
-        )
-
-        # Crop using BORDER corners (1.4x scaled) to capture the patch
-        # Plate corners would miss the patch since it's applied as a border
-        plate_corners = batch['orig_corners'].to(self.device)
-        border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-        corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
-        cropped_plate = K.crop_and_resize(
-            patched_image,
-            corners_box,
-            self.ocr_input_shape[:2]
-        )
-
-        ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-        ocr_output = self.ocr(ocr_input)
-        ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
-
-        if use_ocr_baseline:
-            if not hasattr(self, 'ocr_baseline'):
-                raise ValueError('Must call calculate_baseline_loss before using!')
-
-            if self.impersonation_target:
-                ocr_loss = ocr_loss / self.ocr_baseline
-            else:
-                ocr_loss = self.ocr_baseline / ocr_loss
-
-        return ocr_loss
-
-    def compute_loss_full_image(self, batch: dict, patch: torch.Tensor, use_ocr_baseline=True) -> torch.Tensor:
-        """Compute loss for full image detection"""
-
-        batch = {k: v[0] for k, v in batch.items()}
-
-        # Apply adversarial patch to YOLO input
-        patched_image, _ = self.apply_patch_to_image(
-            batch['prep_image'].to(self.device).unsqueeze(0),
-            batch['new_corners'].to(self.device).unsqueeze(0),
-            patch
-        )
-        batch['prep_image'] = patched_image.squeeze()
-
-        # Apply adversarial patch to full original image
-        patched_image, _ = self.apply_patch_to_image(
-            batch['orig_image'].to(self.device).unsqueeze(0),
-            batch['orig_corners'].to(self.device).unsqueeze(0),
-            patch
-        )
-        batch['orig_image'] = patched_image.squeeze()
-
-        det_loss, ocr_loss = self.partial_loss(batch, patch, use_ocr_baseline=use_ocr_baseline)
-
-        # Add TV regularization loss if enabled
-        if self.use_tv_loss:
-            reg_loss = self.patch_reg_loss(patch)
-        else:
-            reg_loss = 0.0
-
-        # Combine losses with conditional sqrt on OCR loss
-        # Apply sqrt only if ocr_loss > 1 (compress large values)
-        # Below 1, use linear (don't deprioritize reasonable losses)
-        ocr_term = torch.where(
-            ocr_loss > 1.0,
-            torch.sqrt(ocr_loss),
-            ocr_loss
-        )
-        return (det_loss + ocr_term) / 2 + reg_loss
 
     def check_convergence(self, diversity_score: float) -> bool:
         """
@@ -1719,22 +1287,11 @@ class ProgressivePatchTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Progressive Layer Attack for Adversarial Patch Training')
-    parser.add_argument('--match-detection', action='store_true',
-                        help='Maximize IoU with patch bounding box instead of minimizing with ground truth')
-    parser.add_argument('--impersonation-target', type=str, default=None,
-                        help='Target plate text for impersonation (e.g., "ABC123"). If not provided, '
-                        'uses disruption mode to prevent correct reading of VRJ7774')
-    parser.add_argument('--disable-tv-loss', action='store_true',
-                        help='Disable total variation (TV) regularization loss during training')
-    parser.add_argument('--disable-homography', action='store_true',
-                        help='Disable homography-based patch application (use simple rectangle overlay instead)')
+    parser = argparse.ArgumentParser(description='Progressive Layer Diversity Training for Patch Generation')
     parser.add_argument('--basis-dim', type=int, default=16,
-                        help='Dimensionality of basis (default: 16)')
+                        help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
-    parser.add_argument('--diversity-only', action='store_true',
-                        help='Optimize only for diversity, disable adversarial loss (still tracked as metric)')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Gradient accumulation steps / effective batch size (default: 16). '
                         'Reduce if OOM, increase if you have more VRAM.')
@@ -1775,13 +1332,8 @@ def main():
     trainer_kwargs = {
         'device': 'cuda',
         'grad_accumulate': args.batch_size,
-        'match_detection': args.match_detection,
-        'impersonation_target': args.impersonation_target,
-        'use_tv_loss': not args.disable_tv_loss,
-        'use_homography': not args.disable_homography,
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
-        'diversity_only': args.diversity_only,
         'max_epochs_per_layer': args.max_epochs_per_layer,
         'convergence_threshold': args.convergence_threshold,
         'target_layer': args.target_layer,
@@ -1791,7 +1343,7 @@ def main():
 
     # Training mode
     try:
-        trainer = ProgressivePatchTrainer(CSV_PATH, training=True, **trainer_kwargs)
+        trainer = ProgressivePatchTrainer(CSV_PATH, **trainer_kwargs)
 
         history = trainer.train(
             learning_rate=args.learning_rate,
