@@ -670,7 +670,10 @@ class ProgressivePatchTrainer:
 
             if self.ocr_activations is not None:
                 result = self.ocr_activations.squeeze(0)  # [H, W, C]
-                return result if use_grad else result.detach()
+                result = result if use_grad else result.detach()
+                # Clear hook reference to allow garbage collection
+                self.ocr_activations = None
+                return result
 
             # Fallback if OCR didn't produce activations
             if hasattr(self, 'activation_shape'):
@@ -750,11 +753,16 @@ class ProgressivePatchTrainer:
                     activation_deltas.append(delta)
 
             # Average deltas for this patch over sampled images
-            avg_delta = torch.stack(activation_deltas, dim=0).mean(dim=0)  # [H, W, C]
+            stacked_deltas = torch.stack(activation_deltas, dim=0)
+            avg_delta = stacked_deltas.mean(dim=0)  # [H, W, C]
             patch_avg_deltas.append(avg_delta)
+            # Clean up intermediate tensors
+            del stacked_deltas, activation_deltas
 
         # Stack averaged deltas: [batch_size, H, W, C]
         avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
+        # Clean up intermediate list
+        del patch_avg_deltas
         avg_deltas_flat = avg_deltas_stacked.reshape(batch_size, -1)  # [batch_size, H*W*C]
 
         # L2 normalize each patch's average delta vector
@@ -1409,7 +1417,9 @@ class ProgressivePatchTrainer:
                     accumulated_patches.append(patch)
                 else:
                     accumulated_patches.append(patch.detach())
-                accumulated_batches.append({k: v[0] for k, v in batch.items()})
+                # Detach and clone batch tensors to prevent holding references to dataloader tensors
+                accumulated_batches.append({k: v[0].detach().clone() if torch.is_tensor(v[0]) else v[0]
+                                           for k, v in batch.items()})
 
                 # Capture activations (automatically populated by forward hook)
                 # Don't detach if diversity_only - we need gradients for the diagonal entries
@@ -1419,6 +1429,8 @@ class ProgressivePatchTrainer:
                         accumulated_activations.append(self.ocr_activations.squeeze(0).clone())
                     else:
                         accumulated_activations.append(self.ocr_activations.squeeze(0).detach().clone())
+                    # Clear hook reference to allow garbage collection
+                    self.ocr_activations = None
 
                 # Track dataset index for baseline lookup
                 accumulated_indices.append(idx)
@@ -1470,11 +1482,20 @@ class ProgressivePatchTrainer:
 
                     # Memory cleanup after update
                     del combined_loss, mean_adv_loss, diversity_score, diversity_loss
+                    # Clear accumulated lists and their contents
+                    for loss in accumulated_losses:
+                        del loss
+                    for patch in accumulated_patches:
+                        del patch
+                    for act in accumulated_activations:
+                        del act
                     accumulated_losses = []
                     accumulated_patches = []
                     accumulated_batches = []
                     accumulated_activations = []
                     accumulated_indices = []
+                    # Clear hook-stored activations
+                    self.ocr_activations = None
 
                     if self.device == 'cuda':
                         torch.cuda.empty_cache()
@@ -1523,6 +1544,16 @@ class ProgressivePatchTrainer:
                     total_loss += combined_loss.item()
                     total_diversity_loss += diversity_loss.item()
                     num_updates += 1
+
+                    # Memory cleanup for remaining samples
+                    del combined_loss, mean_adv_loss, diversity_score, diversity_loss
+                    for loss in accumulated_losses:
+                        del loss
+                    for patch in accumulated_patches:
+                        del patch
+                    for act in accumulated_activations:
+                        del act
+                    self.ocr_activations = None
 
                 if self.device == 'cuda':
                     torch.cuda.empty_cache()
