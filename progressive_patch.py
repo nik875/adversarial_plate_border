@@ -46,7 +46,7 @@ class LayerConfig:
         return f"{self.description} ({self.name})"
 
 
-def get_ocr_layer_progression() -> List[LayerConfig]:
+def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float = 1.0) -> List[LayerConfig]:
     """
     Define the layer progression for the OCR model.
 
@@ -56,79 +56,87 @@ def get_ocr_layer_progression() -> List[LayerConfig]:
     6-9: Transformer blocks (4 transformer encoder blocks)
     10: Final output (vocab projection softmax)
 
+    Args:
+        max_epochs: Maximum epochs per layer (default 50)
+        convergence_threshold: Diversity threshold for convergence. Use 0 or negative to disable (default 1.0)
+
     Returns:
         List of LayerConfig objects defining the attack progression
     """
+    # Final layer gets more epochs and stricter convergence if convergence is enabled
+    final_layer_epochs = max_epochs * 2 if max_epochs < 100 else max_epochs
+    final_convergence = convergence_threshold * 0.5 if convergence_threshold > 0 else convergence_threshold
+
     return [
         # Conv stem layers (32 → 48 → 64 → 80 → 96 channels)
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_1/BiasAdd",
             description="Conv Layer 1 (32ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_1_2/BiasAdd",
             description="Conv Layer 2 (48ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_2_1/BiasAdd",
             description="Conv Layer 3 (64ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_3_1/BiasAdd",
             description="Conv Layer 4 (80ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_4_1/BiasAdd",
             description="Conv Layer 5 (96ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Patch extractor (visual→sequence)
         LayerConfig(
             name="CCT_OCR_1/patch_extractor_1/convolution",
             description="Patch Extractor (384ch)",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Transformer blocks (4 blocks)
         LayerConfig(
             name="CCT_OCR_1/transformer_block_1_1/add_9_1/Add",
             description="Transformer Block 1 Output",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_2_1/add_11_1/Add",
             description="Transformer Block 2 Output",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_3_1/add_13_1/Add",
             description="Transformer Block 3 Output",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_4_1/add_15_1/Add",
             description="Transformer Block 4 Output",
-            max_epochs=50,
-            convergence_threshold=1.0
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Final output
         LayerConfig(
             name="CCT_OCR_1/vocab_projection_1/dense_9_1/Softmax",
             description="Final Output (Vocab Softmax)",
-            max_epochs=100,  # More epochs for final layer
-            convergence_threshold=0.5  # Stricter convergence for final layer
+            max_epochs=final_layer_epochs,
+            convergence_threshold=final_convergence
         ),
     ]
 
@@ -341,6 +349,8 @@ class ProgressivePatchTrainer:
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
                  diversity_only: bool = False,
+                 max_epochs_per_layer: int = 50,
+                 convergence_threshold: float = 1.0,
                  layer_configs: Optional[List[LayerConfig]] = None):
         self.training = training
         self.print_blur = print_blur
@@ -349,9 +359,14 @@ class ProgressivePatchTrainer:
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.diversity_only = diversity_only
+        self.max_epochs_per_layer = max_epochs_per_layer
+        self.convergence_threshold = convergence_threshold
 
         # Progressive layer configuration
-        self.layer_configs = layer_configs or get_ocr_layer_progression()
+        self.layer_configs = layer_configs or get_ocr_layer_progression(
+            max_epochs=max_epochs_per_layer,
+            convergence_threshold=convergence_threshold
+        )
         self.current_layer_idx = 0
         self.current_layer_epoch = 0
         self.layer_history = []  # Track training history for each layer
@@ -1153,9 +1168,12 @@ class ProgressivePatchTrainer:
             diversity_score: Current diversity score (lower is better)
 
         Returns:
-            True if converged (diversity below threshold)
+            True if converged (diversity below threshold). Returns False if convergence checking is disabled.
         """
         current_config = self.layer_configs[self.current_layer_idx]
+        # If threshold is 0 or negative, convergence checking is disabled
+        if current_config.convergence_threshold <= 0:
+            return False
         return diversity_score < current_config.convergence_threshold
 
     def advance_to_next_layer(self) -> bool:
@@ -1606,6 +1624,12 @@ def main():
                         'Reduce if OOM, increase if you have more VRAM.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
                         help='Peak learning rate after warmup (default: 5e-3)')
+    parser.add_argument('--max-epochs-per-layer', type=int, default=50,
+                        help='Maximum epochs to train on each layer (default: 50). '
+                        'Set to high value like 1000 to disable max epoch stopping.')
+    parser.add_argument('--convergence-threshold', type=float, default=1.0,
+                        help='Diversity score threshold for convergence. Training on a layer stops when diversity < threshold. '
+                        '(default: 1.0). Set to 0 or negative to disable convergence checking and train full max-epochs.')
     args = parser.parse_args()
 
     # Configuration
@@ -1621,7 +1645,9 @@ def main():
         'use_homography': not args.disable_homography,
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
-        'diversity_only': args.diversity_only
+        'diversity_only': args.diversity_only,
+        'max_epochs_per_layer': args.max_epochs_per_layer,
+        'convergence_threshold': args.convergence_threshold
     }
 
     # Training mode
