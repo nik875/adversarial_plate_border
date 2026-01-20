@@ -405,7 +405,7 @@ class ProgressivePatchTrainer:
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False,
-                 use_all_for_train: bool = False):
+                 use_all_for_train: bool = True):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -1473,9 +1473,9 @@ def main():
                         'Default: batch_size^2 (evaluate all pairs). '
                         'Always includes batch_size diagonal evaluations, randomly samples remaining off-diagonal. '
                         'Upper bound: batch_size^2. Use to reduce memory usage with large batch sizes.')
-    parser.add_argument('--use-all-for-train', action='store_true',
-                        help='Use all data for training (disable validation set). '
-                        'Default: uses 80%% train / 20%% validation split.')
+    parser.add_argument('--no-use-all-for-train', action='store_true',
+                        help='Disable using all data for training (use 80%% train / 20%% validation split). '
+                        'Default: uses 100%% of data for training.')
     parser.add_argument('--simple-generator', action='store_true',
                         help='Use simple MLP generator instead of foundation model (VAE-based). '
                         'Simple generator: z → MLP[256→512→1024] → patch. '
@@ -1507,7 +1507,7 @@ def main():
         'target_layer': target_layers,
         'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator,
-        'use_all_for_train': args.use_all_for_train
+        'use_all_for_train': not args.no_use_all_for_train
     }
 
     # Training mode
