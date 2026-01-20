@@ -1258,24 +1258,26 @@ class ProgressivePatchTrainer:
             else:
                 return 0.0
 
-    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5):
+    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True):
         """Save current generator state and sample patches
 
         Args:
             epoch: Current epoch for naming
             save_dir: Directory to save to
             num_samples: Number of sample patches to generate and save (default 5)
+            save_generator: Whether to save the generator model (default True). Set to False to save only sample patches.
         """
         Path(save_dir).mkdir(exist_ok=True)
 
         with torch.no_grad():
-            # Save generator network
-            torch.save({
-                'generator_state_dict': self.generator.state_dict(),
-                'epoch': epoch,
-                'basis_dim': self.basis_dim,
-                'patch_size': (self.patch_height, self.patch_width)
-            }, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
+            # Save generator network (if requested)
+            if save_generator:
+                torch.save({
+                    'generator_state_dict': self.generator.state_dict(),
+                    'epoch': epoch,
+                    'basis_dim': self.basis_dim,
+                    'patch_size': (self.patch_height, self.patch_width)
+                }, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 
             # Sample and save example patches
             z_samples = self.sample_coefficients(num_samples)
@@ -1430,11 +1432,11 @@ class ProgressivePatchTrainer:
                 epoch_summary += f" | LR: {current_lr:.2e}"
                 print(epoch_summary)
 
-                # Save example patches every epoch for final layer
+                # Save example patches every epoch for final layer (without generator model)
                 is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
                 if is_final_layer:
                     final_layer_save_dir = f"final_layer_patches_epoch_{self.current_layer_epoch:04d}"
-                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10)
+                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10, save_generator=False)
 
                 # Save best model globally (higher diversity is better, only if validation enabled)
                 if not self.use_all_for_train and val_diversity_score > best_diversity:
