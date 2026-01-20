@@ -497,8 +497,8 @@ class ProgressivePatchTrainer:
             # Original behavior: target is the text we want to prevent OCR from reading
             self.ocr_target = self.text_to_target_tensor('VRJ7774', 9, alphabet)
 
-        # Load OCR and keep on CPU by default (move to GPU only when needed)
-        self.ocr = onnx2torch.convert(ocr_model)
+        # Load OCR and move to GPU
+        self.ocr = onnx2torch.convert(ocr_model).to(self.device)
         self.ocr.eval()
         self.ocr_loss = self.focal_cce_loss(len(alphabet))
 
@@ -506,9 +506,6 @@ class ProgressivePatchTrainer:
         self.setup_activation_hook()
 
         self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
-
-        # Move OCR to GPU after baseline calculation
-        self.ocr.to(self.device)
 
     def setup_activation_hook(self, layer_name: Optional[str] = None):
         """
