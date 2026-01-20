@@ -1664,6 +1664,11 @@ def main():
                         'Reduce if OOM, increase if you have more VRAM.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
                         help='Peak learning rate after warmup (default: 5e-3)')
+    parser.add_argument('--lr-min', type=float, default=1e-5,
+                        help='Minimum learning rate (initial and final, default: 1e-5). '
+                        'Used as start of warmup and end of cosine annealing.')
+    parser.add_argument('--warmup-epochs', type=int, default=5,
+                        help='Number of epochs for linear warmup (default: 5)')
     parser.add_argument('--max-epochs-per-layer', type=int, default=50,
                         help='Maximum epochs to train on each layer (default: 50). '
                         'Set to high value like 1000 to disable max epoch stopping.')
@@ -1701,7 +1706,9 @@ def main():
         trainer = ProgressivePatchTrainer(CSV_PATH, training=True, **trainer_kwargs)
 
         history = trainer.train(
-            learning_rate=args.learning_rate
+            learning_rate=args.learning_rate,
+            warmup_epochs=args.warmup_epochs,
+            lr_min=args.lr_min
         )
 
         # Save training history as CSV
