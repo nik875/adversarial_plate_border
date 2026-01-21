@@ -185,6 +185,7 @@ class RefineGeneratorTrainer:
                  csv_path: str,
                  generator_checkpoint: str,
                  device: str = None,
+                 batch_size: int = 1,
                  grad_accumulate: int = None,
                  match_detection: bool = False,
                  impersonation_target: str = None,
@@ -225,7 +226,7 @@ class RefineGeneratorTrainer:
 
         # Load dataset
         self.train_loader, self.val_loader = create_dataloaders(
-            csv_path, transform=self.transform, preload=True, batch_size=1, n_jobs=0
+            csv_path, transform=self.transform, preload=True, batch_size=batch_size, n_jobs=0
         )
 
         # Load frozen generator
@@ -255,6 +256,7 @@ class RefineGeneratorTrainer:
 
         print(f"\nRefineGeneratorTrainer initialized:")
         print(f"  Device: {self.device}")
+        print(f"  Batch size: {batch_size}")
         print(f"  Generator type: {generator_type}")
         print(f"  SSIM weight: {ssim_weight}")
         print(f"  Match detection: {match_detection}")
@@ -1034,6 +1036,9 @@ def main():
                         help='Path to dataset CSV')
     parser.add_argument('--device', default='cuda', choices=['cuda', 'mps', 'cpu'],
                         help='Device to use for training')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Batch size for training (default: 1). '
+                        'Increase if OOM allows for faster training, reduce if OOM errors occur.')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001,
@@ -1069,6 +1074,7 @@ def main():
             csv_path=args.csv_path,
             generator_checkpoint=args.generator_checkpoint,
             device=args.device,
+            batch_size=args.batch_size,
             grad_accumulate=args.grad_accumulate,
             match_detection=args.match_detection,
             impersonation_target=args.impersonation_target,
