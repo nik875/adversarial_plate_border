@@ -660,14 +660,24 @@ class RefineGeneratorTrainer:
 
         return det_loss, ocr_loss
 
-    def elbow_sqrt_loss(self, loss: torch.Tensor) -> torch.Tensor:
+    def elbow_sqrt_loss(self, loss) -> torch.Tensor:
         """
         Elbow square root: compress large losses while preserving small ones.
         - If loss <= 1: return loss (linear)
         - If loss > 1: return sqrt(loss) (square root)
 
         This helps with OCR losses that can be very large.
+
+        Args:
+            loss: torch.Tensor or float
+
+        Returns:
+            torch.Tensor: Compressed loss
         """
+        # Convert to tensor if it's a float
+        if isinstance(loss, (float, int)):
+            loss = torch.tensor(loss, dtype=torch.float32, device=self.device)
+
         return torch.where(loss <= 1.0, loss, torch.sqrt(loss))
 
     def patch_reg_loss(self, patch: torch.Tensor):
@@ -746,7 +756,7 @@ class RefineGeneratorTrainer:
 
         return mask
 
-    def compute_ssim_loss(self, base_patch: torch.Tensor, refined_patch: torch.Tensor, debug: bool = False) -> torch.Tensor:
+    def compute_ssim_loss(self, base_patch: torch.Tensor, refined_patch: torch.Tensor) -> torch.Tensor:
         """
         Compute SSIM loss between base and refined patches.
 
@@ -756,7 +766,6 @@ class RefineGeneratorTrainer:
         Args:
             base_patch: [3, H, W] or [1, 3, H, W] base patch from generator
             refined_patch: [3, H, W] or [1, 3, H, W] refined patch
-            debug: Print debug statistics
 
         Returns:
             torch.Tensor: Scalar SSIM loss (1 - SSIM, lower is better)
@@ -781,11 +790,6 @@ class RefineGeneratorTrainer:
         # Compute mean only over visible border region
         num_visible_pixels = border_mask.sum()
         ssim_value = masked_ssim.sum() / num_visible_pixels if num_visible_pixels > 0 else torch.tensor(0.0, device=base.device)
-
-        if debug:
-            patch_diff = (refined - base).abs().mean()
-            print(f"  [DEBUG SSIM] SSIM value: {ssim_value.item():.4f}, Patch diff: {patch_diff.item():.6f}, "
-                  f"Border mask coverage: {(border_mask.sum() / border_mask.numel()).item():.1%}")
 
         # We want to maximize SSIM (patches should be similar), so minimize (1 - SSIM)
         ssim_loss = 1.0 - ssim_value
@@ -1064,15 +1068,6 @@ class RefineGeneratorTrainer:
             # Learning rate scheduling (step after each epoch)
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
-
-            # Debug SSIM on first epoch
-            if epoch == 0:
-                print("  Debugging SSIM computation on first batch:")
-                with torch.no_grad():
-                    z = torch.randn(1, self.basis_dim, device=self.device)
-                    base = self.generator(z).squeeze(0)
-                    refined = self.refinement_net(base.unsqueeze(0), z if self.use_latent_context else None).squeeze(0)
-                    _ = self.compute_ssim_loss(base, refined, debug=True)
 
             # Record history
             history['train_total'].append(train_losses['total'])
