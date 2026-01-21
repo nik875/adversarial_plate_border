@@ -63,7 +63,10 @@ def load_generator_and_generate_samples(
 
     # Load weights
     generator.load_state_dict(checkpoint['generator_state_dict'])
-    generator.eval()
+
+    # Use train mode for generation - BatchNorm eval mode collapses outputs
+    # (running statistics don't properly represent the diverse latent space)
+    generator.train()
 
     print(f"\nGenerating {num_samples} sample patches...")
 
