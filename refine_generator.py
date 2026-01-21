@@ -244,6 +244,9 @@ class RefineGeneratorTrainer:
             generator_checkpoint, generator_type
         )
         self.generator.eval()
+        # Keep VAE in train mode for richer output (batch norm uses batch stats, not running stats)
+        if hasattr(self.generator, 'vae'):
+            self.generator.vae.train()
         for param in self.generator.parameters():
             param.requires_grad = False
         print(f"Generator frozen (latent dim: {self.basis_dim})")
@@ -604,26 +607,22 @@ class RefineGeneratorTrainer:
         model_output = self.model(patched_prep)
 
         best_detection = None
-        det_loss = 0.0
+        best_score = -1.0  # Track best IoU * confidence score
 
         for detection in model_output:
             pred_box = detection[1:5]
             conf = detection[6]
             IoU = self.boxes_IoU(pred_box.unsqueeze(0), target_box.unsqueeze(0))
 
-            if self.match_detection:
-                this_det_loss = -IoU * conf
-            else:
-                this_det_loss = IoU * conf
+            score = IoU * conf
 
-            if self.match_detection:
-                if -this_det_loss > -det_loss:
-                    det_loss = this_det_loss
-                    best_detection = detection
-            else:
-                if this_det_loss > det_loss:
-                    det_loss = this_det_loss
-                    best_detection = detection
+            # Pick detection with highest IoU*conf regardless of mode
+            if score > best_score:
+                best_score = score
+                best_detection = detection
+
+        # Convert score to loss: 1 - score works for both modes
+        det_loss = 1.0 - best_score if best_score >= 0.0 else 1.0
 
         ocr_loss = 0.0
         if best_detection is not None:
