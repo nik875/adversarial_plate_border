@@ -6,40 +6,9 @@ import torch
 from pathlib import Path
 from progressive_patch import FoundationPatchGenerator, SimplePatchGenerator
 import torchvision.transforms as T
-import glob
-
-def find_checkpoint(checkpoint_path: str = None):
-    """
-    Find a checkpoint file. If path not specified, searches for checkpoints in order:
-    1. final_progressive_patch/
-    2. best_progressive_patch/
-    3. layer*_complete_*/
-    """
-    if checkpoint_path and Path(checkpoint_path).exists():
-        return checkpoint_path
-
-    # Search for checkpoints
-    search_paths = [
-        "final_progressive_patch/generator_epoch_*.pt",
-        "best_progressive_patch/generator_epoch_*.pt",
-        "layer*_complete_*/generator_epoch_*.pt",
-    ]
-
-    for pattern in search_paths:
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            latest = matches[-1]  # Get latest epoch
-            print(f"Found checkpoint: {latest}")
-            return latest
-
-    raise FileNotFoundError(
-        f"Could not find checkpoint at {checkpoint_path or 'default locations'}. "
-        "Checked: final_progressive_patch/, best_progressive_patch/, layer*_complete_*/"
-    )
-
 
 def load_generator_and_generate_samples(
-    checkpoint_path: str = None,
+    checkpoint_path: str = "best_progressive_patch/generator_epoch_0108.pt",
     num_samples: int = 9,
     output_dir: str = "generated_samples",
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,14 +17,11 @@ def load_generator_and_generate_samples(
     Load a generator checkpoint and generate sample patches.
 
     Args:
-        checkpoint_path: Path to the generator checkpoint (auto-finds if not specified)
+        checkpoint_path: Path to the generator checkpoint
         num_samples: Number of samples to generate
         output_dir: Directory to save sample images
         device: Device to use (cuda or cpu)
     """
-    # Find checkpoint if not specified
-    checkpoint_path = find_checkpoint(checkpoint_path)
-
     # Create output directory
     Path(output_dir).mkdir(exist_ok=True)
 
@@ -109,7 +75,16 @@ def load_generator_and_generate_samples(
         for i, patch in enumerate(patches):
             # Convert to PIL image and save
             patch_cpu = patch.detach().cpu()
-            patch_pil = T.ToPILImage()(patch_cpu)
+
+            # Min-max stretching for contrast enhancement
+            patch_min = patch_cpu.min()
+            patch_max = patch_cpu.max()
+            if patch_max > patch_min:
+                patch_stretched = (patch_cpu - patch_min) / (patch_max - patch_min)
+            else:
+                patch_stretched = patch_cpu
+
+            patch_pil = T.ToPILImage()(patch_stretched)
 
             output_path = f"{output_dir}/sample_{i:02d}.png"
             patch_pil.save(output_path)
@@ -122,8 +97,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Generate sample patches from a trained generator")
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to generator checkpoint (auto-finds if not specified)")
+    parser.add_argument("--checkpoint", type=str, default="best_progressive_patch/generator_epoch_0108.pt",
+                        help="Path to generator checkpoint")
     parser.add_argument("--num-samples", type=int, default=9,
                         help="Number of samples to generate")
     parser.add_argument("--output-dir", type=str, default="generated_samples",
@@ -134,7 +109,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     load_generator_and_generate_samples(
-        checkpoint_path=args.checkpoint if args.checkpoint else None,
+        checkpoint_path=args.checkpoint,
         num_samples=args.num_samples,
         output_dir=args.output_dir,
         device=args.device
