@@ -192,6 +192,7 @@ class RefineGeneratorTrainer:
                  print_blur: float = 0,
                  training: bool = False,
                  use_tv_loss: bool = True,
+                 tv_weight: float = 1.0,
                  use_homography: bool = True,
                  ssim_weight: float = 1.0,
                  use_latent_context: bool = False,
@@ -201,6 +202,7 @@ class RefineGeneratorTrainer:
         self.training = training
         self.print_blur = print_blur
         self.use_tv_loss = use_tv_loss
+        self.tv_weight = tv_weight
         self.use_homography = use_homography
         self.ssim_weight = ssim_weight
         self.use_latent_context = use_latent_context
@@ -267,9 +269,9 @@ class RefineGeneratorTrainer:
         print(f"  Gradient accumulation: {grad_accumulate or 'disabled'}")
         print(f"  Generator type: {generator_type}")
         print(f"  SSIM weight: {ssim_weight}")
+        print(f"  TV loss: {'Enabled (weight: ' + str(tv_weight) + ')' if use_tv_loss else 'Disabled'}")
         print(f"  Match detection: {match_detection}")
         print(f"  Impersonation target: {impersonation_target or 'None (disruption mode)'}")
-        print(f"  TV loss: {'Enabled' if use_tv_loss else 'Disabled'}")
         print(f"  Homography: {'Enabled' if use_homography else 'Disabled'}")
 
     def _load_frozen_generator(self, checkpoint_path: str, generator_type: str):
@@ -832,7 +834,7 @@ class RefineGeneratorTrainer:
 
         # Combine losses: average detection and compressed OCR
         attack_loss = (det_loss + ocr_loss_compressed) / 2
-        total_loss = self.ssim_weight * ssim_loss + attack_loss + reg_loss
+        total_loss = self.ssim_weight * ssim_loss + attack_loss + self.tv_weight * reg_loss
 
         # Return loss breakdown for logging
         loss_breakdown = {
@@ -1171,6 +1173,9 @@ def main():
                         help='Target plate text for impersonation (e.g., "ABC123")')
     parser.add_argument('--disable-tv-loss', action='store_true',
                         help='Disable total variation regularization')
+    parser.add_argument('--tv-weight', type=float, default=1.0,
+                        help='Weight for total variation loss (default: 1.0). '
+                        'Higher = more smoothness penalty, lower = less smoothness constraint.')
     parser.add_argument('--disable-homography', action='store_true',
                         help='Disable homography-based patch application')
     parser.add_argument('--save-interval', type=int, default=10,
@@ -1194,6 +1199,7 @@ def main():
             impersonation_target=args.impersonation_target,
             training=True,
             use_tv_loss=not args.disable_tv_loss,
+            tv_weight=args.tv_weight,
             use_homography=not args.disable_homography,
             ssim_weight=args.ssim_weight,
             use_latent_context=args.use_latent_context,
