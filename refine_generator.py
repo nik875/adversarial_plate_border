@@ -954,12 +954,10 @@ class RefineGeneratorTrainer:
                     z if self.use_latent_context else None
                 ).squeeze(0)
 
-                # Compute SSIM
-                ssim_value = ssim(
-                    refined_patch.unsqueeze(0),
-                    base_patch.unsqueeze(0),
-                    window_size=11
-                ).item()
+                # Compute SSIM (using same method as training)
+                ssim_loss = self.compute_ssim_loss(base_patch, refined_patch)
+                # For display, show as similarity (1 - loss), higher is more similar
+                ssim_value = (1.0 - ssim_loss).item()
 
                 # Convert to numpy for visualization
                 base_np = base_patch.cpu().permute(1, 2, 0).numpy()
