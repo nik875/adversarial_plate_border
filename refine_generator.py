@@ -899,14 +899,19 @@ class RefineGeneratorTrainer:
                     elif self.device == 'mps':
                         torch.mps.empty_cache()
 
-                    # Update progress
-                    avg_total = total_losses['total'] / (num_updates * update_every)
-                    avg_ssim = total_losses['ssim'] / (num_updates * update_every)
-                    avg_attack = total_losses['attack'] / (num_updates * update_every)
+                    # Update progress with full breakdown
+                    num_batches = num_updates * update_every
+                    avg_total = total_losses['total'] / num_batches
+                    avg_ssim = total_losses['ssim'] / num_batches
+                    avg_detection = total_losses['detection'] / num_batches
+                    avg_ocr = total_losses['ocr'] / num_batches
+                    avg_tv = total_losses['tv'] / num_batches
                     pbar.set_postfix({
                         'Loss': f"{avg_total:.4f}",
                         'SSIM': f"{avg_ssim:.4f}",
-                        'Attack': f"{avg_attack:.4f}",
+                        'Det': f"{avg_detection:.4f}",
+                        'OCR': f"{avg_ocr:.4f}",
+                        'TV': f"{avg_tv:.4f}",
                         'Updates': num_updates
                     })
                 else:
