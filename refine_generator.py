@@ -195,7 +195,8 @@ class RefineGeneratorTrainer:
                  use_homography: bool = True,
                  ssim_weight: float = 1.0,
                  use_latent_context: bool = False,
-                 generator_type: str = 'simple'):
+                 generator_type: str = 'simple',
+                 use_all_for_train: bool = True):
 
         self.training = training
         self.print_blur = print_blur
@@ -203,6 +204,7 @@ class RefineGeneratorTrainer:
         self.use_homography = use_homography
         self.ssim_weight = ssim_weight
         self.use_latent_context = use_latent_context
+        self.use_all_for_train = use_all_for_train
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -226,7 +228,8 @@ class RefineGeneratorTrainer:
 
         # Load dataset
         self.train_loader, self.val_loader = create_dataloaders(
-            csv_path, transform=self.transform, preload=True, batch_size=batch_size, n_jobs=0
+            csv_path, transform=self.transform, preload=True, batch_size=batch_size, n_jobs=0,
+            use_all_for_train=use_all_for_train
         )
 
         # Load frozen generator
@@ -828,6 +831,10 @@ class RefineGeneratorTrainer:
 
     def validate(self) -> dict:
         """Validation pass on held-out data"""
+        # Skip validation if using all data for training
+        if self.use_all_for_train or len(self.val_loader) == 0:
+            return {key: 0.0 for key in ['total', 'ssim', 'detection', 'ocr', 'tv', 'attack']}
+
         self.refinement_net.eval()
 
         total_losses = {
@@ -956,7 +963,11 @@ class RefineGeneratorTrainer:
         patience_counter = 0
 
         print("\nStarting refinement network training")
-        print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
+        if self.use_all_for_train:
+            print(f"   Dataset: {len(self.train_loader)} images (all for training, no validation)")
+        else:
+            print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images "
+                  f"({len(self.train_loader)} train, {len(self.val_loader)} val)")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
         print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
@@ -966,7 +977,7 @@ class RefineGeneratorTrainer:
         for epoch in range(num_epochs):
             # Training
             train_losses = self.train_epoch(optimizer, epoch)
-            val_losses = self.validate()
+            val_losses = self.validate() if not self.use_all_for_train else train_losses
 
             # Learning rate scheduling (step after each epoch)
             scheduler.step()
@@ -982,16 +993,23 @@ class RefineGeneratorTrainer:
             history['learning_rate'].append(current_lr)
 
             # Print epoch summary
-            print(f"Epoch {epoch+1:3d}/{num_epochs} | "
-                  f"Train: {train_losses['total']:.4f} "
-                  f"(SSIM: {train_losses['ssim']:.4f}, Attack: {train_losses['attack']:.4f}) | "
-                  f"Val: {val_losses['total']:.4f} "
-                  f"(SSIM: {val_losses['ssim']:.4f}, Attack: {val_losses['attack']:.4f}) | "
-                  f"LR: {current_lr:.2e}")
+            if self.use_all_for_train:
+                print(f"Epoch {epoch+1:3d}/{num_epochs} | "
+                      f"Loss: {train_losses['total']:.4f} "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Attack: {train_losses['attack']:.4f}) | "
+                      f"LR: {current_lr:.2e}")
+            else:
+                print(f"Epoch {epoch+1:3d}/{num_epochs} | "
+                      f"Train: {train_losses['total']:.4f} "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Attack: {train_losses['attack']:.4f}) | "
+                      f"Val: {val_losses['total']:.4f} "
+                      f"(SSIM: {val_losses['ssim']:.4f}, Attack: {val_losses['attack']:.4f}) | "
+                      f"LR: {current_lr:.2e}")
 
-            # Save best model
-            if val_losses['total'] < best_loss:
-                best_loss = val_losses['total']
+            # Save best model (use training loss if no validation)
+            loss_for_best = train_losses['total'] if self.use_all_for_train else val_losses['total']
+            if loss_for_best < best_loss:
+                best_loss = loss_for_best
                 patience_counter = 0
                 self.save_checkpoint(epoch, "best_refined_patches")
                 self.save_sample_patches(epoch, num_samples=4, save_dir="best_refined_patches")
@@ -1066,6 +1084,9 @@ def main():
                         help='Save checkpoint every N epochs')
     parser.add_argument('--early-stop-patience', type=int, default=15,
                         help='Early stopping patience (epochs)')
+    parser.add_argument('--no-use-all-for-train', action='store_true',
+                        help='Disable using all data for training (use 80%% train / 20%% validation split). '
+                        'Default: uses 100%% of data for training, no validation.')
 
     args = parser.parse_args()
 
@@ -1083,7 +1104,8 @@ def main():
             use_homography=not args.disable_homography,
             ssim_weight=args.ssim_weight,
             use_latent_context=args.use_latent_context,
-            generator_type=args.generator_type
+            generator_type=args.generator_type,
+            use_all_for_train=not args.no_use_all_for_train
         )
 
         history = trainer.train(
