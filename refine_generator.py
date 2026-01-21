@@ -658,9 +658,15 @@ class RefineGeneratorTrainer:
                 else:
                     ocr_loss = self.ocr_baseline / ocr_loss
 
+        # Ensure both losses are tensors (they may be floats if no detection/OCR found)
+        if isinstance(det_loss, (float, int)):
+            det_loss = torch.tensor(det_loss, dtype=torch.float32, device=self.device)
+        if isinstance(ocr_loss, (float, int)):
+            ocr_loss = torch.tensor(ocr_loss, dtype=torch.float32, device=self.device)
+
         return det_loss, ocr_loss
 
-    def elbow_sqrt_loss(self, loss) -> torch.Tensor:
+    def elbow_sqrt_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """
         Elbow square root: compress large losses while preserving small ones.
         - If loss <= 1: return loss (linear)
@@ -669,15 +675,11 @@ class RefineGeneratorTrainer:
         This helps with OCR losses that can be very large.
 
         Args:
-            loss: torch.Tensor or float
+            loss: torch.Tensor
 
         Returns:
             torch.Tensor: Compressed loss
         """
-        # Convert to tensor if it's a float
-        if isinstance(loss, (float, int)):
-            loss = torch.tensor(loss, dtype=torch.float32, device=self.device)
-
         return torch.where(loss <= 1.0, loss, torch.sqrt(loss))
 
     def patch_reg_loss(self, patch: torch.Tensor):
