@@ -613,22 +613,28 @@ class RefineGeneratorTrainer:
         model_output = self.model(patched_prep)
 
         best_detection = None
-        best_score = -1.0  # Track best IoU * confidence score
+        best_iou = -1.0
+        best_conf = -1.0
 
         for detection in model_output:
             pred_box = detection[1:5]
             conf = detection[6]
             IoU = self.boxes_IoU(pred_box.unsqueeze(0), target_box.unsqueeze(0))
 
+            # Use IoU * conf as selection metric (highest combined score)
             score = IoU * conf
 
-            # Pick detection with highest IoU*conf regardless of mode
-            if score > best_score:
-                best_score = score
+            # Pick detection with highest IoU*conf for consistency
+            if score > (best_iou * best_conf if best_iou >= 0 else -1.0):
+                best_iou = IoU
+                best_conf = conf
                 best_detection = detection
 
-        # Convert score to loss: 1 - score works for both modes
-        det_loss = 1.0 - best_score if best_score >= 0.0 else 1.0
+        # Convert to loss using sum: both IoU and conf must decrease independently
+        if best_iou >= 0.0:
+            det_loss = ((1.0 - best_iou) + (1.0 - best_conf)) / 2.0
+        else:
+            det_loss = 1.0
 
         ocr_loss = 0.0
         if best_detection is not None:
