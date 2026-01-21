@@ -1062,6 +1062,10 @@ class RefineGeneratorTrainer:
                       f"(SSIM: {val_losses['ssim']:.4f}, Det: {val_losses['detection']:.4f}, OCR: {val_losses['ocr']:.4f}, TV: {val_losses['tv']:.4f}) | "
                       f"LR: {current_lr:.2e}")
 
+            # Save every epoch
+            self.save_checkpoint(epoch, "all_epochs_refined_patches")
+            self.save_sample_patches(epoch, num_samples=4, save_dir="all_epochs_refined_patches")
+
             # Save best model (use training loss if no validation)
             loss_for_best = train_losses['total'] if self.use_all_for_train else val_losses['total']
             if loss_for_best < best_loss:
@@ -1092,6 +1096,7 @@ class RefineGeneratorTrainer:
         print("\nTraining completed!")
         print(f"   Best loss: {best_loss:.4f}")
         print(f"\nCheckpoints and samples saved to:")
+        print(f"   - all_epochs_refined_patches/: All epoch checkpoints (one per epoch)")
         print(f"   - best_refined_patches/: Best model across all training")
         print(f"   - checkpoint_refined_patches/: Periodic checkpoints (every {save_interval} epochs)")
         print(f"   - {final_save_dir}/: Final model after training completion")
