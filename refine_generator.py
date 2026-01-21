@@ -764,8 +764,8 @@ class RefineGeneratorTrainer:
         """Compute full loss including SSIM, detection, OCR, and TV"""
         batch = {k: v[0] for k, v in batch.items()}
 
-        # Sample random latent
-        z = torch.randn(1, self.basis_dim, device=self.device)
+        # Sample random latent (Uniform [0, 1] to match generator training)
+        z = torch.rand(1, self.basis_dim, device=self.device)
 
         # Generate base patch from frozen generator (no grad)
         with torch.no_grad():
@@ -931,7 +931,7 @@ class RefineGeneratorTrainer:
 
         with torch.no_grad():
             for i in range(num_samples):
-                z = torch.randn(1, self.basis_dim, device=self.device)
+                z = torch.rand(1, self.basis_dim, device=self.device)
 
                 # Generate base patch
                 base_patch = self.generator(z).squeeze(0)
