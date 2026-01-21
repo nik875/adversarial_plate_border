@@ -649,7 +649,7 @@ class RefineGeneratorTrainer:
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             ocr_output = self.ocr(ocr_input)
             ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
-            ocr_loss = 1 - ocr_loss
+            ocr_loss = (1 - ocr_loss) ** 2
 
         # Ensure both losses are tensors (they may be floats if no detection/OCR found)
         if isinstance(det_loss, (float, int)):
