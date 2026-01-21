@@ -911,13 +911,38 @@ class RefineGeneratorTrainer:
         plt.close()
 
     def train(self, num_epochs: int = 100, learning_rate: float = 0.001,
-              save_interval: int = 10, early_stop_patience: int = 15):
+              save_interval: int = 10, early_stop_patience: int = 15,
+              warmup_epochs: int = 5, lr_min: float = 1e-5):
         """Main training loop"""
 
         optimizer = optim.AdamW(self.refinement_net.parameters(), lr=learning_rate, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=5, factor=0.5
-        )
+
+        # Create learning rate scheduler with warmup + cosine annealing
+        if warmup_epochs > 0:
+            # Warmup from lr_min to learning_rate, then cosine anneal to lr_min
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=lr_min / learning_rate,
+                end_factor=1.0,
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=num_epochs - warmup_epochs,
+                eta_min=lr_min
+            )
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+        else:
+            # No warmup: start directly at learning_rate, cosine down to lr_min
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=num_epochs,
+                eta_min=lr_min
+            )
 
         history = {
             'train_total': [], 'train_ssim': [], 'train_attack': [],
@@ -932,7 +957,7 @@ class RefineGeneratorTrainer:
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Device: {self.device}")
         print(f"   Epochs: {num_epochs}")
-        print(f"   Initial LR: {learning_rate}")
+        print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
         print(f"   SSIM weight: {self.ssim_weight}")
         print("-" * 60)
 
@@ -941,8 +966,8 @@ class RefineGeneratorTrainer:
             train_losses = self.train_epoch(optimizer, epoch)
             val_losses = self.validate()
 
-            # Learning rate scheduling
-            scheduler.step(train_losses['total'])
+            # Learning rate scheduling (step after each epoch)
+            scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
 
             # Record history
@@ -1001,7 +1026,12 @@ def main():
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001,
-                        help='Learning rate')
+                        help='Peak learning rate after warmup (default: 0.001)')
+    parser.add_argument('--lr-min', type=float, default=1e-5,
+                        help='Minimum learning rate (initial and final, default: 1e-5). '
+                        'Used as start of warmup and end of cosine annealing.')
+    parser.add_argument('--warmup-epochs', type=int, default=5,
+                        help='Number of epochs for linear warmup (default: 5)')
     parser.add_argument('--grad-accumulate', type=int, default=64,
                         help='Gradient accumulation steps')
     parser.add_argument('--ssim-weight', type=float, default=1.0,
@@ -1043,7 +1073,9 @@ def main():
             num_epochs=args.epochs,
             learning_rate=args.lr,
             save_interval=args.save_interval,
-            early_stop_patience=args.early_stop_patience
+            early_stop_patience=args.early_stop_patience,
+            warmup_epochs=args.warmup_epochs,
+            lr_min=args.lr_min
         )
 
         # Save training history
