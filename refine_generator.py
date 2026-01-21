@@ -360,7 +360,6 @@ class RefineGeneratorTrainer:
 
         self.ocr = onnx2torch.convert(ocr_model).to(self.device)
         self.ocr_loss = self.focal_cce_loss(len(alphabet))
-        self.detection_baseline, self.ocr_baseline = self.calculate_baseline_loss()
         self.ocr.eval()
 
         # Disable gradients for model parameters
@@ -586,7 +585,7 @@ class RefineGeneratorTrainer:
 
         return inter_area / (union_area + 1e-8)
 
-    def partial_loss(self, batch, refined_patch, use_ocr_baseline=True):
+    def partial_loss(self, batch, refined_patch):
         """Compute detection and OCR losses for refined patch"""
         prep_image = batch['prep_image'].to(self.device)
         corners = batch['new_corners'].to(self.device)
@@ -650,15 +649,7 @@ class RefineGeneratorTrainer:
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             ocr_output = self.ocr(ocr_input)
             ocr_loss = self.ocr_loss(self.ocr_target, ocr_output)
-
-            if use_ocr_baseline:
-                if not hasattr(self, 'ocr_baseline'):
-                    raise ValueError('Must call calculate_baseline_loss before using!')
-
-                if self.impersonation_target:
-                    ocr_loss = ocr_loss / self.ocr_baseline
-                else:
-                    ocr_loss = self.ocr_baseline / ocr_loss
+            ocr_loss = 1 - ocr_loss
 
         # Ensure both losses are tensors (they may be floats if no detection/OCR found)
         if isinstance(det_loss, (float, int)):
@@ -696,37 +687,6 @@ class RefineGeneratorTrainer:
         loss = loss * 2.5
 
         return loss
-
-    def calculate_baseline_loss(self) -> Tuple[float, float]:
-        """Calculate baseline OCR loss across dataset"""
-        total_ocr_loss = 0.0
-        total_det_loss = 0.0
-        total_plates = 0
-
-        desc = "Calculating baseline loss"
-        with tqdm(self.train_loader, desc=desc, leave=False) as pbar:
-            with torch.no_grad():
-                for batch in pbar:
-                    batch = {k: v[0] for k, v in batch.items()}
-
-                    # Use a dummy white patch for baseline
-                    dummy_patch = torch.ones(3, self.patch_height, self.patch_width,
-                                            device=self.device) * 0.5
-
-                    det_loss, ocr_loss = self.partial_loss(batch, dummy_patch,
-                                                          use_ocr_baseline=False)
-                    total_det_loss += det_loss
-                    total_ocr_loss += ocr_loss
-                    total_plates += 1
-
-                    avg_ocr = total_ocr_loss / total_plates
-                    avg_det = total_det_loss / total_plates
-                    pbar.set_postfix({
-                        'Avg_Detection_Loss': f'{avg_det.item():.4f}',
-                        'Avg_OCR_Loss': f'{avg_ocr.item():.4f}'
-                    })
-
-        return total_det_loss / total_plates, total_ocr_loss / total_plates
 
     def create_border_mask(self, height: int, width: int, border_scale: float = 1.4) -> torch.Tensor:
         """
@@ -800,7 +760,7 @@ class RefineGeneratorTrainer:
 
         return ssim_loss
 
-    def compute_loss_full(self, batch: dict, use_ocr_baseline=True) -> Tuple[torch.Tensor, dict]:
+    def compute_loss_full(self, batch: dict) -> Tuple[torch.Tensor, dict]:
         """Compute full loss including SSIM, detection, OCR, and TV"""
         batch = {k: v[0] for k, v in batch.items()}
 
@@ -821,7 +781,7 @@ class RefineGeneratorTrainer:
         ssim_loss = self.compute_ssim_loss(base_patch, refined_patch)
 
         # Compute detection and OCR losses
-        det_loss, ocr_loss = self.partial_loss(batch, refined_patch, use_ocr_baseline)
+        det_loss, ocr_loss = self.partial_loss(batch, refined_patch)
 
         # Apply elbow sqrt to OCR loss (compress large values while preserving small ones)
         ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss)
