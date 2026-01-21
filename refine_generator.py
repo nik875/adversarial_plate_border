@@ -704,15 +704,74 @@ class RefineGeneratorTrainer:
 
         return total_det_loss / total_plates, total_ocr_loss / total_plates
 
+    def create_border_mask(self, height: int, width: int, border_scale: float = 1.4) -> torch.Tensor:
+        """
+        Create a mask for the visible border region of the patch.
+
+        When applied, the patch fills a border_scale region around the plate,
+        but the center plate region gets cut out. This mask identifies which
+        parts of the patch are actually visible (border) vs obscured (center).
+
+        Args:
+            height: Patch height
+            width: Patch width
+            border_scale: Scale factor for border (default 1.4)
+
+        Returns:
+            mask: [1, 1, H, W] tensor, 1 = visible border, 0 = obscured center
+        """
+        plate_scale_ratio = 1.0 / border_scale
+
+        center_h = int(height * plate_scale_ratio)
+        center_w = int(width * plate_scale_ratio)
+
+        mask = torch.ones(1, 1, height, width)
+
+        h_start = (height - center_h) // 2
+        h_end = h_start + center_h
+        w_start = (width - center_w) // 2
+        w_end = w_start + center_w
+
+        mask[:, :, h_start:h_end, w_start:w_end] = 0.0
+
+        return mask
+
     def compute_ssim_loss(self, base_patch: torch.Tensor, refined_patch: torch.Tensor) -> torch.Tensor:
-        """Compute SSIM loss between base and refined patches"""
-        # SSIM expects 4D input [B, C, H, W]
+        """
+        Compute SSIM loss between base and refined patches.
+
+        Only compares the visible border region (excludes center plate region
+        that gets obscured when patch is applied).
+
+        Args:
+            base_patch: [3, H, W] or [1, 3, H, W] base patch from generator
+            refined_patch: [3, H, W] or [1, 3, H, W] refined patch
+
+        Returns:
+            torch.Tensor: Scalar SSIM loss (1 - SSIM, lower is better)
+        """
+        # Ensure 4D input [B, C, H, W]
         base = base_patch.unsqueeze(0) if base_patch.dim() == 3 else base_patch
         refined = refined_patch.unsqueeze(0) if refined_patch.dim() == 3 else refined_patch
 
-        # SSIM returns value in [0, 1] where 1 is identical
-        # We want to maximize SSIM, so minimize (1 - SSIM)
-        ssim_value = ssim(refined, base, window_size=11, reduction='mean')
+        # Create border mask (only score visible border, ignore obscured center)
+        _, _, H, W = base.shape
+        border_mask = self.create_border_mask(H, W, border_scale=1.4).to(base.device)
+
+        # Compute SSIM map (returns [B, C, H, W] with per-pixel SSIM values)
+        ssim_map = ssim(refined, base, window_size=11)  # [1, 3, H, W]
+
+        # Average across channels
+        ssim_map_avg = ssim_map.mean(dim=1, keepdim=True)  # [1, 1, H, W]
+
+        # Apply border mask: only consider visible regions
+        masked_ssim = ssim_map_avg * border_mask  # [1, 1, H, W]
+
+        # Compute mean only over visible border region
+        num_visible_pixels = border_mask.sum()
+        ssim_value = masked_ssim.sum() / num_visible_pixels if num_visible_pixels > 0 else torch.tensor(0.0, device=base.device)
+
+        # We want to maximize SSIM (patches should be similar), so minimize (1 - SSIM)
         ssim_loss = 1.0 - ssim_value
 
         return ssim_loss
