@@ -660,7 +660,7 @@ class RefineGeneratorTrainer:
                 if self.impersonation_target:
                     ocr_loss = ocr_loss / self.ocr_baseline
                 else:
-                    ocr_loss = 1.0 / (ocr_loss + 1.0)
+                    ocr_loss = torch.tanh(torch.exp(-ocr_loss))
             else:
                 # For baseline calculation, return raw focal loss
                 pass
@@ -888,7 +888,7 @@ class RefineGeneratorTrainer:
             'total': total_loss.item(),
             'ssim': ssim_loss.item(),
             'detection': det_loss.item(),
-            'ocr': (1.0 / (ocr_loss_raw + 1.0)).item() if isinstance(ocr_loss_raw, torch.Tensor) else (1.0 / (ocr_loss_raw + 1.0)),  # Display: 1 / (raw focal loss + 1)
+            'ocr': (1 - ocr_loss_raw).item() if isinstance(ocr_loss_raw, torch.Tensor) else (1 - ocr_loss_raw),  # Display: 1 - raw focal loss
             'ocr_raw': ocr_loss_baseline.item(),  # Raw baseline-normalized OCR loss used in optimization
             'tv': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
             'attack': attack_loss.item()
