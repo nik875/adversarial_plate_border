@@ -1044,8 +1044,8 @@ class RefineGeneratorTrainer:
             )
 
         history = {
-            'train_total': [], 'train_ssim': [], 'train_detection': [], 'train_ocr': [], 'train_ocr_raw': [],
-            'val_total': [], 'val_ssim': [], 'val_detection': [], 'val_ocr': [], 'val_ocr_raw': [],
+            'train_total': [], 'train_ssim': [], 'train_detection': [], 'train_ocr': [], 'train_ocr_raw': [], 'train_tv': [],
+            'val_total': [], 'val_ssim': [], 'val_detection': [], 'val_ocr': [], 'val_ocr_raw': [], 'val_tv': [],
             'learning_rate': []
         }
 
@@ -1079,25 +1079,27 @@ class RefineGeneratorTrainer:
             history['train_detection'].append(train_losses['detection'])
             history['train_ocr'].append(train_losses['ocr'])
             history['train_ocr_raw'].append(train_losses.get('ocr_raw', train_losses['ocr']))
+            history['train_tv'].append(train_losses['tv'])
             history['val_total'].append(val_losses['total'])
             history['val_ssim'].append(val_losses['ssim'])
             history['val_detection'].append(val_losses['detection'])
             history['val_ocr'].append(val_losses['ocr'])
             history['val_ocr_raw'].append(val_losses.get('ocr_raw', val_losses['ocr']))
+            history['val_tv'].append(val_losses['tv'])
             history['learning_rate'].append(current_lr)
 
             # Print epoch summary
             if self.use_all_for_train:
                 print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                       f"Loss: {train_losses['total']:.4f} "
-                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}) | "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}, TV: {train_losses['tv']:.4f}) | "
                       f"LR: {current_lr:.2e}")
             else:
                 print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                       f"Train: {train_losses['total']:.4f} "
-                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}) | "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}, TV: {train_losses['tv']:.4f}) | "
                       f"Val: {val_losses['total']:.4f} "
-                      f"(SSIM: {val_losses['ssim']:.4f}, Det: {val_losses['detection']:.4f}, OCR: {val_losses['ocr']:.4f}) | "
+                      f"(SSIM: {val_losses['ssim']:.4f}, Det: {val_losses['detection']:.4f}, OCR: {val_losses['ocr']:.4f}, TV: {val_losses['tv']:.4f}) | "
                       f"LR: {current_lr:.2e}")
 
             # Save best model (use training loss if no validation)
