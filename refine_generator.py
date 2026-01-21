@@ -195,6 +195,7 @@ class RefineGeneratorTrainer:
                  tv_weight: float = 1.0,
                  use_homography: bool = True,
                  ssim_weight: float = 1.0,
+                 ocr_weight: float = 1.0,
                  use_latent_context: bool = False,
                  generator_type: str = 'simple',
                  use_all_for_train: bool = True):
@@ -205,6 +206,7 @@ class RefineGeneratorTrainer:
         self.tv_weight = tv_weight
         self.use_homography = use_homography
         self.ssim_weight = ssim_weight
+        self.ocr_weight = ocr_weight
         self.use_latent_context = use_latent_context
         self.use_all_for_train = use_all_for_train
 
@@ -270,6 +272,7 @@ class RefineGeneratorTrainer:
         print(f"  Gradient accumulation: {grad_accumulate or 'disabled'}")
         print(f"  Generator type: {generator_type}")
         print(f"  SSIM weight: {ssim_weight}")
+        print(f"  OCR weight: {ocr_weight}")
         print(f"  TV loss: {'Enabled (weight: ' + str(tv_weight) + ')' if use_tv_loss else 'Disabled'}")
         print(f"  Match detection: {match_detection}")
         print(f"  Impersonation target: {impersonation_target or 'None (disruption mode)'}")
@@ -874,8 +877,8 @@ class RefineGeneratorTrainer:
         else:
             reg_loss = 0.0
 
-        # Combine losses: average detection and compressed OCR
-        attack_loss = (det_loss + ocr_loss_compressed) / 2
+        # Combine losses: detection + weighted OCR
+        attack_loss = (det_loss + self.ocr_weight * ocr_loss_compressed) / (1 + self.ocr_weight)
         total_loss = self.ssim_weight * ssim_loss + attack_loss + self.tv_weight * reg_loss
 
         # For display: compute inverted OCR loss for interpretability
@@ -1231,6 +1234,9 @@ def main():
                         help='Gradient accumulation steps')
     parser.add_argument('--ssim-weight', type=float, default=1.0,
                         help='Weight for SSIM loss (higher = stay closer to generator)')
+    parser.add_argument('--ocr-weight', type=float, default=1.0,
+                        help='Weight for OCR loss relative to detection loss (default: 1.0). '
+                        'Higher = emphasize OCR disruption, lower = emphasize detection.')
     parser.add_argument('--use-latent-context', action='store_true',
                         help='Pass latent z to refinement network for context')
     parser.add_argument('--match-detection', action='store_true',
@@ -1268,6 +1274,7 @@ def main():
             tv_weight=args.tv_weight,
             use_homography=not args.disable_homography,
             ssim_weight=args.ssim_weight,
+            ocr_weight=args.ocr_weight,
             use_latent_context=args.use_latent_context,
             generator_type=args.generator_type,
             use_all_for_train=not args.no_use_all_for_train
