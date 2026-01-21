@@ -6,6 +6,8 @@ import torch
 from pathlib import Path
 from progressive_patch import FoundationPatchGenerator, SimplePatchGenerator
 import torchvision.transforms as T
+import cv2
+import numpy as np
 
 def load_generator_and_generate_samples(
     checkpoint_path: str = "generator_export/training_complete_final_model/generator_epoch_0254.pt",
@@ -76,15 +78,17 @@ def load_generator_and_generate_samples(
             # Convert to PIL image and save
             patch_cpu = patch.detach().cpu()
 
-            # Min-max stretching for contrast enhancement
-            patch_min = patch_cpu.min()
-            patch_max = patch_cpu.max()
-            if patch_max > patch_min:
-                patch_stretched = (patch_cpu - patch_min) / (patch_max - patch_min)
-            else:
-                patch_stretched = patch_cpu
+            # CLAHE (Contrast Limited Adaptive Histogram Equalization) for better local structure preservation
+            patch_uint8 = (patch_cpu * 255).byte()
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-            patch_pil = T.ToPILImage()(patch_stretched)
+            # Apply CLAHE to each channel separately
+            patch_enhanced = torch.stack([
+                torch.from_numpy(clahe.apply(patch_uint8[c].numpy())).float() / 255.0
+                for c in range(3)
+            ])
+
+            patch_pil = T.ToPILImage()(patch_enhanced)
 
             output_path = f"{output_dir}/sample_{i:02d}.png"
             patch_pil.save(output_path)
