@@ -13,7 +13,8 @@ def load_generator_and_generate_samples(
     checkpoint_path: str = "generator_export/final_layer_checkpoint_epoch_0150/generator_epoch_0154.pt",
     num_samples: int = 9,
     output_dir: str = "generated_samples",
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    use_clahe: bool = True
 ):
     """
     Load a generator checkpoint and generate sample patches.
@@ -23,6 +24,7 @@ def load_generator_and_generate_samples(
         num_samples: Number of samples to generate
         output_dir: Directory to save sample images
         device: Device to use (cuda or cpu)
+        use_clahe: Whether to use CLAHE contrast enhancement
     """
     # Create output directory
     Path(output_dir).mkdir(exist_ok=True)
@@ -78,17 +80,26 @@ def load_generator_and_generate_samples(
             # Convert to PIL image and save
             patch_cpu = patch.detach().cpu()
 
-            # CLAHE (Contrast Limited Adaptive Histogram Equalization) for better local structure preservation
-            patch_uint8 = (patch_cpu * 255).byte()
-            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+            if use_clahe:
+                # CLAHE (Contrast Limited Adaptive Histogram Equalization) for better local structure preservation
+                patch_uint8 = (patch_cpu * 255).byte()
+                clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
 
-            # Apply CLAHE to each channel separately
-            patch_enhanced = torch.stack([
-                torch.from_numpy(clahe.apply(patch_uint8[c].numpy())).float() / 255.0
-                for c in range(3)
-            ])
-
-            patch_pil = T.ToPILImage()(patch_enhanced)
+                # Apply CLAHE to each channel separately
+                patch_enhanced = torch.stack([
+                    torch.from_numpy(clahe.apply(patch_uint8[c].numpy())).float() / 255.0
+                    for c in range(3)
+                ])
+                patch_pil = T.ToPILImage()(patch_enhanced)
+            else:
+                # Min-max stretching for contrast enhancement
+                patch_min = patch_cpu.min()
+                patch_max = patch_cpu.max()
+                if patch_max > patch_min:
+                    patch_stretched = (patch_cpu - patch_min) / (patch_max - patch_min)
+                else:
+                    patch_stretched = patch_cpu
+                patch_pil = T.ToPILImage()(patch_stretched)
 
             output_path = f"{output_dir}/sample_{i:02d}.png"
             patch_pil.save(output_path)
@@ -109,6 +120,8 @@ if __name__ == "__main__":
                         help="Output directory for samples")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use (cuda or cpu)")
+    parser.add_argument("--no-clahe", action="store_true",
+                        help="Disable CLAHE contrast enhancement (use min-max stretching instead)")
 
     args = parser.parse_args()
 
@@ -116,5 +129,6 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         num_samples=args.num_samples,
         output_dir=args.output_dir,
-        device=args.device
+        device=args.device,
+        use_clahe=not args.no_clahe
     )
