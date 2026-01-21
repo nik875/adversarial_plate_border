@@ -227,8 +227,12 @@ class RefineGeneratorTrainer:
         self.patch_height = PATCH_HEIGHT
 
         # Load dataset
+        # NOTE: batch_size is forced to 1 because the dataset contains variable-sized images
+        # Batching with different image sizes requires either image resizing or custom collate functions.
+        # gradient accumulation is used instead to simulate larger batch sizes.
+        actual_batch_size = 1
         self.train_loader, self.val_loader = create_dataloaders(
-            csv_path, transform=self.transform, preload=True, batch_size=batch_size, n_jobs=0,
+            csv_path, transform=self.transform, preload=True, batch_size=actual_batch_size, n_jobs=0,
             use_all_for_train=use_all_for_train
         )
 
@@ -259,7 +263,8 @@ class RefineGeneratorTrainer:
 
         print(f"\nRefineGeneratorTrainer initialized:")
         print(f"  Device: {self.device}")
-        print(f"  Batch size: {batch_size}")
+        print(f"  Batch size: 1 (dataset has variable-sized images)")
+        print(f"  Gradient accumulation: {grad_accumulate or 'disabled'}")
         print(f"  Generator type: {generator_type}")
         print(f"  SSIM weight: {ssim_weight}")
         print(f"  Match detection: {match_detection}")
@@ -1055,8 +1060,9 @@ def main():
     parser.add_argument('--device', default='cuda', choices=['cuda', 'mps', 'cpu'],
                         help='Device to use for training')
     parser.add_argument('--batch-size', type=int, default=1,
-                        help='Batch size for training (default: 1). '
-                        'Increase if OOM allows for faster training, reduce if OOM errors occur.')
+                        help='(Ignored - dataset has variable-sized images) '
+                        'Batch size is always 1. Use --grad-accumulate instead to simulate larger batches '
+                        'and control memory/performance tradeoffs.')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001,
