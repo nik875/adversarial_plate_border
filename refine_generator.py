@@ -1016,7 +1016,7 @@ class RefineGeneratorTrainer:
 def main():
     parser = argparse.ArgumentParser(description='Generator Refinement Training')
     parser.add_argument('--generator-checkpoint', required=True,
-                        help='Path to frozen generator checkpoint (.pt file)')
+                        help='Path to frozen generator checkpoint (.pt file from progressive_patch training)')
     parser.add_argument('--generator-type', choices=['simple', 'foundation'], default='simple',
                         help='Type of generator (simple or foundation)')
     parser.add_argument('--csv-path', default='preproc_labels.csv',
