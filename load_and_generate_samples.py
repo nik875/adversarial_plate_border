@@ -8,7 +8,7 @@ from progressive_patch import FoundationPatchGenerator, SimplePatchGenerator
 import torchvision.transforms as T
 
 def load_generator_and_generate_samples(
-    checkpoint_path: str = "best_progressive_patch/generator_epoch_0108.pt",
+    checkpoint_path: str = "generator_export/training_complete_final_model/generator_epoch_0254.pt",
     num_samples: int = 9,
     output_dir: str = "generated_samples",
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Generate sample patches from a trained generator")
-    parser.add_argument("--checkpoint", type=str, default="best_progressive_patch/generator_epoch_0108.pt",
+    parser.add_argument("--checkpoint", type=str, default="generator_export/training_complete_final_model/generator_epoch_0254.pt",
                         help="Path to generator checkpoint")
     parser.add_argument("--num-samples", type=int, default=9,
                         help="Number of samples to generate")
