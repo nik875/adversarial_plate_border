@@ -869,7 +869,8 @@ class RefineGeneratorTrainer:
         det_loss, ocr_loss_baseline = self.partial_loss(batch, refined_patch, use_baseline=True)
 
         # Apply elbow sqrt to OCR loss (compress large values while preserving small ones)
-        ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss_baseline)
+        # Scale by ocr_weight first to keep values in linear region near origin
+        ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss_baseline / self.ocr_weight)
 
         # Compute TV regularization
         if self.use_tv_loss:
