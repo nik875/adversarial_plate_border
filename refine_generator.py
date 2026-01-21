@@ -632,7 +632,7 @@ class RefineGeneratorTrainer:
 
             # Apply patch to original image for OCR
             patched_orig, _ = self.apply_patch_to_image(
-                batch['orig_image'].unsqueeze(0),
+                batch['orig_image'].to(self.device).unsqueeze(0),
                 batch['orig_corners'].to(self.device).unsqueeze(0),
                 refined_patch
             )
