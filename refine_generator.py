@@ -663,7 +663,9 @@ class RefineGeneratorTrainer:
                 if self.impersonation_target:
                     ocr_loss = ocr_loss / self.ocr_baseline
                 else:
-                    ocr_loss = self.ocr_baseline / ocr_loss
+                    # Disruption: maximize OCR loss via smooth quadratic
+                    # Penalizes cases where OCR reads well, rewards where it fails
+                    ocr_loss = 2 * (1 - ocr_loss) ** 2
             else:
                 # For baseline calculation, return raw focal loss
                 pass
