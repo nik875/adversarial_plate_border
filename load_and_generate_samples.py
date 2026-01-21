@@ -80,7 +80,7 @@ def load_generator_and_generate_samples(
 
             # CLAHE (Contrast Limited Adaptive Histogram Equalization) for better local structure preservation
             patch_uint8 = (patch_cpu * 255).byte()
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
 
             # Apply CLAHE to each channel separately
             patch_enhanced = torch.stack([
