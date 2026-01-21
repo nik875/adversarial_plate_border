@@ -1007,8 +1007,19 @@ class RefineGeneratorTrainer:
                 print(f"   Early stopping: No improvement for {early_stop_patience} epochs")
                 break
 
+        # Save final checkpoint and samples (matching progressive_patch.py pattern)
+        final_epoch = epoch  # Use last epoch number
+        final_save_dir = "training_complete_final_refinement"
+        self.save_checkpoint(final_epoch, final_save_dir)
+        self.save_sample_patches(final_epoch, num_samples=8, save_dir=final_save_dir)
+
         print("\nTraining completed!")
         print(f"   Best loss: {best_loss:.4f}")
+        print(f"\nCheckpoints and samples saved to:")
+        print(f"   - best_refined_patches/: Best model across all training")
+        print(f"   - checkpoint_refined_patches/: Periodic checkpoints (every {save_interval} epochs)")
+        print(f"   - {final_save_dir}/: Final model after training completion")
+        print(f"\nTraining history saved to: refinement_training_history.csv")
 
         return history
 
@@ -1124,7 +1135,25 @@ def main():
 
         plt.tight_layout()
         plt.savefig('refinement_training_results.png', dpi=300, bbox_inches='tight')
-        print("Results saved to 'refinement_training_results.png'")
+
+        # Print summary of all outputs
+        print("\n" + "="*70)
+        print("TRAINING COMPLETE - OUTPUT SUMMARY")
+        print("="*70)
+        print("\nCheckpoints and Visualizations:")
+        print("  - best_refined_patches/: Best model across all training")
+        print("    └─ refinement_epoch_*.pt: Best model checkpoint")
+        print("    └─ samples_epoch_*.png: Comparison of base vs. refined patches")
+        print("  - checkpoint_refined_patches/: Periodic checkpoints")
+        print("    └─ refinement_epoch_*.pt: Checkpoints every N epochs")
+        print("    └─ samples_epoch_*.png: Sample visualizations at checkpoints")
+        print("  - training_complete_final_refinement/: Final model after training")
+        print("    └─ refinement_epoch_*.pt: Final model checkpoint")
+        print("    └─ samples_epoch_*.png: 8 final sample comparisons")
+        print("\nTraining Curves:")
+        print("  - refinement_training_results.png: 4-panel plot (loss, SSIM, attack, LR)")
+        print("  - refinement_training_history.csv: Epoch-by-epoch loss metrics")
+        print("="*70 + "\n")
 
     except Exception as e:
         print(f"Training failed: {e}")
