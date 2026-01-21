@@ -804,16 +804,54 @@ class RefineGeneratorTrainer:
 
         return ssim_loss
 
-    def compute_loss_full(self, batch: dict) -> Tuple[torch.Tensor, dict]:
-        """Compute full loss including SSIM, detection, OCR, and TV"""
+    def generate_all_patches_for_epoch(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Generate all patches for this epoch in batches of 8
+
+        Returns:
+            all_patches: [total_patches, 3, H, W] tensor of generated patches
+            all_z: [total_patches, 1, basis_dim] tensor of latent codes, or None if not using latent context
+        """
+        total_patches = len(self.train_loader)
+        all_patches = []
+        all_z = [] if self.use_latent_context else None
+
+        batch_size = 8
+        with torch.no_grad():
+            for i in range(0, total_patches, batch_size):
+                batch_count = min(batch_size, total_patches - i)
+                z_batch = torch.rand(batch_count, self.basis_dim, device=self.device)
+                patches_batch = self.generator(z_batch)  # [batch_count, 3, H, W]
+                all_patches.append(patches_batch)
+
+                if self.use_latent_context:
+                    all_z.append(z_batch)
+
+        # Concatenate all batches
+        all_patches = torch.cat(all_patches, dim=0)  # [total_patches, 3, H, W]
+        if self.use_latent_context:
+            all_z = torch.cat(all_z, dim=0)  # [total_patches, basis_dim]
+
+        return all_patches, all_z
+
+    def compute_loss_full(self, batch: dict, base_patch: Optional[torch.Tensor] = None,
+                         z: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
+        """Compute full loss including SSIM, detection, OCR, and TV
+
+        Args:
+            batch: The current batch of data
+            base_patch: Pre-generated base patch [3, H, W]. If None, will generate a new one.
+            z: Latent code for the base_patch [1, basis_dim]. Used if use_latent_context is True.
+        """
         batch = {k: v[0] for k, v in batch.items()}
 
-        # Sample random latent (Uniform [0, 1] to match generator training)
-        z = torch.rand(1, self.basis_dim, device=self.device)
+        # Use provided base patch or generate a new one
+        if base_patch is None:
+            # Sample random latent (Uniform [0, 1] to match generator training)
+            z = torch.rand(1, self.basis_dim, device=self.device)
 
-        # Generate base patch from frozen generator (no grad)
-        with torch.no_grad():
-            base_patch = self.generator(z).squeeze(0)  # [3, H, W]
+            # Generate base patch from frozen generator (no grad)
+            with torch.no_grad():
+                base_patch = self.generator(z).squeeze(0)  # [3, H, W]
 
         # Refine patch (with grad)
         refined_patch = self.refinement_net(
@@ -862,6 +900,9 @@ class RefineGeneratorTrainer:
         """Train for one epoch with gradient accumulation"""
         self.refinement_net.train()
 
+        # Generate all patches for this epoch upfront (no gradients needed through generator)
+        all_patches, all_z = self.generate_all_patches_for_epoch()
+
         total_losses = {
             'total': 0.0, 'ssim': 0.0, 'detection': 0.0,
             'ocr': 0.0, 'ocr_raw': 0.0, 'tv': 0.0, 'attack': 0.0
@@ -877,7 +918,11 @@ class RefineGeneratorTrainer:
                   total=len(self.train_loader)) as pbar:
 
             for idx, batch in pbar:
-                loss, loss_breakdown = self.compute_loss_full(batch)
+                # Get pre-generated patch for this batch
+                base_patch = all_patches[idx]
+                z = all_z[idx:idx+1] if all_z is not None else None
+
+                loss, loss_breakdown = self.compute_loss_full(batch, base_patch=base_patch, z=z)
                 scaled_loss = loss / effective_batch_size
 
                 scaled_loss.backward()
