@@ -660,7 +660,7 @@ class RefineGeneratorTrainer:
                 if self.impersonation_target:
                     ocr_loss = ocr_loss / self.ocr_baseline
                 else:
-                    ocr_loss = torch.clamp(1 - ocr_loss, min=-100)
+                    ocr_loss = torch.tanh(torch.exp(-ocr_loss))
             else:
                 # For baseline calculation, return raw focal loss
                 pass
