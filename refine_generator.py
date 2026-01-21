@@ -243,10 +243,8 @@ class RefineGeneratorTrainer:
         self.generator, self.basis_dim = self._load_frozen_generator(
             generator_checkpoint, generator_type
         )
-        self.generator.eval()
-        # Keep VAE in train mode for richer output (batch norm uses batch stats, not running stats)
-        if hasattr(self.generator, 'vae'):
-            self.generator.vae.train()
+        # Generator is already in train mode (set in _load_frozen_generator)
+        # This uses batch statistics instead of running statistics, producing diverse outputs
         for param in self.generator.parameters():
             param.requires_grad = False
         print(f"Generator frozen (latent dim: {self.basis_dim})")
@@ -323,6 +321,10 @@ class RefineGeneratorTrainer:
         # Load state dict
         generator.load_state_dict(checkpoint['generator_state_dict'])
         generator.to(self.device)
+
+        # Use train mode for generation - BatchNorm eval mode collapses outputs
+        # (running statistics don't properly represent the diverse latent space)
+        generator.train()
 
         print(f"Loaded {generator_type} generator with basis_dim={basis_dim}")
         if 'epoch' in checkpoint:
