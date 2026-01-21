@@ -197,8 +197,7 @@ class RefineGeneratorTrainer:
                  ssim_weight: float = 1.0,
                  use_latent_context: bool = False,
                  generator_type: str = 'simple',
-                 use_all_for_train: bool = True,
-                 patch_batch_size: int = 8):
+                 use_all_for_train: bool = True):
 
         self.training = training
         self.print_blur = print_blur
@@ -208,7 +207,6 @@ class RefineGeneratorTrainer:
         self.ssim_weight = ssim_weight
         self.use_latent_context = use_latent_context
         self.use_all_for_train = use_all_for_train
-        self.patch_batch_size = patch_batch_size
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -268,8 +266,7 @@ class RefineGeneratorTrainer:
 
         print(f"\nRefineGeneratorTrainer initialized:")
         print(f"  Device: {self.device}")
-        print(f"  Image batch size: 1 (dataset has variable-sized images)")
-        print(f"  Patch batch size: {patch_batch_size} (for generator BatchNorm statistics)")
+        print(f"  Batch size: 1 (dataset has variable-sized images)")
         print(f"  Gradient accumulation: {grad_accumulate or 'disabled'}")
         print(f"  Generator type: {generator_type}")
         print(f"  SSIM weight: {ssim_weight}")
@@ -767,69 +764,6 @@ class RefineGeneratorTrainer:
 
         return mask
 
-    def generate_patch_batch(self, num_patches: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate a batch of patches with proper BatchNorm statistics.
-
-        Returns:
-            z_batch: [num_patches, basis_dim] latent codes
-            base_patches: [num_patches, 3, H, W] generated patches
-        """
-        z_batch = torch.rand(num_patches, self.basis_dim, device=self.device)
-
-        with torch.no_grad():
-            base_patches = self.generator(z_batch)  # [num_patches, 3, H, W]
-
-        return z_batch, base_patches
-
-    def compute_loss_on_patch(self, batch: dict, base_patch: torch.Tensor,
-                              z: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, dict]:
-        """Compute full loss for a single patch"""
-        batch = {k: v[0] for k, v in batch.items()} if isinstance(next(iter(batch.values())), torch.Tensor) and next(iter(batch.values())).dim() > 0 and next(iter(batch.values())).shape[0] == 1 else batch
-
-        # Refine patch (with grad)
-        refined_patch = self.refinement_net(
-            base_patch.unsqueeze(0),
-            z.unsqueeze(0) if self.use_latent_context and z is not None else None
-        ).squeeze(0)  # [3, H, W]
-
-        # Compute SSIM loss
-        ssim_loss = self.compute_ssim_loss(base_patch, refined_patch)
-
-        # Compute detection and OCR losses (with baseline normalization)
-        det_loss, ocr_loss_baseline = self.partial_loss(batch, refined_patch, use_baseline=True)
-
-        # Apply elbow sqrt to OCR loss (compress large values while preserving small ones)
-        ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss_baseline)
-
-        # Compute TV regularization
-        if self.use_tv_loss:
-            reg_loss = self.patch_reg_loss(refined_patch)
-        else:
-            reg_loss = 0.0
-
-        # Combine losses: average detection and compressed OCR
-        attack_loss = (det_loss + ocr_loss_compressed) / 2
-        total_loss = self.ssim_weight * ssim_loss + attack_loss + self.tv_weight * reg_loss
-
-        # For display: compute inverted OCR loss for interpretability
-        # Get the raw focal CCE loss without baseline for display purposes
-        with torch.no_grad():
-            _, ocr_loss_raw = self.partial_loss(batch, refined_patch, use_baseline=False)
-
-        # Return loss breakdown for logging
-        loss_breakdown = {
-            'total': total_loss.item(),
-            'ssim': ssim_loss.item(),
-            'detection': det_loss.item(),
-            'ocr': (1 - ocr_loss_raw).item() if isinstance(ocr_loss_raw, torch.Tensor) else (1 - ocr_loss_raw),
-            'ocr_raw': ocr_loss_baseline.item(),
-            'tv': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
-            'attack': attack_loss.item()
-        }
-
-        return total_loss, loss_breakdown
-
     def compute_ssim_loss(self, base_patch: torch.Tensor, refined_patch: torch.Tensor) -> torch.Tensor:
         """
         Compute SSIM loss between base and refined patches.
@@ -871,18 +805,61 @@ class RefineGeneratorTrainer:
         return ssim_loss
 
     def compute_loss_full(self, batch: dict) -> Tuple[torch.Tensor, dict]:
-        """Compute full loss for a single patch (backward compatibility wrapper)"""
-        # Generate a single patch with proper BatchNorm (batch size 8 for good statistics)
-        z_batch, base_patches = self.generate_patch_batch(self.patch_batch_size)
+        """Compute full loss including SSIM, detection, OCR, and TV"""
+        batch = {k: v[0] for k, v in batch.items()}
 
-        # Use first patch from batch
-        base_patch = base_patches[0]
-        z = z_batch[0] if self.use_latent_context else None
+        # Sample random latent (Uniform [0, 1] to match generator training)
+        z = torch.rand(1, self.basis_dim, device=self.device)
 
-        return self.compute_loss_on_patch(batch, base_patch, z)
+        # Generate base patch from frozen generator (no grad)
+        with torch.no_grad():
+            base_patch = self.generator(z).squeeze(0)  # [3, H, W]
+
+        # Refine patch (with grad)
+        refined_patch = self.refinement_net(
+            base_patch.unsqueeze(0),
+            z if self.use_latent_context else None
+        ).squeeze(0)  # [3, H, W]
+
+        # Compute SSIM loss
+        ssim_loss = self.compute_ssim_loss(base_patch, refined_patch)
+
+        # Compute detection and OCR losses (with baseline normalization)
+        det_loss, ocr_loss_baseline = self.partial_loss(batch, refined_patch, use_baseline=True)
+
+        # Apply elbow sqrt to OCR loss (compress large values while preserving small ones)
+        ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss_baseline)
+
+        # Compute TV regularization
+        if self.use_tv_loss:
+            reg_loss = self.patch_reg_loss(refined_patch)
+        else:
+            reg_loss = 0.0
+
+        # Combine losses: average detection and compressed OCR
+        attack_loss = (det_loss + ocr_loss_compressed) / 2
+        total_loss = self.ssim_weight * ssim_loss + attack_loss + self.tv_weight * reg_loss
+
+        # For display: compute inverted OCR loss for interpretability
+        # Get the raw focal CCE loss without baseline for display purposes
+        with torch.no_grad():
+            _, ocr_loss_raw = self.partial_loss(batch, refined_patch, use_baseline=False)
+
+        # Return loss breakdown for logging
+        loss_breakdown = {
+            'total': total_loss.item(),
+            'ssim': ssim_loss.item(),
+            'detection': det_loss.item(),
+            'ocr': (1 - ocr_loss_raw).item() if isinstance(ocr_loss_raw, torch.Tensor) else (1 - ocr_loss_raw),  # Display: 1 - raw focal loss
+            'ocr_raw': ocr_loss_baseline.item(),  # Raw baseline-normalized OCR loss used in optimization
+            'tv': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
+            'attack': attack_loss.item()
+        }
+
+        return total_loss, loss_breakdown
 
     def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> dict:
-        """Train for one epoch with batch-generated patches and gradient accumulation"""
+        """Train for one epoch with gradient accumulation"""
         self.refinement_net.train()
 
         total_losses = {
@@ -891,7 +868,6 @@ class RefineGeneratorTrainer:
         }
         step_count = 0
         num_updates = 0
-        total_patches_processed = 0
 
         update_every = len(self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
         effective_batch_size = update_every
@@ -901,54 +877,46 @@ class RefineGeneratorTrainer:
                   total=len(self.train_loader)) as pbar:
 
             for idx, batch in pbar:
-                # Generate a batch of patches for this image
-                z_batch, base_patches = self.generate_patch_batch(self.patch_batch_size)
+                loss, loss_breakdown = self.compute_loss_full(batch)
+                scaled_loss = loss / effective_batch_size
 
-                # Compute loss for each patch
-                for patch_idx in range(self.patch_batch_size):
-                    base_patch = base_patches[patch_idx]
-                    z = z_batch[patch_idx] if self.use_latent_context else None
+                scaled_loss.backward()
 
-                    loss, loss_breakdown = self.compute_loss_on_patch(batch, base_patch, z)
-                    scaled_loss = loss / effective_batch_size
+                for key in total_losses:
+                    total_losses[key] += loss_breakdown[key]
+                step_count += 1
 
-                    scaled_loss.backward()
+                if step_count % update_every == 0:
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(self.refinement_net.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                    for key in total_losses:
-                        total_losses[key] += loss_breakdown[key]
-                    step_count += 1
-                    total_patches_processed += 1
+                    num_updates += 1
 
-                    if step_count % update_every == 0:
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(self.refinement_net.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    # Memory cleanup
+                    del loss, scaled_loss
+                    if self.device == 'cuda':
+                        torch.cuda.empty_cache()
+                    elif self.device == 'mps':
+                        torch.mps.empty_cache()
 
-                        num_updates += 1
-
-                        # Memory cleanup
-                        if self.device == 'cuda':
-                            torch.cuda.empty_cache()
-                        elif self.device == 'mps':
-                            torch.mps.empty_cache()
-
-                        # Update progress with full breakdown
-                        num_batches = num_updates * update_every
-                        avg_total = total_losses['total'] / num_batches
-                        avg_ssim = total_losses['ssim'] / num_batches
-                        avg_detection = total_losses['detection'] / num_batches
-                        avg_ocr = total_losses['ocr'] / num_batches
-                        avg_tv = total_losses['tv'] / num_batches
-                        pbar.set_postfix({
-                            'Loss': f"{avg_total:.4f}",
-                            'SSIM': f"{avg_ssim:.4f}",
-                            'Det': f"{avg_detection:.4f}",
-                            'OCR': f"{avg_ocr:.4f}",
-                            'TV': f"{avg_tv:.4f}",
-                            'Updates': num_updates
-                        })
-
+                    # Update progress with full breakdown
+                    num_batches = num_updates * update_every
+                    avg_total = total_losses['total'] / num_batches
+                    avg_ssim = total_losses['ssim'] / num_batches
+                    avg_detection = total_losses['detection'] / num_batches
+                    avg_ocr = total_losses['ocr'] / num_batches
+                    avg_tv = total_losses['tv'] / num_batches
+                    pbar.set_postfix({
+                        'Loss': f"{avg_total:.4f}",
+                        'SSIM': f"{avg_ssim:.4f}",
+                        'Det': f"{avg_detection:.4f}",
+                        'OCR': f"{avg_ocr:.4f}",
+                        'TV': f"{avg_tv:.4f}",
+                        'Updates': num_updates
+                    })
+                else:
                     del loss, scaled_loss
 
             # Handle remaining accumulated gradients
@@ -964,7 +932,7 @@ class RefineGeneratorTrainer:
                     torch.mps.empty_cache()
 
         # Return average losses
-        total_batches = num_updates * update_every if self.grad_accumulate else len(self.train_loader) * self.patch_batch_size
+        total_batches = num_updates * update_every if self.grad_accumulate else len(self.train_loader)
         return {key: val / total_batches for key, val in total_losses.items()}
 
     def validate(self) -> dict:
@@ -1016,17 +984,16 @@ class RefineGeneratorTrainer:
             axes = axes.reshape(1, -1)
 
         with torch.no_grad():
-            # Generate all patches at once for proper BatchNorm
-            z_batch, base_patches = self.generate_patch_batch(num_samples)
-
             for i in range(num_samples):
-                base_patch = base_patches[i]
-                z = z_batch[i] if self.use_latent_context else None
+                z = torch.rand(1, self.basis_dim, device=self.device)
+
+                # Generate base patch
+                base_patch = self.generator(z).squeeze(0)
 
                 # Refine patch
                 refined_patch = self.refinement_net(
                     base_patch.unsqueeze(0),
-                    z.unsqueeze(0) if z is not None else None
+                    z if self.use_latent_context else None
                 ).squeeze(0)
 
                 # Compute SSIM (using same method as training)
@@ -1239,9 +1206,6 @@ def main():
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training, no validation.')
-    parser.add_argument('--patch-batch-size', type=int, default=8,
-                        help='Number of patches to generate per image batch. '
-                        'Larger batches provide better BatchNorm statistics but use more memory (default: 8)')
 
     args = parser.parse_args()
 
@@ -1261,8 +1225,7 @@ def main():
             ssim_weight=args.ssim_weight,
             use_latent_context=args.use_latent_context,
             generator_type=args.generator_type,
-            use_all_for_train=not args.no_use_all_for_train,
-            patch_batch_size=args.patch_batch_size
+            use_all_for_train=not args.no_use_all_for_train
         )
 
         history = trainer.train(
