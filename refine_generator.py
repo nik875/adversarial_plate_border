@@ -660,6 +660,16 @@ class RefineGeneratorTrainer:
 
         return det_loss, ocr_loss
 
+    def elbow_sqrt_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        """
+        Elbow square root: compress large losses while preserving small ones.
+        - If loss <= 1: return loss (linear)
+        - If loss > 1: return sqrt(loss) (square root)
+
+        This helps with OCR losses that can be very large.
+        """
+        return torch.where(loss <= 1.0, loss, torch.sqrt(loss))
+
     def patch_reg_loss(self, patch: torch.Tensor):
         """Compute total variation regularization loss for patch"""
         C, H, W = patch.shape
@@ -799,14 +809,17 @@ class RefineGeneratorTrainer:
         # Compute detection and OCR losses
         det_loss, ocr_loss = self.partial_loss(batch, refined_patch, use_ocr_baseline)
 
+        # Apply elbow sqrt to OCR loss (compress large values while preserving small ones)
+        ocr_loss_compressed = self.elbow_sqrt_loss(ocr_loss)
+
         # Compute TV regularization
         if self.use_tv_loss:
             reg_loss = self.patch_reg_loss(refined_patch)
         else:
             reg_loss = 0.0
 
-        # Combine losses
-        attack_loss = (det_loss + ocr_loss) / 2
+        # Combine losses: average detection and compressed OCR
+        attack_loss = (det_loss + ocr_loss_compressed) / 2
         total_loss = self.ssim_weight * ssim_loss + attack_loss + reg_loss
 
         # Return loss breakdown for logging
@@ -814,7 +827,8 @@ class RefineGeneratorTrainer:
             'total': total_loss.item(),
             'ssim': ssim_loss.item(),
             'detection': det_loss.item(),
-            'ocr': ocr_loss.item(),
+            'ocr': ocr_loss_compressed.item(),
+            'ocr_raw': ocr_loss.item(),  # Raw OCR loss before compression
             'tv': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
             'attack': attack_loss.item()
         }
@@ -827,7 +841,7 @@ class RefineGeneratorTrainer:
 
         total_losses = {
             'total': 0.0, 'ssim': 0.0, 'detection': 0.0,
-            'ocr': 0.0, 'tv': 0.0, 'attack': 0.0
+            'ocr': 0.0, 'ocr_raw': 0.0, 'tv': 0.0, 'attack': 0.0
         }
         step_count = 0
         num_updates = 0
@@ -897,13 +911,13 @@ class RefineGeneratorTrainer:
         """Validation pass on held-out data"""
         # Skip validation if using all data for training
         if self.use_all_for_train or len(self.val_loader) == 0:
-            return {key: 0.0 for key in ['total', 'ssim', 'detection', 'ocr', 'tv', 'attack']}
+            return {key: 0.0 for key in ['total', 'ssim', 'detection', 'ocr', 'ocr_raw', 'tv', 'attack']}
 
         self.refinement_net.eval()
 
         total_losses = {
             'total': 0.0, 'ssim': 0.0, 'detection': 0.0,
-            'ocr': 0.0, 'tv': 0.0, 'attack': 0.0
+            'ocr': 0.0, 'ocr_raw': 0.0, 'tv': 0.0, 'attack': 0.0
         }
 
         with torch.no_grad():
@@ -1016,8 +1030,8 @@ class RefineGeneratorTrainer:
             )
 
         history = {
-            'train_total': [], 'train_ssim': [], 'train_attack': [],
-            'val_total': [], 'val_ssim': [], 'val_attack': [],
+            'train_total': [], 'train_ssim': [], 'train_detection': [], 'train_ocr': [], 'train_ocr_raw': [],
+            'val_total': [], 'val_ssim': [], 'val_detection': [], 'val_ocr': [], 'val_ocr_raw': [],
             'learning_rate': []
         }
 
@@ -1048,24 +1062,28 @@ class RefineGeneratorTrainer:
             # Record history
             history['train_total'].append(train_losses['total'])
             history['train_ssim'].append(train_losses['ssim'])
-            history['train_attack'].append(train_losses['attack'])
+            history['train_detection'].append(train_losses['detection'])
+            history['train_ocr'].append(train_losses['ocr'])
+            history['train_ocr_raw'].append(train_losses.get('ocr_raw', train_losses['ocr']))
             history['val_total'].append(val_losses['total'])
             history['val_ssim'].append(val_losses['ssim'])
-            history['val_attack'].append(val_losses['attack'])
+            history['val_detection'].append(val_losses['detection'])
+            history['val_ocr'].append(val_losses['ocr'])
+            history['val_ocr_raw'].append(val_losses.get('ocr_raw', val_losses['ocr']))
             history['learning_rate'].append(current_lr)
 
             # Print epoch summary
             if self.use_all_for_train:
                 print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                       f"Loss: {train_losses['total']:.4f} "
-                      f"(SSIM: {train_losses['ssim']:.4f}, Attack: {train_losses['attack']:.4f}) | "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}) | "
                       f"LR: {current_lr:.2e}")
             else:
                 print(f"Epoch {epoch+1:3d}/{num_epochs} | "
                       f"Train: {train_losses['total']:.4f} "
-                      f"(SSIM: {train_losses['ssim']:.4f}, Attack: {train_losses['attack']:.4f}) | "
+                      f"(SSIM: {train_losses['ssim']:.4f}, Det: {train_losses['detection']:.4f}, OCR: {train_losses['ocr']:.4f}) | "
                       f"Val: {val_losses['total']:.4f} "
-                      f"(SSIM: {val_losses['ssim']:.4f}, Attack: {val_losses['attack']:.4f}) | "
+                      f"(SSIM: {val_losses['ssim']:.4f}, Det: {val_losses['detection']:.4f}, OCR: {val_losses['ocr']:.4f}) | "
                       f"LR: {current_lr:.2e}")
 
             # Save best model (use training loss if no validation)
