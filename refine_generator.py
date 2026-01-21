@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Generator Refinement: Load a frozen generator and add refinement layers
-to improve attack effectiveness while maintaining SSIM with the original patch.
+to improve attack effectiveness while maintaining structural similarity with the original patch.
 
 The generator provides attack direction, the refiner improves effectiveness
-while staying close to the learned manifold.
+while staying close to the learned manifold. Uses structural similarity (not full SSIM)
+to allow free adjustment of luminance and contrast.
 """
 import os
 from typing import Tuple, List, Optional
@@ -20,7 +21,6 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
-from kornia.metrics import ssim
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -767,9 +767,68 @@ class RefineGeneratorTrainer:
 
         return mask
 
+    def _compute_structural_similarity(self, x: torch.Tensor, y: torch.Tensor, window_size: int = 11) -> torch.Tensor:
+        """
+        Compute structural similarity (structure component only, not luminance/contrast).
+
+        This allows the refinement network to alter brightness and contrast freely
+        while maintaining the structural patterns from the generator.
+
+        Args:
+            x: [B, C, H, W] first image
+            y: [B, C, H, W] second image
+            window_size: Size of Gaussian window (default: 11)
+
+        Returns:
+            torch.Tensor: [B, C, H, W] structural similarity map in range [-1, 1]
+        """
+        # Create Gaussian window
+        sigma = 1.5
+        gauss = torch.exp(-torch.arange(-(window_size // 2), window_size // 2 + 1, dtype=torch.float32) ** 2 / (2 * sigma ** 2))
+        gauss = gauss / gauss.sum()
+
+        # Create 2D window
+        window_1d = gauss.unsqueeze(1)
+        window_2d = window_1d @ window_1d.t()
+        window = window_2d.unsqueeze(0).unsqueeze(0).to(x.device)
+
+        # Replicate window for each channel
+        C = x.shape[1]
+        window = window.expand(C, 1, window_size, window_size).contiguous()
+
+        # Compute local statistics using convolution
+        padding = window_size // 2
+
+        # Means
+        mu_x = F.conv2d(x, window, padding=padding, groups=C)
+        mu_y = F.conv2d(y, window, padding=padding, groups=C)
+
+        # Variances and covariance
+        sigma_x_sq = F.conv2d(x * x, window, padding=padding, groups=C) - mu_x ** 2
+        sigma_y_sq = F.conv2d(y * y, window, padding=padding, groups=C) - mu_y ** 2
+        sigma_xy = F.conv2d(x * y, window, padding=padding, groups=C) - mu_x * mu_y
+
+        # Standard deviations (add epsilon for stability)
+        sigma_x = torch.sqrt(sigma_x_sq.clamp(min=1e-10))
+        sigma_y = torch.sqrt(sigma_y_sq.clamp(min=1e-10))
+
+        # Stability constant (C2/2 from SSIM paper, where C2 = (0.03 * data_range)^2)
+        # For images in [0, 1], data_range = 1, so C2 = 0.03^2 = 0.0009
+        C = 0.0009 / 2
+
+        # Structural similarity component only
+        # s(x,y) = (σ_xy + C) / (σ_x * σ_y + C)
+        structural_similarity = (sigma_xy + C) / (sigma_x * sigma_y + C)
+
+        return structural_similarity
+
     def compute_ssim_loss(self, base_patch: torch.Tensor, refined_patch: torch.Tensor) -> torch.Tensor:
         """
-        Compute SSIM loss between base and refined patches.
+        Compute structural similarity loss between base and refined patches.
+
+        Uses only the structural component of SSIM, allowing the refinement
+        network to freely adjust luminance and contrast while maintaining
+        structural patterns from the generator.
 
         Only compares the visible border region (excludes center plate region
         that gets obscured when patch is applied).
@@ -779,7 +838,7 @@ class RefineGeneratorTrainer:
             refined_patch: [3, H, W] or [1, 3, H, W] refined patch
 
         Returns:
-            torch.Tensor: Scalar SSIM loss (1 - SSIM, lower is better)
+            torch.Tensor: Scalar structural similarity loss (1 - struct_sim, lower is better)
         """
         # Ensure 4D input [B, C, H, W]
         base = base_patch.unsqueeze(0) if base_patch.dim() == 3 else base_patch
@@ -789,23 +848,23 @@ class RefineGeneratorTrainer:
         _, _, H, W = base.shape
         border_mask = self.create_border_mask(H, W, border_scale=1.4).to(base.device)
 
-        # Compute SSIM map (returns [B, C, H, W] with per-pixel SSIM values)
-        ssim_map = ssim(refined, base, window_size=11)  # [1, 3, H, W]
+        # Compute structural similarity map (returns [B, C, H, W] with per-pixel values)
+        struct_sim_map = self._compute_structural_similarity(refined, base, window_size=11)  # [1, 3, H, W]
 
         # Average across channels
-        ssim_map_avg = ssim_map.mean(dim=1, keepdim=True)  # [1, 1, H, W]
+        struct_sim_map_avg = struct_sim_map.mean(dim=1, keepdim=True)  # [1, 1, H, W]
 
         # Apply border mask: only consider visible regions
-        masked_ssim = ssim_map_avg * border_mask  # [1, 1, H, W]
+        masked_struct_sim = struct_sim_map_avg * border_mask  # [1, 1, H, W]
 
         # Compute mean only over visible border region
         num_visible_pixels = border_mask.sum()
-        ssim_value = masked_ssim.sum() / num_visible_pixels if num_visible_pixels > 0 else torch.tensor(0.0, device=base.device)
+        struct_sim_value = masked_struct_sim.sum() / num_visible_pixels if num_visible_pixels > 0 else torch.tensor(0.0, device=base.device)
 
-        # We want to maximize SSIM (patches should be similar), so minimize (1 - SSIM)
-        ssim_loss = 1.0 - ssim_value
+        # We want to maximize structural similarity, so minimize (1 - struct_sim)
+        struct_sim_loss = 1.0 - struct_sim_value
 
-        return ssim_loss
+        return struct_sim_loss
 
     def generate_all_patches_for_epoch(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Generate all patches for this epoch in batches of 8
