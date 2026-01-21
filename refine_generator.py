@@ -800,8 +800,8 @@ class RefineGeneratorTrainer:
             'total': total_loss.item(),
             'ssim': ssim_loss.item(),
             'detection': det_loss.item(),
-            'ocr': (1 - ocr_loss).item() if isinstance(ocr_loss, torch.Tensor) else (1 - ocr_loss),  # Display: 1 - (1 - focal_loss) = focal_loss
-            'ocr_raw': ocr_loss.item(),  # Raw inverted OCR loss
+            'ocr': ocr_loss.item() if isinstance(ocr_loss, torch.Tensor) else ocr_loss,  # Display: inverted OCR loss (1 - focal_cce)
+            'ocr_raw': ocr_loss.item() if isinstance(ocr_loss, torch.Tensor) else ocr_loss,
             'tv': reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss,
             'attack': attack_loss.item()
         }
