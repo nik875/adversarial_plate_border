@@ -41,5 +41,15 @@ if [ -d "$HOME/.cache/huggingface/datasets" ]; then
     ls -la "$HOME/.cache/huggingface/datasets/" | head -5
 fi
 
+if [ -d "$HOME/.cache/icdar2013" ]; then
+    echo "  ✓ ICDAR 2013: $HOME/.cache/icdar2013"
+    ls -la "$HOME/.cache/icdar2013/" | head -5
+fi
+
+if [ -d "$HOME/.cache/icdar2015" ]; then
+    echo "  ✓ ICDAR 2015: $HOME/.cache/icdar2015"
+    ls -la "$HOME/.cache/icdar2015/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"
