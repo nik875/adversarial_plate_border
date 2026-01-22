@@ -183,19 +183,28 @@ def iter_dataset(
 
     count = 0
     for sample in ds:
-        img = sample[cfg["image_key"]]
-        text = sample[cfg["text_key"]]
+        try:
+            img = sample[cfg["image_key"]]
 
-        meta = {
-            "dataset": name,
-            "split": split,
-        }
+            # Ensure image is valid by attempting to access it
+            if hasattr(img, 'convert'):
+                img = img.convert('RGB')
 
-        yield img, text, meta
+            text = sample[cfg["text_key"]]
 
-        count += 1
-        if max_samples is not None and count >= max_samples:
-            break
+            meta = {
+                "dataset": name,
+                "split": split,
+            }
+
+            yield img, text, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            # Skip corrupted/invalid images
+            continue
 
 
 # ---------------------------------------------------------
