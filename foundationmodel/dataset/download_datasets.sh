@@ -41,14 +41,14 @@ if [ -d "$HOME/.cache/huggingface/datasets" ]; then
     ls -la "$HOME/.cache/huggingface/datasets/" | head -5
 fi
 
-if [ -d "$HOME/.cache/icdar2013" ]; then
-    echo "  ✓ ICDAR 2013: $HOME/.cache/icdar2013"
-    ls -la "$HOME/.cache/icdar2013/" | head -5
+if [ -d "$HOME/.cache/icdar2011" ]; then
+    echo "  ✓ ICDAR 2011 (2013 Challenge 1): $HOME/.cache/icdar2011"
+    ls -la "$HOME/.cache/icdar2011/" | head -5
 fi
 
-if [ -d "$HOME/.cache/icdar2015" ]; then
-    echo "  ✓ ICDAR 2015: $HOME/.cache/icdar2015"
-    ls -la "$HOME/.cache/icdar2015/" | head -5
+if [ -d "$HOME/.cache/icdar2013" ]; then
+    echo "  ✓ ICDAR 2013 (2015 Challenge 2): $HOME/.cache/icdar2013"
+    ls -la "$HOME/.cache/icdar2013/" | head -5
 fi
 
 if [ -d "$HOME/.cache/cocotext_crops" ]; then

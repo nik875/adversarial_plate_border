@@ -18,8 +18,8 @@ trap "rm -rf $TEMP_DIR" EXIT
 # Create cache directory structure in temp
 mkdir -p "$TEMP_DIR/.cache/iiit5k"
 mkdir -p "$TEMP_DIR/.cache/huggingface/datasets"
+mkdir -p "$TEMP_DIR/.cache/icdar2011"
 mkdir -p "$TEMP_DIR/.cache/icdar2013"
-mkdir -p "$TEMP_DIR/.cache/icdar2015"
 mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 
 # Copy IIIT5K dataset (if exists)
@@ -38,20 +38,20 @@ else
     echo "Warning: Hugging Face datasets not found at $HOME/.cache/huggingface/datasets"
 fi
 
-# Copy ICDAR 2013 dataset (if exists)
+# Copy ICDAR 2011 dataset (2013 Challenge 1) (if exists)
+if [ -d "$HOME/.cache/icdar2011" ]; then
+    echo "Copying ICDAR 2011 dataset (train & test)..."
+    cp -r "$HOME/.cache/icdar2011"/* "$TEMP_DIR/.cache/icdar2011/" 2>/dev/null || true
+else
+    echo "Warning: ICDAR 2011 dataset not found at $HOME/.cache/icdar2011"
+fi
+
+# Copy ICDAR 2013 dataset (2015 Challenge 2) (if exists)
 if [ -d "$HOME/.cache/icdar2013" ]; then
     echo "Copying ICDAR 2013 dataset (train & test)..."
     cp -r "$HOME/.cache/icdar2013"/* "$TEMP_DIR/.cache/icdar2013/" 2>/dev/null || true
 else
     echo "Warning: ICDAR 2013 dataset not found at $HOME/.cache/icdar2013"
-fi
-
-# Copy ICDAR 2015 dataset (if exists)
-if [ -d "$HOME/.cache/icdar2015" ]; then
-    echo "Copying ICDAR 2015 dataset (train & test)..."
-    cp -r "$HOME/.cache/icdar2015"/* "$TEMP_DIR/.cache/icdar2015/" 2>/dev/null || true
-else
-    echo "Warning: ICDAR 2015 dataset not found at $HOME/.cache/icdar2015"
 fi
 
 # Copy COCO Text crops (if exists)
