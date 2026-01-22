@@ -56,5 +56,10 @@ if [ -d "$HOME/.cache/cocotext_crops" ]; then
     ls -la "$HOME/.cache/cocotext_crops/" | head -5
 fi
 
+if [ -d "$HOME/.cache/roboflow_lpr_crops" ]; then
+    echo "  ✓ Roboflow LPR crops: $HOME/.cache/roboflow_lpr_crops"
+    ls -la "$HOME/.cache/roboflow_lpr_crops/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"

@@ -21,6 +21,7 @@ mkdir -p "$TEMP_DIR/.cache/huggingface/datasets"
 mkdir -p "$TEMP_DIR/.cache/icdar2011"
 mkdir -p "$TEMP_DIR/.cache/icdar2013"
 mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
+mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -60,6 +61,14 @@ if [ -d "$HOME/.cache/cocotext_crops" ]; then
     cp -r "$HOME/.cache/cocotext_crops"/* "$TEMP_DIR/.cache/cocotext_crops/" 2>/dev/null || true
 else
     echo "Warning: COCO Text crops not found at $HOME/.cache/cocotext_crops"
+fi
+
+# Copy Roboflow LPR crops (if exists)
+if [ -d "$HOME/.cache/roboflow_lpr_crops" ]; then
+    echo "Copying Roboflow LPR crops..."
+    cp -r "$HOME/.cache/roboflow_lpr_crops"/* "$TEMP_DIR/.cache/roboflow_lpr_crops/" 2>/dev/null || true
+else
+    echo "Warning: Roboflow LPR crops not found at $HOME/.cache/roboflow_lpr_crops"
 fi
 
 # Create tarball

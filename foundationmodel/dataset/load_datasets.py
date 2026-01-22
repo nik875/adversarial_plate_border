@@ -65,6 +65,11 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "cocotext_crops",
         "splits": ["train"],
     },
+    "roboflow_lpr": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "roboflow_lpr_crops",
+        "splits": ["train", "test", "valid"],
+    },
 }
 
 
@@ -409,6 +414,78 @@ def _iter_cocotext(split: str, max_samples: int | None = None) -> Iterator[Tuple
 
 
 # ---------------------------------------------------------
+# Roboflow LPR cropped images
+# ---------------------------------------------------------
+
+def _iter_roboflow_lpr(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over Roboflow LPR cropped license plate images from local directory.
+    Split should be 'train', 'test', or 'valid'.
+
+    Expects directory structure:
+    - ~/.cache/roboflow_lpr_crops/
+      - labels.txt (format: filename split=X)
+      - roboflow_lpr_*.png (cropped license plate images)
+    """
+    cache_dir = DATASETS["roboflow_lpr"]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"Roboflow LPR crops not found at: {cache_dir}")
+
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels and filter by split
+    labels_dict = {}
+    with open(labels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename split=X
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            filename = parts[0]
+            split_info = parts[1]
+
+            # Parse split=X
+            if '=' in split_info:
+                _, file_split = split_info.split('=', 1)
+                if file_split == split:
+                    labels_dict[filename] = file_split
+
+    count = 0
+    # Iterate through cropped images
+    for img_path in sorted(cache_dir.glob("roboflow_lpr_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
+            continue
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            # Use split as the "text" label since these are images of objects, not text
+            meta = {
+                "dataset": "roboflow_lpr",
+                "split": split,
+            }
+
+            yield img, split, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -444,6 +521,11 @@ def iter_dataset(
     # Handle COCO Text from local directory
     if name == "cocotext":
         yield from _iter_cocotext(split, max_samples)
+        return
+
+    # Handle Roboflow LPR from local directory
+    if name == "roboflow_lpr":
+        yield from _iter_roboflow_lpr(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face
