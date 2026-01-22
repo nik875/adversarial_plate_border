@@ -77,7 +77,7 @@ if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
 fi
 
 if [ -d "$HOME/.cache/mercosur_crops" ]; then
-    echo "  ✓ Mercosur crops (variants): $HOME/.cache/mercosur_crops"
+    echo "  ✓ Mercosur crops: $HOME/.cache/mercosur_crops"
     ls -la "$HOME/.cache/mercosur_crops/" | head -10
 fi
 

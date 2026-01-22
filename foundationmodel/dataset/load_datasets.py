@@ -125,29 +125,9 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_weather",
         "splits": ["train"],
     },
-    "mercosur_monitoring_system": {
+    "mercosur": {
         "source": "local",
-        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "monitoring_system",
-        "splits": ["train"],
-    },
-    "mercosur_parking_lot1": {
-        "source": "local",
-        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot1",
-        "splits": ["train"],
-    },
-    "mercosur_parking_lot2": {
-        "source": "local",
-        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot2",
-        "splits": ["train"],
-    },
-    "mercosur_parking_lot3": {
-        "source": "local",
-        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot3",
-        "splits": ["train"],
-    },
-    "mercosur_cropped_parking_lot": {
-        "source": "local",
-        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "cropped_parking_lot",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops",
         "splits": ["train"],
     },
 }
@@ -764,23 +744,30 @@ def _iter_ccpd2019_variant(dataset_name: str, split: str, max_samples: int | Non
 
 
 # ---------------------------------------------------------
-# Mercosur variant cropped images
+# Mercosur cropped images
 # ---------------------------------------------------------
 
-def _iter_mercosur_variant(dataset_name: str, split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+def _iter_mercosur(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
     """
-    Iterate over Mercosur variant cropped license plate images from local directory.
+    Iterate over Mercosur cropped license plate images from local directory.
     Split should be 'train' (only split available).
 
     Expects directory structure:
-    - ~/.cache/mercosur_crops/monitoring_system/ (or other variants)
-      - labels.txt (format: filename source_image=X)
-      - mercosur_*_*.png (cropped license plate images)
+    - ~/.cache/mercosur_crops/
+      - labels.txt (format: filename source_class=X source_image=Y)
+      - mercosur_*.png (cropped license plate images)
+
+    Mercosur dataset contains 5 source classes based on image origin:
+    - monitoring_system (2925 images)
+    - parking_lot1 (566 images)
+    - parking_lot2 (23 images)
+    - parking_lot3 (11 images)
+    - cropped_parking_lot (315 images)
     """
-    cache_dir = DATASETS[dataset_name]["cache_dir"]
+    cache_dir = DATASETS["mercosur"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Mercosur variant crops not found at: {cache_dir}")
+        raise FileNotFoundError(f"Mercosur crops not found at: {cache_dir}")
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
@@ -794,7 +781,7 @@ def _iter_mercosur_variant(dataset_name: str, split: str, max_samples: int | Non
             if not line:
                 continue
 
-            # Format: filename source_image=X
+            # Format: filename source_class=X source_image=Y
             parts = line.split()
             if len(parts) < 1:
                 continue
@@ -815,7 +802,7 @@ def _iter_mercosur_variant(dataset_name: str, split: str, max_samples: int | Non
 
             # Use split as the "text" label since these are images of objects, not text
             meta = {
-                "dataset": dataset_name,
+                "dataset": "mercosur",
                 "split": split,
             }
 
@@ -887,9 +874,9 @@ def iter_dataset(
         yield from _iter_ccpd2019_variant(name, split, max_samples)
         return
 
-    # Handle Mercosur variants from local directory
-    if name.startswith("mercosur_"):
-        yield from _iter_mercosur_variant(name, split, max_samples)
+    # Handle Mercosur from local directory
+    if name == "mercosur":
+        yield from _iter_mercosur(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face

@@ -74,7 +74,7 @@ def crop_image_region(img_path, bbox, padding=PADDING):
 
 
 def process_mercosur(output_dir=OUTPUT_DIR, mercosur_dir=MERCOSUR_DIR, max_crops=None):
-    """Process Mercosur dataset and crop license plate regions by image class."""
+    """Process Mercosur dataset and crop license plate regions."""
 
     if not mercosur_dir.exists():
         raise FileNotFoundError(f"Mercosur dataset not found: {mercosur_dir}")
@@ -87,107 +87,99 @@ def process_mercosur(output_dir=OUTPUT_DIR, mercosur_dir=MERCOSUR_DIR, max_crops
     if not images_dir.exists():
         raise FileNotFoundError(f"Images directory not found: {images_dir}")
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"Processing Mercosur dataset...")
     print(f"  Dataset directory: {mercosur_dir}")
     print(f"  Output directory: {output_dir}")
     print()
 
-    # Group crops by image class
-    crops_by_class = {}
-    total_crop_count = 0
+    # Create single labels file for all crops
+    labels_file = output_dir / "labels.txt"
+    crop_count = 0
 
-    # Read CSV and process each row
+    # Tracking counters
+    counters = {
+        'total': 0,
+        'image_file_not_found': 0,
+        'crop_error': 0,
+        'success': 0,
+    }
+
+    # Read CSV
     with open(csv_file, 'r') as f:
         reader = csv.DictReader(f)
         rows = list(reader)
+        counters['total'] = len(rows)
         print(f"Found {len(rows)} annotations")
         print()
 
-        # Group rows by image class
-        class_rows = {}
-        for row in rows:
-            img_class = get_image_class(row['image'])
-            if img_class not in class_rows:
-                class_rows[img_class] = []
-            class_rows[img_class].append(row)
+    # Process all rows
+    with open(labels_file, 'w') as labels:
+        for row in tqdm(rows, desc="Processing images"):
+            if max_crops and crop_count >= max_crops:
+                break
 
-        # Process each image class
-        for img_class in sorted(class_rows.keys()):
-            rows_for_class = class_rows[img_class]
-            class_output_dir = output_dir / img_class
-            class_output_dir.mkdir(parents=True, exist_ok=True)
+            img_filename = row['image']
+            img_path = images_dir / img_filename
 
-            labels_file = class_output_dir / "labels.txt"
-            crop_count = 0
+            if not img_path.exists():
+                counters['image_file_not_found'] += 1
+                continue
 
-            # Tracking counters
-            counters = {
-                'total': len(rows_for_class),
-                'image_file_not_found': 0,
-                'crop_error': 0,
-                'success': 0,
+            # Get image class from filename
+            img_class = get_image_class(img_filename)
+
+            # Load image to get dimensions
+            try:
+                img = Image.open(img_path)
+                img_width, img_height = img.size
+            except Exception as e:
+                counters['image_file_not_found'] += 1
+                continue
+
+            # Parse YOLO coordinates
+            norm_bbox = {
+                'x_center': float(row['x_center']),
+                'y_center': float(row['y_center']),
+                'width': float(row['width']),
+                'height': float(row['height']),
             }
 
-            print(f"Processing {img_class}: {len(rows_for_class)} images")
+            # Convert to pixel coordinates
+            bbox = normalize_to_pixel_coords(img_width, img_height, norm_bbox)
 
-            with open(labels_file, 'w') as labels:
-                for row in tqdm(rows_for_class, desc=f"  {img_class}"):
-                    if max_crops and crop_count >= max_crops:
-                        break
+            # Crop image
+            crop = crop_image_region(img_path, bbox)
+            if crop is None:
+                counters['crop_error'] += 1
+                continue
 
-                    img_filename = row['image']
-                    img_path = images_dir / img_filename
+            # Save crop
+            crop_filename = f"mercosur_{crop_count:06d}.png"
+            crop_path = output_dir / crop_filename
+            crop.save(crop_path)
 
-                    if not img_path.exists():
-                        counters['image_file_not_found'] += 1
-                        continue
+            # Write label with metadata
+            # Format: filename source_class source_image
+            labels.write(f"{crop_filename} source_class={img_class} source_image={img_filename}\n")
 
-                    # Load image to get dimensions
-                    try:
-                        img = Image.open(img_path)
-                        img_width, img_height = img.size
-                    except Exception as e:
-                        counters['image_file_not_found'] += 1
-                        continue
+            crop_count += 1
+            counters['success'] += 1
 
-                    # Parse YOLO coordinates
-                    norm_bbox = {
-                        'x_center': float(row['x_center']),
-                        'y_center': float(row['y_center']),
-                        'width': float(row['width']),
-                        'height': float(row['height']),
-                    }
-
-                    # Convert to pixel coordinates
-                    bbox = normalize_to_pixel_coords(img_width, img_height, norm_bbox)
-
-                    # Crop image
-                    crop = crop_image_region(img_path, bbox)
-                    if crop is None:
-                        counters['crop_error'] += 1
-                        continue
-
-                    # Save crop
-                    crop_filename = f"mercosur_{img_class}_{crop_count:06d}.png"
-                    crop_path = class_output_dir / crop_filename
-                    crop.save(crop_path)
-
-                    # Write label
-                    labels.write(f"{crop_filename} source_image={img_filename}\n")
-
-                    crop_count += 1
-                    counters['success'] += 1
-
-            # Print summary for this class
-            print(f"  {img_class}: {counters['success']}/{counters['total']} cropped")
-            total_crop_count += counters['success']
-
+    # Print summary
     print(f"\n{'='*60}")
-    print(f"TOTAL CROP SUMMARY")
+    print(f"CROP SUMMARY")
     print(f"{'='*60}")
-    print(f"✓ Created {total_crop_count} total cropped license plate images")
-    print(f"✓ Output directory: {output_dir}")
-    return total_crop_count
+    print(f"Total annotations processed:      {counters['total']:>8}")
+    print(f"  ✓ Successfully cropped:         {counters['success']:>8}")
+    print(f"  ✗ Skipped:")
+    print(f"    - Image file not found:       {counters['image_file_not_found']:>8}")
+    print(f"    - Crop error:                 {counters['crop_error']:>8}")
+    print(f"{'='*60}")
+    print(f"✓ Created {crop_count} cropped license plate images")
+    print(f"✓ Labels saved to {labels_file}")
+    return crop_count
 
 
 if __name__ == "__main__":
