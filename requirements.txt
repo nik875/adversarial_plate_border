@@ -20,3 +20,4 @@ diffusers
 transformers
 accelerate
 b2
+datasets
