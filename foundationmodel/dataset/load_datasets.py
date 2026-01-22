@@ -39,8 +39,9 @@ DATASETS = {
         "splits": ["train", "test"],
     },
     "mjsynth": {
-        "source": "local",
-        "path": "priyank-m/MJSynth_text_recognition",
+        "hf_id": "priyank-m/MJSynth_text_recognition",
+        "image_key": "image",
+        "text_key": "label",
         "splits": ["train"],
     },
     "iam_line": {
@@ -161,78 +162,6 @@ def _iter_iiit5k(split: str, max_samples: int | None = None) -> Iterator[Tuple[I
 
 
 # ---------------------------------------------------------
-# MJSynth (Synth90k) local dataset loading
-# ---------------------------------------------------------
-
-def _iter_mjsynth(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
-    """
-    Iterate over MJSynth dataset samples from local directory.
-    Split should be 'train' (only split available).
-
-    Expects directory structure:
-    - priyank-m/MJSynth_text_recognition/
-      - mnt/ramdisk/max/90kDICT32px/ (image directory)
-      - gt/ (ground truth)
-        - train.txt (format: image_path label)
-    """
-    dataset_root = Path(DATASETS["mjsynth"]["path"])
-
-    if not dataset_root.exists():
-        raise FileNotFoundError(f"MJSynth dataset not found at: {dataset_root}")
-
-    # Determine annotation file path
-    if split == "train":
-        anno_file = dataset_root / "gt" / "train.txt"
-        img_dir = dataset_root / "mnt" / "ramdisk" / "max" / "90kDICT32px"
-    else:
-        raise ValueError(f"MJSynth only has 'train' split, got '{split}'")
-
-    if not anno_file.exists():
-        raise FileNotFoundError(f"Annotation file not found: {anno_file}")
-
-    if not img_dir.exists():
-        raise FileNotFoundError(f"Image directory not found: {img_dir}")
-
-    count = 0
-    with open(anno_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            # Format: image_path label
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-
-            img_rel_path = parts[0]
-            label = parts[1]
-
-            # Construct image path
-            img_path = img_dir / img_rel_path
-
-            if not img_path.exists():
-                continue
-
-            try:
-                img = Image.open(img_path).convert('RGB')
-            except Exception as e:
-                print(f"Warning: Could not load image {img_path}: {e}")
-                continue
-
-            meta = {
-                "dataset": "mjsynth",
-                "split": split,
-            }
-
-            yield img, label, meta
-
-            count += 1
-            if max_samples is not None and count >= max_samples:
-                break
-
-
-# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -253,11 +182,6 @@ def iter_dataset(
     # Handle IIIT5K with direct download
     if name == "iiit5k":
         yield from _iter_iiit5k(split, max_samples)
-        return
-
-    # Handle MJSynth from local directory
-    if name == "mjsynth":
-        yield from _iter_mjsynth(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face
