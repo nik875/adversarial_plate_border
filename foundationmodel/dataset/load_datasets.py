@@ -56,12 +56,6 @@ DATASETS = {
         "text_key": "text",
         "splits": ["train", "test"],
     },
-    "funsd": {
-        "hf_id": "funsd",
-        "image_key": "image",
-        "text_key": "words",
-        "splits": ["train", "test"],
-    },
 }
 
 
@@ -174,7 +168,7 @@ def iter_dataset(
     Iterate over (image, text, metadata) tuples.
 
     - image: PIL.Image
-    - text: string (or joined words for FUNSD)
+    - text: string
     - metadata: dict with dataset + split info
     """
     cfg = DATASETS[name]
@@ -190,12 +184,7 @@ def iter_dataset(
     count = 0
     for sample in ds:
         img = sample[cfg["image_key"]]
-
-        # normalize text field
-        if name == "funsd":
-            text = " ".join(sample[cfg["text_key"]])
-        else:
-            text = sample[cfg["text_key"]]
+        text = sample[cfg["text_key"]]
 
         meta = {
             "dataset": name,
