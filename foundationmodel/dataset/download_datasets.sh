@@ -72,8 +72,8 @@ if [ -d "$HOME/.cache/indian_plates_kaggle_crops" ]; then
 fi
 
 if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
-    echo "  ✓ CCPD2019 crops: $HOME/.cache/ccpd2019_crops"
-    ls -la "$HOME/.cache/ccpd2019_crops/" | head -5
+    echo "  ✓ CCPD2019 crops (variants): $HOME/.cache/ccpd2019_crops"
+    ls -la "$HOME/.cache/ccpd2019_crops/" | head -15
 fi
 
 echo ""

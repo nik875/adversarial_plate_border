@@ -24,7 +24,15 @@ mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 mkdir -p "$TEMP_DIR/.cache/kaggle_lp_crops"
 mkdir -p "$TEMP_DIR/.cache/indian_plates_kaggle_crops"
-mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_base"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_blur"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_challenge"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_db"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_fn"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_np"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_rotate"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_tilt"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_weather"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -90,9 +98,9 @@ else
     echo "Warning: Indian Plates Kaggle crops not found at $HOME/.cache/indian_plates_kaggle_crops"
 fi
 
-# Copy CCPD2019 crops (if exists)
+# Copy CCPD2019 crops (all variants)
 if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
-    echo "Copying CCPD2019 crops..."
+    echo "Copying CCPD2019 crops (all variants)..."
     cp -r "$HOME/.cache/ccpd2019_crops"/* "$TEMP_DIR/.cache/ccpd2019_crops/" 2>/dev/null || true
 else
     echo "Warning: CCPD2019 crops not found at $HOME/.cache/ccpd2019_crops"

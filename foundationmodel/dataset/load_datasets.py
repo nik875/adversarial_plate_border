@@ -80,9 +80,49 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "indian_plates_kaggle_crops",
         "splits": ["train"],
     },
-    "ccpd2019": {
+    "ccpd2019_base": {
         "source": "local",
-        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_base",
+        "splits": ["train"],
+    },
+    "ccpd2019_blur": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_blur",
+        "splits": ["train"],
+    },
+    "ccpd2019_challenge": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_challenge",
+        "splits": ["train"],
+    },
+    "ccpd2019_db": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_db",
+        "splits": ["train"],
+    },
+    "ccpd2019_fn": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_fn",
+        "splits": ["train"],
+    },
+    "ccpd2019_np": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_np",
+        "splits": ["train"],
+    },
+    "ccpd2019_rotate": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_rotate",
+        "splits": ["train"],
+    },
+    "ccpd2019_tilt": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_tilt",
+        "splits": ["train"],
+    },
+    "ccpd2019_weather": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_weather",
         "splits": ["train"],
     },
 }
@@ -633,23 +673,23 @@ def _iter_indian_plates_kaggle(split: str, max_samples: int | None = None) -> It
 
 
 # ---------------------------------------------------------
-# CCPD2019 cropped images
+# CCPD2019 variant cropped images
 # ---------------------------------------------------------
 
-def _iter_ccpd2019(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+def _iter_ccpd2019_variant(dataset_name: str, split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
     """
-    Iterate over CCPD2019 cropped license plate images from local directory.
+    Iterate over CCPD2019 variant cropped license plate images from local directory.
     Split should be 'train' (only split available).
 
     Expects directory structure:
-    - ~/.cache/ccpd2019_crops/
+    - ~/.cache/ccpd2019_crops/ccpd_*/
       - labels.txt (format: filename brightness=X blurriness=Y)
-      - ccpd2019_*.png (cropped license plate images)
+      - ccpd_*_*.png (cropped license plate images)
     """
-    cache_dir = DATASETS["ccpd2019"]["cache_dir"]
+    cache_dir = DATASETS[dataset_name]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"CCPD2019 crops not found at: {cache_dir}")
+        raise FileNotFoundError(f"CCPD2019 variant crops not found at: {cache_dir}")
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
@@ -673,7 +713,7 @@ def _iter_ccpd2019(split: str, max_samples: int | None = None) -> Iterator[Tuple
 
     count = 0
     # Iterate through cropped images
-    for img_path in sorted(cache_dir.glob("ccpd2019_*.png")):
+    for img_path in sorted(cache_dir.glob("*.png")):
         filename = img_path.name
 
         if filename not in labels_dict:
@@ -684,7 +724,7 @@ def _iter_ccpd2019(split: str, max_samples: int | None = None) -> Iterator[Tuple
 
             # Use split as the "text" label since these are images of objects, not text
             meta = {
-                "dataset": "ccpd2019",
+                "dataset": dataset_name,
                 "split": split,
             }
 
@@ -751,9 +791,9 @@ def iter_dataset(
         yield from _iter_indian_plates_kaggle(split, max_samples)
         return
 
-    # Handle CCPD2019 from local directory
-    if name == "ccpd2019":
-        yield from _iter_ccpd2019(split, max_samples)
+    # Handle CCPD2019 variants from local directory
+    if name.startswith("ccpd2019_"):
+        yield from _iter_ccpd2019_variant(name, split, max_samples)
         return
 
     # Handle other datasets via Hugging Face

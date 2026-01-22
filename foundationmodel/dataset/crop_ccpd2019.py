@@ -98,86 +98,89 @@ def crop_image_region(img_path, bbox, padding=PADDING):
 
 
 def process_ccpd2019(output_dir=OUTPUT_DIR, ccpd_dir=CCPD2019_DIR, max_crops=None):
-    """Process CCPD2019 dataset and crop license plate regions."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create label file
-    labels_file = output_dir / "labels.txt"
-    crop_count = 0
-
-    # Tracking counters
-    counters = {
-        'total': 0,
-        'parse_error': 0,
-        'image_file_not_found': 0,
-        'crop_error': 0,
-        'success': 0,
-    }
-
-    print(f"Processing CCPD2019 dataset...")
-    print(f"  Output directory: {output_dir}")
-    print(f"  Dataset directory: {ccpd_dir}")
-    print()
+    """Process CCPD2019 dataset subdirectories and crop license plate regions."""
 
     if not ccpd_dir.exists():
         raise FileNotFoundError(f"CCPD2019 dataset not found: {ccpd_dir}")
 
-    # Get all image files (recursively from subdirectories)
-    img_files = sorted(ccpd_dir.glob("**/*.jpg"))
-    print(f"Found {len(img_files)} image files")
+    # Get all subdirectories (ccpd_base, ccpd_blur, etc.)
+    subdirs = sorted([d for d in ccpd_dir.iterdir() if d.is_dir() and d.name.startswith('ccpd_')])
+
+    if not subdirs:
+        raise FileNotFoundError(f"No ccpd_* subdirectories found in {ccpd_dir}")
+
+    print(f"Processing CCPD2019 dataset...")
+    print(f"  Dataset directory: {ccpd_dir}")
+    print(f"  Found {len(subdirs)} subdirectories")
     print()
 
-    with open(labels_file, 'w') as labels:
-        for img_path in tqdm(img_files, desc="Processing images"):
-            if max_crops and crop_count >= max_crops:
-                break
+    # Process each subdirectory separately
+    total_crop_count = 0
+    for subdir in subdirs:
+        subdir_name = subdir.name
+        subdir_output = output_dir / subdir_name
+        subdir_output.mkdir(parents=True, exist_ok=True)
 
-            # Parse filename annotation
-            annotation = parse_ccpd_filename(img_path.name)
-            if annotation is None:
-                counters['parse_error'] += 1
-                continue
+        # Create label file for this subdirectory
+        labels_file = subdir_output / "labels.txt"
+        crop_count = 0
 
-            counters['total'] += 1
-            bbox = annotation['bbox']
+        # Tracking counters
+        counters = {
+            'total': 0,
+            'parse_error': 0,
+            'image_file_not_found': 0,
+            'crop_error': 0,
+            'success': 0,
+        }
 
-            # Verify image exists
-            if not img_path.exists():
-                counters['image_file_not_found'] += 1
-                continue
+        # Get all image files in this subdirectory
+        img_files = sorted(subdir.glob("*.jpg"))
 
-            # Crop image
-            crop = crop_image_region(img_path, bbox)
-            if crop is None:
-                counters['crop_error'] += 1
-                continue
+        print(f"Processing {subdir_name}: {len(img_files)} images")
 
-            # Save crop
-            crop_filename = f"ccpd2019_{crop_count:06d}.png"
-            crop_path = output_dir / crop_filename
-            crop.save(crop_path)
+        with open(labels_file, 'w') as labels:
+            for img_path in tqdm(img_files, desc=f"  {subdir_name}"):
+                if max_crops and crop_count >= max_crops:
+                    break
 
-            # Write label with metadata
-            # Format: filename brightness blurriness
-            labels.write(f"{crop_filename} brightness={annotation['brightness']} blurriness={annotation['blurriness']}\n")
+                # Parse filename annotation
+                annotation = parse_ccpd_filename(img_path.name)
+                if annotation is None:
+                    counters['parse_error'] += 1
+                    continue
 
-            crop_count += 1
-            counters['success'] += 1
+                counters['total'] += 1
+                bbox = annotation['bbox']
 
-    # Print summary
+                # Crop image
+                crop = crop_image_region(img_path, bbox)
+                if crop is None:
+                    counters['crop_error'] += 1
+                    continue
+
+                # Save crop
+                crop_filename = f"{subdir_name}_{crop_count:06d}.png"
+                crop_path = subdir_output / crop_filename
+                crop.save(crop_path)
+
+                # Write label with metadata
+                # Format: filename brightness blurriness
+                labels.write(f"{crop_filename} brightness={annotation['brightness']} blurriness={annotation['blurriness']}\n")
+
+                crop_count += 1
+                counters['success'] += 1
+
+        # Print summary for this subdirectory
+        print(f"  {subdir_name}: {counters['success']}/{counters['total']} cropped")
+        total_crop_count += counters['success']
+
     print(f"\n{'='*60}")
-    print(f"CROP SUMMARY")
+    print(f"TOTAL CROP SUMMARY")
     print(f"{'='*60}")
-    print(f"Total annotations processed:      {counters['total']:>8}")
-    print(f"  ✓ Successfully cropped:         {counters['success']:>8}")
-    print(f"  ✗ Skipped:")
-    print(f"    - Parse error:                {counters['parse_error']:>8}")
-    print(f"    - Image file not found:       {counters['image_file_not_found']:>8}")
-    print(f"    - Crop error:                 {counters['crop_error']:>8}")
-    print(f"{'='*60}")
-    print(f"✓ Created {crop_count} cropped license plate images")
-    print(f"✓ Labels saved to {labels_file}")
-    return crop_count
+    print(f"✓ Created {total_crop_count} total cropped license plate images")
+    print(f"✓ Output directory: {output_dir}")
+    return total_crop_count
 
 
 if __name__ == "__main__":
