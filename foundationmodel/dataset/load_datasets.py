@@ -70,6 +70,11 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "roboflow_lpr_crops",
         "splits": ["train", "test", "valid"],
     },
+    "kaggle_lp": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "kaggle_lp_crops",
+        "splits": ["train"],
+    },
 }
 
 
@@ -486,6 +491,72 @@ def _iter_roboflow_lpr(split: str, max_samples: int | None = None) -> Iterator[T
 
 
 # ---------------------------------------------------------
+# Kaggle LP cropped images
+# ---------------------------------------------------------
+
+def _iter_kaggle_lp(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over Kaggle LP cropped license plate images from local directory.
+    Split should be 'train' (only split available).
+
+    Expects directory structure:
+    - ~/.cache/kaggle_lp_crops/
+      - labels.txt (format: filename dataset=kaggle_lp)
+      - kaggle_lp_*.png (cropped license plate images)
+    """
+    cache_dir = DATASETS["kaggle_lp"]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"Kaggle LP crops not found at: {cache_dir}")
+
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels
+    labels_dict = {}
+    with open(labels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename dataset=kaggle_lp
+            parts = line.split()
+            if len(parts) < 1:
+                continue
+
+            filename = parts[0]
+            labels_dict[filename] = True
+
+    count = 0
+    # Iterate through cropped images
+    for img_path in sorted(cache_dir.glob("kaggle_lp_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
+            continue
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            # Use split as the "text" label since these are images of objects, not text
+            meta = {
+                "dataset": "kaggle_lp",
+                "split": split,
+            }
+
+            yield img, split, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -526,6 +597,11 @@ def iter_dataset(
     # Handle Roboflow LPR from local directory
     if name == "roboflow_lpr":
         yield from _iter_roboflow_lpr(split, max_samples)
+        return
+
+    # Handle Kaggle LP from local directory
+    if name == "kaggle_lp":
+        yield from _iter_kaggle_lp(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face

@@ -61,5 +61,10 @@ if [ -d "$HOME/.cache/roboflow_lpr_crops" ]; then
     ls -la "$HOME/.cache/roboflow_lpr_crops/" | head -5
 fi
 
+if [ -d "$HOME/.cache/kaggle_lp_crops" ]; then
+    echo "  ✓ Kaggle LP crops: $HOME/.cache/kaggle_lp_crops"
+    ls -la "$HOME/.cache/kaggle_lp_crops/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"
