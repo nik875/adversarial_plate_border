@@ -130,6 +130,18 @@ def main():
         help="Maximum CMA-ES iterations (default: 100)"
     )
     parser.add_argument(
+        "--population-size",
+        type=int,
+        default=None,
+        help="CMA-ES population size (default: 4 + 3*log(latent_dim))"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for CMA-ES reproducibility (default: None)"
+    )
+    parser.add_argument(
         "--output-patch",
         default="optimized_patch_cmaes.png",
         help="Output path for optimized patch"
@@ -152,7 +164,8 @@ def main():
     print(f"Mode: {'Disruption' if args.target_plate is None else 'Impersonation'}")
     if args.target_plate:
         print(f"Target plate: {args.target_plate}")
-    print(f"CMA-ES parameters: sigma0={args.sigma0}, max_iterations={args.max_iterations}")
+    print(f"CMA-ES parameters: sigma0={args.sigma0}, max_iterations={args.max_iterations}, ", end="")
+    print(f"population_size={args.population_size or 'auto'}, seed={args.seed or 'None'}")
     print("=" * 70)
     print()
 
@@ -177,7 +190,9 @@ def main():
     best_z, best_fitness = optimizer.optimize(
         oracle,
         sigma0=args.sigma0,
-        max_iterations=args.max_iterations
+        max_iterations=args.max_iterations,
+        population_size=args.population_size,
+        seed=args.seed
     )
 
     # Save results

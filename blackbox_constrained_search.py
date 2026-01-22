@@ -421,7 +421,8 @@ class BlackBoxPatchOptimizer:
                 initial_z: Optional[np.ndarray] = None,
                 sigma0: float = 0.3,
                 max_iterations: int = 100,
-                population_size: Optional[int] = None) -> Tuple[np.ndarray, float]:
+                population_size: Optional[int] = None,
+                seed: Optional[int] = None) -> Tuple[np.ndarray, float]:
         """
         Optimize latent code using CMA-ES.
 
@@ -431,6 +432,7 @@ class BlackBoxPatchOptimizer:
             sigma0: Initial standard deviation for CMA-ES
             max_iterations: Maximum number of CMA-ES generations
             population_size: Population size (default: 4 + 3*log(latent_dim))
+            seed: Random seed for reproducibility (default: None)
 
         Returns:
             best_z: Best latent code found
@@ -451,12 +453,18 @@ class BlackBoxPatchOptimizer:
         if population_size is not None:
             opts['popsize'] = population_size
 
+        if seed is not None:
+            opts['seed'] = seed
+
         # Initialize CMA-ES
         es = cma.CMAEvolutionStrategy(initial_z, sigma0, opts)
 
         print(f"\nStarting CMA-ES optimization:")
         print(f"  Latent dimension: {self.latent_dim}")
         print(f"  Population size: {es.popsize}")
+        print(f"  Initial sigma: {sigma0}")
+        if seed is not None:
+            print(f"  Seed: {seed}")
         print(f"  Mode: {'Disruption' if self.disruption_mode else 'Impersonation'}")
         if not self.disruption_mode:
             print(f"  Target plate: {self.target_plate}")
@@ -543,6 +551,10 @@ def main():
                        help='Initial CMA-ES standard deviation (default: 0.3)')
     parser.add_argument('--max-iterations', type=int, default=100,
                        help='Maximum CMA-ES iterations (default: 100)')
+    parser.add_argument('--population-size', type=int, default=None,
+                       help='CMA-ES population size (default: 4 + 3*log(latent_dim))')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed for CMA-ES reproducibility (default: None)')
     parser.add_argument('--output-patch', default='optimized_patch.png',
                        help='Output path for optimized patch')
     parser.add_argument('--output-latent', default='optimized_latent.npy',
