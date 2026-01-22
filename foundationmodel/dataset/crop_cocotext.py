@@ -24,14 +24,32 @@ MAX_WIDTH = 500  # maximum crop width
 MAX_HEIGHT = 200  # maximum crop height
 
 
-def load_cocotext(json_path=COCOTEXT_JSON):
+def load_cocotext(json_path=COCOTEXT_JSON, debug=False):
     """Load COCO Text annotations."""
     json_path = Path(json_path)
     if not json_path.exists():
         raise FileNotFoundError(f"COCO Text JSON not found: {json_path}")
 
     with open(json_path, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
+
+    if debug:
+        print(f"\n[DEBUG] JSON structure:")
+        print(f"  Keys: {list(data.keys())}")
+        if 'imgs' in data:
+            print(f"  imgs type: {type(data['imgs'])}")
+            print(f"  imgs count: {len(data['imgs'])}")
+            if data['imgs']:
+                first_img_id = next(iter(data['imgs']))
+                print(f"  Sample img ID: {first_img_id} (type: {type(first_img_id)})")
+        if 'anns' in data:
+            print(f"  anns count: {len(data['anns'])}")
+            if data['anns']:
+                first_ann = next(iter(data['anns'].values()))
+                print(f"  Sample ann image_id: {first_ann.get('image_id')} (type: {type(first_ann.get('image_id'))})")
+        print()
+
+    return data
 
 
 def is_valid_annotation(ann):
@@ -62,12 +80,12 @@ def crop_image_region(img_path, bbox, padding=PADDING):
     return crop
 
 
-def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max_crops=None, cocotext_json=COCOTEXT_JSON):
+def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max_crops=None, cocotext_json=COCOTEXT_JSON, debug=False):
     """Process COCO Text and crop images."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load annotations
-    data = load_cocotext(cocotext_json)
+    data = load_cocotext(cocotext_json, debug=debug)
     anns = data['anns']
     imgs = data['imgs']
     img_to_anns = data['imgToAnns']
@@ -102,14 +120,18 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
                 counters['invalid_bbox'] += 1
                 continue
 
-            image_id = ann['image_id']
+            image_id = str(ann['image_id'])  # Convert to string for dictionary lookup
             if image_id not in imgs:
                 counters['image_id_not_found'] += 1
                 continue
 
             # Construct image path
             img_info = imgs[image_id]
-            img_filename = img_info['name']
+            # Debug: Check what keys are available
+            if debug and crop_count == 0:
+                print(f"[DEBUG] img_info keys: {list(img_info.keys())}")
+                print(f"[DEBUG] img_info: {img_info}")
+            img_filename = img_info.get('name') or img_info.get('file_name')
 
             # Try different possible paths
             possible_paths = [
@@ -174,6 +196,7 @@ if __name__ == "__main__":
     parser.add_argument("--coco-dir", type=Path, default=COCO_IMAGES_DIR, help="COCO images directory")
     parser.add_argument("--max-crops", type=int, help="Maximum number of crops to create")
     parser.add_argument("--padding", type=int, default=PADDING, help="Padding around bbox")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
 
     args = parser.parse_args()
 
@@ -182,4 +205,5 @@ if __name__ == "__main__":
         coco_images_dir=args.coco_dir,
         max_crops=args.max_crops,
         cocotext_json=args.cocotext_json,
+        debug=args.debug,
     )
