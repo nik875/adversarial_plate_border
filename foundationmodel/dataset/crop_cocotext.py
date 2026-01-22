@@ -34,27 +34,11 @@ def load_cocotext(json_path=COCOTEXT_JSON):
         return json.load(f)
 
 
-def is_valid_annotation(ann, verbose=False):
-    """Check if annotation should be cropped. Returns (valid, reason)."""
-    # Skip empty text
-    if not ann.get('utf8_string', '').strip():
-        return False, "empty_text"
-
-    # Skip illegible text
-    if ann.get('legibility') != 'legible':
-        return False, f"illegible ({ann.get('legibility', 'unknown')})"
-
-    # Check bounding box
+def is_valid_annotation(ann):
+    """Check if annotation has a valid bounding box."""
     bbox = ann.get('bbox')
     if not bbox or len(bbox) != 4:
         return False, "invalid_bbox"
-
-    x, y, w, h = bbox
-    if w < MIN_WIDTH or h < MIN_HEIGHT:
-        return False, f"too_small ({w:.1f}x{h:.1f}, min {MIN_WIDTH}x{MIN_HEIGHT})"
-    if w > MAX_WIDTH or h > MAX_HEIGHT:
-        return False, f"too_large ({w:.1f}x{h:.1f}, max {MAX_WIDTH}x{MAX_HEIGHT})"
-
     return True, "valid"
 
 
@@ -95,11 +79,7 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
     # Tracking counters
     counters = {
         'total': len(anns),
-        'empty_text': 0,
-        'illegible': 0,
         'invalid_bbox': 0,
-        'too_small': 0,
-        'too_large': 0,
         'image_id_not_found': 0,
         'image_file_not_found': 0,
         'crop_error': 0,
@@ -110,7 +90,6 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
     print(f"  Total annotations: {len(anns)}")
     print(f"  Output directory: {output_dir}")
     print(f"  COCO directory: {coco_images_dir}")
-    print(f"  Constraints: {MIN_WIDTH}x{MIN_HEIGHT} to {MAX_WIDTH}x{MAX_HEIGHT} pixels")
     print()
 
     with open(labels_file, 'w') as labels:
@@ -120,17 +99,7 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
 
             valid, reason = is_valid_annotation(ann)
             if not valid:
-                # Track rejection reason
-                if 'empty_text' in reason:
-                    counters['empty_text'] += 1
-                elif 'illegible' in reason:
-                    counters['illegible'] += 1
-                elif 'invalid_bbox' in reason:
-                    counters['invalid_bbox'] += 1
-                elif 'too_small' in reason:
-                    counters['too_small'] += 1
-                elif 'too_large' in reason:
-                    counters['too_large'] += 1
+                counters['invalid_bbox'] += 1
                 continue
 
             image_id = ann['image_id']
@@ -185,12 +154,8 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
     print(f"{'='*60}")
     print(f"Total annotations processed:      {counters['total']:>8}")
     print(f"  ✓ Successfully cropped:         {counters['success']:>8}")
-    print(f"  ✗ Filtered:")
-    print(f"    - Empty text:                 {counters['empty_text']:>8}")
-    print(f"    - Illegible:                  {counters['illegible']:>8}")
+    print(f"  ✗ Skipped:")
     print(f"    - Invalid bbox:               {counters['invalid_bbox']:>8}")
-    print(f"    - Too small:                  {counters['too_small']:>8}")
-    print(f"    - Too large:                  {counters['too_large']:>8}")
     print(f"    - Image ID not found:         {counters['image_id_not_found']:>8}")
     print(f"    - Image file not found:       {counters['image_file_not_found']:>8}")
     print(f"    - Crop error:                 {counters['crop_error']:>8}")
@@ -209,19 +174,8 @@ if __name__ == "__main__":
     parser.add_argument("--coco-dir", type=Path, default=COCO_IMAGES_DIR, help="COCO images directory")
     parser.add_argument("--max-crops", type=int, help="Maximum number of crops to create")
     parser.add_argument("--padding", type=int, default=PADDING, help="Padding around bbox")
-    parser.add_argument("--min-width", type=int, default=MIN_WIDTH, help="Minimum crop width")
-    parser.add_argument("--max-width", type=int, default=MAX_WIDTH, help="Maximum crop width")
-    parser.add_argument("--min-height", type=int, default=MIN_HEIGHT, help="Minimum crop height")
-    parser.add_argument("--max-height", type=int, default=MAX_HEIGHT, help="Maximum crop height")
 
     args = parser.parse_args()
-
-    # Update global config
-    PADDING = args.padding
-    MIN_WIDTH = args.min_width
-    MAX_WIDTH = args.max_width
-    MIN_HEIGHT = args.min_height
-    MAX_HEIGHT = args.max_height
 
     process_cocotext(
         output_dir=args.output_dir,
