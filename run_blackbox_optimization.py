@@ -102,9 +102,9 @@ def main():
         help="Generator architecture type"
     )
     parser.add_argument(
-        "--test-images-dir",
-        required=True,
-        help="Directory with test images and corner annotations"
+        "--csv",
+        default="preproc_labels.csv",
+        help="CSV file with image paths and corners (default: preproc_labels.csv)"
     )
     parser.add_argument(
         "--device",
@@ -148,7 +148,7 @@ def main():
     print(f"Generator checkpoint: {args.generator_checkpoint}")
     if args.refinement_checkpoint:
         print(f"Refinement checkpoint: {args.refinement_checkpoint}")
-    print(f"Test images directory: {args.test_images_dir}")
+    print(f"CSV file: {args.csv}")
     print(f"Mode: {'Disruption' if args.target_plate is None else 'Impersonation'}")
     if args.target_plate:
         print(f"Target plate: {args.target_plate}")
@@ -163,7 +163,7 @@ def main():
         refinement_checkpoint=args.refinement_checkpoint,
         generator_type=args.generator_type,
         device=args.device,
-        test_images_dir=args.test_images_dir,
+        csv_path=args.csv,
         target_plate=args.target_plate,
         disruption_mode=(args.target_plate is None)
     )

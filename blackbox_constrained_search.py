@@ -62,6 +62,7 @@ class BlackBoxPatchOptimizer:
                  generator_type: str = 'simple',
                  device: str = None,
                  test_images_dir: Optional[str] = None,
+                 csv_path: Optional[str] = None,
                  target_plate: Optional[str] = None,
                  disruption_mode: bool = True):
         """
@@ -70,7 +71,8 @@ class BlackBoxPatchOptimizer:
             refinement_checkpoint: Path to refinement .pt file (optional)
             generator_type: 'simple' or 'foundation'
             device: 'cuda', 'mps', or 'cpu'
-            test_images_dir: Directory containing test images with license plates
+            test_images_dir: Directory containing test images with license plates (alternative to csv_path)
+            csv_path: CSV file with image paths and corners (alternative to test_images_dir)
             target_plate: Target plate text for impersonation (None for disruption)
             disruption_mode: If True, optimize for detection failure. If False, impersonation.
         """
@@ -111,6 +113,9 @@ class BlackBoxPatchOptimizer:
         if test_images_dir:
             self._load_test_images(test_images_dir)
             print(f"Loaded {len(self.test_images)} test images")
+        elif csv_path:
+            self._load_test_images_from_csv(csv_path)
+            print(f"Loaded {len(self.test_images)} test images from CSV")
 
     def _load_generator(self, checkpoint_path: str, generator_type: str):
         """Load frozen generator from checkpoint"""
@@ -200,6 +205,46 @@ class BlackBoxPatchOptimizer:
                 corners_text = f.read().strip()
                 coords = [float(x) for x in corners_text.replace(',', ' ').split()]
                 corners = np.array(coords).reshape(4, 2)
+
+            self.test_images.append(image_np)
+            self.test_corners.append(corners)
+
+    def _load_test_images_from_csv(self, csv_path: str):
+        """
+        Load test images and corners from CSV file.
+
+        Expected CSV columns:
+        - 'path': Path to image file
+        - 'corners': Corners as "x1,y1,x2,y2,x3,y3,x4,y4" or similar format
+        """
+        import pandas as pd
+
+        df = pd.read_csv(csv_path)
+
+        for idx, row in df.iterrows():
+            img_path = row['path']
+
+            if not Path(img_path).exists():
+                print(f"Warning: Image not found: {img_path}, skipping")
+                continue
+
+            # Load image
+            try:
+                image = Image.open(img_path).convert('RGB')
+                image_np = np.array(image)
+            except Exception as e:
+                print(f"Warning: Failed to load image {img_path}: {e}, skipping")
+                continue
+
+            # Parse corners from CSV
+            try:
+                corners_str = str(row['corners'])
+                # Handle both "x1,y1,x2,y2,..." and "[[x1,y1],[x2,y2],...]" formats
+                coords = [float(x) for x in corners_str.replace('[', '').replace(']', '').split(',')]
+                corners = np.array(coords).reshape(4, 2)
+            except Exception as e:
+                print(f"Warning: Failed to parse corners for {img_path}: {e}, skipping")
+                continue
 
             self.test_images.append(image_np)
             self.test_corners.append(corners)
@@ -484,8 +529,10 @@ def main():
                        help='Path to refinement checkpoint (.pt file, optional)')
     parser.add_argument('--generator-type', choices=['simple', 'foundation'],
                        default='simple', help='Generator architecture type')
-    parser.add_argument('--test-images-dir', required=True,
-                       help='Directory with test images and corner annotations')
+    parser.add_argument('--test-images-dir', default=None,
+                       help='Directory with test images and corner annotations (alternative to --csv)')
+    parser.add_argument('--csv', default=None,
+                       help='CSV file with image paths and corners (alternative to --test-images-dir)')
     parser.add_argument('--device', default='cuda', choices=['cuda', 'mps', 'cpu'],
                        help='Device to use')
     parser.add_argument('--target-plate', default=None,
@@ -500,6 +547,11 @@ def main():
                        help='Output path for optimized latent code')
 
     args = parser.parse_args()
+
+    # Validate that at least one test image source is provided
+    if not args.test_images_dir and not args.csv:
+        print("Error: Must provide either --test-images-dir or --csv")
+        return
 
     print("=" * 70)
     print("BLACK-BOX ADVERSARIAL PATCH OPTIMIZATION")
@@ -537,6 +589,7 @@ def main():
         generator_type=args.generator_type,
         device=args.device,
         test_images_dir=args.test_images_dir,
+        csv_path=args.csv,
         target_plate=args.target_plate,
         disruption_mode=(args.target_plate is None)
     )
