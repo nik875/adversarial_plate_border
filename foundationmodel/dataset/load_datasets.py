@@ -25,6 +25,7 @@ import os
 import torch
 from PIL import Image
 from datasets import load_dataset
+import scipy.io
 
 
 # ---------------------------------------------------------
@@ -74,7 +75,7 @@ def _ensure_iiit5k_extracted(cache_dir: Path = Path.home() / ".cache" / "iiit5k"
     Returns the path to the extracted dataset directory.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    extracted_dir = cache_dir / "IIIT5K_3000"
+    extracted_dir = cache_dir / "IIIT5K-Word_V3.0"
 
     if extracted_dir.exists():
         return extracted_dir
@@ -101,14 +102,17 @@ def _iter_iiit5k(split: str, max_samples: int | None = None) -> Iterator[Tuple[I
     """
     Iterate over IIIT5K dataset samples.
     Split should be 'train' or 'test'.
+
+    Loads ground truth labels from MATLAB annotation files:
+    - traindata.mat / testdata.mat contain image names and ground truth labels
+    - Image files are located in train/ and test/ subdirectories
     """
     extracted_dir = _ensure_iiit5k_extracted()
-    words_dir = extracted_dir / "words_v001d"
 
-    # Map split names to annotation files
+    # Map split names to MATLAB annotation files
     split_files = {
-        "train": "IIIT5K_3000_train.txt",
-        "test": "IIIT5K_3000_test.txt",
+        "train": "traindata.mat",
+        "test": "testdata.mat",
     }
 
     anno_file = extracted_dir / split_files[split]
@@ -116,43 +120,45 @@ def _iter_iiit5k(split: str, max_samples: int | None = None) -> Iterator[Tuple[I
     if not anno_file.exists():
         raise FileNotFoundError(f"Annotation file not found: {anno_file}")
 
+    # Load MATLAB annotations
+    mat_data = scipy.io.loadmat(str(anno_file), simplify_cells=True)
+    samples = mat_data[split + "data"]  # 'traindata' or 'testdata'
+
+    if not isinstance(samples, list):
+        samples = [samples]
+
     count = 0
-    with open(anno_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    for sample in samples:
+        # Each sample is a dict with: ImgName, GroundTruth, smallLexi, mediumLexi
+        img_rel_path = sample.get("ImgName")
+        label = sample.get("GroundTruth")
 
-            # Parse annotation line: filename label
-            parts = line.split()
-            if len(parts) < 2:
-                continue
+        if img_rel_path is None or label is None:
+            continue
 
-            filename = parts[0]
-            label = parts[1]
+        # Construct full image path
+        img_path = extracted_dir / img_rel_path
 
-            # Construct image path
-            img_path = words_dir / filename
+        if not img_path.exists():
+            print(f"Warning: Image not found: {img_path}")
+            continue
 
-            if not img_path.exists():
-                continue
+        try:
+            img = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
 
-            try:
-                img = Image.open(img_path).convert('RGB')
-            except Exception as e:
-                print(f"Warning: Could not load image {img_path}: {e}")
-                continue
+        meta = {
+            "dataset": "iiit5k",
+            "split": split,
+        }
 
-            meta = {
-                "dataset": "iiit5k",
-                "split": split,
-            }
+        yield img, label, meta
 
-            yield img, label, meta
-
-            count += 1
-            if max_samples is not None and count >= max_samples:
-                break
+        count += 1
+        if max_samples is not None and count >= max_samples:
+            break
 
 
 # ---------------------------------------------------------
