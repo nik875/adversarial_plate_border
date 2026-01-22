@@ -71,5 +71,10 @@ if [ -d "$HOME/.cache/indian_plates_kaggle_crops" ]; then
     ls -la "$HOME/.cache/indian_plates_kaggle_crops/" | head -5
 fi
 
+if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
+    echo "  ✓ CCPD2019 crops: $HOME/.cache/ccpd2019_crops"
+    ls -la "$HOME/.cache/ccpd2019_crops/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"

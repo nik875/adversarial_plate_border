@@ -24,6 +24,7 @@ mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 mkdir -p "$TEMP_DIR/.cache/kaggle_lp_crops"
 mkdir -p "$TEMP_DIR/.cache/indian_plates_kaggle_crops"
+mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -87,6 +88,14 @@ if [ -d "$HOME/.cache/indian_plates_kaggle_crops" ]; then
     cp -r "$HOME/.cache/indian_plates_kaggle_crops"/* "$TEMP_DIR/.cache/indian_plates_kaggle_crops/" 2>/dev/null || true
 else
     echo "Warning: Indian Plates Kaggle crops not found at $HOME/.cache/indian_plates_kaggle_crops"
+fi
+
+# Copy CCPD2019 crops (if exists)
+if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
+    echo "Copying CCPD2019 crops..."
+    cp -r "$HOME/.cache/ccpd2019_crops"/* "$TEMP_DIR/.cache/ccpd2019_crops/" 2>/dev/null || true
+else
+    echo "Warning: CCPD2019 crops not found at $HOME/.cache/ccpd2019_crops"
 fi
 
 # Create tarball
