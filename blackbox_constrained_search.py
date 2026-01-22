@@ -211,18 +211,18 @@ class BlackBoxPatchOptimizer:
 
     def _load_test_images_from_csv(self, csv_path: str):
         """
-        Load test images and corners from CSV file.
+        Load test images and corners from CSV file (preproc_labels.csv format).
 
-        Expected CSV columns:
-        - 'path': Path to image file
-        - 'corners': Corners as "x1,y1,x2,y2,x3,y3,x4,y4" or similar format
+        Expected CSV columns (from AdversarialPatchDataset):
+        - 'preprocessed_filename': Path to preprocessed image
+        - 'new_p1_x', 'new_p1_y', 'new_p2_x', 'new_p2_y', etc: Corner coordinates
         """
         import pandas as pd
 
         df = pd.read_csv(csv_path)
 
         for idx, row in df.iterrows():
-            img_path = row['path']
+            img_path = row['preprocessed_filename']
 
             if not Path(img_path).exists():
                 print(f"Warning: Image not found: {img_path}, skipping")
@@ -236,12 +236,14 @@ class BlackBoxPatchOptimizer:
                 print(f"Warning: Failed to load image {img_path}: {e}, skipping")
                 continue
 
-            # Parse corners from CSV
+            # Parse corners from CSV columns
             try:
-                corners_str = str(row['corners'])
-                # Handle both "x1,y1,x2,y2,..." and "[[x1,y1],[x2,y2],...]" formats
-                coords = [float(x) for x in corners_str.replace('[', '').replace(']', '').split(',')]
-                corners = np.array(coords).reshape(4, 2)
+                corners = np.array([
+                    [row['new_p1_x'], row['new_p1_y']],
+                    [row['new_p2_x'], row['new_p2_y']],
+                    [row['new_p3_x'], row['new_p3_y']],
+                    [row['new_p4_x'], row['new_p4_y']]
+                ], dtype=np.float32)
             except Exception as e:
                 print(f"Warning: Failed to parse corners for {img_path}: {e}, skipping")
                 continue
