@@ -174,6 +174,11 @@ def main():
         help="Path to refinement checkpoint (.pt file, optional)"
     )
     parser.add_argument(
+        "--disable-refiner",
+        action="store_true",
+        help="Disable refinement network even if checkpoint provided"
+    )
+    parser.add_argument(
         "--generator-type",
         choices=["simple", "foundation"],
         default="simple",
@@ -255,9 +260,10 @@ def main():
 
     # Initialize optimizer
     print("Initializing optimizer...")
+    refinement_checkpoint = None if args.disable_refiner else args.refinement_checkpoint
     optimizer = BlackBoxPatchOptimizer(
         generator_checkpoint=args.generator_checkpoint,
-        refinement_checkpoint=args.refinement_checkpoint,
+        refinement_checkpoint=refinement_checkpoint,
         generator_type=args.generator_type,
         device=args.device,
         csv_path=args.csv,
