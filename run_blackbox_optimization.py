@@ -20,6 +20,59 @@ except ImportError:
 from blackbox_constrained_search import BaseBlackBoxOracle, BlackBoxPatchOptimizer
 
 
+def polygon_iou(corners1: np.ndarray, corners2: np.ndarray) -> float:
+    """
+    Calculate IoU between two quadrilaterals.
+
+    Args:
+        corners1: [4, 2] array of (x, y) corners
+        corners2: [4, 2] array of (x, y) corners
+
+    Returns:
+        IoU score in [0, 1]
+    """
+    try:
+        from shapely.geometry import Polygon
+        from shapely.validation import make_valid
+    except ImportError:
+        raise ImportError("shapely required for IoU calculation. Install with: pip install shapely")
+
+    poly1 = Polygon(corners1)
+    poly2 = Polygon(corners2)
+
+    # Make valid in case of self-intersecting polygons
+    if not poly1.is_valid:
+        poly1 = make_valid(poly1)
+    if not poly2.is_valid:
+        poly2 = make_valid(poly2)
+
+    intersection = poly1.intersection(poly2).area
+    union = poly1.union(poly2).area
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def bbox_to_corners(bbox) -> np.ndarray:
+    """
+    Convert bounding box to corner array.
+
+    Args:
+        bbox: Object with x1, y1, x2, y2 attributes (from fast-alpr)
+
+    Returns:
+        [4, 2] array of corners in format [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+    """
+    return np.array([
+        [bbox.x1, bbox.y1],
+        [bbox.x2, bbox.y1],
+        [bbox.x2, bbox.y2],
+        [bbox.x1, bbox.y2]
+    ], dtype=np.float32)
+
+
 class FastALPROracle(BaseBlackBoxOracle):
     """Black-box oracle using fast-alpr for license plate detection and recognition."""
 
@@ -44,12 +97,13 @@ class FastALPROracle(BaseBlackBoxOracle):
 
         print("fast-alpr loaded successfully")
 
-    def query(self, image: np.ndarray) -> Optional[str]:
+    def query(self, image: np.ndarray, corners: Optional[np.ndarray] = None) -> Optional[str]:
         """
         Query fast-alpr for license plate detection and recognition.
 
         Args:
             image: RGB image [H, W, 3], uint8, range [0, 255]
+            corners: Optional [4, 2] array of ground truth plate corners for IoU-based selection
 
         Returns:
             Detected license plate text, or None if no detection
@@ -68,12 +122,36 @@ class FastALPROracle(BaseBlackBoxOracle):
         if not predictions:
             return None
 
-        # Return text from highest-confidence detection
-        best_pred = max(
-            predictions,
-            key=lambda p: p.ocr.confidence if p.ocr else 0.0,
-            default=None
-        )
+        # If corners provided, select detection with highest IoU to ground truth
+        if corners is not None:
+            best_pred = None
+            best_iou = 0.0
+
+            for pred in predictions:
+                if pred.detection is None:
+                    continue
+
+                # Convert detection bbox to corners
+                det_corners = bbox_to_corners(pred.detection)
+
+                # Calculate IoU with ground truth corners
+                iou = polygon_iou(det_corners, corners)
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_pred = pred
+
+            # If no detection has reasonable IoU, treat as no detection
+            if best_iou < 0.1:  # Threshold for minimum overlap
+                return None
+
+        else:
+            # Fallback: use highest-confidence detection if no corners provided
+            best_pred = max(
+                predictions,
+                key=lambda p: p.ocr.confidence if p.ocr else 0.0,
+                default=None
+            )
 
         if best_pred is None or best_pred.ocr is None:
             return None

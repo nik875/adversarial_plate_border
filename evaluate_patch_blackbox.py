@@ -28,6 +28,59 @@ except ImportError:
 import kornia.geometry as K
 
 
+def polygon_iou(corners1: np.ndarray, corners2: np.ndarray) -> float:
+    """
+    Calculate IoU between two quadrilaterals.
+
+    Args:
+        corners1: [4, 2] array of (x, y) corners
+        corners2: [4, 2] array of (x, y) corners
+
+    Returns:
+        IoU score in [0, 1]
+    """
+    try:
+        from shapely.geometry import Polygon
+        from shapely.validation import make_valid
+    except ImportError:
+        raise ImportError("shapely required for IoU calculation. Install with: pip install shapely")
+
+    poly1 = Polygon(corners1)
+    poly2 = Polygon(corners2)
+
+    # Make valid in case of self-intersecting polygons
+    if not poly1.is_valid:
+        poly1 = make_valid(poly1)
+    if not poly2.is_valid:
+        poly2 = make_valid(poly2)
+
+    intersection = poly1.intersection(poly2).area
+    union = poly1.union(poly2).area
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def bbox_to_corners(bbox) -> np.ndarray:
+    """
+    Convert bounding box to corner array.
+
+    Args:
+        bbox: Object with x1, y1, x2, y2 attributes (from fast-alpr)
+
+    Returns:
+        [4, 2] array of corners in format [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+    """
+    return np.array([
+        [bbox.x1, bbox.y1],
+        [bbox.x2, bbox.y1],
+        [bbox.x2, bbox.y2],
+        [bbox.x1, bbox.y2]
+    ], dtype=np.float32)
+
+
 def load_patch(patch_path: str) -> torch.Tensor:
     """Load patch image and convert to tensor [3, H, W] in range [0, 1]"""
     img = Image.open(patch_path).convert('RGB')
@@ -203,9 +256,11 @@ def main():
 
     # Process each image
     results = []
+    misread_count = 0
 
     print("\nEvaluating patch on all control images...")
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
+    pbar = tqdm(df.iterrows(), total=len(df), desc="Processing")
+    for idx, row in pbar:
         # Get image path
         img_path = row['filename']
 
@@ -244,9 +299,29 @@ def main():
             detected_text = None
         else:
             if predictions and len(predictions) > 0:
-                # Get highest confidence detection
-                best_pred = max(predictions, key=lambda p: p.ocr.confidence if p.ocr else 0.0)
-                detected_text = best_pred.ocr.text if best_pred.ocr else None
+                # Select detection with highest IoU to ground truth corners
+                best_pred = None
+                best_iou = 0.0
+
+                for pred in predictions:
+                    if pred.detection is None:
+                        continue
+
+                    # Convert detection bbox to corners
+                    det_corners = bbox_to_corners(pred.detection)
+
+                    # Calculate IoU with ground truth corners
+                    iou = polygon_iou(det_corners, corners)
+
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_pred = pred
+
+                # If no detection has reasonable IoU, treat as no detection
+                if best_iou < 0.1 or best_pred is None or best_pred.ocr is None:
+                    detected_text = None
+                else:
+                    detected_text = best_pred.ocr.text
             else:
                 detected_text = None
 
@@ -258,6 +333,13 @@ def main():
             'detected_text': detected_text,
             'category': category
         })
+
+        # Track misreads and update progress bar
+        if category == 'Misread':
+            misread_count += 1
+
+        misread_prop = misread_count / len(results) if len(results) > 0 else 0.0
+        pbar.set_postfix({'misread_prop': f'{misread_prop:.3f}'})
 
     # Convert to DataFrame
     results_df = pd.DataFrame(results)

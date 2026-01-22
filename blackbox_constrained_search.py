@@ -34,12 +34,13 @@ class BaseBlackBoxOracle(ABC):
     """
 
     @abstractmethod
-    def query(self, image: np.ndarray) -> Optional[str]:
+    def query(self, image: np.ndarray, corners: Optional[np.ndarray] = None) -> Optional[str]:
         """
         Query the black-box detection system with an image.
 
         Args:
             image: RGB image as numpy array [H, W, 3] in range [0, 255], uint8
+            corners: Optional [4, 2] array of ground truth plate corners for IoU-based selection
 
         Returns:
             Detected license plate text as string, or None if no plate detected
@@ -380,8 +381,8 @@ class BlackBoxPatchOptimizer:
             # Apply patch
             patched_image = self.apply_patch_to_image(image, corners, patch)
 
-            # Query oracle
-            detected_text = oracle.query(patched_image)
+            # Query oracle (pass corners for IoU-based detection selection)
+            detected_text = oracle.query(patched_image, corners)
 
             if self.disruption_mode:
                 # Disruption: want no detection (None)
