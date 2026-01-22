@@ -203,7 +203,9 @@ def iter_dataset(
             if max_samples is not None and count >= max_samples:
                 break
         except Exception as e:
-            # Skip corrupted/invalid images
+            # Log error details but skip this sample
+            import traceback
+            print(f"[{name}/{split}] Error loading sample: {type(e).__name__}: {str(e)}", file=__import__('sys').stderr)
             continue
 
 
