@@ -197,8 +197,8 @@ def main():
     )
     parser.add_argument(
         '--patch',
-        required=True,
-        help='Path to patch image file (PNG/JPG)'
+        default=None,
+        help='Path to patch image file (PNG/JPG). If not provided, runs control case with no patch.'
     )
     parser.add_argument(
         '--corners-csv',
@@ -238,10 +238,14 @@ def main():
         print("Error: fast-alpr not installed. Install with: pip install fast-alpr")
         return
 
-    # Load patch
-    print(f"Loading patch from {args.patch}...")
-    patch = load_patch(args.patch)
-    print(f"Patch loaded: shape={patch.shape}")
+    # Load patch (optional for control case)
+    if args.patch is not None:
+        print(f"Loading patch from {args.patch}...")
+        patch = load_patch(args.patch)
+        print(f"Patch loaded: shape={patch.shape}")
+    else:
+        patch = None
+        print("Running control case (no patch applied)")
 
     # Load control images and corners from CSV
     print(f"\nLoading control images from {args.corners_csv}...")
@@ -292,8 +296,11 @@ def main():
             [row['p4_x'], row['p4_y']]
         ], dtype=np.float32)
 
-        # Apply patch
-        patched_image = apply_patch_to_image(image, corners, patch, device=args.device)
+        # Apply patch (or use original image if no patch provided)
+        if patch is not None:
+            patched_image = apply_patch_to_image(image, corners, patch, device=args.device)
+        else:
+            patched_image = image
 
         # Convert to BGR for fast-alpr
         patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
@@ -399,8 +406,11 @@ def main():
         autotext.set_weight('bold')
 
     # Title
-    mode = "IMPERSONATION" if args.impersonation_target else "DISRUPTION"
-    ax.set_title(f'{mode} Patch Evaluation - Detection Outcomes',
+    if args.patch is None:
+        mode = "CONTROL (No Patch)"
+    else:
+        mode = "IMPERSONATION" if args.impersonation_target else "DISRUPTION"
+    ax.set_title(f'{mode} - Detection Outcomes',
                 fontsize=16, weight='bold', pad=20)
 
     plt.text(0.5, 0.95, f'(n={len(results_df)} control images evaluated)',
@@ -413,9 +423,13 @@ def main():
 
     # Print summary
     print("\n" + "="*70)
-    print(f"PATCH EVALUATION SUMMARY: {mode} MODE")
+    if args.patch is None:
+        print("CONTROL CASE EVALUATION SUMMARY (No Patch)")
+    else:
+        print(f"PATCH EVALUATION SUMMARY: {mode} MODE")
     print("="*70)
-    print(f"Patch: {args.patch}")
+    if args.patch is not None:
+        print(f"Patch: {args.patch}")
     print(f"True plate: {args.true_plate}")
     if args.impersonation_target:
         print(f"Impersonation target: {args.impersonation_target}")
