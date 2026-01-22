@@ -70,12 +70,6 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "roboflow_lpr_crops",
         "splits": ["train", "test", "valid"],
     },
-    "license_plate_detection": {
-        "hf_id": "keremberke/license-plate-object-detection",
-        "image_key": "image",
-        "text_key": "image_id",  # Use image_id as placeholder since this is detection, not text
-        "splits": ["train", "validation", "test"],
-    },
 }
 
 

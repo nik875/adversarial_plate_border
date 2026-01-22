@@ -18,11 +18,10 @@ DATASETS_TO_VIZ = [
     ("icdar2015", "train"),
     ("icdar2015", "test"),
     ("cocotext", "train"),
-    ("license_plate_detection", "train"),
 ]
 
-# Create figure with subplots (9 datasets, use 3x3 grid)
-fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+# Create figure with subplots (8 datasets, use 2x4 grid)
+fig, axes = plt.subplots(2, 4, figsize=(18, 8))
 axes = axes.flatten()
 
 # Count images per dataset split
