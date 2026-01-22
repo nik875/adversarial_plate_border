@@ -17,9 +17,10 @@ DATASETS_TO_VIZ = [
     ("icdar2013", "test"),
     ("icdar2015", "train"),
     ("icdar2015", "test"),
+    ("cocotext", "train"),
 ]
 
-# Create figure with subplots (7 datasets, use 2x4 grid with one empty)
+# Create figure with subplots (8 datasets, use 2x4 grid)
 fig, axes = plt.subplots(2, 4, figsize=(18, 8))
 axes = axes.flatten()
 
@@ -69,9 +70,6 @@ for idx, (dataset_name, split) in enumerate(DATASETS_TO_VIZ):
                 fontsize=10, color='red')
         ax.set_title(f"{dataset_name.upper()} ({split})", fontsize=10, fontweight='bold')
         ax.axis('off')
-
-# Hide the extra subplot
-axes[-1].axis('off')
 
 plt.tight_layout()
 plt.savefig('dataset_examples.png', dpi=150, bbox_inches='tight')

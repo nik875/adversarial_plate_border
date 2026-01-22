@@ -60,6 +60,11 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "icdar2015",
         "splits": ["train", "test"],
     },
+    "cocotext": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "cocotext_crops",
+        "splits": ["train"],
+    },
 }
 
 
@@ -336,6 +341,74 @@ def _iter_icdar2015_local(split: str, max_samples: int | None = None) -> Iterato
 
 
 # ---------------------------------------------------------
+# COCO Text cropped images
+# ---------------------------------------------------------
+
+def _iter_cocotext(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over COCO Text cropped images from local directory.
+    Split should be 'train' (only split available from crop_cocotext.py).
+
+    Expects directory structure:
+    - ~/.cache/cocotext_crops/
+      - labels.txt (format: filename text legibility=X class=Y)
+      - cocotext_*.png (cropped images)
+    """
+    cache_dir = DATASETS["cocotext"]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"COCO Text crops not found at: {cache_dir}")
+
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels
+    labels_dict = {}
+    with open(labels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename text legibility=X class=Y
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+
+            filename = parts[0]
+            text = parts[1]
+            labels_dict[filename] = text
+
+    count = 0
+    # Iterate through all cropped images
+    for img_path in sorted(cache_dir.glob("cocotext_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
+            continue
+
+        text = labels_dict[filename]
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            meta = {
+                "dataset": "cocotext",
+                "split": split,
+            }
+
+            yield img, text, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -366,6 +439,11 @@ def iter_dataset(
     # Handle ICDAR 2015 from local directory
     if name == "icdar2015":
         yield from _iter_icdar2015_local(split, max_samples)
+        return
+
+    # Handle COCO Text from local directory
+    if name == "cocotext":
+        yield from _iter_cocotext(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face
