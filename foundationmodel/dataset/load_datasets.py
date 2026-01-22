@@ -171,7 +171,7 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
     Expects directory structure:
     Train:
     - ~/.cache/icdar2013/Challenge1_train/
-      - gt/ (ground truth text files)
+      - gt.txt (single file with all labels, format: filename label)
       - *.png (image files)
 
     Test:
@@ -183,92 +183,55 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
 
     if split == "train":
         challenge_dir = cache_dir / "Challenge1_train"
-        gt_dir = challenge_dir / "gt"
-        use_single_gt = False
+        gt_file_path = challenge_dir / "gt.txt"
     elif split == "test":
         challenge_dir = cache_dir / "Challenge1_test"
         gt_file_path = challenge_dir / "Challenge1_Test_Task3_GT.txt"
-        use_single_gt = True
     else:
         raise ValueError(f"Unknown split '{split}', expected 'train' or 'test'")
 
     if not challenge_dir.exists():
         raise FileNotFoundError(f"ICDAR 2013 dataset not found at: {challenge_dir}")
 
-    if use_single_gt:
-        # Load test GT file (format: filename label per line)
-        if not gt_file_path.exists():
-            raise FileNotFoundError(f"Ground truth file not found: {gt_file_path}")
+    # Load GT file (format: filename label per line)
+    if not gt_file_path.exists():
+        raise FileNotFoundError(f"Ground truth file not found: {gt_file_path}")
 
-        gt_dict = {}
-        with open(gt_file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)  # Split on first whitespace
-                if len(parts) == 2:
-                    filename, label = parts
-                    gt_dict[filename] = label
-
-        count = 0
-        for img_path in sorted(challenge_dir.glob("*.png")):
-            img_name = img_path.name
-            if img_name not in gt_dict:
+    gt_dict = {}
+    with open(gt_file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
+            parts = line.split(None, 1)  # Split on first whitespace
+            if len(parts) == 2:
+                filename, label = parts
+                gt_dict[filename] = label
 
-            label = gt_dict[img_name]
+    count = 0
+    for img_path in sorted(challenge_dir.glob("*.png")):
+        img_name = img_path.name
+        if img_name not in gt_dict:
+            continue
 
-            try:
-                img = Image.open(img_path).convert('RGB')
+        label = gt_dict[img_name]
 
-                meta = {
-                    "dataset": "icdar2013",
-                    "split": split,
-                }
+        try:
+            img = Image.open(img_path).convert('RGB')
 
-                yield img, label, meta
+            meta = {
+                "dataset": "icdar2013",
+                "split": split,
+            }
 
-                count += 1
-                if max_samples is not None and count >= max_samples:
-                    break
-            except Exception as e:
-                print(f"Warning: Could not load image {img_path}: {e}")
-                continue
-    else:
-        # Load train GT files (per-image text files)
-        if not gt_dir.exists():
-            raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+            yield img, label, meta
 
-        count = 0
-        for img_path in sorted(challenge_dir.glob("*.png")):
-            gt_file = gt_dir / f"{img_path.stem}.txt"
-
-            if not gt_file.exists():
-                continue
-
-            try:
-                with open(gt_file, 'r') as f:
-                    label = f.read().strip()
-
-                if not label:
-                    continue
-
-                img = Image.open(img_path).convert('RGB')
-
-                meta = {
-                    "dataset": "icdar2013",
-                    "split": split,
-                }
-
-                yield img, label, meta
-
-                count += 1
-                if max_samples is not None and count >= max_samples:
-                    break
-            except Exception as e:
-                print(f"Warning: Could not load image {img_path}: {e}")
-                continue
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
 
 
 # ---------------------------------------------------------
