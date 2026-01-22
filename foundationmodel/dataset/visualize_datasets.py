@@ -1,20 +1,43 @@
 #!/usr/bin/env python3
 """
-Visualize example images from each dataset.
+Visualize example images from each dataset and count total images.
 """
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from load_datasets import iter_dataset
+from load_datasets import iter_dataset, DATASETS
 
 # Datasets to visualize
-DATASETS = ["iiit5k", "mjsynth", "iam_line", "icdar2015"]
+DATASET_NAMES = ["iiit5k", "mjsynth", "iam_line", "icdar2015"]
 
 # Create figure with subplots
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 axes = axes.flatten()
 
-for idx, dataset_name in enumerate(DATASETS):
+# Count images per dataset
+print("Counting images in each dataset...\n")
+dataset_counts = {}
+total_images = 0
+
+for dataset_name in DATASET_NAMES:
+    try:
+        dataset_counts[dataset_name] = 0
+        splits = DATASETS[dataset_name]["splits"]
+
+        for split in splits:
+            for img, text, meta in iter_dataset(dataset_name, split):
+                dataset_counts[dataset_name] += 1
+
+        total_images += dataset_counts[dataset_name]
+        print(f"  {dataset_name:12} : {dataset_counts[dataset_name]:>6} images")
+    except Exception as e:
+        dataset_counts[dataset_name] = 0
+        print(f"  {dataset_name:12} : Error - {str(e)[:50]}")
+
+print(f"\n  {'TOTAL':12} : {total_images:>6} images\n")
+
+# Visualize examples
+for idx, dataset_name in enumerate(DATASET_NAMES):
     ax = axes[idx]
 
     try:
