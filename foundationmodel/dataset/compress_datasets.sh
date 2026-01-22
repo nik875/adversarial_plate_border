@@ -33,6 +33,11 @@ mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_np"
 mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_rotate"
 mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_tilt"
 mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_weather"
+mkdir -p "$TEMP_DIR/.cache/mercosur_crops/monitoring_system"
+mkdir -p "$TEMP_DIR/.cache/mercosur_crops/parking_lot1"
+mkdir -p "$TEMP_DIR/.cache/mercosur_crops/parking_lot2"
+mkdir -p "$TEMP_DIR/.cache/mercosur_crops/parking_lot3"
+mkdir -p "$TEMP_DIR/.cache/mercosur_crops/cropped_parking_lot"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -104,6 +109,14 @@ if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
     cp -r "$HOME/.cache/ccpd2019_crops"/* "$TEMP_DIR/.cache/ccpd2019_crops/" 2>/dev/null || true
 else
     echo "Warning: CCPD2019 crops not found at $HOME/.cache/ccpd2019_crops"
+fi
+
+# Copy Mercosur crops (all variants)
+if [ -d "$HOME/.cache/mercosur_crops" ]; then
+    echo "Copying Mercosur crops (all variants)..."
+    cp -r "$HOME/.cache/mercosur_crops"/* "$TEMP_DIR/.cache/mercosur_crops/" 2>/dev/null || true
+else
+    echo "Warning: Mercosur crops not found at $HOME/.cache/mercosur_crops"
 fi
 
 # Create tarball

@@ -76,5 +76,10 @@ if [ -d "$HOME/.cache/ccpd2019_crops" ]; then
     ls -la "$HOME/.cache/ccpd2019_crops/" | head -15
 fi
 
+if [ -d "$HOME/.cache/mercosur_crops" ]; then
+    echo "  ✓ Mercosur crops (variants): $HOME/.cache/mercosur_crops"
+    ls -la "$HOME/.cache/mercosur_crops/" | head -10
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"

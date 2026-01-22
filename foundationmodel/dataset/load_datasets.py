@@ -125,6 +125,31 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_weather",
         "splits": ["train"],
     },
+    "mercosur_monitoring_system": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "monitoring_system",
+        "splits": ["train"],
+    },
+    "mercosur_parking_lot1": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot1",
+        "splits": ["train"],
+    },
+    "mercosur_parking_lot2": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot2",
+        "splits": ["train"],
+    },
+    "mercosur_parking_lot3": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "parking_lot3",
+        "splits": ["train"],
+    },
+    "mercosur_cropped_parking_lot": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "mercosur_crops" / "cropped_parking_lot",
+        "splits": ["train"],
+    },
 }
 
 
@@ -739,6 +764,72 @@ def _iter_ccpd2019_variant(dataset_name: str, split: str, max_samples: int | Non
 
 
 # ---------------------------------------------------------
+# Mercosur variant cropped images
+# ---------------------------------------------------------
+
+def _iter_mercosur_variant(dataset_name: str, split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over Mercosur variant cropped license plate images from local directory.
+    Split should be 'train' (only split available).
+
+    Expects directory structure:
+    - ~/.cache/mercosur_crops/monitoring_system/ (or other variants)
+      - labels.txt (format: filename source_image=X)
+      - mercosur_*_*.png (cropped license plate images)
+    """
+    cache_dir = DATASETS[dataset_name]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"Mercosur variant crops not found at: {cache_dir}")
+
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels
+    labels_dict = {}
+    with open(labels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename source_image=X
+            parts = line.split()
+            if len(parts) < 1:
+                continue
+
+            filename = parts[0]
+            labels_dict[filename] = True
+
+    count = 0
+    # Iterate through cropped images
+    for img_path in sorted(cache_dir.glob("mercosur_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
+            continue
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            # Use split as the "text" label since these are images of objects, not text
+            meta = {
+                "dataset": dataset_name,
+                "split": split,
+            }
+
+            yield img, split, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -794,6 +885,11 @@ def iter_dataset(
     # Handle CCPD2019 variants from local directory
     if name.startswith("ccpd2019_"):
         yield from _iter_ccpd2019_variant(name, split, max_samples)
+        return
+
+    # Handle Mercosur variants from local directory
+    if name.startswith("mercosur_"):
+        yield from _iter_mercosur_variant(name, split, max_samples)
         return
 
     # Handle other datasets via Hugging Face
