@@ -34,28 +34,28 @@ def load_cocotext(json_path=COCOTEXT_JSON):
         return json.load(f)
 
 
-def is_valid_annotation(ann):
-    """Check if annotation should be cropped."""
+def is_valid_annotation(ann, verbose=False):
+    """Check if annotation should be cropped. Returns (valid, reason)."""
     # Skip empty text
     if not ann.get('utf8_string', '').strip():
-        return False
+        return False, "empty_text"
 
     # Skip illegible text
     if ann.get('legibility') != 'legible':
-        return False
+        return False, f"illegible ({ann.get('legibility', 'unknown')})"
 
     # Check bounding box
     bbox = ann.get('bbox')
     if not bbox or len(bbox) != 4:
-        return False
+        return False, "invalid_bbox"
 
     x, y, w, h = bbox
     if w < MIN_WIDTH or h < MIN_HEIGHT:
-        return False
+        return False, f"too_small ({w:.1f}x{h:.1f}, min {MIN_WIDTH}x{MIN_HEIGHT})"
     if w > MAX_WIDTH or h > MAX_HEIGHT:
-        return False
+        return False, f"too_large ({w:.1f}x{h:.1f}, max {MAX_WIDTH}x{MAX_HEIGHT})"
 
-    return True
+    return True, "valid"
 
 
 def crop_image_region(img_path, bbox, padding=PADDING):
@@ -92,20 +92,50 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
     labels_file = output_dir / "labels.txt"
     crop_count = 0
 
+    # Tracking counters
+    counters = {
+        'total': len(anns),
+        'empty_text': 0,
+        'illegible': 0,
+        'invalid_bbox': 0,
+        'too_small': 0,
+        'too_large': 0,
+        'image_id_not_found': 0,
+        'image_file_not_found': 0,
+        'crop_error': 0,
+        'success': 0,
+    }
+
     print(f"Processing COCO Text annotations...")
     print(f"  Total annotations: {len(anns)}")
     print(f"  Output directory: {output_dir}")
+    print(f"  COCO directory: {coco_images_dir}")
+    print(f"  Constraints: {MIN_WIDTH}x{MIN_HEIGHT} to {MAX_WIDTH}x{MAX_HEIGHT} pixels")
+    print()
 
     with open(labels_file, 'w') as labels:
         for ann_id, ann in tqdm(anns.items(), total=len(anns)):
             if max_crops and crop_count >= max_crops:
                 break
 
-            if not is_valid_annotation(ann):
+            valid, reason = is_valid_annotation(ann)
+            if not valid:
+                # Track rejection reason
+                if 'empty_text' in reason:
+                    counters['empty_text'] += 1
+                elif 'illegible' in reason:
+                    counters['illegible'] += 1
+                elif 'invalid_bbox' in reason:
+                    counters['invalid_bbox'] += 1
+                elif 'too_small' in reason:
+                    counters['too_small'] += 1
+                elif 'too_large' in reason:
+                    counters['too_large'] += 1
                 continue
 
             image_id = ann['image_id']
             if image_id not in imgs:
+                counters['image_id_not_found'] += 1
                 continue
 
             # Construct image path
@@ -126,11 +156,13 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
                     break
 
             if img_path is None:
+                counters['image_file_not_found'] += 1
                 continue
 
             # Crop image
             crop = crop_image_region(img_path, ann['bbox'])
             if crop is None:
+                counters['crop_error'] += 1
                 continue
 
             # Save crop
@@ -145,8 +177,25 @@ def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max
             labels.write(f"{crop_filename} {text} legibility={legibility} class={class_type}\n")
 
             crop_count += 1
+            counters['success'] += 1
 
-    print(f"\n✓ Created {crop_count} cropped images")
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"CROP SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total annotations processed:      {counters['total']:>8}")
+    print(f"  ✓ Successfully cropped:         {counters['success']:>8}")
+    print(f"  ✗ Filtered:")
+    print(f"    - Empty text:                 {counters['empty_text']:>8}")
+    print(f"    - Illegible:                  {counters['illegible']:>8}")
+    print(f"    - Invalid bbox:               {counters['invalid_bbox']:>8}")
+    print(f"    - Too small:                  {counters['too_small']:>8}")
+    print(f"    - Too large:                  {counters['too_large']:>8}")
+    print(f"    - Image ID not found:         {counters['image_id_not_found']:>8}")
+    print(f"    - Image file not found:       {counters['image_file_not_found']:>8}")
+    print(f"    - Crop error:                 {counters['crop_error']:>8}")
+    print(f"{'='*60}")
+    print(f"✓ Created {crop_count} cropped images")
     print(f"✓ Labels saved to {labels_file}")
     return crop_count
 
