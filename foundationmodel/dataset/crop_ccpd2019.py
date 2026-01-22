@@ -122,8 +122,8 @@ def process_ccpd2019(output_dir=OUTPUT_DIR, ccpd_dir=CCPD2019_DIR, max_crops=Non
     if not ccpd_dir.exists():
         raise FileNotFoundError(f"CCPD2019 dataset not found: {ccpd_dir}")
 
-    # Get all image files
-    img_files = sorted(ccpd_dir.glob("*.jpg"))
+    # Get all image files (recursively from subdirectories)
+    img_files = sorted(ccpd_dir.glob("**/*.jpg"))
     print(f"Found {len(img_files)} image files")
     print()
 
