@@ -142,6 +142,12 @@ def main():
         help="Random seed for CMA-ES reproducibility (default: None)"
     )
     parser.add_argument(
+        "--test-image-subset",
+        type=int,
+        default=None,
+        help="Sample this many test images per iteration (default: use all)"
+    )
+    parser.add_argument(
         "--output-patch",
         default="optimized_patch_cmaes.png",
         help="Output path for optimized patch"
@@ -178,7 +184,8 @@ def main():
         device=args.device,
         csv_path=args.csv,
         target_plate=args.target_plate,
-        disruption_mode=(args.target_plate is None)
+        disruption_mode=(args.target_plate is None),
+        test_image_subset=args.test_image_subset
     )
 
     # Create fast-alpr oracle

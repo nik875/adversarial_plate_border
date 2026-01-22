@@ -64,7 +64,8 @@ class BlackBoxPatchOptimizer:
                  test_images_dir: Optional[str] = None,
                  csv_path: Optional[str] = None,
                  target_plate: Optional[str] = None,
-                 disruption_mode: bool = True):
+                 disruption_mode: bool = True,
+                 test_image_subset: Optional[int] = None):
         """
         Args:
             generator_checkpoint: Path to generator .pt file
@@ -89,6 +90,7 @@ class BlackBoxPatchOptimizer:
 
         self.target_plate = target_plate
         self.disruption_mode = disruption_mode
+        self.test_image_subset = test_image_subset
 
         # Load generator
         print(f"Loading generator from: {generator_checkpoint}")
@@ -363,9 +365,18 @@ class BlackBoxPatchOptimizer:
         if len(self.test_images) == 0:
             raise ValueError("No test images loaded. Provide test_images_dir.")
 
+        # Subsample test images if specified
+        if self.test_image_subset is not None and self.test_image_subset < len(self.test_images):
+            indices = np.random.choice(len(self.test_images), size=self.test_image_subset, replace=False)
+            test_images = [self.test_images[i] for i in indices]
+            test_corners = [self.test_corners[i] for i in indices]
+        else:
+            test_images = self.test_images
+            test_corners = self.test_corners
+
         results = []
 
-        for image, corners in zip(self.test_images, self.test_corners):
+        for image, corners in zip(test_images, test_corners):
             # Apply patch
             patched_image = self.apply_patch_to_image(image, corners, patch)
 
@@ -543,6 +554,8 @@ def main():
                        help='Directory with test images and corner annotations (alternative to --csv)')
     parser.add_argument('--csv', default=None,
                        help='CSV file with image paths and corners (alternative to --test-images-dir)')
+    parser.add_argument('--test-image-subset', type=int, default=None,
+                       help='Sample this many test images per iteration (default: use all)')
     parser.add_argument('--device', default='cuda', choices=['cuda', 'mps', 'cpu'],
                        help='Device to use')
     parser.add_argument('--target-plate', default=None,
@@ -605,7 +618,8 @@ def main():
         test_images_dir=args.test_images_dir,
         csv_path=args.csv,
         target_plate=args.target_plate,
-        disruption_mode=(args.target_plate is None)
+        disruption_mode=(args.target_plate is None),
+        test_image_subset=args.test_image_subset
     )
 
     # Create oracle instance
