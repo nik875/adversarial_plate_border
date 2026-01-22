@@ -56,6 +56,11 @@ DATASETS = {
         "text_key": "text",
         "splits": ["train", "test"],
     },
+    "icdar2013": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "icdar2013",
+        "splits": ["train"],
+    },
 }
 
 
@@ -156,6 +161,65 @@ def _iter_iiit5k(split: str, max_samples: int | None = None) -> Iterator[Tuple[I
 
 
 # ---------------------------------------------------------
+# ICDAR 2013 Challenge 1 local dataset loading
+# ---------------------------------------------------------
+
+def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over ICDAR 2013 Challenge 1 dataset samples from local directory.
+    Split should be 'train' (only split available).
+
+    Expects directory structure:
+    - ~/.cache/icdar2013/Challenge1/
+      - gt/ (ground truth text files)
+      - *.png (image files)
+    """
+    cache_dir = DATASETS["icdar2013"]["cache_dir"]
+    challenge_dir = cache_dir / "Challenge1"
+
+    if not challenge_dir.exists():
+        raise FileNotFoundError(f"ICDAR 2013 dataset not found at: {challenge_dir}")
+
+    gt_dir = challenge_dir / "gt"
+    if not gt_dir.exists():
+        raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+
+    count = 0
+    # Iterate through all image files
+    for img_path in sorted(challenge_dir.glob("*.png")):
+        # Find corresponding ground truth file
+        gt_file = gt_dir / f"{img_path.stem}.txt"
+
+        if not gt_file.exists():
+            continue
+
+        try:
+            # Read ground truth text
+            with open(gt_file, 'r') as f:
+                label = f.read().strip()
+
+            if not label:
+                continue
+
+            # Load image
+            img = Image.open(img_path).convert('RGB')
+
+            meta = {
+                "dataset": "icdar2013",
+                "split": split,
+            }
+
+            yield img, label, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -178,43 +242,40 @@ def iter_dataset(
         yield from _iter_iiit5k(split, max_samples)
         return
 
+    # Handle ICDAR 2013 from local directory
+    if name == "icdar2013":
+        yield from _iter_icdar2013(split, max_samples)
+        return
+
     # Handle other datasets via Hugging Face
     ds = load_dataset(cfg["hf_id"], split=split)
 
-    # Filter out corrupted images
-    def is_valid_sample(sample):
-        """Check if sample has valid image and text fields."""
-        try:
-            img = sample[cfg["image_key"]]
-            if img is None:
-                return False
-            if hasattr(img, 'convert'):
-                img.convert('RGB')
-            return sample[cfg["text_key"]] is not None
-        except Exception:
-            return False
-
-    ds = ds.filter(is_valid_sample, desc=f"Filtering {name}/{split}")
-
     count = 0
     for sample in ds:
-        img = sample[cfg["image_key"]]
-        text = sample[cfg["text_key"]]
+        try:
+            img = sample[cfg["image_key"]]
 
-        # Ensure RGB
-        if hasattr(img, 'convert'):
-            img = img.convert('RGB')
+            # Ensure image is valid by attempting to access it
+            if hasattr(img, 'convert'):
+                img = img.convert('RGB')
 
-        meta = {
-            "dataset": name,
-            "split": split,
-        }
+            text = sample[cfg["text_key"]]
 
-        yield img, text, meta
+            meta = {
+                "dataset": name,
+                "split": split,
+            }
 
-        count += 1
-        if max_samples is not None and count >= max_samples:
-            break
+            yield img, text, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            # Log error details but skip this sample
+            import traceback
+            print(f"[{name}/{split}] Error loading sample: {type(e).__name__}: {str(e)}", file=__import__('sys').stderr)
+            continue
 
 
 # ---------------------------------------------------------

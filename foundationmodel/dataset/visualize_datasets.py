@@ -9,10 +9,10 @@ import traceback
 from load_datasets import iter_dataset, DATASETS
 
 # Datasets to visualize
-DATASET_NAMES = ["iiit5k", "mjsynth", "iam_line", "icdar2015"]
+DATASET_NAMES = ["iiit5k", "mjsynth", "iam_line", "icdar2015", "icdar2013"]
 
-# Create figure with subplots
-fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+# Create figure with subplots (5 datasets, use 2x3 grid)
+fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 axes = axes.flatten()
 
 # Count images per dataset
@@ -59,6 +59,7 @@ for idx, dataset_name in enumerate(DATASET_NAMES):
             "mjsynth": "train",
             "iam_line": "train",
             "icdar2015": "train",
+            "icdar2013": "train",
         }
         split = cfg_splits[dataset_name]
 
@@ -74,6 +75,9 @@ for idx, dataset_name in enumerate(DATASET_NAMES):
                 fontsize=10, color='red')
         ax.set_title(dataset_name.upper(), fontsize=10, fontweight='bold')
         ax.axis('off')
+
+# Hide the extra subplot
+axes[-1].axis('off')
 
 plt.tight_layout()
 plt.savefig('dataset_examples.png', dpi=150, bbox_inches='tight')
