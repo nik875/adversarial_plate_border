@@ -15,7 +15,8 @@ echo "Creating cache directory..."
 mkdir -p "$CHALLENGE_DIR"
 
 echo "Downloading ICDAR 2015 Challenge 2 Test Images..."
-curl --header 'Host: rrc.cvc.uab.es' \
+curl --insecure \
+  --header 'Host: rrc.cvc.uab.es' \
   --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0' \
   --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
   --header 'Accept-Language: en-US,en;q=0.5' \
@@ -39,7 +40,7 @@ fi
 echo "✓ Test images download complete"
 
 echo "Downloading ICDAR 2015 Challenge 2 Test Ground Truth..."
-curl --location \
+curl --insecure --location \
   --header 'Host: rrc.cvc.uab.es' \
   --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0' \
   'https://rrc.cvc.uab.es/?com=downloads&action=download&ch=2&f=aHR0cHM6Ly9ycmMuY3ZjLnVhYi5lcy9kb3dubG9hZHMvQ2hhbGxlbmdlMl9UZXN0X1Rhc2szX0dULnR4dA==' \

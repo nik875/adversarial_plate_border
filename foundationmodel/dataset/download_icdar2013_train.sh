@@ -6,7 +6,7 @@
 set -e
 
 CACHE_DIR="$HOME/.cache/icdar2013"
-CHALLENGE_DIR="$CACHE_DIR/Challenge1"
+CHALLENGE_DIR="$CACHE_DIR/Challenge1_train"
 ZIP_FILE=$(mktemp)
 
 trap "rm -f $ZIP_FILE" EXIT
@@ -15,7 +15,8 @@ echo "Creating cache directory..."
 mkdir -p "$CHALLENGE_DIR"
 
 echo "Downloading ICDAR 2013 Challenge 1 dataset..."
-curl --header 'Host: rrc.cvc.uab.es' \
+curl --insecure \
+  --header 'Host: rrc.cvc.uab.es' \
   --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Gecko/20100101 Firefox/140.0' \
   --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
   --header 'Accept-Language: en-US,en;q=0.5' \
