@@ -181,32 +181,40 @@ def iter_dataset(
     # Handle other datasets via Hugging Face
     ds = load_dataset(cfg["hf_id"], split=split)
 
-    count = 0
-    for sample in ds:
+    # Filter out corrupted images
+    def is_valid_sample(sample):
+        """Check if sample has valid image and text fields."""
         try:
             img = sample[cfg["image_key"]]
-
-            # Ensure image is valid by attempting to access it
+            if img is None:
+                return False
             if hasattr(img, 'convert'):
-                img = img.convert('RGB')
+                img.convert('RGB')
+            return sample[cfg["text_key"]] is not None
+        except Exception:
+            return False
 
-            text = sample[cfg["text_key"]]
+    ds = ds.filter(is_valid_sample, desc=f"Filtering {name}/{split}")
 
-            meta = {
-                "dataset": name,
-                "split": split,
-            }
+    count = 0
+    for sample in ds:
+        img = sample[cfg["image_key"]]
+        text = sample[cfg["text_key"]]
 
-            yield img, text, meta
+        # Ensure RGB
+        if hasattr(img, 'convert'):
+            img = img.convert('RGB')
 
-            count += 1
-            if max_samples is not None and count >= max_samples:
-                break
-        except Exception as e:
-            # Log error details but skip this sample
-            import traceback
-            print(f"[{name}/{split}] Error loading sample: {type(e).__name__}: {str(e)}", file=__import__('sys').stderr)
-            continue
+        meta = {
+            "dataset": name,
+            "split": split,
+        }
+
+        yield img, text, meta
+
+        count += 1
+        if max_samples is not None and count >= max_samples:
+            break
 
 
 # ---------------------------------------------------------
