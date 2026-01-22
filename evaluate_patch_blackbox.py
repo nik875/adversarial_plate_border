@@ -225,6 +225,12 @@ def main():
         default=None,
         help='Save detailed results to CSV (default: None, no CSV output)'
     )
+    parser.add_argument(
+        '--device',
+        choices=['cpu', 'cuda', 'mps'],
+        default='cpu',
+        help='Device to use for patch application (default: cpu)'
+    )
 
     args = parser.parse_args()
 
@@ -287,7 +293,7 @@ def main():
         ], dtype=np.float32)
 
         # Apply patch
-        patched_image = apply_patch_to_image(image, corners, patch)
+        patched_image = apply_patch_to_image(image, corners, patch, device=args.device)
 
         # Convert to BGR for fast-alpr
         patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
