@@ -87,4 +87,34 @@ if [ -d "$HOME/.cache/crpd_crops" ]; then
 fi
 
 echo ""
+echo "Original Datasets:"
+if [ -d "$HOME/.cache/coco_text" ]; then
+    echo "  ✓ COCO Text: $HOME/.cache/coco_text"
+fi
+
+if [ -d "$HOME/.cache/roboflow_lpr_dataset" ]; then
+    echo "  ✓ Roboflow LPR: $HOME/.cache/roboflow_lpr_dataset"
+fi
+
+if [ -d "$HOME/.cache/indian_plates_kaggle" ]; then
+    echo "  ✓ Indian Plates Kaggle: $HOME/.cache/indian_plates_kaggle"
+fi
+
+if [ -d "$HOME/.cache/kaggle_lp_detection" ]; then
+    echo "  ✓ Kaggle LP Detection: $HOME/.cache/kaggle_lp_detection"
+fi
+
+if [ -d "$HOME/.cache/CCPD2019" ]; then
+    echo "  ✓ CCPD2019: $HOME/.cache/CCPD2019"
+fi
+
+if [ -d "$HOME/.cache/Mercosur" ]; then
+    echo "  ✓ Mercosur: $HOME/.cache/Mercosur"
+fi
+
+if [ -d "$HOME/.cache/CRPD" ]; then
+    echo "  ✓ CRPD: $HOME/.cache/CRPD"
+fi
+
+echo ""
 echo "✓ Dataset download and extraction complete"

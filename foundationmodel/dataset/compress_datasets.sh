@@ -16,10 +16,20 @@ TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 # Create cache directory structure in temp
+# Original datasets
 mkdir -p "$TEMP_DIR/.cache/iiit5k"
 mkdir -p "$TEMP_DIR/.cache/huggingface/datasets"
 mkdir -p "$TEMP_DIR/.cache/icdar2011"
 mkdir -p "$TEMP_DIR/.cache/icdar2013"
+mkdir -p "$TEMP_DIR/.cache/coco_text"
+mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_dataset"
+mkdir -p "$TEMP_DIR/.cache/indian_plates_kaggle"
+mkdir -p "$TEMP_DIR/.cache/kaggle_lp_detection"
+mkdir -p "$TEMP_DIR/.cache/CCPD2019"
+mkdir -p "$TEMP_DIR/.cache/Mercosur"
+mkdir -p "$TEMP_DIR/.cache/CRPD"
+
+# Cropped datasets
 mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 mkdir -p "$TEMP_DIR/.cache/kaggle_lp_crops"
@@ -122,6 +132,64 @@ if [ -d "$HOME/.cache/crpd_crops" ]; then
     cp -r "$HOME/.cache/crpd_crops"/* "$TEMP_DIR/.cache/crpd_crops/" 2>/dev/null || true
 else
     echo "Warning: CRPD crops not found at $HOME/.cache/crpd_crops"
+fi
+
+# === ORIGINAL DATASETS ===
+
+# Copy COCO Text dataset (if exists)
+if [ -d "$HOME/.cache/coco_text" ]; then
+    echo "Copying COCO Text dataset..."
+    cp -r "$HOME/.cache/coco_text"/* "$TEMP_DIR/.cache/coco_text/" 2>/dev/null || true
+else
+    echo "Warning: COCO Text dataset not found at $HOME/.cache/coco_text"
+fi
+
+# Copy Roboflow LPR dataset (if exists)
+if [ -d "$HOME/.cache/roboflow_lpr_dataset" ]; then
+    echo "Copying Roboflow LPR dataset..."
+    cp -r "$HOME/.cache/roboflow_lpr_dataset"/* "$TEMP_DIR/.cache/roboflow_lpr_dataset/" 2>/dev/null || true
+else
+    echo "Warning: Roboflow LPR dataset not found at $HOME/.cache/roboflow_lpr_dataset"
+fi
+
+# Copy Indian Plates Kaggle dataset (if exists)
+if [ -d "$HOME/.cache/indian_plates_kaggle" ]; then
+    echo "Copying Indian Plates Kaggle dataset..."
+    cp -r "$HOME/.cache/indian_plates_kaggle"/* "$TEMP_DIR/.cache/indian_plates_kaggle/" 2>/dev/null || true
+else
+    echo "Warning: Indian Plates Kaggle dataset not found at $HOME/.cache/indian_plates_kaggle"
+fi
+
+# Copy Kaggle LP Detection dataset (if exists)
+if [ -d "$HOME/.cache/kaggle_lp_detection" ]; then
+    echo "Copying Kaggle LP Detection dataset..."
+    cp -r "$HOME/.cache/kaggle_lp_detection"/* "$TEMP_DIR/.cache/kaggle_lp_detection/" 2>/dev/null || true
+else
+    echo "Warning: Kaggle LP Detection dataset not found at $HOME/.cache/kaggle_lp_detection"
+fi
+
+# Copy CCPD2019 dataset (if exists)
+if [ -d "$HOME/.cache/CCPD2019" ]; then
+    echo "Copying CCPD2019 dataset..."
+    cp -r "$HOME/.cache/CCPD2019"/* "$TEMP_DIR/.cache/CCPD2019/" 2>/dev/null || true
+else
+    echo "Warning: CCPD2019 dataset not found at $HOME/.cache/CCPD2019"
+fi
+
+# Copy Mercosur dataset (if exists)
+if [ -d "$HOME/.cache/Mercosur" ]; then
+    echo "Copying Mercosur dataset..."
+    cp -r "$HOME/.cache/Mercosur"/* "$TEMP_DIR/.cache/Mercosur/" 2>/dev/null || true
+else
+    echo "Warning: Mercosur dataset not found at $HOME/.cache/Mercosur"
+fi
+
+# Copy CRPD dataset (if exists)
+if [ -d "$HOME/.cache/CRPD" ]; then
+    echo "Copying CRPD dataset..."
+    cp -r "$HOME/.cache/CRPD"/* "$TEMP_DIR/.cache/CRPD/" 2>/dev/null || true
+else
+    echo "Warning: CRPD dataset not found at $HOME/.cache/CRPD"
 fi
 
 # Create tarball
