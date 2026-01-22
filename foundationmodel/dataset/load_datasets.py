@@ -176,7 +176,7 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
 
     Test:
     - ~/.cache/icdar2013/Challenge1_test/
-      - Challenge1_Test_Task3_GT.txt (single file with all labels)
+      - Challenge1_Test_Task3_GT.txt (single file with all labels, format: filename label)
       - *.png (image files)
     """
     cache_dir = DATASETS["icdar2013"]["cache_dir"]
@@ -193,7 +193,7 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
     if not challenge_dir.exists():
         raise FileNotFoundError(f"ICDAR 2013 dataset not found at: {challenge_dir}")
 
-    # Load GT file (format: filename label per line)
+    # Load GT file (format: filename, "label" with quotes)
     if not gt_file_path.exists():
         raise FileNotFoundError(f"Ground truth file not found: {gt_file_path}")
 
@@ -203,10 +203,22 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(None, 1)  # Split on first whitespace
-            if len(parts) == 2:
-                filename, label = parts
-                gt_dict[filename] = label
+            # Format: filename, "label"
+            # Split on comma to separate filename and label
+            if ',' not in line:
+                continue
+
+            parts = line.split(',', 1)
+            filename = parts[0].strip()
+            label_part = parts[1].strip()
+
+            # Remove quotes from label
+            if label_part.startswith('"') and label_part.endswith('"'):
+                label = label_part[1:-1]
+            else:
+                label = label_part
+
+            gt_dict[filename] = label
 
     count = 0
     for img_path in sorted(challenge_dir.glob("*.png")):
@@ -251,7 +263,7 @@ def _iter_icdar2015_local(split: str, max_samples: int | None = None) -> Iterato
 
     Test:
     - ~/.cache/icdar2015/Challenge2_test/
-      - gt.txt (single file with all labels, format: filename, "label")
+      - Challenge2_Test_Task3_GT.txt (single file with all labels, format: filename, "label")
       - *.png or *.jpg (image files)
     """
     cache_dir = DATASETS["icdar2015"]["cache_dir"]
@@ -261,7 +273,7 @@ def _iter_icdar2015_local(split: str, max_samples: int | None = None) -> Iterato
         gt_file_path = challenge_dir / "gt.txt"
     elif split == "test":
         challenge_dir = cache_dir / "Challenge2_test"
-        gt_file_path = challenge_dir / "gt.txt"
+        gt_file_path = challenge_dir / "Challenge2_Test_Task3_GT.txt"
     else:
         raise ValueError(f"Unknown split '{split}', expected 'train' or 'test'")
 
