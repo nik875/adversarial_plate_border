@@ -52,12 +52,12 @@ DATASETS = {
     },
     "icdar2013": {
         "source": "local",
-        "cache_dir": Path.home() / ".cache" / "icdar2013",
+        "cache_dir": Path.home() / ".cache" / "icdar2011",
         "splits": ["train", "test"],
     },
     "icdar2015": {
         "source": "local",
-        "cache_dir": Path.home() / ".cache" / "icdar2015",
+        "cache_dir": Path.home() / ".cache" / "icdar2013",
         "splits": ["train", "test"],
     },
     "cocotext": {
@@ -175,12 +175,12 @@ def _iter_icdar2013(split: str, max_samples: int | None = None) -> Iterator[Tupl
 
     Expects directory structure:
     Train:
-    - ~/.cache/icdar2013/Challenge1_train/
+    - ~/.cache/icdar2011/Challenge1_train/
       - gt.txt (single file with all labels, format: filename label)
       - *.png (image files)
 
     Test:
-    - ~/.cache/icdar2013/Challenge1_test/
+    - ~/.cache/icdar2011/Challenge1_test/
       - Challenge1_Test_Task3_GT.txt (single file with all labels, format: filename label)
       - *.png (image files)
     """
@@ -262,12 +262,12 @@ def _iter_icdar2015_local(split: str, max_samples: int | None = None) -> Iterato
 
     Expects directory structure:
     Train:
-    - ~/.cache/icdar2015/Challenge2_train/
+    - ~/.cache/icdar2013/Challenge2_train/
       - gt.txt (single file with all labels, format: filename, "label")
       - *.png or *.jpg (image files)
 
     Test:
-    - ~/.cache/icdar2015/Challenge2_test/
+    - ~/.cache/icdar2013/Challenge2_test/
       - Challenge2_Test_Task3_GT.txt (single file with all labels, format: filename, "label")
       - *.png or *.jpg (image files)
     """
