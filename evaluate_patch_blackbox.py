@@ -263,7 +263,7 @@ def main():
 
     # Process each image
     results = []
-    misread_count = 0
+    correct_read_count = 0
 
     print("\nEvaluating patch on all control images...")
     pbar = tqdm(df.iterrows(), total=len(df), desc="Processing")
@@ -341,12 +341,12 @@ def main():
             'category': category
         })
 
-        # Track misreads and update progress bar
-        if category == 'Misread':
-            misread_count += 1
+        # Track correct reads and update progress bar
+        if category == 'Correct read':
+            correct_read_count += 1
 
-        misread_prop = misread_count / len(results) if len(results) > 0 else 0.0
-        pbar.set_postfix({'misread_prop': f'{misread_prop:.3f}'})
+        correct_read_rate = correct_read_count / len(results) if len(results) > 0 else 0.0
+        pbar.set_postfix({'correct_read_rate': f'{correct_read_rate:.3f}'})
 
     # Convert to DataFrame
     results_df = pd.DataFrame(results)
