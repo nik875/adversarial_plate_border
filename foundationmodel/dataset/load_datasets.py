@@ -246,108 +246,81 @@ def _iter_icdar2015_local(split: str, max_samples: int | None = None) -> Iterato
     Expects directory structure:
     Train:
     - ~/.cache/icdar2015/Challenge2_train/
-      - gt/ (ground truth text files)
+      - gt.txt (single file with all labels, format: filename, "label")
       - *.png or *.jpg (image files)
 
     Test:
     - ~/.cache/icdar2015/Challenge2_test/
-      - Challenge2_Test_Task3_GT.txt (single file with all labels)
+      - gt.txt (single file with all labels, format: filename, "label")
       - *.png or *.jpg (image files)
     """
     cache_dir = DATASETS["icdar2015"]["cache_dir"]
 
     if split == "train":
         challenge_dir = cache_dir / "Challenge2_train"
-        gt_dir = challenge_dir / "gt"
-        use_single_gt = False
+        gt_file_path = challenge_dir / "gt.txt"
     elif split == "test":
         challenge_dir = cache_dir / "Challenge2_test"
-        gt_file_path = challenge_dir / "Challenge2_Test_Task3_GT.txt"
-        use_single_gt = True
+        gt_file_path = challenge_dir / "gt.txt"
     else:
         raise ValueError(f"Unknown split '{split}', expected 'train' or 'test'")
 
     if not challenge_dir.exists():
         raise FileNotFoundError(f"ICDAR 2015 dataset not found at: {challenge_dir}")
 
-    if use_single_gt:
-        # Load test GT file (format: filename label per line)
-        if not gt_file_path.exists():
-            raise FileNotFoundError(f"Ground truth file not found: {gt_file_path}")
+    # Load GT file (format: filename, "label")
+    if not gt_file_path.exists():
+        raise FileNotFoundError(f"Ground truth file not found: {gt_file_path}")
 
-        gt_dict = {}
-        with open(gt_file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) == 2:
-                    filename, label = parts
-                    gt_dict[filename] = label
+    gt_dict = {}
+    with open(gt_file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            # Format: filename, "label"
+            # Split on comma to separate filename and label
+            if ',' not in line:
+                continue
 
-        count = 0
-        # Look for both .png and .jpg files
-        for ext in ["*.png", "*.jpg"]:
-            for img_path in sorted(challenge_dir.glob(ext)):
-                img_name = img_path.name
-                if img_name not in gt_dict:
-                    continue
+            parts = line.split(',', 1)
+            filename = parts[0].strip()
+            label_part = parts[1].strip()
 
-                label = gt_dict[img_name]
+            # Remove quotes from label
+            if label_part.startswith('"') and label_part.endswith('"'):
+                label = label_part[1:-1]
+            else:
+                label = label_part
 
-                try:
-                    img = Image.open(img_path).convert('RGB')
+            gt_dict[filename] = label
 
-                    meta = {
-                        "dataset": "icdar2015",
-                        "split": split,
-                    }
+    count = 0
+    # Look for both .png and .jpg files
+    for ext in ["*.png", "*.jpg"]:
+        for img_path in sorted(challenge_dir.glob(ext)):
+            img_name = img_path.name
+            if img_name not in gt_dict:
+                continue
 
-                    yield img, label, meta
+            label = gt_dict[img_name]
 
-                    count += 1
-                    if max_samples is not None and count >= max_samples:
-                        return
-                except Exception as e:
-                    print(f"Warning: Could not load image {img_path}: {e}")
-                    continue
-    else:
-        # Load train GT files (per-image text files)
-        if not gt_dir.exists():
-            raise FileNotFoundError(f"Ground truth directory not found: {gt_dir}")
+            try:
+                img = Image.open(img_path).convert('RGB')
 
-        count = 0
-        # Look for both .png and .jpg files
-        for ext in ["*.png", "*.jpg"]:
-            for img_path in sorted(challenge_dir.glob(ext)):
-                gt_file = gt_dir / f"{img_path.stem}.txt"
+                meta = {
+                    "dataset": "icdar2015",
+                    "split": split,
+                }
 
-                if not gt_file.exists():
-                    continue
+                yield img, label, meta
 
-                try:
-                    with open(gt_file, 'r') as f:
-                        label = f.read().strip()
-
-                    if not label:
-                        continue
-
-                    img = Image.open(img_path).convert('RGB')
-
-                    meta = {
-                        "dataset": "icdar2015",
-                        "split": split,
-                    }
-
-                    yield img, label, meta
-
-                    count += 1
-                    if max_samples is not None and count >= max_samples:
-                        return
-                except Exception as e:
-                    print(f"Warning: Could not load image {img_path}: {e}")
-                    continue
+                count += 1
+                if max_samples is not None and count >= max_samples:
+                    return
+            except Exception as e:
+                print(f"Warning: Could not load image {img_path}: {e}")
+                continue
 
 
 # ---------------------------------------------------------
