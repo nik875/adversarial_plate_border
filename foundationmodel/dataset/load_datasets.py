@@ -75,7 +75,7 @@ def _ensure_iiit5k_extracted(cache_dir: Path = Path.home() / ".cache" / "iiit5k"
     Returns the path to the extracted dataset directory.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    extracted_dir = cache_dir / "IIIT5K-Word_V3.0"
+    extracted_dir = cache_dir / "IIIT5K"
 
     if extracted_dir.exists():
         return extracted_dir
@@ -91,7 +91,7 @@ def _ensure_iiit5k_extracted(cache_dir: Path = Path.home() / ".cache" / "iiit5k"
         ], check=True)
 
     # Extract
-    print(f"Extracting IIIT5K to {extracted_dir}...")
+    print(f"Extracting IIIT5K to {cache_dir}...")
     with tarfile.open(tar_path, "r:gz") as tar:
         tar.extractall(cache_dir)
 
