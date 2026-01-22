@@ -434,7 +434,8 @@ class BlackBoxPatchOptimizer:
                 sigma0: float = 0.3,
                 max_iterations: int = 100,
                 population_size: Optional[int] = None,
-                seed: Optional[int] = None) -> Tuple[np.ndarray, float]:
+                seed: Optional[int] = None,
+                checkpoint_dir: Optional[str] = None) -> Tuple[np.ndarray, float]:
         """
         Optimize latent code using CMA-ES.
 
@@ -445,6 +446,7 @@ class BlackBoxPatchOptimizer:
             max_iterations: Maximum number of CMA-ES generations
             population_size: Population size (default: 4 + 3*log(latent_dim))
             seed: Random seed for reproducibility (default: None)
+            checkpoint_dir: Directory to save checkpoints at each best fitness (default: None)
 
         Returns:
             best_z: Best latent code found
@@ -468,6 +470,10 @@ class BlackBoxPatchOptimizer:
         if seed is not None:
             opts['seed'] = seed
 
+        # Create checkpoint directory if specified
+        if checkpoint_dir is not None:
+            Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
         # Initialize CMA-ES
         es = cma.CMAEvolutionStrategy(initial_z, sigma0, opts)
 
@@ -482,6 +488,8 @@ class BlackBoxPatchOptimizer:
             print(f"  Target plate: {self.target_plate}")
         print(f"  Test images: {len(self.test_images)}")
         print(f"  Max iterations: {max_iterations}")
+        if checkpoint_dir is not None:
+            print(f"  Checkpoints: {checkpoint_dir}")
         print()
 
         iteration = 0
@@ -507,6 +515,28 @@ class BlackBoxPatchOptimizer:
                 if fitness_values[best_idx] < best_fitness_ever:
                     best_fitness_ever = fitness_values[best_idx]
                     best_z_ever = solutions[best_idx].copy()
+
+                    # Save checkpoint if checkpoint directory specified
+                    if checkpoint_dir is not None:
+                        checkpoint_path = Path(checkpoint_dir) / f"checkpoint_iter{iteration:04d}_fitness{best_fitness_ever:.6f}"
+                        checkpoint_path.mkdir(exist_ok=True)
+
+                        # Save patch
+                        patch_path = checkpoint_path / "patch.png"
+                        self.save_patch(best_z_ever, str(patch_path))
+
+                        # Save latent code
+                        latent_path = checkpoint_path / "latent.npy"
+                        np.save(latent_path, best_z_ever)
+
+                        # Save metadata
+                        metadata_path = checkpoint_path / "metadata.txt"
+                        with open(metadata_path, 'w') as f:
+                            f.write(f"Iteration: {iteration}\n")
+                            f.write(f"Fitness: {best_fitness_ever:.6f}\n")
+                            f.write(f"Mode: {'Disruption' if self.disruption_mode else 'Impersonation'}\n")
+                            if not self.disruption_mode:
+                                f.write(f"Target plate: {self.target_plate}\n")
 
                 # Update progress
                 iteration += 1

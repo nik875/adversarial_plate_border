@@ -241,6 +241,11 @@ def main():
         default="optimized_latent_cmaes.npy",
         help="Output path for optimized latent code"
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Directory to save checkpoints at each best fitness (default: None)"
+    )
 
     args = parser.parse_args()
 
@@ -284,7 +289,8 @@ def main():
         sigma0=args.sigma0,
         max_iterations=args.max_iterations,
         population_size=args.population_size,
-        seed=args.seed
+        seed=args.seed,
+        checkpoint_dir=args.checkpoint_dir
     )
 
     # Save results
