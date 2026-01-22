@@ -34,6 +34,7 @@ mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_rotate"
 mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_tilt"
 mkdir -p "$TEMP_DIR/.cache/ccpd2019_crops/ccpd_weather"
 mkdir -p "$TEMP_DIR/.cache/mercosur_crops"
+mkdir -p "$TEMP_DIR/.cache/crpd_crops"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -113,6 +114,14 @@ if [ -d "$HOME/.cache/mercosur_crops" ]; then
     cp -r "$HOME/.cache/mercosur_crops"/* "$TEMP_DIR/.cache/mercosur_crops/" 2>/dev/null || true
 else
     echo "Warning: Mercosur crops not found at $HOME/.cache/mercosur_crops"
+fi
+
+# Copy CRPD crops
+if [ -d "$HOME/.cache/crpd_crops" ]; then
+    echo "Copying CRPD crops..."
+    cp -r "$HOME/.cache/crpd_crops"/* "$TEMP_DIR/.cache/crpd_crops/" 2>/dev/null || true
+else
+    echo "Warning: CRPD crops not found at $HOME/.cache/crpd_crops"
 fi
 
 # Create tarball

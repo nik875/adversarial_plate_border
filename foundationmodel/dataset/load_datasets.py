@@ -130,6 +130,11 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "mercosur_crops",
         "splits": ["train"],
     },
+    "crpd": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "crpd_crops",
+        "splits": ["train", "test", "val"],
+    },
 }
 
 
@@ -817,6 +822,87 @@ def _iter_mercosur(split: str, max_samples: int | None = None) -> Iterator[Tuple
 
 
 # ---------------------------------------------------------
+# CRPD cropped images
+# ---------------------------------------------------------
+
+def _iter_crpd(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over CRPD cropped license plate images from local directory.
+    Split should be 'train', 'test', or 'val'.
+
+    Expects directory structure:
+    - ~/.cache/crpd_crops/
+      - labels.txt (format: filename variant=X split=Y type=Z content=W)
+      - crpd_*.png (cropped license plate images)
+
+    CRPD dataset contains 3 variants:
+    - CRPD_multi (multi-plate images)
+    - CRPD_single (single-plate images)
+    - CRPD_double (double-plate images)
+
+    Each variant has train, test, val splits.
+    Type field indicates plate type (0 or 1).
+    Content field contains the actual license plate text (in Chinese).
+    """
+    cache_dir = DATASETS["crpd"]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"CRPD crops not found at: {cache_dir}")
+
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels and filter by split
+    labels_dict = {}
+    with open(labels_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename variant=X split=Y type=Z content=W
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+
+            filename = parts[0]
+            split_info = parts[2]  # split=Y
+
+            # Parse split=Y
+            if '=' in split_info:
+                _, file_split = split_info.split('=', 1)
+                if file_split == split:
+                    labels_dict[filename] = True
+
+    count = 0
+    # Iterate through cropped images
+    for img_path in sorted(cache_dir.glob("crpd_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
+            continue
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            # Use split as the "text" label since these are images of objects, not text
+            meta = {
+                "dataset": "crpd",
+                "split": split,
+            }
+
+            yield img, split, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -877,6 +963,11 @@ def iter_dataset(
     # Handle Mercosur from local directory
     if name == "mercosur":
         yield from _iter_mercosur(split, max_samples)
+        return
+
+    # Handle CRPD from local directory
+    if name == "crpd":
+        yield from _iter_crpd(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face
