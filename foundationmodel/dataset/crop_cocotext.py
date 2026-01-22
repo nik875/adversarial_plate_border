@@ -24,12 +24,13 @@ MAX_WIDTH = 500  # maximum crop width
 MAX_HEIGHT = 200  # maximum crop height
 
 
-def load_cocotext():
+def load_cocotext(json_path=COCOTEXT_JSON):
     """Load COCO Text annotations."""
-    if not COCOTEXT_JSON.exists():
-        raise FileNotFoundError(f"COCO Text JSON not found: {COCOTEXT_JSON}")
+    json_path = Path(json_path)
+    if not json_path.exists():
+        raise FileNotFoundError(f"COCO Text JSON not found: {json_path}")
 
-    with open(COCOTEXT_JSON, 'r') as f:
+    with open(json_path, 'r') as f:
         return json.load(f)
 
 
@@ -77,12 +78,12 @@ def crop_image_region(img_path, bbox, padding=PADDING):
     return crop
 
 
-def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max_crops=None):
+def process_cocotext(output_dir=OUTPUT_DIR, coco_images_dir=COCO_IMAGES_DIR, max_crops=None, cocotext_json=COCOTEXT_JSON):
     """Process COCO Text and crop images."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load annotations
-    data = load_cocotext()
+    data = load_cocotext(cocotext_json)
     anns = data['anns']
     imgs = data['imgs']
     img_to_anns = data['imgToAnns']
@@ -154,6 +155,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Crop COCO Text images")
+    parser.add_argument("--cocotext-json", type=Path, default=COCOTEXT_JSON, help="Path to cocotext.v2.json file")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR, help="Output directory")
     parser.add_argument("--coco-dir", type=Path, default=COCO_IMAGES_DIR, help="COCO images directory")
     parser.add_argument("--max-crops", type=int, help="Maximum number of crops to create")
@@ -176,4 +178,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         coco_images_dir=args.coco_dir,
         max_crops=args.max_crops,
+        cocotext_json=args.cocotext_json,
     )
