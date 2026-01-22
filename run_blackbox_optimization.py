@@ -55,16 +55,17 @@ def polygon_iou(corners1: np.ndarray, corners2: np.ndarray) -> float:
     return intersection / union
 
 
-def bbox_to_corners(bbox) -> np.ndarray:
+def bbox_to_corners(detection) -> np.ndarray:
     """
-    Convert bounding box to corner array.
+    Convert detection result to corner array.
 
     Args:
-        bbox: Object with x1, y1, x2, y2 attributes (from fast-alpr)
+        detection: DetectionResult object from fast-alpr with bounding_box attribute
 
     Returns:
         [4, 2] array of corners in format [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
     """
+    bbox = detection.bounding_box
     return np.array([
         [bbox.x1, bbox.y1],
         [bbox.x2, bbox.y1],
