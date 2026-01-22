@@ -66,5 +66,10 @@ if [ -d "$HOME/.cache/kaggle_lp_crops" ]; then
     ls -la "$HOME/.cache/kaggle_lp_crops/" | head -5
 fi
 
+if [ -d "$HOME/.cache/kaggle_lp_only" ]; then
+    echo "  ✓ Kaggle LP only: $HOME/.cache/kaggle_lp_only"
+    ls -la "$HOME/.cache/kaggle_lp_only/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"

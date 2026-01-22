@@ -75,6 +75,11 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "kaggle_lp_crops",
         "splits": ["train"],
     },
+    "kaggle_lp_only": {
+        "source": "local",
+        "cache_dir": Path.home() / ".cache" / "kaggle_lp_only",
+        "splits": ["train"],
+    },
 }
 
 
@@ -557,6 +562,53 @@ def _iter_kaggle_lp(split: str, max_samples: int | None = None) -> Iterator[Tupl
 
 
 # ---------------------------------------------------------
+# Kaggle LP only (unprocessed images, no labels)
+# ---------------------------------------------------------
+
+def _iter_kaggle_lp_only(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+    """
+    Iterate over Kaggle LP images from local directory (no cropping, no text labels).
+    Split should be 'train' (only split available).
+
+    Expects directory structure:
+    - ~/.cache/kaggle_lp_only/
+      - images/ (all image files, any format)
+    """
+    cache_dir = DATASETS["kaggle_lp_only"]["cache_dir"]
+
+    if not cache_dir.exists():
+        raise FileNotFoundError(f"Kaggle LP only dataset not found at: {cache_dir}")
+
+    images_dir = cache_dir / "images"
+    if not images_dir.exists():
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+
+    count = 0
+    # Iterate through all image files (png, jpg, jpeg, bmp, gif)
+    for img_path in sorted(images_dir.glob("*")):
+        if img_path.suffix.lower() not in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']:
+            continue
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+
+            # Use filename as placeholder since no text labels
+            meta = {
+                "dataset": "kaggle_lp_only",
+                "split": split,
+            }
+
+            yield img, img_path.name, meta
+
+            count += 1
+            if max_samples is not None and count >= max_samples:
+                break
+        except Exception as e:
+            print(f"Warning: Could not load image {img_path}: {e}")
+            continue
+
+
+# ---------------------------------------------------------
 # Unified sample iterator
 # ---------------------------------------------------------
 
@@ -602,6 +654,11 @@ def iter_dataset(
     # Handle Kaggle LP from local directory
     if name == "kaggle_lp":
         yield from _iter_kaggle_lp(split, max_samples)
+        return
+
+    # Handle Kaggle LP only from local directory
+    if name == "kaggle_lp_only":
+        yield from _iter_kaggle_lp_only(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face

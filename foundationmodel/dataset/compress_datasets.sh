@@ -23,6 +23,7 @@ mkdir -p "$TEMP_DIR/.cache/icdar2013"
 mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 mkdir -p "$TEMP_DIR/.cache/kaggle_lp_crops"
+mkdir -p "$TEMP_DIR/.cache/kaggle_lp_only"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -78,6 +79,14 @@ if [ -d "$HOME/.cache/kaggle_lp_crops" ]; then
     cp -r "$HOME/.cache/kaggle_lp_crops"/* "$TEMP_DIR/.cache/kaggle_lp_crops/" 2>/dev/null || true
 else
     echo "Warning: Kaggle LP crops not found at $HOME/.cache/kaggle_lp_crops"
+fi
+
+# Copy Kaggle LP only (if exists)
+if [ -d "$HOME/.cache/kaggle_lp_only" ]; then
+    echo "Copying Kaggle LP only dataset..."
+    cp -r "$HOME/.cache/kaggle_lp_only"/* "$TEMP_DIR/.cache/kaggle_lp_only/" 2>/dev/null || true
+else
+    echo "Warning: Kaggle LP only dataset not found at $HOME/.cache/kaggle_lp_only"
 fi
 
 # Create tarball
