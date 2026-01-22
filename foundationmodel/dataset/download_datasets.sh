@@ -51,5 +51,10 @@ if [ -d "$HOME/.cache/icdar2015" ]; then
     ls -la "$HOME/.cache/icdar2015/" | head -5
 fi
 
+if [ -d "$HOME/.cache/cocotext_crops" ]; then
+    echo "  ✓ COCO Text crops: $HOME/.cache/cocotext_crops"
+    ls -la "$HOME/.cache/cocotext_crops/" | head -5
+fi
+
 echo ""
 echo "✓ Dataset download and extraction complete"

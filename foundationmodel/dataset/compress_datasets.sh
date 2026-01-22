@@ -19,6 +19,8 @@ trap "rm -rf $TEMP_DIR" EXIT
 mkdir -p "$TEMP_DIR/.cache/iiit5k"
 mkdir -p "$TEMP_DIR/.cache/huggingface/datasets"
 mkdir -p "$TEMP_DIR/.cache/icdar2013"
+mkdir -p "$TEMP_DIR/.cache/icdar2015"
+mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -50,6 +52,14 @@ if [ -d "$HOME/.cache/icdar2015" ]; then
     cp -r "$HOME/.cache/icdar2015"/* "$TEMP_DIR/.cache/icdar2015/" 2>/dev/null || true
 else
     echo "Warning: ICDAR 2015 dataset not found at $HOME/.cache/icdar2015"
+fi
+
+# Copy COCO Text crops (if exists)
+if [ -d "$HOME/.cache/cocotext_crops" ]; then
+    echo "Copying COCO Text crops..."
+    cp -r "$HOME/.cache/cocotext_crops"/* "$TEMP_DIR/.cache/cocotext_crops/" 2>/dev/null || true
+else
+    echo "Warning: COCO Text crops not found at $HOME/.cache/cocotext_crops"
 fi
 
 # Create tarball
