@@ -75,9 +75,9 @@ DATASETS = {
         "cache_dir": Path.home() / ".cache" / "kaggle_lp_crops",
         "splits": ["train"],
     },
-    "kaggle_lp_only": {
+    "indian_plates_kaggle": {
         "source": "local",
-        "cache_dir": Path.home() / ".cache" / "kaggle_lp_only",
+        "cache_dir": Path.home() / ".cache" / "indian_plates_kaggle_crops",
         "splits": ["train"],
     },
 }
@@ -562,43 +562,62 @@ def _iter_kaggle_lp(split: str, max_samples: int | None = None) -> Iterator[Tupl
 
 
 # ---------------------------------------------------------
-# Kaggle LP only (unprocessed images, no labels)
+# Indian Plates Kaggle cropped images
 # ---------------------------------------------------------
 
-def _iter_kaggle_lp_only(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
+def _iter_indian_plates_kaggle(split: str, max_samples: int | None = None) -> Iterator[Tuple[Image.Image, str, Dict]]:
     """
-    Iterate over Kaggle LP images from local directory (no cropping, no text labels).
+    Iterate over Indian Plates Kaggle cropped license plate images from local directory.
     Split should be 'train' (only split available).
 
     Expects directory structure:
-    - ~/.cache/kaggle_lp_only/
-      - images/ (all image files, any format)
+    - ~/.cache/indian_plates_kaggle_crops/
+      - labels.txt (format: filename dataset=indian_plates)
+      - indian_plates_*.png (cropped license plate images)
     """
-    cache_dir = DATASETS["kaggle_lp_only"]["cache_dir"]
+    cache_dir = DATASETS["indian_plates_kaggle"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Kaggle LP only dataset not found at: {cache_dir}")
+        raise FileNotFoundError(f"Indian Plates Kaggle crops not found at: {cache_dir}")
 
-    images_dir = cache_dir / "images"
-    if not images_dir.exists():
-        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+    labels_file = cache_dir / "labels.txt"
+    if not labels_file.exists():
+        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+
+    # Load labels
+    labels_dict = {}
+    with open(labels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Format: filename dataset=indian_plates
+            parts = line.split()
+            if len(parts) < 1:
+                continue
+
+            filename = parts[0]
+            labels_dict[filename] = True
 
     count = 0
-    # Iterate through all image files (png, jpg, jpeg, bmp, gif)
-    for img_path in sorted(images_dir.glob("*")):
-        if img_path.suffix.lower() not in ['.png', '.jpg', '.jpeg', '.bmp', '.gif']:
+    # Iterate through cropped images
+    for img_path in sorted(cache_dir.glob("indian_plates_*.png")):
+        filename = img_path.name
+
+        if filename not in labels_dict:
             continue
 
         try:
             img = Image.open(img_path).convert('RGB')
 
-            # Use filename as placeholder since no text labels
+            # Use split as the "text" label since these are images of objects, not text
             meta = {
-                "dataset": "kaggle_lp_only",
+                "dataset": "indian_plates_kaggle",
                 "split": split,
             }
 
-            yield img, img_path.name, meta
+            yield img, split, meta
 
             count += 1
             if max_samples is not None and count >= max_samples:
@@ -656,9 +675,9 @@ def iter_dataset(
         yield from _iter_kaggle_lp(split, max_samples)
         return
 
-    # Handle Kaggle LP only from local directory
-    if name == "kaggle_lp_only":
-        yield from _iter_kaggle_lp_only(split, max_samples)
+    # Handle Indian Plates Kaggle from local directory
+    if name == "indian_plates_kaggle":
+        yield from _iter_indian_plates_kaggle(split, max_samples)
         return
 
     # Handle other datasets via Hugging Face

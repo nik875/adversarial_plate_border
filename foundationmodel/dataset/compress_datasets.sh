@@ -23,7 +23,7 @@ mkdir -p "$TEMP_DIR/.cache/icdar2013"
 mkdir -p "$TEMP_DIR/.cache/cocotext_crops"
 mkdir -p "$TEMP_DIR/.cache/roboflow_lpr_crops"
 mkdir -p "$TEMP_DIR/.cache/kaggle_lp_crops"
-mkdir -p "$TEMP_DIR/.cache/kaggle_lp_only"
+mkdir -p "$TEMP_DIR/.cache/indian_plates_kaggle_crops"
 
 # Copy IIIT5K dataset (if exists)
 if [ -d "$HOME/.cache/iiit5k" ]; then
@@ -81,12 +81,12 @@ else
     echo "Warning: Kaggle LP crops not found at $HOME/.cache/kaggle_lp_crops"
 fi
 
-# Copy Kaggle LP only (if exists)
-if [ -d "$HOME/.cache/kaggle_lp_only" ]; then
-    echo "Copying Kaggle LP only dataset..."
-    cp -r "$HOME/.cache/kaggle_lp_only"/* "$TEMP_DIR/.cache/kaggle_lp_only/" 2>/dev/null || true
+# Copy Indian Plates Kaggle crops (if exists)
+if [ -d "$HOME/.cache/indian_plates_kaggle_crops" ]; then
+    echo "Copying Indian Plates Kaggle crops..."
+    cp -r "$HOME/.cache/indian_plates_kaggle_crops"/* "$TEMP_DIR/.cache/indian_plates_kaggle_crops/" 2>/dev/null || true
 else
-    echo "Warning: Kaggle LP only dataset not found at $HOME/.cache/kaggle_lp_only"
+    echo "Warning: Indian Plates Kaggle crops not found at $HOME/.cache/indian_plates_kaggle_crops"
 fi
 
 # Create tarball
