@@ -189,7 +189,13 @@ def load_trocr_model(device='cuda'):
 
         print("Model loaded successfully (vision encoder)")
         print(f"Encoder type: {type(model).__name__}")
-        print(f"Expected input size: {processor.feature_extractor.size}")
+
+        # Get expected input size (try both old and new attribute names)
+        if hasattr(processor, 'image_processor'):
+            print(f"Expected input size: {processor.image_processor.size}")
+        elif hasattr(processor, 'feature_extractor'):
+            print(f"Expected input size: {processor.feature_extractor.size}")
+
         return model, "trocr_small_printed_encoder", processor
     except Exception as e:
         print(f"Error loading TrOCR model: {e}")
