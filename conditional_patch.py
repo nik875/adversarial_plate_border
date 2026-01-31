@@ -540,6 +540,10 @@ class ConditionalPatchTrainer:
             layers_to_extract = [target_layer_name] + prior_layer_names
 
             try:
+                # Debug: Check tensor shapes before extraction
+                if i == 0:
+                    print(f"    Input shapes - clean: {cropped_clean.shape}, patched: {cropped_patched.shape}")
+
                 mem_before = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 clean_acts = self.extract_activations(ocr_model, cropped_clean,
@@ -549,6 +553,13 @@ class ConditionalPatchTrainer:
                 patched_acts = self.extract_activations(ocr_model, cropped_patched,
                                                         layers_to_extract, input_format)
                 mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
+
+                # Debug: Check activation shapes after extraction
+                if i == 0:
+                    for layer_name in layers_to_extract:
+                        clean_shape = clean_acts[layer_name].shape if layer_name in clean_acts else None
+                        patched_shape = patched_acts[layer_name].shape if layer_name in patched_acts else None
+                        print(f"    Layer '{layer_name}' - clean: {clean_shape}, patched: {patched_shape}")
 
                 if i == 0:  # Print memory info for first sample only
                     print(f"  Sample {i}: {mem_before:.2f}GB → {mem_after_clean:.2f}GB (clean) → {mem_after_patched:.2f}GB (patched)")
