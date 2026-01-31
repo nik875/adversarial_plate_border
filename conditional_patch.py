@@ -273,6 +273,13 @@ class ConditionalPatchTrainer:
         self.model_to_idx = {name: idx for idx, name in enumerate(self.model_names)}
         self.n_models = len(self.model_names)
 
+        # Define model-specific input shapes (from profile_ocr_models.py)
+        self.model_input_shapes = {
+            'vitstr_small': (32, 128),  # ViTSTR expects 32x128
+            'cct_xs_v1_global': (64, 128),  # CCT expects 64x128
+            'trocr_small_printed_encoder': (64, 128),  # TrOCR initial crop 64x128
+        }
+
         # Create encoder and generator
         self.encoder = LayerProfileEncoder(input_dim=12, latent_dim=32).to(device)
         self.generator = SimplePatchGenerator(latent_dim=32,
@@ -488,8 +495,11 @@ class ConditionalPatchTrainer:
             image_cpu = batch['prep_image'].unsqueeze(0)  # [1, 3, H, W]
             corners_cpu = batch['new_corners'].unsqueeze(0)  # [1, 4, 2]
 
-            # Crop to license plate area (64, 128)
-            cropped_clean = K.crop_and_resize(image_cpu, corners_cpu, (64, 128))
+            # Get model-specific input shape
+            model_input_shape = self.model_input_shapes[model_name]
+
+            # Crop to license plate area using model-specific shape
+            cropped_clean = K.crop_and_resize(image_cpu, corners_cpu, model_input_shape)
 
             # Load only the cropped image to GPU
             cropped_clean = cropped_clean.to(self.device)
@@ -533,8 +543,8 @@ class ConditionalPatchTrainer:
             # Apply patch to border region
             patched_border = self.apply_patch(border_region, corners_in_region, patch)
 
-            # Crop patched region to 64x128
-            cropped_patched = K.crop_and_resize(patched_border, corners_in_region, (64, 128))
+            # Crop patched region to model-specific input shape
+            cropped_patched = K.crop_and_resize(patched_border, corners_in_region, model_input_shape)
 
             # Extract activations from target layer (and prior if any)
             layers_to_extract = [target_layer_name] + prior_layer_names
