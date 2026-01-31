@@ -520,8 +520,9 @@ class ConditionalPatchTrainer:
             corners_in_region[:, 1] -= y_min
             corners_in_region = corners_in_region.unsqueeze(0)
 
-            # Load border region to GPU
+            # Load border region and corners to GPU
             border_region = border_region.to(self.device)
+            corners_in_region = corners_in_region.to(self.device)
 
             # Apply patch to border region
             patched_border = self.apply_patch(border_region, corners_in_region, patch)
