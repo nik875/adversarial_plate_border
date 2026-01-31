@@ -284,7 +284,8 @@ class ConditionalPatchTrainer:
     """Trainer for conditional patch generation"""
 
     def __init__(self, csv_path: str, profile_dir: str = "layer_profiles",
-                 device: str = 'cuda', learning_rate: float = 1e-3):
+                 device: str = 'cuda', learning_rate: float = 1e-3,
+                 models_to_use: set = None):
         self.device = device
         self.learning_rate = learning_rate
 
@@ -292,7 +293,20 @@ class ConditionalPatchTrainer:
 
         # Load layer profiles
         print("\nLoading layer profiles...")
-        self.layer_profiles = load_layer_profiles(profile_dir)
+        all_profiles = load_layer_profiles(profile_dir)
+
+        # Filter profiles based on selected models
+        if models_to_use:
+            model_mapping = {
+                'vitstr': 'vitstr_small',
+                'cct': 'cct_xs_v1_global',
+                'trocr': 'trocr_small_printed_encoder'
+            }
+            selected_models = {model_mapping[m] for m in models_to_use}
+            self.layer_profiles = {k: v for k, v in all_profiles.items() if k in selected_models}
+        else:
+            self.layer_profiles = all_profiles
+
         print(f"GPU Memory after loading profiles: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         print(f"Loaded profiles for {len(self.layer_profiles)} models:")
         for model_name, profile_data in self.layer_profiles.items():
@@ -300,7 +314,15 @@ class ConditionalPatchTrainer:
 
         # Load OCR models
         print("\nLoading OCR models...")
-        self.ocr_models = load_ocr_models(device)
+        all_ocr_models = load_ocr_models(device)
+
+        # Filter OCR models based on selected models
+        if models_to_use:
+            self.ocr_models = {k: v for k, v in all_ocr_models.items()
+                             if k in self.layer_profiles.keys()}
+        else:
+            self.ocr_models = all_ocr_models
+
         print(f"GPU Memory after loading OCR models: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # Create model name to index mapping
@@ -823,6 +845,8 @@ def main():
                        help='Path to dataset CSV')
     parser.add_argument('--profile-dir', type=str, default='layer_profiles',
                        help='Path to layer profiles directory')
+    parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
+                       help='Comma-separated list of models to use: vitstr,cct,trocr (default: all)')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=16,
@@ -831,10 +855,27 @@ def main():
                        help='Learning rate')
     args = parser.parse_args()
 
+    # Parse model selection
+    models_to_use = set(args.models.lower().split(','))
+    model_mapping = {
+        'vitstr': 'vitstr_small',
+        'cct': 'cct_xs_v1_global',
+        'trocr': 'trocr_small_printed_encoder'
+    }
+
+    # Validate model choices
+    valid_models = set(model_mapping.keys())
+    if not models_to_use.issubset(valid_models):
+        invalid = models_to_use - valid_models
+        parser.error(f"Invalid models: {invalid}. Choose from: {','.join(valid_models)}")
+
+    print(f"Selected models: {', '.join(sorted(models_to_use))}")
+
     trainer = ConditionalPatchTrainer(
         csv_path=args.csv_path,
         profile_dir=args.profile_dir,
-        learning_rate=args.lr
+        learning_rate=args.lr,
+        models_to_use=models_to_use
     )
 
     trainer.train(num_epochs=args.epochs, batch_size=args.batch_size)
