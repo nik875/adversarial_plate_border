@@ -38,28 +38,24 @@ class OCRImageDataset(Dataset):
     Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
     returns variable-sized images that can't be stacked.
     """
-    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None,
-                 border_scale=1.4, device='cuda'):
+    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None, device='cuda'):
         """
         Args:
             dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
             target_size: (height, width) for OCR input (used if preprocessor is None)
             preprocessor: Optional preprocessing function/processor (e.g., TrOCRProcessor)
                          If provided, applies after cropping
-            border_scale: Scale factor for border around plate (default 1.4, matches progressive_patch.py)
             device: Device for kornia operations
         """
         self.images = []
         self.target_size = target_size
         self.preprocessor = preprocessor
-        self.border_scale = border_scale
         self.device = device
 
         if preprocessor is not None:
             print(f"Extracting cropped plate regions with custom preprocessor...")
         else:
             print(f"Extracting cropped plate regions (target size: {target_size})...")
-        print(f"Using border_scale={border_scale} (matches progressive_patch.py)")
         print("(No batching - iterating individual images due to variable sizes)")
 
         # Manually iterate without batching
@@ -72,19 +68,13 @@ class OCRImageDataset(Dataset):
             prep_image = prep_image.to(self.device)
             new_corners = new_corners.to(self.device)
 
-            # Calculate border corners (1.4x scaled, matches progressive_patch.py)
-            plate_corners = new_corners[0]  # [4, 2]
-            center_x = plate_corners[:, 0].mean()
-            center_y = plate_corners[:, 1].mean()
-            center = torch.tensor([center_x, center_y], device=self.device)
+            # Use plate corners directly (no border scaling)
+            plate_corners = new_corners  # [1, 4, 2]
 
-            border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
-            border_corners = border_corners.unsqueeze(0)  # [1, 4, 2]
-
-            # Crop and resize plate region using kornia (matches progressive_patch.py)
+            # Crop and resize plate region using kornia
             cropped_plate = K.crop_and_resize(
                 prep_image,
-                border_corners,
+                plate_corners,
                 target_size  # (H, W)
             )
 
@@ -305,12 +295,11 @@ def main():
         try:
             model, model_name = load_cct_model(device)
 
-            # Create CCT-specific dataset (64x128 for license plate OCR - matches progressive_patch.py)
+            # Create CCT-specific dataset (64x128 for license plate OCR)
             print(f"\nCreating dataset for {model_name}...")
             cct_dataset = OCRImageDataset(
                 train_loader,
                 target_size=(64, 128),  # Matches progressive_patch.py ocr_input_shape
-                border_scale=1.4,  # Matches progressive_patch.py
                 device=device
             )
             if args.limit_images > 0:
@@ -331,13 +320,12 @@ def main():
             model, model_name, processor = load_trocr_model(device)
 
             # Create TrOCR-specific dataset
-            # First crop to reasonable size, then use processor for final preprocessing
+            # First crop to plate region, then use processor for final preprocessing
             print(f"\nCreating dataset for {model_name}...")
             trocr_dataset = OCRImageDataset(
                 train_loader,
                 target_size=(64, 128),  # Initial crop size before processor
                 preprocessor=processor,  # Processor will resize to model's expected size
-                border_scale=1.4,
                 device=device
             )
             if args.limit_images > 0:
