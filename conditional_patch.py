@@ -11,6 +11,7 @@ Loss = CKA(target_layer) - mean(CKA(prior_layers))
 import os
 import json
 import argparse
+import traceback
 from pathlib import Path
 from typing import Tuple, Dict, List
 import numpy as np
@@ -127,6 +128,8 @@ def compute_cosine_similarity(X: torch.Tensor, Y: torch.Tensor, epsilon: float =
     """
     Compute mean cosine similarity between two activation matrices.
 
+    Handles variable-sized activations by truncating to common dimension.
+
     Args:
         X: [n_samples, n_features_x]
         Y: [n_samples, n_features_y]
@@ -135,9 +138,14 @@ def compute_cosine_similarity(X: torch.Tensor, Y: torch.Tensor, epsilon: float =
     Returns:
         similarity: Scalar cosine similarity in [0, 1]
     """
-    # Flatten and normalize
+    # Flatten to 2D
     X_flat = X.reshape(X.shape[0], -1)
     Y_flat = Y.reshape(Y.shape[0], -1)
+
+    # Truncate to common dimension (handles different activation sizes)
+    min_features = min(X_flat.shape[1], Y_flat.shape[1])
+    X_flat = X_flat[:, :min_features]
+    Y_flat = Y_flat[:, :min_features]
 
     # Normalize vectors
     X_norm = F.normalize(X_flat, p=2, dim=1)
@@ -548,6 +556,7 @@ class ConditionalPatchTrainer:
             except Exception as e:
                 # Skip this sample if extraction fails
                 print(f"  Sample {i} extraction failed: {e}")
+                traceback.print_exc()
                 continue
 
             # Compute cosine similarity for target layer
