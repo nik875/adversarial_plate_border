@@ -415,25 +415,21 @@ class ConditionalPatchTrainer:
             from PIL import Image
             import numpy as np
 
-            # For tensors that require gradients, we need to keep them in torch
-            # For gradients to flow, use torch operations instead of numpy
+            # TrOCR uses DeiT preprocessing: resize to 384x384, normalize to [-1, 1]
+            # Formula: (x/255 - 0.5) / 0.5 = x/127.5 - 1
+            height, width = 384, 384
+
+            # For tensors that require gradients, use torch operations to preserve gradients
             requires_grad = images.requires_grad
 
             if requires_grad:
                 # Keep gradients: use torch-based preprocessing
-                # Get the expected input size from processor
-                expected_size = processor.image_processor.size
-                if isinstance(expected_size, dict):
-                    height, width = expected_size.get('height', 384), expected_size.get('width', 384)
-                else:
-                    height, width = expected_size, expected_size
-
                 # Resize using torch (bilinear interpolation preserves gradients)
                 images_resized = torch.nn.functional.interpolate(
                     images, size=(height, width), mode='bilinear', align_corners=False
                 )
-                # Normalize to [-1, 1] (standard for vision transformers)
-                images = images_resized / 255.0 * 2.0 - 1.0
+                # Normalize: (x/255 - 0.5) / 0.5 = x/127.5 - 1
+                images = images_resized / 127.5 - 1.0
             else:
                 # No gradients: use PIL-based processor (more accurate)
                 img = images[0]  # [3, H, W]
@@ -442,7 +438,7 @@ class ConditionalPatchTrainer:
 
                 # Process with TrOCRProcessor
                 processed = processor(images=pil_img, return_tensors="pt")
-                images = processed.pixel_values.to(self.device)  # [1, 3, H_model, W_model]
+                images = processed.pixel_values.to(self.device)  # [1, 3, 384, 384]
         else:
             # Format images for other models
             if input_format['channels_last']:
