@@ -16,6 +16,7 @@ from typing import Tuple, Dict, List
 import numpy as np
 import torch
 from torch import nn, optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from tqdm import tqdm
@@ -122,11 +123,9 @@ class SimplePatchGenerator(nn.Module):
         return patches
 
 
-def linear_cka(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+def compute_cosine_similarity(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     """
-    Compute linear CKA (Centered Kernel Alignment) between two activation matrices.
-
-    CKA(X, Y) = ||X^T Y||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
+    Compute mean cosine similarity between two activation matrices.
 
     Args:
         X: [n_samples, n_features_x]
@@ -134,21 +133,20 @@ def linear_cka(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch
         epsilon: Small value for numerical stability
 
     Returns:
-        cka: Scalar similarity in [0, 1]
+        similarity: Scalar cosine similarity in [0, 1]
     """
-    # Center the features
-    X = X - X.mean(dim=0, keepdim=True)
-    Y = Y - Y.mean(dim=0, keepdim=True)
+    # Flatten and normalize
+    X_flat = X.reshape(X.shape[0], -1)
+    Y_flat = Y.reshape(Y.shape[0], -1)
 
-    # Compute Frobenius norms
-    XTX = torch.norm(X.T @ X, p='fro')
-    YTY = torch.norm(Y.T @ Y, p='fro')
-    XTY = torch.norm(X.T @ Y, p='fro')
+    # Normalize vectors
+    X_norm = F.normalize(X_flat, p=2, dim=1)
+    Y_norm = F.normalize(Y_flat, p=2, dim=1)
 
-    # CKA formula
-    cka = (XTY ** 2) / (XTX * YTY + epsilon)
+    # Cosine similarity: mean of dot products between normalized vectors
+    similarity = (X_norm * Y_norm).sum(dim=1).mean()
 
-    return cka
+    return similarity
 
 
 def load_layer_profiles(profile_dir: str = "layer_profiles") -> Dict:
@@ -552,34 +550,34 @@ class ConditionalPatchTrainer:
                 print(f"  Sample {i} extraction failed: {e}")
                 continue
 
-            # Compute CKA for target layer
+            # Compute cosine similarity for target layer
             if target_layer_name in clean_acts and target_layer_name in patched_acts:
-                target_cka = linear_cka(clean_acts[target_layer_name],
-                                       patched_acts[target_layer_name])
-                stats['target_cka'].append(target_cka.item())
+                target_sim = compute_cosine_similarity(clean_acts[target_layer_name],
+                                                       patched_acts[target_layer_name])
+                stats['target_cka'].append(target_sim.item())
             else:
-                target_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
+                target_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            # Compute CKA for prior layers (if any)
+            # Compute cosine similarity for prior layers (if any)
             if prior_layer_names:
-                prior_ckas = []
+                prior_sims = []
                 for prior_name in prior_layer_names:
                     if prior_name in clean_acts and prior_name in patched_acts:
-                        prior_cka = linear_cka(clean_acts[prior_name],
-                                              patched_acts[prior_name])
-                        prior_ckas.append(prior_cka)
+                        prior_sim = compute_cosine_similarity(clean_acts[prior_name],
+                                                              patched_acts[prior_name])
+                        prior_sims.append(prior_sim)
 
-                if prior_ckas:
-                    mean_prior_cka = torch.stack(prior_ckas).mean()
-                    stats['prior_cka'].append(mean_prior_cka.item())
+                if prior_sims:
+                    mean_prior_sim = torch.stack(prior_sims).mean()
+                    stats['prior_cka'].append(mean_prior_sim.item())
                 else:
-                    mean_prior_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
+                    mean_prior_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
             else:
-                mean_prior_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
+                mean_prior_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            # Sample loss: minimize target CKA, maximize prior CKA
-            # Loss = target_CKA - mean_prior_CKA
-            sample_loss = target_cka - mean_prior_cka
+            # Sample loss: minimize target similarity, maximize prior similarity
+            # Loss = target_sim - mean_prior_sim
+            sample_loss = target_sim - mean_prior_sim
             total_cka_loss = total_cka_loss + sample_loss
             valid_samples += 1
 
