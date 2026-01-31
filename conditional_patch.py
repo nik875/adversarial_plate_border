@@ -478,18 +478,56 @@ class ConditionalPatchTrainer:
             target_layer_name = all_layer_names[layer_idx]
             prior_layer_names = all_layer_names[:layer_idx] if layer_idx > 0 else []
 
-            # Extract single image
-            image = batch['prep_image'].unsqueeze(0).to(self.device)  # [1, 3, H, W]
-            corners = batch['new_corners'].unsqueeze(0).to(self.device)  # [1, 4, 2]
+            # Crop plate region on CPU before loading to GPU (reduces memory usage)
+            image_cpu = batch['prep_image'].unsqueeze(0)  # [1, 3, H, W]
+            corners_cpu = batch['new_corners'].unsqueeze(0)  # [1, 4, 2]
+
+            # Crop to license plate area (64, 128)
+            cropped_clean = K.crop_and_resize(image_cpu, corners_cpu, (64, 128))
+
+            # Load only the cropped image to GPU
+            cropped_clean = cropped_clean.to(self.device)
+            corners = corners_cpu.to(self.device)  # [1, 4, 2]
             patch = patches[i:i+1]  # [1, 3, 256, 512]
 
-            # Crop plate region (same as profile_ocr_models.py)
-            plate_corners = corners  # [1, 4, 2]
-            cropped_clean = K.crop_and_resize(image, plate_corners, (64, 128))
+            # For patching, we need to apply patch to cropped region
+            # Crop the original image for patching with border
+            border_scale = 1.4
+            plate_corners = corners_cpu[0]  # [4, 2]
+            plate_min = plate_corners.min(dim=0)[0]
+            plate_max = plate_corners.max(dim=0)[0]
+            plate_center = (plate_min + plate_max) / 2
+            plate_size = plate_max - plate_min
 
-            # Apply patch
-            patched_image = self.apply_patch(image, corners, patch)
-            cropped_patched = K.crop_and_resize(patched_image, plate_corners, (64, 128))
+            # Expand corners for border (1.4x)
+            border_size = plate_size * border_scale / 2
+            border_min = plate_center - border_size
+            border_max = plate_center + border_size
+
+            # Clamp to image bounds
+            H, W = image_cpu.shape[2], image_cpu.shape[3]
+            border_min = torch.clamp(border_min, min=0)
+            border_max = torch.clamp(border_max, max=torch.tensor([W, H], dtype=border_max.dtype))
+
+            # Crop border region on CPU
+            x_min, y_min = int(border_min[0].item()), int(border_min[1].item())
+            x_max, y_max = int(border_max[0].item()), int(border_max[1].item())
+            border_region = image_cpu[:, :, y_min:y_max, x_min:x_max]
+
+            # Adjust corners to be relative to cropped border region
+            corners_in_region = corners_cpu[0].clone()
+            corners_in_region[:, 0] -= x_min
+            corners_in_region[:, 1] -= y_min
+            corners_in_region = corners_in_region.unsqueeze(0)
+
+            # Load border region to GPU
+            border_region = border_region.to(self.device)
+
+            # Apply patch to border region
+            patched_border = self.apply_patch(border_region, corners_in_region, patch)
+
+            # Crop patched region to 64x128
+            cropped_patched = K.crop_and_resize(patched_border, corners_in_region, (64, 128))
 
             # Extract activations from target layer (and prior if any)
             layers_to_extract = [target_layer_name] + prior_layer_names
