@@ -3,7 +3,7 @@
 Profile OCR Models with RDM
 
 Profiles three OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
-1. OpenCV CRNN EN 2023 (from HuggingFace)
+1. DTrOCR (Decoder-only Transformer OCR)
 2. CCT-XS-V1 Global (from progressive_patch.py)
 3. Microsoft TrOCR Small Printed (vision encoder)
 
@@ -26,6 +26,15 @@ from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
 import torchvision.transforms as T
 import kornia.geometry as K
+
+# DTrOCR imports
+try:
+    from dtrocr.config import DTrOCRConfig
+    from dtrocr.model import DTrOCRLMHeadModel
+    from dtrocr.processor import DTrOCRProcessor as DTrOCRProcessorClass
+    DTROCR_AVAILABLE = True
+except ImportError:
+    DTROCR_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -102,9 +111,27 @@ class OCRImageDataset(Dataset):
                 img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
 
-                # Process with TrOCRProcessor (or other processor)
-                processed = preprocessor(images=pil_img, return_tensors="pt")
-                img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
+                # Process with model-specific processor
+                if hasattr(preprocessor, 'tokeniser'):
+                    # DTrOCR processor - needs both images and texts
+                    processed = preprocessor(
+                        images=pil_img,
+                        texts=preprocessor.tokeniser.bos_token,
+                        return_tensors="pt"
+                    )
+                    # Extract just the image features (pixel_values or inputs)
+                    if hasattr(processed, 'pixel_values'):
+                        img_processed = processed.pixel_values.squeeze(0)
+                    elif 'pixel_values' in processed:
+                        img_processed = processed['pixel_values'].squeeze(0)
+                    else:
+                        # Use the first tensor in the dict
+                        img_processed = list(processed.values())[0].squeeze(0)
+                else:
+                    # TrOCRProcessor or other standard processor
+                    processed = preprocessor(images=pil_img, return_tensors="pt")
+                    img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
+
                 self.images.append(img_processed)
             else:
                 # Apply format transformations for specific models
@@ -159,47 +186,46 @@ def load_cct_model(device='cuda'):
     return model, "cct_xs_v1_global"
 
 
-def load_crnn_model(device='cuda'):
+def load_dtrocr_model(device='cuda'):
     """
-    Load text_recognition_CRNN_EN_2023feb_fp16.onnx from HuggingFace.
+    Load DTrOCR (Decoder-only Transformer OCR) model.
 
-    Downloads directly from URL and converts to PyTorch.
+    DTrOCR is a PyTorch-native decoder-only transformer for OCR.
+    Returns the model and processor for image preprocessing.
 
     Returns:
-        model: PyTorch model
+        model: PyTorch model (DTrOCRLMHeadModel)
         model_name: String identifier
+        processor: DTrOCRProcessor for image preprocessing
     """
     print("\n" + "="*80)
-    print("Loading OpenCV CRNN EN 2023 Model")
+    print("Loading DTrOCR Model")
     print("="*80)
 
+    if not DTROCR_AVAILABLE:
+        raise RuntimeError(
+            "DTrOCR is not installed. Install it with:\n"
+            "pip install dtrocr"
+        )
+
     try:
-        # Download ONNX model directly from URL
-        model_url = "https://huggingface.co/opencv/opencv_zoo/resolve/main/models/text_recognition_crnn/text_recognition_CRNN_EN_2023feb_fp16.onnx"
-        cache_dir = Path.home() / ".cache/opencv_crnn"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        onnx_path = cache_dir / "text_recognition_CRNN_EN_2023feb_fp16.onnx"
+        # Load DTrOCR config and model
+        print("Initializing DTrOCR model...")
+        config = DTrOCRConfig()
+        model = DTrOCRLMHeadModel(config).to(device)
+        model.eval()  # Set to evaluation mode
 
-        # Download if not cached
-        if not onnx_path.exists():
-            print(f"Downloading CRNN model from {model_url}...")
-            urllib.request.urlretrieve(model_url, onnx_path)
-            print(f"Downloaded to: {onnx_path}")
-        else:
-            print(f"Using cached model: {onnx_path}")
-
-        # Load and convert ONNX model
-        print("Converting ONNX to PyTorch...")
-        onnx_model = onnx.load(str(onnx_path))
-        model = onnx2torch.convert(onnx_model).to(device)
-        model.eval()
+        # Load processor for image preprocessing
+        processor = DTrOCRProcessorClass(DTrOCRConfig())
 
         print("Model loaded successfully")
-        return model, "crnn_en_2023feb"
+        print(f"Model type: {type(model).__name__}")
+        return model, "dtrocr", processor
     except Exception as e:
-        print(f"Error loading CRNN model: {e}")
+        print(f"Error loading DTrOCR model: {e}")
         raise RuntimeError(
-            f"Failed to load CRNN model. Error: {e}"
+            f"Failed to load DTrOCR model. Error: {e}\n"
+            "Make sure dtrocr is installed: pip install dtrocr"
         )
 
 
@@ -308,8 +334,8 @@ def main():
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size for profiling (default: 16)')
-    parser.add_argument('--models', type=str, default='crnn,cct,trocr',
-                        help='Comma-separated list of models to profile: crnn,cct,trocr (default: all)')
+    parser.add_argument('--models', type=str, default='dtrocr,cct,trocr',
+                        help='Comma-separated list of models to profile: dtrocr,cct,trocr (default: all)')
     parser.add_argument('--limit-images', type=int, default=0,
                         help='Limit number of images to profile (0=all, default: 0)')
     args = parser.parse_args()
@@ -359,33 +385,31 @@ def main():
     print(f"Loaded dataloader with {len(train_loader)} images\n")
 
     # Profile each requested model
-    # CRNN is profiled FIRST to catch errors early
+    # DTrOCR is profiled FIRST to catch errors early
     results = {}
 
-    if 'crnn' in models_to_profile:
+    if 'dtrocr' in models_to_profile:
         try:
-            model, model_name = load_crnn_model(device)
+            model, model_name, processor = load_dtrocr_model(device)
 
-            # Create CRNN dataset - try channels_last like CCT first
-            # (CRNN models often expect [H, W, C] format)
+            # Create DTrOCR dataset using the model's processor
             print(f"\nCreating dataset for {model_name}...")
-            crnn_dataset = OCRImageDataset(
+            dtrocr_dataset = OCRImageDataset(
                 train_loader,
-                target_size=(64, 128),  # Common OCR input size
-                device=device,
-                channels_last=True,  # Try [H, W, C] format
-                scale_to_255=True    # Try [0, 255] range
+                target_size=(64, 128),  # Initial crop before processor
+                preprocessor=processor,  # Use DTrOCR processor
+                device=device
             )
             if args.limit_images > 0:
                 print(f"Limiting to {args.limit_images} images")
-                crnn_dataset.images = crnn_dataset.images[:args.limit_images]
+                dtrocr_dataset.images = dtrocr_dataset.images[:args.limit_images]
 
-            rdms = profile_model(model, model_name, crnn_dataset, args.output_dir, device, args.batch_size)
+            rdms = profile_model(model, model_name, dtrocr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
-            del model, crnn_dataset  # Free memory
+            del model, dtrocr_dataset, processor  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling CRNN model: {e}")
+            print(f"\nERROR profiling DTrOCR model: {e}")
             import traceback
             traceback.print_exc()
 
