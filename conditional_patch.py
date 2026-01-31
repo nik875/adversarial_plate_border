@@ -26,6 +26,7 @@ import onnx2torch
 from transformers import VisionEncoderDecoderModel
 from doctr.models import vitstr_small
 import kornia.geometry as K
+from diffusers import AutoencoderKL
 
 from dataset import create_dataloaders
 
@@ -150,6 +151,72 @@ class SimplePatchGenerator(nn.Module):
 
         # Progressive upsampling with convolutions
         patches = self.conv_blocks(x)  # [batch, 3, 256, 512]
+
+        return patches
+
+
+class DiffusionPatchGenerator(nn.Module):
+    """Stable Diffusion VAE-based patch generator"""
+    def __init__(self, latent_dim: int = 32, patch_height: int = 256,
+                 patch_width: int = 512, device: str = 'cuda'):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+
+        # VAE latent space dimensions (8x downsampling)
+        self.vae_latent_h = patch_height // 8  # 32
+        self.vae_latent_w = patch_width // 8   # 64
+        self.vae_latent_channels = 4
+        self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
+
+        # Load pretrained VAE from Stable Diffusion
+        print("Loading Stable Diffusion VAE decoder...")
+        self.vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=torch.float32
+        ).to(device)
+        self.vae.train()
+        print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
+
+        # Adapter network: map latent → VAE latent space
+        self.adapter = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, self.vae_latent_dim),
+        )
+
+        # Initialize adapter weights
+        for m in self.adapter.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [batch_size, latent_dim]
+        Returns:
+            patches: [batch_size, 3, patch_height, patch_width]
+        """
+        # Map latent to VAE latent space
+        vae_latent_flat = self.adapter(z)  # [batch, vae_latent_dim]
+        vae_latent = vae_latent_flat.view(
+            z.shape[0],
+            self.vae_latent_channels,
+            self.vae_latent_h,
+            self.vae_latent_w
+        )  # [batch, 4, 32, 64]
+
+        # Decode with VAE
+        patches = self.vae.decode(vae_latent).sample  # [batch, 3, 256, 512]
+        patches = torch.clamp(patches, 0.0, 1.0)
 
         return patches
 
@@ -285,28 +352,16 @@ class ConditionalPatchTrainer:
 
     def __init__(self, csv_path: str, profile_dir: str = "layer_profiles",
                  device: str = 'cuda', learning_rate: float = 1e-3,
-                 models_to_use: set = None):
+                 generator_type: str = 'simple'):
         self.device = device
         self.learning_rate = learning_rate
+        self.generator_type = generator_type
 
         print(f"\nGPU Memory at start: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # Load layer profiles
         print("\nLoading layer profiles...")
-        all_profiles = load_layer_profiles(profile_dir)
-
-        # Filter profiles based on selected models
-        if models_to_use:
-            model_mapping = {
-                'vitstr': 'vitstr_small',
-                'cct': 'cct_xs_v1_global',
-                'trocr': 'trocr_small_printed_encoder'
-            }
-            selected_models = {model_mapping[m] for m in models_to_use}
-            self.layer_profiles = {k: v for k, v in all_profiles.items() if k in selected_models}
-        else:
-            self.layer_profiles = all_profiles
-
+        self.layer_profiles = load_layer_profiles(profile_dir)
         print(f"GPU Memory after loading profiles: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         print(f"Loaded profiles for {len(self.layer_profiles)} models:")
         for model_name, profile_data in self.layer_profiles.items():
@@ -314,15 +369,7 @@ class ConditionalPatchTrainer:
 
         # Load OCR models
         print("\nLoading OCR models...")
-        all_ocr_models = load_ocr_models(device)
-
-        # Filter OCR models based on selected models
-        if models_to_use:
-            self.ocr_models = {k: v for k, v in all_ocr_models.items()
-                             if k in self.layer_profiles.keys()}
-        else:
-            self.ocr_models = all_ocr_models
-
+        self.ocr_models = load_ocr_models(device)
         print(f"GPU Memory after loading OCR models: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # Create model name to index mapping
@@ -332,9 +379,18 @@ class ConditionalPatchTrainer:
 
         # Create encoder and generator
         self.encoder = LayerProfileEncoder(input_dim=12, latent_dim=32).to(device)
-        self.generator = SimplePatchGenerator(latent_dim=32,
-                                             patch_height=PATCH_HEIGHT,
-                                             patch_width=PATCH_WIDTH).to(device)
+
+        if generator_type == 'diffusion':
+            print(f"\nUsing Diffusion-based generator")
+            self.generator = DiffusionPatchGenerator(latent_dim=32,
+                                                     patch_height=PATCH_HEIGHT,
+                                                     patch_width=PATCH_WIDTH,
+                                                     device=device)
+        else:
+            print(f"\nUsing Simple CNN generator")
+            self.generator = SimplePatchGenerator(latent_dim=32,
+                                                 patch_height=PATCH_HEIGHT,
+                                                 patch_width=PATCH_WIDTH).to(device)
 
         # Optimizer
         self.optimizer = optim.Adam(
@@ -845,37 +901,21 @@ def main():
                        help='Path to dataset CSV')
     parser.add_argument('--profile-dir', type=str, default='layer_profiles',
                        help='Path to layer profiles directory')
-    parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
-                       help='Comma-separated list of models to use: vitstr,cct,trocr (default: all)')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=16,
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
+    parser.add_argument('--generator', type=str, default='simple', choices=['simple', 'diffusion'],
+                       help='Generator type: simple (CNN) or diffusion (Stable Diffusion VAE)')
     args = parser.parse_args()
-
-    # Parse model selection
-    models_to_use = set(args.models.lower().split(','))
-    model_mapping = {
-        'vitstr': 'vitstr_small',
-        'cct': 'cct_xs_v1_global',
-        'trocr': 'trocr_small_printed_encoder'
-    }
-
-    # Validate model choices
-    valid_models = set(model_mapping.keys())
-    if not models_to_use.issubset(valid_models):
-        invalid = models_to_use - valid_models
-        parser.error(f"Invalid models: {invalid}. Choose from: {','.join(valid_models)}")
-
-    print(f"Selected models: {', '.join(sorted(models_to_use))}")
 
     trainer = ConditionalPatchTrainer(
         csv_path=args.csv_path,
         profile_dir=args.profile_dir,
         learning_rate=args.lr,
-        models_to_use=models_to_use
+        generator_type=args.generator
     )
 
     trainer.train(num_epochs=args.epochs, batch_size=args.batch_size)
