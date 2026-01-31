@@ -417,7 +417,7 @@ class ConditionalPatchTrainer:
 
             # Convert tensor [1, 3, H, W] to PIL Image
             img = images[0]  # [3, H, W]
-            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img_np = (img.detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             pil_img = Image.fromarray(img_np)
 
             # Process with TrOCRProcessor
