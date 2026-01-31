@@ -457,8 +457,9 @@ class ConditionalPatchTrainer:
 
         # Process each sample individually (no stacking due to variable image sizes)
         batch_size = len(batches)
-        total_cka_loss = 0
+        total_cka_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         stats = {'target_cka': [], 'prior_cka': []}
+        valid_samples = 0
 
         for i in range(batch_size):
             model_name = model_names[i]
@@ -504,7 +505,7 @@ class ConditionalPatchTrainer:
                                        patched_acts[target_layer_name])
                 stats['target_cka'].append(target_cka.item())
             else:
-                target_cka = torch.tensor(0.0, device=self.device)
+                target_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
 
             # Compute CKA for prior layers (if any)
             if prior_layer_names:
@@ -519,19 +520,21 @@ class ConditionalPatchTrainer:
                     mean_prior_cka = torch.stack(prior_ckas).mean()
                     stats['prior_cka'].append(mean_prior_cka.item())
                 else:
-                    mean_prior_cka = torch.tensor(0.0, device=self.device)
+                    mean_prior_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
             else:
-                mean_prior_cka = torch.tensor(0.0, device=self.device)
+                mean_prior_cka = torch.tensor(0.0, device=self.device, requires_grad=True)
 
             # Sample loss: minimize target CKA, maximize prior CKA
             # Loss = target_CKA - mean_prior_CKA
             sample_loss = target_cka - mean_prior_cka
-            total_cka_loss += sample_loss
+            total_cka_loss = total_cka_loss + sample_loss
+            valid_samples += 1
 
-        # Average over batch
-        if batch_size > 0:
-            loss = total_cka_loss / batch_size
+        # Average over valid samples
+        if valid_samples > 0:
+            loss = total_cka_loss / valid_samples
         else:
+            # If no valid samples, return zero loss (will skip update)
             loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # Aggregate stats
