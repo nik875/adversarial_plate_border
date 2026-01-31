@@ -2,9 +2,10 @@
 """
 Profile OCR Models with RDM
 
-Profiles two OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
-1. CCT-XS-V1 Global (from progressive_patch.py)
-2. Microsoft TrOCR Small Printed (vision encoder)
+Profiles three OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
+1. OpenCV CRNN EN 2023 (from HuggingFace)
+2. CCT-XS-V1 Global (from progressive_patch.py)
+3. Microsoft TrOCR Small Printed (vision encoder)
 
 Profiles every layer of each model over the entire training dataset from progressive_patch.py.
 Saves layer profiles to an output directory with clear labels.
@@ -19,6 +20,7 @@ from torch.utils.data import Dataset
 import onnx
 import onnx2torch
 from transformers import VisionEncoderDecoderModel, TrOCRProcessor
+from huggingface_hub import hf_hub_download
 import warnings
 from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
@@ -157,6 +159,45 @@ def load_cct_model(device='cuda'):
     return model, "cct_xs_v1_global"
 
 
+def load_crnn_model(device='cuda'):
+    """
+    Load text_recognition_CRNN_EN_2023feb_fp16.onnx from HuggingFace.
+
+    Downloads from opencv/text_recognition_crnn repo and converts to PyTorch.
+
+    Returns:
+        model: PyTorch model
+        model_name: String identifier
+    """
+    print("\n" + "="*80)
+    print("Loading OpenCV CRNN EN 2023 Model")
+    print("="*80)
+
+    try:
+        # Download ONNX model from HuggingFace Hub
+        print("Downloading CRNN model from HuggingFace...")
+        onnx_path = hf_hub_download(
+            repo_id="opencv/text_recognition_crnn",
+            filename="models/text_recognition_crnn/text_recognition_CRNN_EN_2023feb_fp16.onnx"
+        )
+        print(f"Downloaded to: {onnx_path}")
+
+        # Load and convert ONNX model
+        print("Converting ONNX to PyTorch...")
+        onnx_model = onnx.load(onnx_path)
+        model = onnx2torch.convert(onnx_model).to(device)
+        model.eval()
+
+        print("Model loaded successfully")
+        return model, "crnn_en_2023feb"
+    except Exception as e:
+        print(f"Error loading CRNN model: {e}")
+        raise RuntimeError(
+            f"Failed to load CRNN model from HuggingFace. Error: {e}\n"
+            "Make sure huggingface_hub is installed: pip install huggingface_hub"
+        )
+
+
 def load_trocr_model(device='cuda'):
     """
     Load microsoft/trocr-small-printed from HuggingFace.
@@ -262,8 +303,8 @@ def main():
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size for profiling (default: 16)')
-    parser.add_argument('--models', type=str, default='cct,trocr',
-                        help='Comma-separated list of models to profile: cct,trocr (default: all)')
+    parser.add_argument('--models', type=str, default='crnn,cct,trocr',
+                        help='Comma-separated list of models to profile: crnn,cct,trocr (default: all)')
     parser.add_argument('--limit-images', type=int, default=0,
                         help='Limit number of images to profile (0=all, default: 0)')
     args = parser.parse_args()
@@ -312,7 +353,35 @@ def main():
     print(f"Loaded dataloader with {len(train_loader)} images\n")
 
     # Profile each requested model
+    # CRNN is profiled FIRST to catch errors early
     results = {}
+
+    if 'crnn' in models_to_profile:
+        try:
+            model, model_name = load_crnn_model(device)
+
+            # Create CRNN dataset - try channels_last like CCT first
+            # (CRNN models often expect [H, W, C] format)
+            print(f"\nCreating dataset for {model_name}...")
+            crnn_dataset = OCRImageDataset(
+                train_loader,
+                target_size=(64, 128),  # Common OCR input size
+                device=device,
+                channels_last=True,  # Try [H, W, C] format
+                scale_to_255=True    # Try [0, 255] range
+            )
+            if args.limit_images > 0:
+                print(f"Limiting to {args.limit_images} images")
+                crnn_dataset.images = crnn_dataset.images[:args.limit_images]
+
+            rdms = profile_model(model, model_name, crnn_dataset, args.output_dir, device, args.batch_size)
+            results[model_name] = rdms
+            del model, crnn_dataset  # Free memory
+            torch.cuda.empty_cache() if device == 'cuda' else None
+        except Exception as e:
+            print(f"\nERROR profiling CRNN model: {e}")
+            import traceback
+            traceback.print_exc()
 
     if 'cct' in models_to_profile:
         try:
