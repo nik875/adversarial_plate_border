@@ -95,6 +95,36 @@ def process_rdm_file(rdm_path: Path, output_dir: Path, k: int = 8):
         layer_names_list = []
 
         print(f"Processing {len(layer_keys)} layers...")
+
+        # Check RDM sizes first
+        rdm_sizes = {}
+        for layer_key in layer_keys:
+            layer_group = model_group[layer_key]
+            rdm_shape = layer_group["rdm"].shape
+            layer_name = layer_group.attrs["layer_name"]
+            rdm_sizes[layer_name] = rdm_shape[0]
+
+        # Find expected size (most common)
+        from collections import Counter
+
+        size_counts = Counter(rdm_sizes.values())
+        expected_size = size_counts.most_common(1)[0][0]
+
+        print(f"  Expected n_images: {expected_size}")
+        mismatched_layers = [
+            (name, size)
+            for name, size in rdm_sizes.items()
+            if size != expected_size
+        ]
+        if mismatched_layers:
+            print(
+                f"  WARNING: {len(mismatched_layers)} layers have mismatched sizes:"
+            )
+            for name, size in mismatched_layers[:5]:  # Show first 5
+                print(f"    - {name}: {size}")
+            if len(mismatched_layers) > 5:
+                print(f"    ... and {len(mismatched_layers) - 5} more")
+
         with tqdm(layer_keys, desc="Eigendecomposing layers") as pbar:
             for layer_key in pbar:
                 layer_group = model_group[layer_key]
@@ -102,6 +132,13 @@ def process_rdm_file(rdm_path: Path, output_dir: Path, k: int = 8):
 
                 # Load RDM
                 rdm = layer_group["rdm"][:]  # [n_images, n_images]
+
+                # Skip layers with mismatched size
+                if rdm.shape[0] != expected_size:
+                    pbar.write(
+                        f"  Skipping {layer_name} (size {rdm.shape[0]} != {expected_size})"
+                    )
+                    continue
 
                 # Double-center
                 G = double_center_distance_matrix(rdm)
@@ -115,6 +152,10 @@ def process_rdm_file(rdm_path: Path, output_dir: Path, k: int = 8):
                 layer_names_list.append(layer_name)
 
                 pbar.set_postfix({"layer": layer_name[:30]})
+
+        if not layer_profiles:
+            print(f"  ERROR: No valid layers found for {model_name}")
+            return
 
         # Stack all layers: [n_images, n_layers * k]
         all_profiles = np.concatenate(layer_profiles, axis=1)
