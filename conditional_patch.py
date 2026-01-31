@@ -81,7 +81,7 @@ class LayerProfileEncoder(nn.Module):
 
 
 class SimplePatchGenerator(nn.Module):
-    """Simple MLP patch generator"""
+    """CNN-based patch generator using transposed convolutions"""
     def __init__(self, latent_dim: int = 32, patch_height: int = 256,
                  patch_width: int = 512):
         super().__init__()
@@ -89,25 +89,50 @@ class SimplePatchGenerator(nn.Module):
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
-        self.patch_dim = 3 * patch_height * patch_width
 
-        self.network = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.LayerNorm(256),
+        # Dense layer to expand latent to spatial tensor
+        # Output: (512, 4, 8) = 16384 features
+        self.fc = nn.Linear(latent_dim, 512 * 4 * 8)
+
+        # Transposed convolution blocks (progressively upsample)
+        self.conv_blocks = nn.Sequential(
+            # 512x4x8 → 256x8x16
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 512),
-            nn.LayerNorm(512),
+
+            # 256x8x16 → 128x16x32
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
-            nn.LayerNorm(1024),
+
+            # 128x16x32 → 64x32x64
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, self.patch_dim),
+
+            # 64x32x64 → 32x64x128
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+
+            # 32x64x128 → 16x128x256
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+
+            # 16x128x256 → 3x256x512
+            nn.ConvTranspose2d(16, 3, kernel_size=4, stride=2, padding=1),
             nn.Sigmoid(),  # Output in [0, 1]
         )
 
         # Initialize weights
         for m in self.modules():
-            if isinstance(m, nn.Linear):
+            if isinstance(m, (nn.ConvTranspose2d, nn.Conv2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -119,8 +144,13 @@ class SimplePatchGenerator(nn.Module):
         Returns:
             patches: [batch_size, 3, patch_height, patch_width]
         """
-        patches_flat = self.network(z)
-        patches = patches_flat.view(-1, 3, self.patch_height, self.patch_width)
+        # Expand latent to spatial tensor
+        x = self.fc(z)  # [batch, 512*4*8]
+        x = x.view(-1, 512, 4, 8)  # [batch, 512, 4, 8]
+
+        # Progressive upsampling with convolutions
+        patches = self.conv_blocks(x)  # [batch, 3, 256, 512]
+
         return patches
 
 
