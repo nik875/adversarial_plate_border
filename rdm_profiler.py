@@ -344,14 +344,16 @@ class ActivationProcessor:
 
         elif len(activation.shape) == 4:
             # Conv layer: [batch, channels, height, width] → [batch, channels*height*width]
+            # Use reshape instead of view to handle non-contiguous tensors
             batch_size = activation.shape[0]
-            flattened = activation.view(batch_size, -1)
+            flattened = activation.reshape(batch_size, -1)
             return flattened
 
         else:
             # General case: flatten everything except first dimension
+            # Use reshape instead of view to handle non-contiguous tensors
             batch_size = activation.shape[0]
-            flattened = activation.view(batch_size, -1)
+            flattened = activation.reshape(batch_size, -1)
             return flattened
 
 
