@@ -389,7 +389,7 @@ class ConditionalPatchTrainer:
         return patched_image
 
     def extract_activations(self, model, images: torch.Tensor, layer_names: List[str],
-                           input_format: Dict, processor=None) -> Dict[str, torch.Tensor]:
+                           input_format: Dict, processor=None, model_name: str = None) -> Dict[str, torch.Tensor]:
         """
         Run model and extract activations at specified layers.
 
@@ -399,6 +399,7 @@ class ConditionalPatchTrainer:
             layer_names: List of layer names to extract
             input_format: Dict with 'channels_last' and 'scale_to_255' flags
             processor: Optional TrOCRProcessor for TrOCR model
+            model_name: Name of the model for determining preprocessing
 
         Returns:
             activations: Dict {layer_name: tensor [batch, features]}
@@ -434,7 +435,19 @@ class ConditionalPatchTrainer:
                 processed = processor(images=pil_img, return_tensors="pt")
                 images = processed.pixel_values.to(self.device)  # [1, 3, 384, 384]
         else:
-            # Format images for other models
+            # Model-specific preprocessing for ViTSTR and CCT
+            if model_name and 'vitstr' in model_name:
+                # ViTSTR expects 32x128
+                images = torch.nn.functional.interpolate(
+                    images, size=(32, 128), mode='bicubic', align_corners=False
+                )
+            elif model_name and 'cct' in model_name:
+                # CCT expects 64x128
+                images = torch.nn.functional.interpolate(
+                    images, size=(64, 128), mode='bicubic', align_corners=False
+                )
+
+            # Format images for model
             if input_format['channels_last']:
                 # Permute to [batch, H, W, C]
                 images = images.permute(0, 2, 3, 1)
@@ -581,11 +594,11 @@ class ConditionalPatchTrainer:
                 mem_before = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 clean_acts = self.extract_activations(ocr_model, clean_border,
-                                                      layers_to_extract, input_format, processor)
+                                                      layers_to_extract, input_format, processor, model_name)
                 mem_after_clean = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 patched_acts = self.extract_activations(ocr_model, patched_border,
-                                                        layers_to_extract, input_format, processor)
+                                                        layers_to_extract, input_format, processor, model_name)
                 mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 if i == 0:  # Print memory info for first sample only
@@ -594,7 +607,7 @@ class ConditionalPatchTrainer:
             except Exception as e:
                 # Skip this sample if extraction fails
                 print(f"  Sample {i} ({model_name}) extraction failed: {e}")
-                print(f"    Clean shape: {cropped_clean.shape}, Patched shape: {cropped_patched.shape}")
+                print(f"    Clean border shape: {clean_border.shape}, Patched border shape: {patched_border.shape}")
                 traceback.print_exc()
                 continue
 
