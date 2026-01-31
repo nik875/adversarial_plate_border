@@ -35,16 +35,22 @@ class OCRImageDataset(Dataset):
     Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
     returns variable-sized images that can't be stacked.
     """
-    def __init__(self, dataloader, target_size=(64, 256)):
+    def __init__(self, dataloader, target_size=(64, 256), preprocessor=None):
         """
         Args:
             dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
-            target_size: (height, width) for OCR input
+            target_size: (height, width) for OCR input (used if preprocessor is None)
+            preprocessor: Optional preprocessing function/processor (e.g., TrOCRProcessor)
+                         If provided, target_size is ignored
         """
         self.images = []
         self.target_size = target_size
+        self.preprocessor = preprocessor
 
-        print(f"Extracting images from dataloader (target size: {target_size})...")
+        if preprocessor is not None:
+            print(f"Extracting images from dataloader with custom preprocessor...")
+        else:
+            print(f"Extracting images from dataloader (target size: {target_size})...")
         print("(No batching - iterating individual images due to variable sizes)")
 
         # Manually iterate without batching
@@ -55,9 +61,25 @@ class OCRImageDataset(Dataset):
             # Extract the single image from batch dimension
             img = prep_image[0]  # Shape: [3, H, W]
 
-            # Resize to OCR input size
-            img_resized = T.Resize(self.target_size)(img)
-            self.images.append(img_resized)
+            # Preprocess image
+            if preprocessor is not None:
+                # Use custom preprocessor (returns pixel_values tensor)
+                # Convert tensor to PIL Image for processor
+                from PIL import Image
+                import numpy as np
+
+                # Convert [C, H, W] tensor to PIL Image
+                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                pil_img = Image.fromarray(img_np)
+
+                # Process with TrOCRProcessor (or other processor)
+                processed = preprocessor(images=pil_img, return_tensors="pt")
+                img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
+                self.images.append(img_processed)
+            else:
+                # Simple resize
+                img_resized = T.Resize(self.target_size)(img)
+                self.images.append(img_resized)
 
             if (i + 1) % 100 == 0:
                 print(f"  Processed {i + 1} images...")
@@ -110,12 +132,16 @@ def load_trocr_model(device='cuda'):
     Returns:
         model: PyTorch model (vision encoder only)
         model_name: String identifier
+        processor: TrOCRProcessor for image preprocessing
     """
     print("\n" + "="*80)
     print("Loading Microsoft TrOCR Small Printed Model")
     print("="*80)
 
     try:
+        # Load processor for image preprocessing
+        processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+
         # Load full model
         full_model = VisionEncoderDecoderModel.from_pretrained(
             "microsoft/trocr-small-printed"
@@ -128,7 +154,8 @@ def load_trocr_model(device='cuda'):
 
         print("Model loaded successfully (vision encoder)")
         print(f"Encoder type: {type(model).__name__}")
-        return model, "trocr_small_printed_encoder"
+        print(f"Expected input size: {processor.feature_extractor.size}")
+        return model, "trocr_small_printed_encoder", processor
     except Exception as e:
         print(f"Error loading TrOCR model: {e}")
         raise RuntimeError(
@@ -223,6 +250,8 @@ def main():
     models_to_profile = [m.strip().lower() for m in args.models.split(',')]
 
     # Load training dataset from progressive_patch.py
+    # Note: We'll create model-specific datasets as needed since different models
+    # require different preprocessing
     print("Loading training dataset...")
     transform = T.Compose([
         T.ToPILImage(),
@@ -239,16 +268,7 @@ def main():
         use_all_for_train=True
     )
 
-    # Convert to OCR dataset (extract and resize images)
-    # Note: Different models may need different input sizes
-    ocr_dataset = OCRImageDataset(train_loader, target_size=(64, 256))
-
-    # Limit images if specified
-    if args.limit_images > 0:
-        print(f"Limiting to {args.limit_images} images")
-        ocr_dataset.images = ocr_dataset.images[:args.limit_images]
-
-    print(f"Dataset ready: {len(ocr_dataset)} images\n")
+    print(f"Loaded dataloader with {len(train_loader)} images\n")
 
     # Profile each requested model
     results = {}
@@ -256,9 +276,17 @@ def main():
     if 'cct' in models_to_profile:
         try:
             model, model_name = load_cct_model(device)
-            rdms = profile_model(model, model_name, ocr_dataset, args.output_dir, device, args.batch_size)
+
+            # Create CCT-specific dataset (64x256 for license plate OCR)
+            print(f"\nCreating dataset for {model_name}...")
+            cct_dataset = OCRImageDataset(train_loader, target_size=(64, 256))
+            if args.limit_images > 0:
+                print(f"Limiting to {args.limit_images} images")
+                cct_dataset.images = cct_dataset.images[:args.limit_images]
+
+            rdms = profile_model(model, model_name, cct_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
-            del model  # Free memory
+            del model, cct_dataset  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
             print(f"\nERROR profiling CCT model: {e}")
@@ -267,10 +295,18 @@ def main():
 
     if 'trocr' in models_to_profile:
         try:
-            model, model_name = load_trocr_model(device)
-            rdms = profile_model(model, model_name, ocr_dataset, args.output_dir, device, args.batch_size)
+            model, model_name, processor = load_trocr_model(device)
+
+            # Create TrOCR-specific dataset (uses processor for correct preprocessing)
+            print(f"\nCreating dataset for {model_name}...")
+            trocr_dataset = OCRImageDataset(train_loader, preprocessor=processor)
+            if args.limit_images > 0:
+                print(f"Limiting to {args.limit_images} images")
+                trocr_dataset.images = trocr_dataset.images[:args.limit_images]
+
+            rdms = profile_model(model, model_name, trocr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
-            del model  # Free memory
+            del model, trocr_dataset, processor  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
             print(f"\nERROR profiling TrOCR model: {e}")
