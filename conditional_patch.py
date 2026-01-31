@@ -231,14 +231,19 @@ def load_ocr_models(device: str = 'cuda') -> Dict:
 
     # TrOCR model (encoder only)
     print("Loading TrOCR model...")
+    from transformers import TrOCRProcessor
+
     trocr_full = VisionEncoderDecoderModel.from_pretrained(
         "microsoft/trocr-small-printed"
     ).to(device)
     trocr_encoder = trocr_full.encoder
     trocr_encoder.eval()
+    trocr_processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+
     models['trocr_small_printed_encoder'] = (
         trocr_encoder,
-        {'channels_last': False, 'scale_to_255': False}
+        {'channels_last': False, 'scale_to_255': False},
+        trocr_processor
     )
     print("  TrOCR loaded")
 
@@ -391,19 +396,40 @@ class ConditionalPatchTrainer:
         return patched_image
 
     def extract_activations(self, model, images: torch.Tensor, layer_names: List[str],
-                           input_format: Dict) -> Dict[str, torch.Tensor]:
+                           input_format: Dict, processor=None) -> Dict[str, torch.Tensor]:
         """
         Run model and extract activations at specified layers.
+
+        Args:
+            model: The OCR model
+            images: [1, 3, H, W] image tensor
+            layer_names: List of layer names to extract
+            input_format: Dict with 'channels_last' and 'scale_to_255' flags
+            processor: Optional TrOCRProcessor for TrOCR model
 
         Returns:
             activations: Dict {layer_name: tensor [batch, features]}
         """
-        # Format images for model
-        if input_format['channels_last']:
-            # Permute to [batch, H, W, C]
-            images = images.permute(0, 2, 3, 1)
-        if input_format['scale_to_255']:
-            images = images * 255
+        # Use processor for TrOCR (converts to model's expected input size)
+        if processor is not None:
+            from PIL import Image
+            import numpy as np
+
+            # Convert tensor [1, 3, H, W] to PIL Image
+            img = images[0]  # [3, H, W]
+            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_np)
+
+            # Process with TrOCRProcessor
+            processed = processor(images=pil_img, return_tensors="pt")
+            images = processed.pixel_values.to(self.device)  # [1, 3, H_model, W_model]
+        else:
+            # Format images for other models
+            if input_format['channels_last']:
+                # Permute to [batch, H, W, C]
+                images = images.permute(0, 2, 3, 1)
+            if input_format['scale_to_255']:
+                images = images * 255
 
         # Register hooks
         activations = {}
@@ -483,8 +509,13 @@ class ConditionalPatchTrainer:
             layer_idx = layer_indices[i]
             batch = batches[i]
 
-            # Get model and input format
-            ocr_model, input_format = self.ocr_models[model_name]
+            # Get model and input format (processor for TrOCR only)
+            model_data = self.ocr_models[model_name]
+            if len(model_data) == 3:
+                ocr_model, input_format, processor = model_data
+            else:
+                ocr_model, input_format = model_data
+                processor = None
 
             # Get layer names (target + all prior)
             all_layer_names = self.layer_profiles[model_name]['layer_names']
@@ -562,11 +593,11 @@ class ConditionalPatchTrainer:
                 mem_before = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 clean_acts = self.extract_activations(ocr_model, cropped_clean,
-                                                      layers_to_extract, input_format)
+                                                      layers_to_extract, input_format, processor)
                 mem_after_clean = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 patched_acts = self.extract_activations(ocr_model, cropped_patched,
-                                                        layers_to_extract, input_format)
+                                                        layers_to_extract, input_format, processor)
                 mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
                 if i == 0:  # Print memory info for first sample only
