@@ -501,6 +501,10 @@ class ConditionalPatchTrainer:
             # Crop to license plate area using model-specific shape
             cropped_clean = K.crop_and_resize(image_cpu, corners_cpu, model_input_shape)
 
+            # Debug: verify cropping worked as expected
+            if cropped_clean.shape != (1, 3, model_input_shape[0], model_input_shape[1]):
+                print(f"  WARNING Sample {i} ({model_name}): Expected shape (1, 3, {model_input_shape[0]}, {model_input_shape[1]}), got {cropped_clean.shape}")
+
             # Load only the cropped image to GPU
             cropped_clean = cropped_clean.to(self.device)
             corners = corners_cpu.to(self.device)  # [1, 4, 2]
@@ -546,6 +550,11 @@ class ConditionalPatchTrainer:
             # Crop patched region to model-specific input shape
             cropped_patched = K.crop_and_resize(patched_border, corners_in_region, model_input_shape)
 
+            # Debug: verify patched cropping worked as expected
+            if cropped_patched.shape != (1, 3, model_input_shape[0], model_input_shape[1]):
+                print(f"  WARNING Sample {i} ({model_name}): Patched shape mismatch - Expected (1, 3, {model_input_shape[0]}, {model_input_shape[1]}), got {cropped_patched.shape}")
+                print(f"    Border region shape: {border_region.shape}, Corners in region: {corners_in_region}")
+
             # Extract activations from target layer (and prior if any)
             layers_to_extract = [target_layer_name] + prior_layer_names
 
@@ -565,7 +574,8 @@ class ConditionalPatchTrainer:
 
             except Exception as e:
                 # Skip this sample if extraction fails
-                print(f"  Sample {i} extraction failed: {e}")
+                print(f"  Sample {i} ({model_name}) extraction failed: {e}")
+                print(f"    Clean shape: {cropped_clean.shape}, Patched shape: {cropped_patched.shape}")
                 traceback.print_exc()
                 continue
 
