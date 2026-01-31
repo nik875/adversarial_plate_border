@@ -3,7 +3,7 @@
 Profile OCR Models with RDM
 
 Profiles three OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
-1. DTrOCR (Decoder-only Transformer OCR)
+1. ViTSTR Small (from doctr - Vision Transformer STR)
 2. CCT-XS-V1 Global (from progressive_patch.py)
 3. Microsoft TrOCR Small Printed (vision encoder)
 
@@ -26,15 +26,6 @@ from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
 import torchvision.transforms as T
 import kornia.geometry as K
-
-# DTrOCR imports
-try:
-    from dtrocr.config import DTrOCRConfig
-    from dtrocr.model import DTrOCRLMHeadModel
-    from dtrocr.processor import DTrOCRProcessor as DTrOCRProcessorClass
-    DTROCR_AVAILABLE = True
-except ImportError:
-    DTROCR_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
@@ -111,27 +102,9 @@ class OCRImageDataset(Dataset):
                 img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
 
-                # Process with model-specific processor
-                if hasattr(preprocessor, 'tokeniser'):
-                    # DTrOCR processor - needs both images and texts
-                    processed = preprocessor(
-                        images=pil_img,
-                        texts=preprocessor.tokeniser.bos_token,
-                        return_tensors="pt"
-                    )
-                    # Extract just the image features (pixel_values or inputs)
-                    if hasattr(processed, 'pixel_values'):
-                        img_processed = processed.pixel_values.squeeze(0)
-                    elif 'pixel_values' in processed:
-                        img_processed = processed['pixel_values'].squeeze(0)
-                    else:
-                        # Use the first tensor in the dict
-                        img_processed = list(processed.values())[0].squeeze(0)
-                else:
-                    # TrOCRProcessor or other standard processor
-                    processed = preprocessor(images=pil_img, return_tensors="pt")
-                    img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
-
+                # Process with TrOCRProcessor (or other processor)
+                processed = preprocessor(images=pil_img, return_tensors="pt")
+                img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
                 self.images.append(img_processed)
             else:
                 # Apply format transformations for specific models
@@ -186,46 +159,38 @@ def load_cct_model(device='cuda'):
     return model, "cct_xs_v1_global"
 
 
-def load_dtrocr_model(device='cuda'):
+def load_vitstr_model(device='cuda'):
     """
-    Load DTrOCR (Decoder-only Transformer OCR) model.
-
-    DTrOCR is a PyTorch-native decoder-only transformer for OCR.
-    Returns the model and processor for image preprocessing.
+    Load ViTSTR Small model from doctr.
 
     Returns:
-        model: PyTorch model (DTrOCRLMHeadModel)
+        model: PyTorch model
         model_name: String identifier
-        processor: DTrOCRProcessor for image preprocessing
     """
     print("\n" + "="*80)
-    print("Loading DTrOCR Model")
+    print("Loading ViTSTR Small Model (doctr)")
     print("="*80)
 
-    if not DTROCR_AVAILABLE:
-        raise RuntimeError(
-            "DTrOCR is not installed. Install it with:\n"
-            "pip install dtrocr"
-        )
-
     try:
-        # Load DTrOCR config and model
-        print("Initializing DTrOCR model...")
-        config = DTrOCRConfig()
-        model = DTrOCRLMHeadModel(config).to(device)
-        model.eval()  # Set to evaluation mode
+        from doctr.models import vitstr_small
 
-        # Load processor for image preprocessing
-        processor = DTrOCRProcessorClass(DTrOCRConfig())
+        print("Loading pretrained ViTSTR model...")
+        model = vitstr_small(pretrained=True)
+        model.eval()  # Set to eval mode for profiling
+        model.to(device)
 
         print("Model loaded successfully")
         print(f"Model type: {type(model).__name__}")
-        return model, "dtrocr", processor
-    except Exception as e:
-        print(f"Error loading DTrOCR model: {e}")
+        return model, "vitstr_small"
+    except ImportError:
         raise RuntimeError(
-            f"Failed to load DTrOCR model. Error: {e}\n"
-            "Make sure dtrocr is installed: pip install dtrocr"
+            "doctr library not found. Install it with:\n"
+            "pip install python-doctr[torch]"
+        )
+    except Exception as e:
+        print(f"Error loading ViTSTR model: {e}")
+        raise RuntimeError(
+            f"Failed to load ViTSTR model. Error: {e}"
         )
 
 
@@ -334,8 +299,8 @@ def main():
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size for profiling (default: 16)')
-    parser.add_argument('--models', type=str, default='dtrocr,cct,trocr',
-                        help='Comma-separated list of models to profile: dtrocr,cct,trocr (default: all)')
+    parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
+                        help='Comma-separated list of models to profile: vitstr,cct,trocr (default: all)')
     parser.add_argument('--limit-images', type=int, default=0,
                         help='Limit number of images to profile (0=all, default: 0)')
     args = parser.parse_args()
@@ -385,31 +350,33 @@ def main():
     print(f"Loaded dataloader with {len(train_loader)} images\n")
 
     # Profile each requested model
-    # DTrOCR is profiled FIRST to catch errors early
+    # ViTSTR is profiled FIRST to catch errors early
     results = {}
 
-    if 'dtrocr' in models_to_profile:
+    if 'vitstr' in models_to_profile:
         try:
-            model, model_name, processor = load_dtrocr_model(device)
+            model, model_name = load_vitstr_model(device)
 
-            # Create DTrOCR dataset using the model's processor
+            # Create ViTSTR dataset - use standard PyTorch format [C, H, W]
+            # ViTSTR expects normalized images in [0, 1] range
             print(f"\nCreating dataset for {model_name}...")
-            dtrocr_dataset = OCRImageDataset(
+            vitstr_dataset = OCRImageDataset(
                 train_loader,
-                target_size=(64, 128),  # Initial crop before processor
-                preprocessor=processor,  # Use DTrOCR processor
-                device=device
+                target_size=(32, 128),  # ViTSTR input size (H=32, W=128)
+                device=device,
+                channels_last=False,  # Use [C, H, W] format (standard PyTorch)
+                scale_to_255=False    # Keep [0, 1] range
             )
             if args.limit_images > 0:
                 print(f"Limiting to {args.limit_images} images")
-                dtrocr_dataset.images = dtrocr_dataset.images[:args.limit_images]
+                vitstr_dataset.images = vitstr_dataset.images[:args.limit_images]
 
-            rdms = profile_model(model, model_name, dtrocr_dataset, args.output_dir, device, args.batch_size)
+            rdms = profile_model(model, model_name, vitstr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
-            del model, dtrocr_dataset, processor  # Free memory
+            del model, vitstr_dataset  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling DTrOCR model: {e}")
+            print(f"\nERROR profiling ViTSTR model: {e}")
             import traceback
             traceback.print_exc()
 
