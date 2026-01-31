@@ -278,13 +278,6 @@ class ConditionalPatchTrainer:
         self.model_to_idx = {name: idx for idx, name in enumerate(self.model_names)}
         self.n_models = len(self.model_names)
 
-        # Define model-specific input shapes (from profile_ocr_models.py)
-        self.model_input_shapes = {
-            'vitstr_small': (32, 128),  # ViTSTR expects 32x128
-            'cct_xs_v1_global': (64, 128),  # CCT expects 64x128
-            'trocr_small_printed_encoder': (64, 128),  # TrOCR initial crop 64x128
-        }
-
         # Create encoder and generator
         self.encoder = LayerProfileEncoder(input_dim=12, latent_dim=32).to(device)
         self.generator = SimplePatchGenerator(latent_dim=32,
@@ -539,27 +532,13 @@ class ConditionalPatchTrainer:
             target_layer_name = all_layer_names[layer_idx]
             prior_layer_names = all_layer_names[:layer_idx] if layer_idx > 0 else []
 
-            # Crop plate region on CPU before loading to GPU (reduces memory usage)
+            # Load images and corners
             image_cpu = batch['prep_image'].unsqueeze(0)  # [1, 3, H, W]
             corners_cpu = batch['new_corners'].unsqueeze(0)  # [1, 4, 2]
-
-            # Get model-specific input shape
-            model_input_shape = self.model_input_shapes[model_name]
-
-            # Crop to license plate area using model-specific shape
-            cropped_clean = K.crop_and_resize(image_cpu, corners_cpu, model_input_shape)
-
-            # Debug: verify cropping worked as expected
-            if cropped_clean.shape != (1, 3, model_input_shape[0], model_input_shape[1]):
-                print(f"  WARNING Sample {i} ({model_name}): Expected shape (1, 3, {model_input_shape[0]}, {model_input_shape[1]}), got {cropped_clean.shape}")
-
-            # Load only the cropped image to GPU
-            cropped_clean = cropped_clean.to(self.device)
-            corners = corners_cpu.to(self.device)  # [1, 4, 2]
             patch = patches[i:i+1]  # [1, 3, 256, 512]
 
-            # For patching, we need to apply patch to cropped region
-            # Crop the original image for patching with border
+            # Crop to border region on CPU (1.4x plate size) to reduce memory
+            # The DEIT preprocessor will handle resizing to 384x384
             border_scale = 1.4
             plate_corners = corners_cpu[0]  # [4, 2]
             plate_min = plate_corners.min(dim=0)[0]
@@ -580,7 +559,7 @@ class ConditionalPatchTrainer:
             # Crop border region on CPU
             x_min, y_min = int(border_min[0].item()), int(border_min[1].item())
             x_max, y_max = int(border_max[0].item()), int(border_max[1].item())
-            border_region = image_cpu[:, :, y_min:y_max, x_min:x_max]
+            clean_border = image_cpu[:, :, y_min:y_max, x_min:x_max]
 
             # Adjust corners to be relative to cropped border region
             corners_in_region = corners_cpu[0].clone()
@@ -589,19 +568,11 @@ class ConditionalPatchTrainer:
             corners_in_region = corners_in_region.unsqueeze(0)
 
             # Load border region and corners to GPU
-            border_region = border_region.to(self.device)
+            clean_border = clean_border.to(self.device)
             corners_in_region = corners_in_region.to(self.device)
 
             # Apply patch to border region
-            patched_border = self.apply_patch(border_region, corners_in_region, patch)
-
-            # Crop patched region to model-specific input shape
-            cropped_patched = K.crop_and_resize(patched_border, corners_in_region, model_input_shape)
-
-            # Debug: verify patched cropping worked as expected
-            if cropped_patched.shape != (1, 3, model_input_shape[0], model_input_shape[1]):
-                print(f"  WARNING Sample {i} ({model_name}): Patched shape mismatch - Expected (1, 3, {model_input_shape[0]}, {model_input_shape[1]}), got {cropped_patched.shape}")
-                print(f"    Border region shape: {border_region.shape}, Corners in region: {corners_in_region}")
+            patched_border = self.apply_patch(clean_border, corners_in_region, patch)
 
             # Extract activations from target layer (and prior if any)
             layers_to_extract = [target_layer_name] + prior_layer_names
@@ -609,11 +580,11 @@ class ConditionalPatchTrainer:
             try:
                 mem_before = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
-                clean_acts = self.extract_activations(ocr_model, cropped_clean,
+                clean_acts = self.extract_activations(ocr_model, clean_border,
                                                       layers_to_extract, input_format, processor)
                 mem_after_clean = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
-                patched_acts = self.extract_activations(ocr_model, cropped_patched,
+                patched_acts = self.extract_activations(ocr_model, patched_border,
                                                         layers_to_extract, input_format, processor)
                 mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
