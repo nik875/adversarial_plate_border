@@ -32,28 +32,38 @@ class OCRImageDataset(Dataset):
     """
     Wrapper to convert AdversarialPatchDataset to simple image dataset for RDM profiling.
     Extracts preprocessed images and resizes them for OCR models.
+
+    Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
+    returns variable-sized images that can't be stacked.
     """
     def __init__(self, dataloader, target_size=(64, 256)):
         """
         Args:
-            dataloader: DataLoader from progressive_patch.py dataset
+            dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
             target_size: (height, width) for OCR input
         """
         self.images = []
         self.target_size = target_size
 
         print(f"Extracting images from dataloader (target size: {target_size})...")
-        for batch in dataloader:
-            # Extract preprocessed images from batch
-            prep_images = batch['prep_image']  # Shape: [batch, 3, H, W]
+        print("(No batching - iterating individual images due to variable sizes)")
 
-            # Process each image in batch
-            for img in prep_images:
-                # Resize to OCR input size
-                img_resized = T.Resize(target_size)(img)
-                self.images.append(img_resized)
+        # Manually iterate without batching
+        for i, batch in enumerate(dataloader):
+            # Each batch is a dict with single image (batch_size=1)
+            prep_image = batch['prep_image']  # Shape: [1, 3, H, W] (single item in batch)
 
-        print(f"Loaded {len(self.images)} images")
+            # Extract the single image from batch dimension
+            img = prep_image[0]  # Shape: [3, H, W]
+
+            # Resize to OCR input size
+            img_resized = T.Resize(self.target_size)(img)
+            self.images.append(img_resized)
+
+            if (i + 1) % 100 == 0:
+                print(f"  Processed {i + 1} images...")
+
+        print(f"Loaded {len(self.images)} images total")
 
     def __len__(self):
         return len(self.images)
@@ -250,11 +260,12 @@ def main():
         T.ToTensor()
     ])
 
+    # Must use batch_size=1 because images have variable sizes and can't be stacked
     train_loader, val_loader = create_dataloaders(
         args.csv_path,
         transform=transform,
         preload=True,
-        batch_size=32,  # Use larger batch for faster loading
+        batch_size=1,  # MUST be 1 - images have different sizes, can't batch
         n_jobs=0,
         use_all_for_train=True
     )
