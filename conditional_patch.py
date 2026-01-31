@@ -415,28 +415,29 @@ class ConditionalPatchTrainer:
             from PIL import Image
             import numpy as np
 
-            # TrOCR uses DeiT preprocessing: resize to 384x384, normalize to [-1, 1]
-            # Formula: (x/255 - 0.5) / 0.5 = x/127.5 - 1
+            # TrOCR uses DeiT preprocessing:
+            # 1. Resize to 384×384 (BICUBIC, no aspect ratio preservation)
+            # 2. Rescale: divide by 255
+            # 3. Normalize: (x - 0.5) / 0.5
+            # Final formula: (x/255 - 0.5) / 0.5 = x/127.5 - 1
             height, width = 384, 384
 
-            # For tensors that require gradients, use torch operations to preserve gradients
             requires_grad = images.requires_grad
 
             if requires_grad:
-                # Keep gradients: use torch-based preprocessing
-                # Resize using torch (bilinear interpolation preserves gradients)
+                # For gradients: use torch operations
+                # Resize using bilinear interpolation (equivalent to BICUBIC in behavior)
                 images_resized = torch.nn.functional.interpolate(
-                    images, size=(height, width), mode='bilinear', align_corners=False
+                    images, size=(height, width), mode='bicubic', align_corners=False
                 )
-                # Normalize: (x/255 - 0.5) / 0.5 = x/127.5 - 1
+                # Rescale and normalize: (x/255 - 0.5) / 0.5
                 images = images_resized / 127.5 - 1.0
             else:
-                # No gradients: use PIL-based processor (more accurate)
+                # For non-gradient tensors: use official processor
                 img = images[0]  # [3, H, W]
                 img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
 
-                # Process with TrOCRProcessor
                 processed = processor(images=pil_img, return_tensors="pt")
                 images = processed.pixel_values.to(self.device)  # [1, 3, 384, 384]
         else:
