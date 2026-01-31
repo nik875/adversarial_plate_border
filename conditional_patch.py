@@ -415,14 +415,34 @@ class ConditionalPatchTrainer:
             from PIL import Image
             import numpy as np
 
-            # Convert tensor [1, 3, H, W] to PIL Image
-            img = images[0]  # [3, H, W]
-            img_np = (img.detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            pil_img = Image.fromarray(img_np)
+            # For tensors that require gradients, we need to keep them in torch
+            # For gradients to flow, use torch operations instead of numpy
+            requires_grad = images.requires_grad
 
-            # Process with TrOCRProcessor
-            processed = processor(images=pil_img, return_tensors="pt")
-            images = processed.pixel_values.to(self.device)  # [1, 3, H_model, W_model]
+            if requires_grad:
+                # Keep gradients: use torch-based preprocessing
+                # Get the expected input size from processor
+                expected_size = processor.image_processor.size
+                if isinstance(expected_size, dict):
+                    height, width = expected_size.get('height', 384), expected_size.get('width', 384)
+                else:
+                    height, width = expected_size, expected_size
+
+                # Resize using torch (bilinear interpolation preserves gradients)
+                images_resized = torch.nn.functional.interpolate(
+                    images, size=(height, width), mode='bilinear', align_corners=False
+                )
+                # Normalize to [-1, 1] (standard for vision transformers)
+                images = images_resized / 255.0 * 2.0 - 1.0
+            else:
+                # No gradients: use PIL-based processor (more accurate)
+                img = images[0]  # [3, H, W]
+                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                pil_img = Image.fromarray(img_np)
+
+                # Process with TrOCRProcessor
+                processed = processor(images=pil_img, return_tensors="pt")
+                images = processed.pixel_values.to(self.device)  # [1, 3, H_model, W_model]
         else:
             # Format images for other models
             if input_format['channels_last']:
