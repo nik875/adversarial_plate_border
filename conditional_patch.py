@@ -910,10 +910,9 @@ class ConditionalPatchTrainer:
                         })
 
                         # Track stats
-                        if loss.item() > 0:  # Only track if loss was computed
-                            epoch_losses.append(loss.item())
-                            epoch_target_cka.append(stats['target_cka'])
-                            epoch_prior_cka.append(stats['prior_cka'])
+                        epoch_losses.append(loss.item())
+                        epoch_target_cka.append(stats['target_cka'])
+                        epoch_prior_cka.append(stats['prior_cka'])
 
                         # Clear accumulated
                         accumulated_batches = []
