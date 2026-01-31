@@ -656,6 +656,9 @@ class ModelRDMProfiler:
         all_activations = {layer_name: [] for layer_name in hooked_layers}
         layer_info = {layer_name: {} for layer_name in hooked_layers}
 
+        # Track expected batch size for detecting sequence-collapsed activations
+        expected_batch_size = None
+
         print("\nRunning inference and collecting activations...")
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing batches")):
@@ -668,6 +671,10 @@ class ModelRDMProfiler:
                 # Move to device
                 if isinstance(images, torch.Tensor):
                     images = images.to(self.device)
+
+                # Track expected batch size from first batch
+                if expected_batch_size is None:
+                    expected_batch_size = images.shape[0]
 
                 # Forward pass
                 _ = self.model(images)
@@ -686,6 +693,28 @@ class ModelRDMProfiler:
                         flattened = self.processor.flatten_activation(
                             torch.from_numpy(activation_cpu)
                         ).numpy()
+
+                        # Check for sequence-collapsed activations
+                        # If first dim != batch_size but is a multiple, reshape and aggregate
+                        if flattened.shape[0] != expected_batch_size:
+                            if flattened.shape[0] % expected_batch_size == 0:
+                                seq_len = flattened.shape[0] // expected_batch_size
+                                # Reshape [batch*seq_len, features] -> [batch, seq_len, features]
+                                reshaped = flattened.reshape(expected_batch_size, seq_len, -1)
+                                # Aggregate across sequence dimension (mean pooling)
+                                flattened = reshaped.mean(axis=1)
+
+                                if batch_idx == 0:
+                                    warnings.warn(
+                                        f"Layer {layer_name}: Detected sequence-collapsed activation "
+                                        f"[{flattened.shape[0]}x{seq_len}, {flattened.shape[1]}]. "
+                                        f"Aggregating across sequence dimension."
+                                    )
+                            else:
+                                warnings.warn(
+                                    f"Layer {layer_name}: Unexpected activation shape "
+                                    f"{flattened.shape} (expected batch_size={expected_batch_size})"
+                                )
 
                         all_activations[layer_name].append(flattened)
 
