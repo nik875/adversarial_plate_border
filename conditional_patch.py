@@ -346,10 +346,13 @@ class ConditionalPatchTrainer:
 
     def apply_patch(self, image: torch.Tensor, corners: torch.Tensor,
                     patch: torch.Tensor) -> torch.Tensor:
-        """Apply patch as border around license plate (same as progressive_patch.py)"""
-        # Get 4 corners of license plate
-        plate_corners = corners[0]  # [4, 2]
+        """Apply patch as border around license plate (same as progressive_patch.py)
 
+        Args:
+            image: [1, 3, H, W]
+            corners: [1, 4, 2]
+            patch: [1, 3, 256, 512] (already has batch dim from generator)
+        """
         # Create patch corner coordinates
         patch_h, patch_w = self.generator.patch_height, self.generator.patch_width
         src_corners = torch.tensor([
@@ -359,10 +362,9 @@ class ConditionalPatchTrainer:
         # Compute perspective transformation
         M_plate = K.get_perspective_transform(src_corners, corners)
 
-        # Warp patch
+        # Warp patch (patch already has batch dim: [1, 3, 256, 512])
         dsize = (image.shape[2], image.shape[3])  # (H, W)
-        patch_batch = patch.unsqueeze(0)
-        warped_patch = K.warp_perspective(patch_batch, M_plate, dsize=dsize)
+        warped_patch = K.warp_perspective(patch, M_plate, dsize=dsize)
 
         # Blend with image
         patched_image = image.clone()
