@@ -21,3 +21,6 @@ transformers
 accelerate
 b2
 datasets
+python-doctr[torch]
+sentencepiece
+h5py
