@@ -247,9 +247,12 @@ class ConditionalPatchTrainer:
         self.device = device
         self.learning_rate = learning_rate
 
+        print(f"\nGPU Memory at start: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+
         # Load layer profiles
         print("\nLoading layer profiles...")
         self.layer_profiles = load_layer_profiles(profile_dir)
+        print(f"GPU Memory after loading profiles: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         print(f"Loaded profiles for {len(self.layer_profiles)} models:")
         for model_name, profile_data in self.layer_profiles.items():
             print(f"  - {model_name}: {profile_data['n_layers']} layers")
@@ -257,6 +260,7 @@ class ConditionalPatchTrainer:
         # Load OCR models
         print("\nLoading OCR models...")
         self.ocr_models = load_ocr_models(device)
+        print(f"GPU Memory after loading OCR models: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
         # Create model name to index mapping
         self.model_names = sorted(self.layer_profiles.keys())
@@ -491,12 +495,22 @@ class ConditionalPatchTrainer:
             layers_to_extract = [target_layer_name] + prior_layer_names
 
             try:
+                mem_before = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
+
                 clean_acts = self.extract_activations(ocr_model, cropped_clean,
                                                       layers_to_extract, input_format)
+                mem_after_clean = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
+
                 patched_acts = self.extract_activations(ocr_model, cropped_patched,
                                                         layers_to_extract, input_format)
+                mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
+
+                if i == 0:  # Print memory info for first sample only
+                    print(f"  Sample {i}: {mem_before:.2f}GB → {mem_after_clean:.2f}GB (clean) → {mem_after_patched:.2f}GB (patched)")
+
             except Exception as e:
                 # Skip this sample if extraction fails
+                print(f"  Sample {i} extraction failed: {e}")
                 continue
 
             # Compute CKA for target layer
