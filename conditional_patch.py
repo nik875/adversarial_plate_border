@@ -670,8 +670,8 @@ class ConditionalPatchTrainer:
                         # Update progress
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
-                            'target_cka': f"{stats['target_cka']:.3f}",
-                            'prior_cka': f"{stats['prior_cka']:.3f}"
+                            'target_sim': f"{stats['target_cka']:.3f}",
+                            'prior_sim': f"{stats['prior_cka']:.3f}"
                         })
 
                     # Clear accumulated
@@ -681,8 +681,8 @@ class ConditionalPatchTrainer:
             # Epoch summary
             print(f"Epoch {epoch+1} Summary:")
             print(f"  Loss: {np.mean(epoch_losses):.4f}")
-            print(f"  Target CKA: {np.mean(epoch_target_cka):.3f}")
-            print(f"  Prior CKA: {np.mean(epoch_prior_cka):.3f}")
+            print(f"  Target Cosine Similarity: {np.mean(epoch_target_cka):.3f}")
+            print(f"  Prior Cosine Similarity: {np.mean(epoch_prior_cka):.3f}")
             print()
 
             # Save checkpoint every 10 epochs
