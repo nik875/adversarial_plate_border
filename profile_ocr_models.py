@@ -23,53 +23,82 @@ import warnings
 from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
 import torchvision.transforms as T
+import kornia.geometry as K
 
 warnings.filterwarnings("ignore")
 
 
 class OCRImageDataset(Dataset):
     """
-    Wrapper to convert AdversarialPatchDataset to simple image dataset for RDM profiling.
-    Extracts preprocessed images and resizes them for OCR models.
+    Wrapper to extract cropped license plate regions from AdversarialPatchDataset.
+
+    This extracts the license plate region using corners (just like progressive_patch.py)
+    and prepares them for OCR model profiling.
 
     Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
     returns variable-sized images that can't be stacked.
     """
-    def __init__(self, dataloader, target_size=(64, 256), preprocessor=None):
+    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None,
+                 border_scale=1.4, device='cuda'):
         """
         Args:
             dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
             target_size: (height, width) for OCR input (used if preprocessor is None)
             preprocessor: Optional preprocessing function/processor (e.g., TrOCRProcessor)
-                         If provided, target_size is ignored
+                         If provided, applies after cropping
+            border_scale: Scale factor for border around plate (default 1.4, matches progressive_patch.py)
+            device: Device for kornia operations
         """
         self.images = []
         self.target_size = target_size
         self.preprocessor = preprocessor
+        self.border_scale = border_scale
+        self.device = device
 
         if preprocessor is not None:
-            print(f"Extracting images from dataloader with custom preprocessor...")
+            print(f"Extracting cropped plate regions with custom preprocessor...")
         else:
-            print(f"Extracting images from dataloader (target size: {target_size})...")
+            print(f"Extracting cropped plate regions (target size: {target_size})...")
+        print(f"Using border_scale={border_scale} (matches progressive_patch.py)")
         print("(No batching - iterating individual images due to variable sizes)")
 
         # Manually iterate without batching
         for i, batch in enumerate(dataloader):
             # Each batch is a dict with single image (batch_size=1)
-            prep_image = batch['prep_image']  # Shape: [1, 3, H, W] (single item in batch)
+            prep_image = batch['prep_image']  # Shape: [1, 3, H, W]
+            new_corners = batch['new_corners']  # Shape: [1, 4, 2] - corners in preprocessed image
 
-            # Extract the single image from batch dimension
-            img = prep_image[0]  # Shape: [3, H, W]
+            # Move to device for kornia operations
+            prep_image = prep_image.to(self.device)
+            new_corners = new_corners.to(self.device)
 
-            # Preprocess image
+            # Calculate border corners (1.4x scaled, matches progressive_patch.py)
+            plate_corners = new_corners[0]  # [4, 2]
+            center_x = plate_corners[:, 0].mean()
+            center_y = plate_corners[:, 1].mean()
+            center = torch.tensor([center_x, center_y], device=self.device)
+
+            border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
+            border_corners = border_corners.unsqueeze(0)  # [1, 4, 2]
+
+            # Crop and resize plate region using kornia (matches progressive_patch.py)
+            cropped_plate = K.crop_and_resize(
+                prep_image,
+                border_corners,
+                target_size  # (H, W)
+            )
+
+            # Extract single image and move to CPU
+            img = cropped_plate[0].cpu()  # Shape: [3, H, W]
+
+            # Preprocess image if processor provided
             if preprocessor is not None:
-                # Use custom preprocessor (returns pixel_values tensor)
                 # Convert tensor to PIL Image for processor
                 from PIL import Image
                 import numpy as np
 
                 # Convert [C, H, W] tensor to PIL Image
-                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
 
                 # Process with TrOCRProcessor (or other processor)
@@ -77,14 +106,13 @@ class OCRImageDataset(Dataset):
                 img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
                 self.images.append(img_processed)
             else:
-                # Simple resize
-                img_resized = T.Resize(self.target_size)(img)
-                self.images.append(img_resized)
+                # Already resized by crop_and_resize
+                self.images.append(img)
 
             if (i + 1) % 100 == 0:
                 print(f"  Processed {i + 1} images...")
 
-        print(f"Loaded {len(self.images)} images total")
+        print(f"Loaded {len(self.images)} cropped plates total")
 
     def __len__(self):
         return len(self.images)
@@ -277,9 +305,14 @@ def main():
         try:
             model, model_name = load_cct_model(device)
 
-            # Create CCT-specific dataset (64x256 for license plate OCR)
+            # Create CCT-specific dataset (64x128 for license plate OCR - matches progressive_patch.py)
             print(f"\nCreating dataset for {model_name}...")
-            cct_dataset = OCRImageDataset(train_loader, target_size=(64, 256))
+            cct_dataset = OCRImageDataset(
+                train_loader,
+                target_size=(64, 128),  # Matches progressive_patch.py ocr_input_shape
+                border_scale=1.4,  # Matches progressive_patch.py
+                device=device
+            )
             if args.limit_images > 0:
                 print(f"Limiting to {args.limit_images} images")
                 cct_dataset.images = cct_dataset.images[:args.limit_images]
@@ -297,9 +330,16 @@ def main():
         try:
             model, model_name, processor = load_trocr_model(device)
 
-            # Create TrOCR-specific dataset (uses processor for correct preprocessing)
+            # Create TrOCR-specific dataset
+            # First crop to reasonable size, then use processor for final preprocessing
             print(f"\nCreating dataset for {model_name}...")
-            trocr_dataset = OCRImageDataset(train_loader, preprocessor=processor)
+            trocr_dataset = OCRImageDataset(
+                train_loader,
+                target_size=(64, 128),  # Initial crop size before processor
+                preprocessor=processor,  # Processor will resize to model's expected size
+                border_scale=1.4,
+                device=device
+            )
             if args.limit_images > 0:
                 print(f"Limiting to {args.limit_images} images")
                 trocr_dataset.images = trocr_dataset.images[:args.limit_images]
