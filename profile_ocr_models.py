@@ -2,10 +2,9 @@
 """
 Profile OCR Models with RDM
 
-Profiles three OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
+Profiles two OCR models using the RDM (Representational Dissimilarity Matrix) profiler:
 1. CCT-XS-V1 Global (from progressive_patch.py)
-2. PaddlePaddle/en_PP-OCRv5_mobile_rec
-3. opencv/text_recognition_crnn
+2. Microsoft TrOCR Small Printed (vision encoder)
 
 Profiles every layer of each model over the entire training dataset from progressive_patch.py.
 Saves layer profiles to an output directory with clear labels.
@@ -19,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import onnx
 import onnx2torch
-from transformers import AutoModel
+from transformers import VisionEncoderDecoderModel, TrOCRProcessor
 import warnings
 from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
@@ -101,70 +100,40 @@ def load_cct_model(device='cuda'):
     return model, "cct_xs_v1_global"
 
 
-def load_paddleocr_model(device='cuda'):
+def load_trocr_model(device='cuda'):
     """
-    Load PaddlePaddle/en_PP-OCRv5_mobile_rec from HuggingFace.
+    Load microsoft/trocr-small-printed from HuggingFace.
+
+    This is a Vision Encoder-Decoder model for OCR. We profile the vision encoder
+    which is the part that processes images into representations.
 
     Returns:
-        model: PyTorch model
+        model: PyTorch model (vision encoder only)
         model_name: String identifier
     """
     print("\n" + "="*80)
-    print("Loading PaddlePaddle en_PP-OCRv5_mobile_rec Model")
+    print("Loading Microsoft TrOCR Small Printed Model")
     print("="*80)
 
     try:
-        model = AutoModel.from_pretrained(
-            "PaddlePaddle/en_PP-OCRv5_mobile_rec",
-            trust_remote_code=True
+        # Load full model
+        full_model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-small-printed"
         ).to(device)
-        model.eval()
-        print("Model loaded successfully")
-        return model, "paddle_ppocr_v5_mobile"
+        full_model.eval()
+
+        # Extract vision encoder (the part that processes images)
+        # The decoder is for text generation, not relevant for RDM profiling
+        model = full_model.encoder
+
+        print("Model loaded successfully (vision encoder)")
+        print(f"Encoder type: {type(model).__name__}")
+        return model, "trocr_small_printed_encoder"
     except Exception as e:
-        print(f"Error loading PaddleOCR model: {e}")
-        print("Attempting alternative loading method...")
-
-        # Alternative: Try loading with different config
-        try:
-            from paddleocr import PaddleOCR
-            # Note: This may require paddlepaddle installation
-            raise NotImplementedError(
-                "PaddleOCR model loading requires custom implementation. "
-                "Please install paddlepaddle and implement custom loader."
-            )
-        except ImportError:
-            raise RuntimeError(
-                "Failed to load PaddleOCR model. Please install required dependencies:\n"
-                "pip install paddlepaddle paddleocr"
-            )
-
-
-def load_opencv_crnn_model(device='cuda'):
-    """
-    Load opencv/text_recognition_crnn from HuggingFace.
-
-    Returns:
-        model: PyTorch model
-        model_name: String identifier
-    """
-    print("\n" + "="*80)
-    print("Loading OpenCV Text Recognition CRNN Model")
-    print("="*80)
-
-    try:
-        model = AutoModel.from_pretrained(
-            "opencv/text_recognition_crnn",
-            trust_remote_code=True
-        ).to(device)
-        model.eval()
-        print("Model loaded successfully")
-        return model, "opencv_crnn"
-    except Exception as e:
-        print(f"Error loading OpenCV CRNN model: {e}")
+        print(f"Error loading TrOCR model: {e}")
         raise RuntimeError(
-            f"Failed to load OpenCV CRNN model from HuggingFace. Error: {e}\n"
-            "The model may not be available or may require custom loading."
+            f"Failed to load TrOCR model from HuggingFace. Error: {e}\n"
+            "Please ensure transformers is installed: pip install transformers"
         )
 
 
@@ -225,8 +194,8 @@ def main():
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=16,
                         help='Batch size for profiling (default: 16)')
-    parser.add_argument('--models', type=str, default='cct,paddle,opencv',
-                        help='Comma-separated list of models to profile: cct,paddle,opencv (default: all)')
+    parser.add_argument('--models', type=str, default='cct,trocr',
+                        help='Comma-separated list of models to profile: cct,trocr (default: all)')
     parser.add_argument('--limit-images', type=int, default=0,
                         help='Limit number of images to profile (0=all, default: 0)')
     args = parser.parse_args()
@@ -296,27 +265,15 @@ def main():
             import traceback
             traceback.print_exc()
 
-    if 'paddle' in models_to_profile:
+    if 'trocr' in models_to_profile:
         try:
-            model, model_name = load_paddleocr_model(device)
+            model, model_name = load_trocr_model(device)
             rdms = profile_model(model, model_name, ocr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
             del model  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling PaddleOCR model: {e}")
-            import traceback
-            traceback.print_exc()
-
-    if 'opencv' in models_to_profile:
-        try:
-            model, model_name = load_opencv_crnn_model(device)
-            rdms = profile_model(model, model_name, ocr_dataset, args.output_dir, device, args.batch_size)
-            results[model_name] = rdms
-            del model  # Free memory
-            torch.cuda.empty_cache() if device == 'cuda' else None
-        except Exception as e:
-            print(f"\nERROR profiling OpenCV CRNN model: {e}")
+            print(f"\nERROR profiling TrOCR model: {e}")
             import traceback
             traceback.print_exc()
 
