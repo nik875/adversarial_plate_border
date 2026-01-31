@@ -653,89 +653,138 @@ class ConditionalPatchTrainer:
 
     def train(self, num_epochs: int = 100, batch_size: int = 16):
         """Train conditional patch generator"""
+        import datetime
+
+        # Create unique run ID based on timestamp
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
         print("\n" + "="*80)
         print("CONDITIONAL PATCH TRAINING")
         print("="*80)
+        print(f"Run ID: {run_id}")
         print(f"Epochs: {num_epochs}")
         print(f"Batch size: {batch_size}")
         print(f"Learning rate: {self.learning_rate}")
         print()
 
-        for epoch in range(num_epochs):
-            self.encoder.train()
-            self.generator.train()
+        # Track full training history
+        training_history = {
+            'run_id': run_id,
+            'num_epochs': num_epochs,
+            'batch_size': batch_size,
+            'learning_rate': self.learning_rate,
+            'epochs': []
+        }
 
-            epoch_losses = []
-            epoch_target_cka = []
-            epoch_prior_cka = []
+        try:
+            for epoch in range(num_epochs):
+                self.encoder.train()
+                self.generator.train()
 
-            # Manually accumulate batches
-            accumulated_batches = []
-            accumulated_indices = []
+                epoch_losses = []
+                epoch_target_cka = []
+                epoch_prior_cka = []
 
-            pbar = tqdm(enumerate(self.train_loader), desc=f"Epoch {epoch+1}/{num_epochs}",
-                       total=len(self.train_loader))
+                # Manually accumulate batches
+                accumulated_batches = []
+                accumulated_indices = []
 
-            for idx, batch in pbar:
-                # Extract single image from batch (batch_size=1 from dataloader)
-                single_batch = {k: v[0] for k, v in batch.items()}
-                accumulated_batches.append(single_batch)
-                accumulated_indices.append(idx)
+                pbar = tqdm(enumerate(self.train_loader), desc=f"Epoch {epoch+1}/{num_epochs}",
+                           total=len(self.train_loader))
 
-                # Process when we have enough samples
-                if len(accumulated_batches) == batch_size or idx == len(self.train_loader) - 1:
-                    if len(accumulated_batches) == 0:
-                        continue
+                for idx, batch in pbar:
+                    # Extract single image from batch (batch_size=1 from dataloader)
+                    single_batch = {k: v[0] for k, v in batch.items()}
+                    accumulated_batches.append(single_batch)
+                    accumulated_indices.append(idx)
 
-                    # Sample conditions
-                    conditions = self.sample_conditions(len(accumulated_batches),
-                                                       accumulated_indices)
+                    # Process when we have enough samples
+                    if len(accumulated_batches) == batch_size or idx == len(self.train_loader) - 1:
+                        if len(accumulated_batches) == 0:
+                            continue
 
-                    # Compute loss (pass as list of individual batches, not merged)
-                    loss, stats = self.compute_loss(accumulated_batches, conditions)
+                        # Sample conditions
+                        conditions = self.sample_conditions(len(accumulated_batches),
+                                                           accumulated_indices)
 
-                    # Backward
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
+                        # Compute loss (pass as list of individual batches, not merged)
+                        loss, stats = self.compute_loss(accumulated_batches, conditions)
 
-                    # Update progress bar
-                    pbar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'target_sim': f"{stats['target_cka']:.3f}",
-                        'prior_sim': f"{stats['prior_cka']:.3f}"
-                    })
+                        # Backward
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
 
-                    # Track stats
-                    if loss.item() > 0:  # Only track if loss was computed
-                        epoch_losses.append(loss.item())
-                        epoch_target_cka.append(stats['target_cka'])
-                        epoch_prior_cka.append(stats['prior_cka'])
+                        # Update progress bar
+                        pbar.set_postfix({
+                            'loss': f"{loss.item():.4f}",
+                            'target_sim': f"{stats['target_cka']:.3f}",
+                            'prior_sim': f"{stats['prior_cka']:.3f}"
+                        })
 
-                    # Clear accumulated
-                    accumulated_batches = []
-                    accumulated_indices = []
+                        # Track stats
+                        if loss.item() > 0:  # Only track if loss was computed
+                            epoch_losses.append(loss.item())
+                            epoch_target_cka.append(stats['target_cka'])
+                            epoch_prior_cka.append(stats['prior_cka'])
 
-            # Epoch summary
-            print(f"Epoch {epoch+1} Summary:")
-            print(f"  Loss: {np.mean(epoch_losses):.4f}")
-            print(f"  Target Cosine Similarity: {np.mean(epoch_target_cka):.3f}")
-            print(f"  Prior Cosine Similarity: {np.mean(epoch_prior_cka):.3f}")
-            print()
+                        # Clear accumulated
+                        accumulated_batches = []
+                        accumulated_indices = []
 
-            # Save checkpoint every 10 epochs
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f"conditional_patch_epoch{epoch+1}.pt")
+                # Epoch summary
+                mean_loss = np.mean(epoch_losses) if epoch_losses else 0
+                mean_target_sim = np.mean(epoch_target_cka) if epoch_target_cka else 0
+                mean_prior_sim = np.mean(epoch_prior_cka) if epoch_prior_cka else 0
 
-    def save_checkpoint(self, filename: str):
-        """Save model checkpoint"""
+                print(f"Epoch {epoch+1} Summary:")
+                print(f"  Loss: {mean_loss:.4f}")
+                print(f"  Target Cosine Similarity: {mean_target_sim:.3f}")
+                print(f"  Prior Cosine Similarity: {mean_prior_sim:.3f}")
+                print()
+
+                # Save to training history
+                training_history['epochs'].append({
+                    'epoch': epoch + 1,
+                    'loss': float(mean_loss),
+                    'target_sim': float(mean_target_sim),
+                    'prior_sim': float(mean_prior_sim),
+                    'num_batches': len(epoch_losses)
+                })
+
+                # Save checkpoint every epoch
+                self.save_checkpoint(epoch + 1, run_id, training_history)
+
+        except KeyboardInterrupt:
+            print("\n\nTraining interrupted by user")
+            # Save history even on interrupt
+            self.save_training_history(run_id, training_history)
+            raise
+
+        # Final save
+        self.save_training_history(run_id, training_history)
+        print(f"\nTraining complete! Run ID: {run_id}")
+
+    def save_checkpoint(self, epoch: int, run_id: str, training_history: dict):
+        """Save model checkpoint and training history"""
         checkpoint = {
+            'epoch': epoch,
+            'run_id': run_id,
             'encoder': self.encoder.state_dict(),
             'generator': self.generator.state_dict(),
             'optimizer': self.optimizer.state_dict(),
         }
-        torch.save(checkpoint, filename)
-        print(f"Saved checkpoint: {filename}")
+        checkpoint_path = f"conditional_patch_{run_id}_epoch{epoch}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint: {checkpoint_path}")
+
+    def save_training_history(self, run_id: str, training_history: dict):
+        """Save full training history to JSON"""
+        history_path = f"training_history_{run_id}.json"
+        import json
+        with open(history_path, 'w') as f:
+            json.dump(training_history, f, indent=2)
+        print(f"Saved training history: {history_path}")
 
 
 def main():
