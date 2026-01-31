@@ -129,13 +129,18 @@ def linear_cka(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch
     CKA(X, Y) = ||X^T Y||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
 
     Args:
-        X: [n_samples, n_features_x]
-        Y: [n_samples, n_features_y]
+        X: [n_samples, n_features_x] (can be on any device)
+        Y: [n_samples, n_features_y] (can be on any device)
         epsilon: Small value for numerical stability
 
     Returns:
-        cka: Scalar similarity in [0, 1]
+        cka: Scalar similarity in [0, 1] (on CPU)
     """
+    # Move to CPU for computation (not part of gradient graph)
+    device = X.device
+    X = X.cpu().float()
+    Y = Y.cpu().float()
+
     # Center the features
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
@@ -148,7 +153,7 @@ def linear_cka(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch
     # CKA formula
     cka = (XTY ** 2) / (XTX * YTY + epsilon)
 
-    return cka
+    return cka.to(device)  # Return on original device
 
 
 def load_layer_profiles(profile_dir: str = "layer_profiles") -> Dict:
@@ -396,9 +401,9 @@ class ConditionalPatchTrainer:
             def hook(module, input, output):
                 # Store activation, flatten to [batch, features]
                 if isinstance(output, torch.Tensor):
-                    act = output.detach()
+                    act = output.detach().cpu()  # Move to CPU immediately to save VRAM
                 elif isinstance(output, tuple):
-                    act = output[0].detach()
+                    act = output[0].detach().cpu()
                 else:
                     return
 
@@ -426,9 +431,13 @@ class ConditionalPatchTrainer:
         with torch.no_grad():
             _ = model(images)
 
-        # Remove hooks
+        # Remove hooks immediately
         for handle in handles:
             handle.remove()
+
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return activations
 
@@ -490,10 +499,17 @@ class ConditionalPatchTrainer:
             layers_to_extract = [target_layer_name] + prior_layer_names
 
             try:
-                clean_acts = self.extract_activations(ocr_model, cropped_clean,
-                                                      layers_to_extract, input_format)
-                patched_acts = self.extract_activations(ocr_model, cropped_patched,
-                                                        layers_to_extract, input_format)
+                # Extract activations with explicit memory management
+                with torch.cuda.empty_cache():  # Clear cache before extraction
+                    clean_acts = self.extract_activations(ocr_model, cropped_clean,
+                                                          layers_to_extract, input_format)
+                    patched_acts = self.extract_activations(ocr_model, cropped_patched,
+                                                            layers_to_extract, input_format)
+            except RuntimeError as e:
+                # Skip this sample if OOM or other runtime error
+                if "out of memory" in str(e).lower():
+                    print(f"OOM on sample {i}, skipping")
+                continue
             except Exception as e:
                 # Skip this sample if extraction fails
                 continue
