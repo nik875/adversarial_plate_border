@@ -607,7 +607,6 @@ class ConditionalPatchTrainer:
             except Exception as e:
                 # Skip this sample if extraction fails
                 print(f"  Sample {i} ({model_name}) extraction failed: {e}")
-                print(f"    Clean border shape: {clean_border.shape}, Patched border shape: {patched_border.shape}")
                 traceback.print_exc()
                 continue
 
