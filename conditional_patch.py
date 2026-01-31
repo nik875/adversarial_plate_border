@@ -601,9 +601,6 @@ class ConditionalPatchTrainer:
                                                         layers_to_extract, input_format, processor, model_name)
                 mem_after_patched = torch.cuda.memory_allocated() / 1e9 if self.device == 'cuda' else 0
 
-                if i == 0:  # Print memory info for first sample only
-                    print(f"  Sample {i}: {mem_before:.2f}GB → {mem_after_clean:.2f}GB (clean) → {mem_after_patched:.2f}GB (patched)")
-
             except Exception as e:
                 # Skip this sample if extraction fails
                 print(f"  Sample {i} ({model_name}) extraction failed: {e}")
@@ -702,18 +699,18 @@ class ConditionalPatchTrainer:
                     loss.backward()
                     self.optimizer.step()
 
+                    # Update progress bar
+                    pbar.set_postfix({
+                        'loss': f"{loss.item():.4f}",
+                        'target_sim': f"{stats['target_cka']:.3f}",
+                        'prior_sim': f"{stats['prior_cka']:.3f}"
+                    })
+
                     # Track stats
                     if loss.item() > 0:  # Only track if loss was computed
                         epoch_losses.append(loss.item())
                         epoch_target_cka.append(stats['target_cka'])
                         epoch_prior_cka.append(stats['prior_cka'])
-
-                        # Update progress
-                        pbar.set_postfix({
-                            'loss': f"{loss.item():.4f}",
-                            'target_sim': f"{stats['target_cka']:.3f}",
-                            'prior_sim': f"{stats['prior_cka']:.3f}"
-                        })
 
                     # Clear accumulated
                     accumulated_batches = []
