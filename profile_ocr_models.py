@@ -34,93 +34,43 @@ import h5py
 warnings.filterwarnings("ignore")
 
 
-class OCRImageDataset(Dataset):
+class CroppedPlateDataset(Dataset):
     """
-    Wrapper to extract cropped license plate regions from AdversarialPatchDataset.
-
-    This extracts the license plate region using corners (just like progressive_patch.py)
-    and prepares them for OCR model profiling.
-
-    Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
-    returns variable-sized images that can't be stacked.
+    Loads and crops license plate regions once from the dataset.
+    Stores raw cropped plates that can be preprocessed differently per model.
     """
-    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None,
-                 device='cuda', channels_last=False, scale_to_255=False):
+    def __init__(self, dataloader, target_size=(64, 128), device='cuda'):
         """
         Args:
             dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
-            target_size: (height, width) for OCR input (used if preprocessor is None)
-            preprocessor: Optional preprocessing function/processor (e.g., TrOCRProcessor)
-                         If provided, applies after cropping
+            target_size: (height, width) for cropping
             device: Device for kornia operations
-            channels_last: If True, output [H, W, C] instead of [C, H, W] (for CCT model)
-            scale_to_255: If True, scale values from [0,1] to [0,255] (for CCT model)
         """
         self.images = []
         self.target_size = target_size
-        self.preprocessor = preprocessor
         self.device = device
-        self.channels_last = channels_last
-        self.scale_to_255 = scale_to_255
 
-        if preprocessor is not None:
-            print(f"Extracting cropped plate regions with custom preprocessor...")
-        else:
-            print(f"Extracting cropped plate regions (target size: {target_size})...")
-            if channels_last:
-                print(f"  Format: [H, W, C] (channels last)")
-            if scale_to_255:
-                print(f"  Scaling: [0, 1] -> [0, 255]")
+        print(f"Extracting cropped plate regions (target size: {target_size})...")
         print("(No batching - iterating individual images due to variable sizes)")
 
         # Manually iterate without batching
         for i, batch in enumerate(dataloader):
-            # Each batch is a dict with single image (batch_size=1)
-            prep_image = batch['prep_image']  # Shape: [1, 3, H, W]
-            new_corners = batch['new_corners']  # Shape: [1, 4, 2] - corners in preprocessed image
+            prep_image = batch['prep_image']  # [1, 3, H, W]
+            new_corners = batch['new_corners']  # [1, 4, 2]
 
-            # Move to device for kornia operations
             prep_image = prep_image.to(self.device)
             new_corners = new_corners.to(self.device)
-
-            # Use plate corners directly (no border scaling)
-            plate_corners = new_corners  # [1, 4, 2]
 
             # Crop and resize plate region using kornia
             cropped_plate = K.crop_and_resize(
                 prep_image,
-                plate_corners,
-                target_size  # (H, W)
+                new_corners,
+                target_size
             )
 
-            # Extract single image and move to CPU
+            # Move to CPU and store: [3, H, W] in [0, 1] range
             img = cropped_plate[0].cpu()  # Shape: [3, H, W]
-
-            # Preprocess image if processor provided
-            if preprocessor is not None:
-                # Convert tensor to PIL Image for processor
-                from PIL import Image
-                import numpy as np
-
-                # Convert [C, H, W] tensor to PIL Image
-                img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                pil_img = Image.fromarray(img_np)
-
-                # Process with TrOCRProcessor (or other processor)
-                processed = preprocessor(images=pil_img, return_tensors="pt")
-                img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
-                self.images.append(img_processed)
-            else:
-                # Apply format transformations for specific models
-                if channels_last:
-                    # CCT model expects [H, W, C] format
-                    img = img.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
-
-                if scale_to_255:
-                    # CCT model expects [0, 255] range
-                    img = img * 255
-
-                self.images.append(img)
+            self.images.append(img)
 
             if (i + 1) % 100 == 0:
                 print(f"  Processed {i + 1} images...")
@@ -132,6 +82,54 @@ class OCRImageDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.images[idx]
+
+
+class OCRImageDataset(Dataset):
+    """
+    Applies model-specific preprocessing to raw cropped plates.
+    Wraps a CroppedPlateDataset with different format/scale options.
+    """
+    def __init__(self, cropped_dataset, preprocessor=None,
+                 channels_last=False, scale_to_255=False):
+        """
+        Args:
+            cropped_dataset: CroppedPlateDataset with raw plates
+            preprocessor: Optional TrOCRProcessor
+            channels_last: If True, output [H, W, C] instead of [C, H, W]
+            scale_to_255: If True, scale values from [0,1] to [0,255]
+        """
+        self.cropped_dataset = cropped_dataset
+        self.preprocessor = preprocessor
+        self.channels_last = channels_last
+        self.scale_to_255 = scale_to_255
+
+    def __len__(self):
+        return len(self.cropped_dataset)
+
+    def __getitem__(self, idx):
+        img = self.cropped_dataset[idx].clone()  # [3, H, W] in [0, 1]
+
+        # Apply processor if provided (TrOCR)
+        if self.preprocessor is not None:
+            from PIL import Image
+            import numpy as np
+
+            # Convert to PIL Image
+            img_np = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_np)
+
+            # Process with TrOCRProcessor
+            processed = self.preprocessor(images=pil_img, return_tensors="pt")
+            return processed.pixel_values.squeeze(0)
+
+        # Apply format transformations for other models
+        if self.channels_last:
+            img = img.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+
+        if self.scale_to_255:
+            img = img * 255  # [0, 1] -> [0, 255]
+
+        return img
 
 
 def load_cct_model(device='cuda'):
@@ -561,6 +559,18 @@ def main():
 
     print(f"Loaded dataloader with {len(train_loader)} images\n")
 
+    # Load and crop plates once (done at 64x128 which both models use)
+    print("Loading and cropping license plate regions (done once for all models)...")
+    cropped_plates = CroppedPlateDataset(
+        train_loader,
+        target_size=(64, 128),  # Standard size for both CCT and TrOCR
+        device=device
+    )
+
+    if args.limit_images > 0:
+        print(f"Limiting to {args.limit_images} images")
+        cropped_plates.images = cropped_plates.images[:args.limit_images]
+
     # Profile each requested model
     # ViTSTR is profiled FIRST to catch errors early
     results = {}
@@ -569,19 +579,16 @@ def main():
         try:
             model, model_name = load_vitstr_model(device)
 
-            # Create ViTSTR dataset - use standard PyTorch format [C, H, W]
-            # ViTSTR expects normalized images in [0, 1] range
-            print(f"\nCreating dataset for {model_name}...")
+            # Create ViTSTR dataset wrapper with model-specific preprocessing
+            # ViTSTR needs 32x128, so we'll resize on-the-fly
+            print(f"\nCreating preprocessing wrapper for {model_name}...")
             vitstr_dataset = OCRImageDataset(
-                train_loader,
-                target_size=(32, 128),  # ViTSTR input size (H=32, W=128)
-                device=device,
-                channels_last=False,  # Use [C, H, W] format (standard PyTorch)
+                cropped_plates,
+                preprocessor=None,
+                channels_last=False,  # Use [C, H, W] format
                 scale_to_255=False    # Keep [0, 1] range
             )
-            if args.limit_images > 0:
-                print(f"Limiting to {args.limit_images} images")
-                vitstr_dataset.images = vitstr_dataset.images[:args.limit_images]
+            # Note: ViTSTR resizing is done in profile_model's extract_activations
 
             rdms = profile_model(model, model_name, vitstr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
@@ -596,19 +603,14 @@ def main():
         try:
             model, model_name = load_cct_model(device)
 
-            # Create CCT-specific dataset (64x128 for license plate OCR)
-            # CCT model expects [H, W, C] format and [0, 255] range (matches progressive_patch.py)
-            print(f"\nCreating dataset for {model_name}...")
+            # Create CCT-specific preprocessing wrapper
+            print(f"\nCreating preprocessing wrapper for {model_name}...")
             cct_dataset = OCRImageDataset(
-                train_loader,
-                target_size=(64, 128),  # Matches progressive_patch.py ocr_input_shape
-                device=device,
-                channels_last=True,  # CCT expects [H, W, C] not [C, H, W]
-                scale_to_255=True    # CCT expects [0, 255] not [0, 1]
+                cropped_plates,
+                preprocessor=None,
+                channels_last=True,  # CCT expects [H, W, C]
+                scale_to_255=True    # CCT expects [0, 255]
             )
-            if args.limit_images > 0:
-                print(f"Limiting to {args.limit_images} images")
-                cct_dataset.images = cct_dataset.images[:args.limit_images]
 
             rdms = profile_model(model, model_name, cct_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
@@ -623,18 +625,14 @@ def main():
         try:
             model, model_name, processor = load_trocr_model(device)
 
-            # Create TrOCR-specific dataset
-            # First crop to plate region, then use processor for final preprocessing
-            print(f"\nCreating dataset for {model_name}...")
+            # Create TrOCR-specific preprocessing wrapper
+            print(f"\nCreating preprocessing wrapper for {model_name}...")
             trocr_dataset = OCRImageDataset(
-                train_loader,
-                target_size=(64, 128),  # Initial crop size before processor
-                preprocessor=processor,  # Processor will resize to model's expected size
-                device=device
+                cropped_plates,
+                preprocessor=processor,
+                channels_last=False,
+                scale_to_255=False
             )
-            if args.limit_images > 0:
-                print(f"Limiting to {args.limit_images} images")
-                trocr_dataset.images = trocr_dataset.images[:args.limit_images]
 
             rdms = profile_model(model, model_name, trocr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms

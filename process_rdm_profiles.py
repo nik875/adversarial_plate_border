@@ -17,6 +17,7 @@ import h5py
 from pathlib import Path
 from tqdm import tqdm
 import json
+import shutil
 
 
 def double_center_distance_matrix(D: np.ndarray) -> np.ndarray:
@@ -223,6 +224,7 @@ def main():
     # Process each model
     for model_dir in rdm_files:
         rdm_file = model_dir / f"{model_dir.name}_rdms.h5"
+        stats_file = model_dir / f"{model_dir.name}_activation_statistics.h5"
 
         if not rdm_file.exists():
             print(f"RDM file not found: {rdm_file}")
@@ -230,6 +232,15 @@ def main():
 
         try:
             process_rdm_file(rdm_file, output_dir, k=8)
+
+            # Copy activation statistics if available
+            if stats_file.exists():
+                output_stats_file = output_dir / f"{model_dir.name}_activation_statistics.h5"
+                shutil.copy2(stats_file, output_stats_file)
+                print(f"Copied activation statistics: {output_stats_file}")
+            else:
+                print(f"Activation statistics not found: {stats_file}")
+
         except Exception as e:
             print(f"ERROR processing {model_dir.name}: {e}")
             import traceback
