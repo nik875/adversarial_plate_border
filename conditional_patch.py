@@ -223,19 +223,19 @@ class DiffusionPatchGenerator(nn.Module):
 
 
 def load_activation_statistics(model_name: str, layer_name: str,
-                              stats_dir: str = "rdm_profiles") -> torch.Tensor:
+                              stats_dir: str = "layer_profiles") -> torch.Tensor:
     """
     Load activation statistics (std per neuron) for a specific layer.
 
     Args:
         model_name: Name of the model (e.g., 'vitstr_small')
         layer_name: Name of the layer (e.g., 'encoder.blocks.0.norm1')
-        stats_dir: Directory containing activation statistics HDF5 files
+        stats_dir: Directory containing activation statistics HDF5 files (default: layer_profiles)
 
     Returns:
         std: Tensor of shape [n_features] with std for each neuron
     """
-    stats_path = Path(stats_dir) / model_name / f"{model_name}_activation_statistics.h5"
+    stats_path = Path(stats_dir) / f"{model_name}_activation_statistics.h5"
 
     if not stats_path.exists():
         # Return None if file doesn't exist - will use default value
