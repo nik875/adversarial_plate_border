@@ -20,7 +20,7 @@ from torch.utils.data import Dataset
 import onnx
 import onnx2torch
 from transformers import VisionEncoderDecoderModel, TrOCRProcessor
-from huggingface_hub import hf_hub_download
+import urllib.request
 import warnings
 from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
@@ -163,7 +163,7 @@ def load_crnn_model(device='cuda'):
     """
     Load text_recognition_CRNN_EN_2023feb_fp16.onnx from HuggingFace.
 
-    Downloads from opencv/text_recognition_crnn repo and converts to PyTorch.
+    Downloads directly from URL and converts to PyTorch.
 
     Returns:
         model: PyTorch model
@@ -174,17 +174,23 @@ def load_crnn_model(device='cuda'):
     print("="*80)
 
     try:
-        # Download ONNX model from HuggingFace Hub
-        print("Downloading CRNN model from HuggingFace...")
-        onnx_path = hf_hub_download(
-            repo_id="opencv/text_recognition_crnn",
-            filename="models/text_recognition_crnn/text_recognition_CRNN_EN_2023feb_fp16.onnx"
-        )
-        print(f"Downloaded to: {onnx_path}")
+        # Download ONNX model directly from URL
+        model_url = "https://huggingface.co/opencv/opencv_zoo/resolve/main/models/text_recognition_crnn/text_recognition_CRNN_EN_2023feb_fp16.onnx"
+        cache_dir = Path.home() / ".cache/opencv_crnn"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        onnx_path = cache_dir / "text_recognition_CRNN_EN_2023feb_fp16.onnx"
+
+        # Download if not cached
+        if not onnx_path.exists():
+            print(f"Downloading CRNN model from {model_url}...")
+            urllib.request.urlretrieve(model_url, onnx_path)
+            print(f"Downloaded to: {onnx_path}")
+        else:
+            print(f"Using cached model: {onnx_path}")
 
         # Load and convert ONNX model
         print("Converting ONNX to PyTorch...")
-        onnx_model = onnx.load(onnx_path)
+        onnx_model = onnx.load(str(onnx_path))
         model = onnx2torch.convert(onnx_model).to(device)
         model.eval()
 
@@ -193,8 +199,7 @@ def load_crnn_model(device='cuda'):
     except Exception as e:
         print(f"Error loading CRNN model: {e}")
         raise RuntimeError(
-            f"Failed to load CRNN model from HuggingFace. Error: {e}\n"
-            "Make sure huggingface_hub is installed: pip install huggingface_hub"
+            f"Failed to load CRNN model. Error: {e}"
         )
 
 
@@ -341,10 +346,11 @@ def main():
     ])
 
     # Must use batch_size=1 because images have variable sizes and can't be stacked
+    # preload=False to reduce initial overhead (images loaded on-demand)
     train_loader, val_loader = create_dataloaders(
         args.csv_path,
         transform=transform,
-        preload=True,
+        preload=False,  # Don't preload - reduces initial overhead
         batch_size=1,  # MUST be 1 - images have different sizes, can't batch
         n_jobs=0,
         use_all_for_train=True
