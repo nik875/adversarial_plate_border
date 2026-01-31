@@ -38,7 +38,8 @@ class OCRImageDataset(Dataset):
     Note: Uses manual iteration (no batching) because progressive_patch.py dataloader
     returns variable-sized images that can't be stacked.
     """
-    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None, device='cuda'):
+    def __init__(self, dataloader, target_size=(64, 128), preprocessor=None,
+                 device='cuda', channels_last=False, scale_to_255=False):
         """
         Args:
             dataloader: DataLoader from progressive_patch.py dataset (batch_size must be 1)
@@ -46,16 +47,24 @@ class OCRImageDataset(Dataset):
             preprocessor: Optional preprocessing function/processor (e.g., TrOCRProcessor)
                          If provided, applies after cropping
             device: Device for kornia operations
+            channels_last: If True, output [H, W, C] instead of [C, H, W] (for CCT model)
+            scale_to_255: If True, scale values from [0,1] to [0,255] (for CCT model)
         """
         self.images = []
         self.target_size = target_size
         self.preprocessor = preprocessor
         self.device = device
+        self.channels_last = channels_last
+        self.scale_to_255 = scale_to_255
 
         if preprocessor is not None:
             print(f"Extracting cropped plate regions with custom preprocessor...")
         else:
             print(f"Extracting cropped plate regions (target size: {target_size})...")
+            if channels_last:
+                print(f"  Format: [H, W, C] (channels last)")
+            if scale_to_255:
+                print(f"  Scaling: [0, 1] -> [0, 255]")
         print("(No batching - iterating individual images due to variable sizes)")
 
         # Manually iterate without batching
@@ -96,7 +105,15 @@ class OCRImageDataset(Dataset):
                 img_processed = processed.pixel_values.squeeze(0)  # Remove batch dim
                 self.images.append(img_processed)
             else:
-                # Already resized by crop_and_resize
+                # Apply format transformations for specific models
+                if channels_last:
+                    # CCT model expects [H, W, C] format
+                    img = img.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+
+                if scale_to_255:
+                    # CCT model expects [0, 255] range
+                    img = img * 255
+
                 self.images.append(img)
 
             if (i + 1) % 100 == 0:
@@ -296,11 +313,14 @@ def main():
             model, model_name = load_cct_model(device)
 
             # Create CCT-specific dataset (64x128 for license plate OCR)
+            # CCT model expects [H, W, C] format and [0, 255] range (matches progressive_patch.py)
             print(f"\nCreating dataset for {model_name}...")
             cct_dataset = OCRImageDataset(
                 train_loader,
                 target_size=(64, 128),  # Matches progressive_patch.py ocr_input_shape
-                device=device
+                device=device,
+                channels_last=True,  # CCT expects [H, W, C] not [C, H, W]
+                scale_to_255=True    # CCT expects [0, 255] not [0, 1]
             )
             if args.limit_images > 0:
                 print(f"Limiting to {args.limit_images} images")
