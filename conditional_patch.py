@@ -663,8 +663,8 @@ class ConditionalPatchTrainer:
                 mean_prior_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
 
             # Sample loss: minimize target similarity, maximize prior similarity
-            # Loss = target_sim - mean_prior_sim
-            sample_loss = target_sim - mean_prior_sim
+            # Loss = target_sim - 0.5 * mean_prior_sim (halved prior weight)
+            sample_loss = target_sim - 0.5 * mean_prior_sim
             total_cka_loss = total_cka_loss + sample_loss
             valid_samples += 1
 
