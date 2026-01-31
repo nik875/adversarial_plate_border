@@ -29,6 +29,7 @@ import kornia.geometry as K
 from diffusers import AutoencoderKL
 
 from dataset import create_dataloaders
+import h5py
 
 
 PATCH_HEIGHT = 256
@@ -221,35 +222,89 @@ class DiffusionPatchGenerator(nn.Module):
         return patches
 
 
-def compute_cosine_similarity(X: torch.Tensor, Y: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+def load_activation_statistics(model_name: str, layer_name: str,
+                              stats_dir: str = "rdm_profiles") -> torch.Tensor:
     """
-    Compute mean cosine similarity between two activation matrices.
-
-    Handles variable-sized activations by truncating to common dimension.
+    Load activation statistics (std per neuron) for a specific layer.
 
     Args:
-        X: [n_samples, n_features_x]
-        Y: [n_samples, n_features_y]
+        model_name: Name of the model (e.g., 'vitstr_small')
+        layer_name: Name of the layer (e.g., 'encoder.blocks.0.norm1')
+        stats_dir: Directory containing activation statistics HDF5 files
+
+    Returns:
+        std: Tensor of shape [n_features] with std for each neuron
+    """
+    stats_path = Path(stats_dir) / model_name / f"{model_name}_activation_statistics.h5"
+
+    if not stats_path.exists():
+        # Return None if file doesn't exist - will use default value
+        print(f"Warning: Activation statistics not found at {stats_path}")
+        return None
+
+    try:
+        with h5py.File(stats_path, 'r') as f:
+            if 'activation_statistics' not in f:
+                return None
+
+            stats_group = f['activation_statistics']
+            if layer_name not in stats_group:
+                return None
+
+            layer_group = stats_group[layer_name]
+            std_array = np.array(layer_group['std'][:])
+            std_tensor = torch.from_numpy(std_array).float()
+
+            return std_tensor
+    except Exception as e:
+        print(f"Error loading activation statistics: {e}")
+        return None
+
+
+def compute_normalized_delta(X: torch.Tensor, Y: torch.Tensor,
+                            layer_std: torch.Tensor = None,
+                            epsilon: float = 1e-8) -> torch.Tensor:
+    """
+    Compute normalized delta between two activation matrices.
+
+    For each neuron: (|activation_clean - activation_patched|) / std_neuron
+    Then take the mean across all neurons.
+
+    Args:
+        X: Clean activations [n_samples, n_features_x]
+        Y: Patched activations [n_samples, n_features_y]
+        layer_std: Standard deviation per neuron [n_features]. If None, uses std=1.0
         epsilon: Small value for numerical stability
 
     Returns:
-        similarity: Scalar cosine similarity in [0, 1]
+        similarity: Scalar in [0, inf) - lower is more similar
     """
     # Flatten to 2D
     X_flat = X.reshape(X.shape[0], -1)
     Y_flat = Y.reshape(Y.shape[0], -1)
 
-    # Truncate to common dimension (handles different activation sizes)
+    # Truncate to common dimension
     min_features = min(X_flat.shape[1], Y_flat.shape[1])
     X_flat = X_flat[:, :min_features]
     Y_flat = Y_flat[:, :min_features]
 
-    # Normalize vectors
-    X_norm = F.normalize(X_flat, p=2, dim=1)
-    Y_norm = F.normalize(Y_flat, p=2, dim=1)
+    # Compute absolute delta
+    delta = torch.abs(X_flat - Y_flat)  # [n_samples, n_features]
 
-    # Cosine similarity: mean of dot products between normalized vectors
-    similarity = (X_norm * Y_norm).sum(dim=1).mean()
+    # Normalize by neuron-wise std
+    if layer_std is not None:
+        # Ensure std is on the same device
+        layer_std = layer_std.to(delta.device)
+        # Use only the std values for the features we have
+        layer_std = layer_std[:min_features]
+        # Normalize delta by std
+        normalized_delta = delta / (layer_std.unsqueeze(0) + epsilon)  # [n_samples, n_features]
+    else:
+        # If no std provided, just use the raw delta
+        normalized_delta = delta
+
+    # Mean across all neurons and samples
+    similarity = normalized_delta.mean()
 
     return similarity
 
@@ -366,6 +421,18 @@ class ConditionalPatchTrainer:
         print(f"Loaded profiles for {len(self.layer_profiles)} models:")
         for model_name, profile_data in self.layer_profiles.items():
             print(f"  - {model_name}: {profile_data['n_layers']} layers")
+
+        # Load activation statistics for normalized delta computation
+        print("\nLoading activation statistics...")
+        self.activation_stats = {}
+        for model_name in self.layer_profiles.keys():
+            all_layer_names = self.layer_profiles[model_name]['layer_names']
+            self.activation_stats[model_name] = {}
+            for layer_name in all_layer_names:
+                layer_std = load_activation_statistics(model_name, layer_name, profile_dir)
+                if layer_std is not None:
+                    self.activation_stats[model_name][layer_name] = layer_std
+        print(f"Loaded activation statistics for {len(self.activation_stats)} models")
 
         # Load OCR models
         print("\nLoading OCR models...")
@@ -715,21 +782,33 @@ class ConditionalPatchTrainer:
                 traceback.print_exc()
                 continue
 
-            # Compute cosine similarity for target layer
+            # Compute normalized delta for target layer
             if target_layer_name in clean_acts and target_layer_name in patched_acts:
-                target_sim = compute_cosine_similarity(clean_acts[target_layer_name],
-                                                       patched_acts[target_layer_name])
+                # Get activation statistics if available
+                target_std = None
+                if model_name in self.activation_stats and target_layer_name in self.activation_stats[model_name]:
+                    target_std = self.activation_stats[model_name][target_layer_name].to(self.device)
+
+                target_sim = compute_normalized_delta(clean_acts[target_layer_name],
+                                                      patched_acts[target_layer_name],
+                                                      layer_std=target_std)
                 stats['target_cka'].append(target_sim.item())
             else:
                 target_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            # Compute cosine similarity for prior layers (if any)
+            # Compute normalized delta for prior layers (if any)
             if prior_layer_names:
                 prior_sims = []
                 for prior_name in prior_layer_names:
                     if prior_name in clean_acts and prior_name in patched_acts:
-                        prior_sim = compute_cosine_similarity(clean_acts[prior_name],
-                                                              patched_acts[prior_name])
+                        # Get activation statistics if available
+                        prior_std = None
+                        if model_name in self.activation_stats and prior_name in self.activation_stats[model_name]:
+                            prior_std = self.activation_stats[model_name][prior_name].to(self.device)
+
+                        prior_sim = compute_normalized_delta(clean_acts[prior_name],
+                                                             patched_acts[prior_name],
+                                                             layer_std=prior_std)
                         prior_sims.append(prior_sim)
 
                 if prior_sims:
@@ -740,9 +819,9 @@ class ConditionalPatchTrainer:
             else:
                 mean_prior_sim = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            # Sample loss: minimize target similarity, maximize prior similarity
-            # Loss = target_sim - 0.5 * mean_prior_sim (halved prior weight)
-            sample_loss = target_sim - 0.5 * mean_prior_sim
+            # Sample loss: maximize target delta, minimize prior delta
+            # Loss = -target_delta + 0.5 * mean_prior_delta
+            sample_loss = -1 * target_sim + 0.5 * mean_prior_sim
             total_cka_loss = total_cka_loss + sample_loss
             valid_samples += 1
 
@@ -826,8 +905,8 @@ class ConditionalPatchTrainer:
                         # Update progress bar
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
-                            'target_sim': f"{stats['target_cka']:.3f}",
-                            'prior_sim': f"{stats['prior_cka']:.3f}"
+                            'target_delta': f"{stats['target_cka']:.3f}",
+                            'prior_delta': f"{stats['prior_cka']:.3f}"
                         })
 
                         # Track stats
@@ -847,8 +926,8 @@ class ConditionalPatchTrainer:
 
                 print(f"Epoch {epoch+1} Summary:")
                 print(f"  Loss: {mean_loss:.4f}")
-                print(f"  Target Cosine Similarity: {mean_target_sim:.3f}")
-                print(f"  Prior Cosine Similarity: {mean_prior_sim:.3f}")
+                print(f"  Target Normalized Delta: {mean_target_sim:.3f}")
+                print(f"  Prior Normalized Delta: {mean_prior_sim:.3f}")
                 print()
 
                 # Save to training history

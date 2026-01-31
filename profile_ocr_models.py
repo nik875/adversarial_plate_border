@@ -22,10 +22,14 @@ import onnx2torch
 from transformers import VisionEncoderDecoderModel, TrOCRProcessor
 import urllib.request
 import warnings
+import numpy as np
+from datetime import datetime
+from tqdm import tqdm
 from rdm_profiler import ModelRDMProfiler
 from dataset import create_dataloaders
 import torchvision.transforms as T
 import kornia.geometry as K
+import h5py
 
 warnings.filterwarnings("ignore")
 
@@ -242,9 +246,83 @@ def load_trocr_model(device='cuda'):
         )
 
 
+def compute_activation_statistics(all_activations, layer_names):
+    """
+    Compute mean and standard deviation for each neuron's activations across dataset.
+
+    Args:
+        all_activations: Dict mapping layer names to lists of activation arrays
+                        Each array has shape [batch_size, n_features]
+        layer_names: List of layer names to compute statistics for
+
+    Returns:
+        Dict mapping layer names to dicts with 'mean' and 'std' arrays
+        Each array has shape [n_features]
+    """
+    activation_stats = {}
+
+    for layer_name in layer_names:
+        if layer_name not in all_activations or not all_activations[layer_name]:
+            continue
+
+        # Concatenate all activations for this layer across all batches
+        layer_acts = np.concatenate(all_activations[layer_name], axis=0)  # [n_images, n_features]
+
+        # Compute mean and std per neuron (across images)
+        mean = layer_acts.mean(axis=0)  # [n_features]
+        std = layer_acts.std(axis=0)    # [n_features]
+
+        activation_stats[layer_name] = {
+            'mean': mean.astype(np.float32),
+            'std': std.astype(np.float32),
+            'n_images': layer_acts.shape[0],
+            'n_features': layer_acts.shape[1]
+        }
+
+    return activation_stats
+
+
+def save_activation_statistics(activation_stats, save_path):
+    """
+    Save activation statistics to HDF5 file.
+
+    Args:
+        activation_stats: Dict mapping layer names to stats dicts
+        save_path: Path to save HDF5 file
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(save_path, 'w') as f:
+        stats_group = f.create_group('activation_statistics')
+
+        for layer_name, stats in activation_stats.items():
+            layer_group = stats_group.create_group(layer_name)
+
+            # Save mean and std
+            layer_group.create_dataset(
+                'mean',
+                data=stats['mean'],
+                compression='gzip',
+                compression_opts=4,
+                dtype=np.float32
+            )
+            layer_group.create_dataset(
+                'std',
+                data=stats['std'],
+                compression='gzip',
+                compression_opts=4,
+                dtype=np.float32
+            )
+
+            # Save metadata
+            layer_group.attrs['n_images'] = stats['n_images']
+            layer_group.attrs['n_features'] = stats['n_features']
+
+
 def profile_model(model, model_name, dataset, output_dir, device='cuda', batch_size=16):
     """
-    Profile a single model and save RDMs for all layers.
+    Profile a single model and save RDMs and activation statistics for all layers.
 
     Args:
         model: PyTorch model to profile
@@ -271,20 +349,154 @@ def profile_model(model, model_name, dataset, output_dir, device='cuda', batch_s
         layer_indices=None
     )
 
-    # Profile and save
-    save_path = model_output_dir / f"{model_name}_rdms.h5"
-    rdms = profiler.profile(
-        image_dataset=dataset,
+    # Need to capture activations during profiling for statistics
+    # We'll do this by extending the profiler workflow
+    from torch.utils.data import DataLoader
+
+    profiler.extractor.register_hooks()
+    hooked_layers = profiler.extractor.get_hooked_layers()
+
+    if not hooked_layers:
+        raise RuntimeError("No layers matched filter criteria. Check layer names/indices.")
+
+    print(f"Profiling {len(hooked_layers)} layers on {device}")
+    print(f"Layers: {hooked_layers}")
+
+    # Create dataloader
+    dataloader = DataLoader(
+        dataset,
         batch_size=batch_size,
-        save_path=save_path
+        shuffle=False,
+        num_workers=0
     )
+
+    # Collect activations from all images
+    all_activations = {layer_name: [] for layer_name in hooked_layers}
+    layer_info = {layer_name: {} for layer_name in hooked_layers}
+
+    expected_batch_size = None
+
+    print("\nRunning inference and collecting activations...")
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing batches")):
+            # Handle different batch formats
+            if isinstance(batch, (tuple, list)):
+                images = batch[0]
+            else:
+                images = batch
+
+            # Move to device
+            if isinstance(images, torch.Tensor):
+                images = images.to(device)
+
+            # Track expected batch size from first batch
+            if expected_batch_size is None:
+                expected_batch_size = images.shape[0]
+
+            # Forward pass
+            _ = model(images)
+
+            # Collect activations from this batch
+            for layer_name in hooked_layers:
+                if layer_name in profiler.extractor.activations:
+                    activation = profiler.extractor.activations[layer_name]
+
+                    # Store shape info from first batch
+                    if batch_idx == 0:
+                        layer_info[layer_name]['activation_shape'] = tuple(activation.shape)
+
+                    # Move to CPU and flatten
+                    activation_cpu = activation.cpu().numpy()
+                    from rdm_profiler import ActivationProcessor
+                    flattened = ActivationProcessor.flatten_activation(
+                        torch.from_numpy(activation_cpu)
+                    ).numpy()
+
+                    # Check for sequence-collapsed activations
+                    if flattened.shape[0] != expected_batch_size:
+                        if flattened.shape[0] % expected_batch_size == 0:
+                            seq_len = flattened.shape[0] // expected_batch_size
+                            reshaped = flattened.reshape(expected_batch_size, seq_len, -1)
+                            flattened = reshaped.mean(axis=1)
+
+                            if batch_idx == 0:
+                                warnings.warn(
+                                    f"Layer {layer_name}: Detected sequence-collapsed activation "
+                                    f"[{flattened.shape[0]}x{seq_len}, {flattened.shape[1]}]. "
+                                    f"Aggregating across sequence dimension."
+                                )
+                        else:
+                            warnings.warn(
+                                f"Layer {layer_name}: Unexpected activation shape "
+                                f"{flattened.shape} (expected batch_size={expected_batch_size})"
+                            )
+
+                    all_activations[layer_name].append(flattened)
+
+            # Clear activations for next batch
+            profiler.extractor.clear_activations()
+
+    # Remove hooks
+    profiler.extractor.remove_hooks()
+
+    # Compute RDMs and activation statistics
+    print("\nComputing RDMs and activation statistics...")
+    rdms = {}
+
+    for layer_name in tqdm(hooked_layers, desc="Computing RDMs"):
+        if not all_activations[layer_name]:
+            warnings.warn(f"No activations collected for layer {layer_name}")
+            continue
+
+        layer_activations = np.concatenate(all_activations[layer_name], axis=0)
+        n_images = layer_activations.shape[0]
+
+        # Compute RDM
+        rdm = profiler.rdm_computer.compute_rdm(layer_activations)
+        rdms[layer_name] = rdm
+
+        # Get layer type
+        layer_module = None
+        for name, module in model.named_modules():
+            if name == layer_name:
+                layer_module = module
+                break
+
+        layer_info[layer_name]['layer_type'] = (
+            layer_module.__class__.__name__ if layer_module else 'Unknown'
+        )
+
+    # Compute activation statistics
+    print("\nComputing activation statistics (mean/std per neuron)...")
+    activation_stats = compute_activation_statistics(all_activations, hooked_layers)
+
+    # Save RDMs
+    save_path = model_output_dir / f"{model_name}_rdms.h5"
+    from rdm_profiler import RDMStorage
+    metadata = {
+        'n_images': n_images,
+        'metric': 'correlation',
+        'timestamp': datetime.now().isoformat(),
+        'device': device,
+        'batch_size': batch_size
+    }
+    storage = RDMStorage(save_path)
+    storage.save(model_name, rdms, layer_info, metadata)
+    print(f"Saved RDMs to {save_path}")
+
+    # Save activation statistics
+    stats_path = model_output_dir / f"{model_name}_activation_statistics.h5"
+    save_activation_statistics(activation_stats, stats_path)
+    print(f"Saved activation statistics to {stats_path}")
 
     print(f"\n{model_name} profiling complete!")
     print(f"Profiled {len(rdms)} layers")
-    print(f"Results saved to: {save_path}")
-    print(f"\nLayer names:")
-    for i, layer_name in enumerate(rdms.keys(), 1):
+    print(f"\nLayer activation statistics summary:")
+    for i, (layer_name, stats) in enumerate(activation_stats.items(), 1):
         print(f"  {i:3d}. {layer_name}")
+        print(f"       Images: {stats['n_images']}, Features: {stats['n_features']}")
+        print(f"       Mean range: [{stats['mean'].min():.4f}, {stats['mean'].max():.4f}]")
+        print(f"       Std range: [{stats['std'].min():.4f}, {stats['std'].max():.4f}]")
 
     return rdms
 
