@@ -430,11 +430,15 @@ class ConditionalPatchTrainer:
 
         return activations
 
-    def compute_loss(self, batch, conditions) -> Tuple[torch.Tensor, Dict]:
+    def compute_loss(self, batches: List[Dict], conditions) -> Tuple[torch.Tensor, Dict]:
         """
         Compute loss for conditional patch generation.
 
         Loss = CKA(target_layer) - mean(CKA(prior_layers))
+
+        Args:
+            batches: List of individual batch dicts (each has single image)
+            conditions: Tuple of (model_names, layer_indices, layer_profiles, layer_depths, model_codes)
         """
         model_names, layer_indices, layer_profiles, layer_depths, model_codes = conditions
 
@@ -449,14 +453,15 @@ class ConditionalPatchTrainer:
         # Generate patches
         patches = self.generator(z)
 
-        # Apply patches to images
-        batch_size = len(model_names)
+        # Process each sample individually (no stacking due to variable image sizes)
+        batch_size = len(batches)
         total_cka_loss = 0
         stats = {'target_cka': [], 'prior_cka': []}
 
         for i in range(batch_size):
             model_name = model_names[i]
             layer_idx = layer_indices[i]
+            batch = batches[i]
 
             # Get model and input format
             ocr_model, input_format = self.ocr_models[model_name]
@@ -466,10 +471,10 @@ class ConditionalPatchTrainer:
             target_layer_name = all_layer_names[layer_idx]
             prior_layer_names = all_layer_names[:layer_idx] if layer_idx > 0 else []
 
-            # Extract single image and apply patch
-            image = batch['prep_image'][i:i+1].to(self.device)
-            corners = batch['new_corners'][i:i+1].to(self.device)
-            patch = patches[i]
+            # Extract single image
+            image = batch['prep_image'].unsqueeze(0).to(self.device)  # [1, 3, H, W]
+            corners = batch['new_corners'].unsqueeze(0).to(self.device)  # [1, 4, 2]
+            patch = patches[i:i+1]  # [1, 3, 256, 512]
 
             # Crop plate region (same as profile_ocr_models.py)
             plate_corners = corners  # [1, 4, 2]
@@ -482,10 +487,14 @@ class ConditionalPatchTrainer:
             # Extract activations from target layer (and prior if any)
             layers_to_extract = [target_layer_name] + prior_layer_names
 
-            clean_acts = self.extract_activations(ocr_model, cropped_clean,
-                                                  layers_to_extract, input_format)
-            patched_acts = self.extract_activations(ocr_model, cropped_patched,
-                                                    layers_to_extract, input_format)
+            try:
+                clean_acts = self.extract_activations(ocr_model, cropped_clean,
+                                                      layers_to_extract, input_format)
+                patched_acts = self.extract_activations(ocr_model, cropped_patched,
+                                                        layers_to_extract, input_format)
+            except Exception as e:
+                # Skip this sample if extraction fails
+                continue
 
             # Compute CKA for target layer
             if target_layer_name in clean_acts and target_layer_name in patched_acts:
@@ -518,7 +527,10 @@ class ConditionalPatchTrainer:
             total_cka_loss += sample_loss
 
         # Average over batch
-        loss = total_cka_loss / batch_size
+        if batch_size > 0:
+            loss = total_cka_loss / batch_size
+        else:
+            loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # Aggregate stats
         stats['target_cka'] = np.mean(stats['target_cka']) if stats['target_cka'] else 0
@@ -552,8 +564,9 @@ class ConditionalPatchTrainer:
                        total=len(self.train_loader))
 
             for idx, batch in pbar:
-                # Accumulate batch
-                accumulated_batches.append({k: v[0] for k, v in batch.items()})
+                # Extract single image from batch (batch_size=1 from dataloader)
+                single_batch = {k: v[0] for k, v in batch.items()}
+                accumulated_batches.append(single_batch)
                 accumulated_indices.append(idx)
 
                 # Process when we have enough samples
@@ -561,19 +574,12 @@ class ConditionalPatchTrainer:
                     if len(accumulated_batches) == 0:
                         continue
 
-                    # Merge batches
-                    merged_batch = {
-                        k: torch.stack([b[k] for b in accumulated_batches])
-                        for k in accumulated_batches[0].keys()
-                        if isinstance(accumulated_batches[0][k], torch.Tensor)
-                    }
-
                     # Sample conditions
                     conditions = self.sample_conditions(len(accumulated_batches),
                                                        accumulated_indices)
 
-                    # Compute loss
-                    loss, stats = self.compute_loss(merged_batch, conditions)
+                    # Compute loss (pass as list of individual batches, not merged)
+                    loss, stats = self.compute_loss(accumulated_batches, conditions)
 
                     # Backward
                     self.optimizer.zero_grad()
@@ -581,16 +587,17 @@ class ConditionalPatchTrainer:
                     self.optimizer.step()
 
                     # Track stats
-                    epoch_losses.append(loss.item())
-                    epoch_target_cka.append(stats['target_cka'])
-                    epoch_prior_cka.append(stats['prior_cka'])
+                    if loss.item() > 0:  # Only track if loss was computed
+                        epoch_losses.append(loss.item())
+                        epoch_target_cka.append(stats['target_cka'])
+                        epoch_prior_cka.append(stats['prior_cka'])
 
-                    # Update progress
-                    pbar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'target_cka': f"{stats['target_cka']:.3f}",
-                        'prior_cka': f"{stats['prior_cka']:.3f}"
-                    })
+                        # Update progress
+                        pbar.set_postfix({
+                            'loss': f"{loss.item():.4f}",
+                            'target_cka': f"{stats['target_cka']:.3f}",
+                            'prior_cka': f"{stats['prior_cka']:.3f}"
+                        })
 
                     # Clear accumulated
                     accumulated_batches = []
