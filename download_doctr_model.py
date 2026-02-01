@@ -41,15 +41,21 @@ def download_doctr_model(output_dir="./doctr_model"):
     model = vitstr_small(pretrained=True)
     model.eval()
 
-    # Export to ONNX via temporary file
-    print("Exporting to ONNX...")
-    onnx_path = output_path / "vitstr_small.onnx"
+    # We only use the encoder (feature extraction), not the full model with decoder
+    # This also avoids exporting the postprocessor which has compatibility issues
+    print("Extracting encoder (feature extractor)...")
+    encoder = model.feat_extractor  # Get the backbone CNN encoder
+    encoder.eval()
+
+    # Export encoder to ONNX
+    print("Exporting encoder to ONNX...")
+    onnx_path = output_path / "vitstr_encoder.onnx"
 
     # Create a dummy input for export
     dummy_input = torch.randn(1, 3, 32, 128)
 
     torch.onnx.export(
-        model,
+        encoder,
         dummy_input,
         str(onnx_path),
         input_names=['input'],
@@ -58,19 +64,19 @@ def download_doctr_model(output_dir="./doctr_model"):
         do_constant_folding=True,
         verbose=False
     )
-    print(f"✓ ONNX model saved to {onnx_path}")
+    print(f"✓ ONNX encoder saved to {onnx_path}")
 
     # Convert ONNX back to PyTorch (removes doctr dependencies)
     print("Converting ONNX back to PyTorch...")
     onnx_model = onnx.load(str(onnx_path))
-    torch_model = onnx2torch.ConvertModel(onnx_model)
-    torch_model.eval()
+    torch_encoder = onnx2torch.ConvertModel(onnx_model)
+    torch_encoder.eval()
 
-    # Save PyTorch model
+    # Save PyTorch encoder
     model_path = output_path / "vitstr_small.pt"
-    print(f"Saving converted PyTorch model to {model_path}...")
-    torch.save(torch_model, str(model_path))
-    print(f"✓ PyTorch model saved to {model_path}")
+    print(f"Saving converted PyTorch encoder to {model_path}...")
+    torch.save(torch_encoder, str(model_path))
+    print(f"✓ PyTorch encoder saved to {model_path}")
 
     print()
     print("=" * 80)
