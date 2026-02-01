@@ -6,22 +6,56 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 B2_PATH="b2://licenseplate-dataset/opensourcedata.tar"
+LOCAL_TAR="$SCRIPT_DIR/opensourcedata.tar"
 TEMP_FILE=$(mktemp)
+SKIP_DOWNLOAD=false
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --local)
+            SKIP_DOWNLOAD=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --local       Skip B2 download and use local opensourcedata.tar in this directory"
+            echo "  --help, -h    Show this help message"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
 
 trap "rm -f $TEMP_FILE" EXIT
 
-echo "Downloading datasets from B2..."
-echo "Source: $B2_PATH"
-
-# Download from B2
-b2 file download "$B2_PATH" "$TEMP_FILE"
+if [ "$SKIP_DOWNLOAD" = true ]; then
+    echo "Using local tarball..."
+    if [ ! -f "$LOCAL_TAR" ]; then
+        echo "Error: opensourcedata.tar not found at $LOCAL_TAR"
+        exit 1
+    fi
+    echo "Source: $LOCAL_TAR"
+    cp "$LOCAL_TAR" "$TEMP_FILE"
+else
+    echo "Downloading datasets from B2..."
+    echo "Source: $B2_PATH"
+    # Download from B2
+    b2 file download "$B2_PATH" "$TEMP_FILE"
+fi
 
 if [ ! -f "$TEMP_FILE" ]; then
-    echo "Error: Failed to download from B2"
+    echo "Error: Failed to get tarball"
     exit 1
 fi
 
-echo "✓ Download complete"
+echo "✓ Tarball ready"
 echo "Extracting datasets to cache directories..."
 
 # Extract to home directory (will restore .cache structure)
