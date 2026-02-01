@@ -88,7 +88,10 @@ class LPCropsDataset(Dataset):
             seed: Random seed for reproducibility
             datasets: List of dataset names to load. If None, loads from all datasets.
         """
-        print(f"Loading {num_samples} random license plate crops...")
+        if num_samples <= 0:
+            print(f"Loading all available license plate crops...")
+        else:
+            print(f"Loading up to {num_samples} random license plate crops...")
         if datasets:
             print(f"  Using datasets: {', '.join(datasets)}")
 
@@ -119,15 +122,17 @@ class LPCropsDataset(Dataset):
         for img, text, meta in iterator:
             samples.append(img)
             total_loaded += 1
-            if len(samples) >= num_samples:
-                break
 
-        # Shuffle and take num_samples
-        if len(samples) > num_samples:
-            indices = np.random.permutation(len(samples))[:num_samples]
-            samples = [samples[i] for i in indices]
+        # Shuffle all samples
+        indices = np.random.permutation(len(samples))
+        samples = [samples[i] for i in indices]
 
-        print(f"Loaded {len(samples)} license plate images (from {total_loaded} total available)")
+        # If num_samples > 0 and less than total, sample; otherwise use all
+        if num_samples > 0 and len(samples) > num_samples:
+            samples = samples[:num_samples]
+            print(f"Loaded {len(samples)} license plate images (sampled from {total_loaded} total available)")
+        else:
+            print(f"Loaded {total_loaded} license plate images (all available)")
 
         # Resize all images to target size
         self.images = []
@@ -645,8 +650,8 @@ def main():
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Batch size for profiling (default: 32)')
-    parser.add_argument('--num-samples', type=int, default=1024,
-                        help='Number of random images to use (default: 1024)')
+    parser.add_argument('--num-samples', type=int, default=0,
+                        help='Max number of random images to use (0=all available, default: 0)')
     parser.add_argument('--pca-dim', type=int, default=128,
                         help='Target dimension for PCA compression (default: 128)')
     parser.add_argument('--ae-epochs', type=int, default=50,
