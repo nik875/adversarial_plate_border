@@ -80,23 +80,45 @@ class LPCropsDataset(Dataset):
     Loads random cropped license plates from load_lp_crops.py.
     Stores raw PIL images and applies preprocessing per model.
     """
-    def __init__(self, num_samples=1024, target_size=(64, 128), seed=42):
+    def __init__(self, num_samples=1024, target_size=(64, 128), seed=42, datasets=None):
         """
         Args:
             num_samples: Number of random samples to load
             target_size: (height, width) for resizing
             seed: Random seed for reproducibility
+            datasets: List of dataset names to load. If None, loads from all datasets.
         """
         print(f"Loading {num_samples} random license plate crops...")
+        if datasets:
+            print(f"  Using datasets: {', '.join(datasets)}")
 
         # Set random seed for reproducibility
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Load samples from build_anchor_pool
+        # Load samples from specified datasets
         samples = []
-        for img, text, meta in build_anchor_pool(max_per_dataset=10000):
+        total_loaded = 0
+
+        if datasets is None:
+            # Load from all datasets
+            from load_lp_crops import build_anchor_pool
+            iterator = build_anchor_pool(max_per_dataset=10000)
+        else:
+            # Load from specific datasets only
+            from load_lp_crops import iter_dataset
+            def custom_pool():
+                for dataset_name in datasets:
+                    for split in ['train', 'test', 'valid', 'val']:
+                        try:
+                            yield from iter_dataset(dataset_name, split, max_samples=10000)
+                        except (ValueError, StopIteration):
+                            pass
+            iterator = custom_pool()
+
+        for img, text, meta in iterator:
             samples.append(img)
+            total_loaded += 1
             if len(samples) >= num_samples:
                 break
 
@@ -105,7 +127,7 @@ class LPCropsDataset(Dataset):
             indices = np.random.permutation(len(samples))[:num_samples]
             samples = [samples[i] for i in indices]
 
-        print(f"Loaded {len(samples)} images")
+        print(f"Loaded {len(samples)} license plate images (from {total_loaded} total available)")
 
         # Resize all images to target size
         self.images = []
@@ -663,7 +685,8 @@ def main():
     base_dataset = LPCropsDataset(
         num_samples=args.num_samples,
         target_size=(64, 128),
-        seed=42
+        seed=42,
+        datasets=['roboflow_lpr', 'kaggle_lp', 'mercosur']
     )
 
     # Profile each requested model
