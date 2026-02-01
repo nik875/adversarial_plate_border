@@ -126,10 +126,14 @@ def _iter_cocotext(split: str, max_samples: int | None = None) -> Iterator[Tuple
     cache_dir = DATASETS["cocotext"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  COCO Text crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_cocotext.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  COCO Text labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_cocotext.py")
         return
 
     # Load labels
@@ -194,10 +198,14 @@ def _iter_roboflow_lpr(split: str, max_samples: int | None = None) -> Iterator[T
     cache_dir = DATASETS["roboflow_lpr"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  Roboflow LPR crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_roboflow_lpr.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  Roboflow LPR labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_roboflow_lpr.py")
         return
 
     # Load labels and filter by split
@@ -266,10 +274,14 @@ def _iter_kaggle_lp(split: str, max_samples: int | None = None) -> Iterator[Tupl
     cache_dir = DATASETS["kaggle_lp"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  Kaggle LP crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_kaggle_lp.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  Kaggle LP labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_kaggle_lp.py")
         return
 
     # Load labels
@@ -332,10 +344,14 @@ def _iter_indian_plates_kaggle(split: str, max_samples: int | None = None) -> It
     cache_dir = DATASETS["indian_plates_kaggle"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  Indian Plates Kaggle crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_indian_plates_kaggle.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  Indian Plates Kaggle labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_indian_plates_kaggle.py")
         return
 
     # Load labels
@@ -398,10 +414,14 @@ def _iter_ccpd2019_variant(dataset_name: str, split: str, max_samples: int | Non
     cache_dir = DATASETS[dataset_name]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  CCPD2019 {dataset_name} crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_ccpd2019.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  CCPD2019 {dataset_name} labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_ccpd2019.py")
         return
 
     # Load labels
@@ -471,10 +491,14 @@ def _iter_mercosur(split: str, max_samples: int | None = None) -> Iterator[Tuple
     cache_dir = DATASETS["mercosur"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  Mercosur crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_mercosur.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  Mercosur labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_mercosur.py")
         return
 
     # Load labels
@@ -546,10 +570,14 @@ def _iter_crpd(split: str, max_samples: int | None = None) -> Iterator[Tuple[Ima
     cache_dir = DATASETS["crpd"]["cache_dir"]
 
     if not cache_dir.exists():
+        print(f"⚠️  CRPD crops not found at {cache_dir}")
+        print(f"    Run: python foundationmodel/dataset/crop_crpd.py")
         return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
+        print(f"⚠️  CRPD labels file not found at {labels_file}")
+        print(f"    Run: python foundationmodel/dataset/crop_crpd.py")
         return
 
     # Load labels and filter by split
