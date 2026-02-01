@@ -56,9 +56,11 @@ class DoctrLoader:
             print(f"Loading doctr ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
 
             # Load full model (includes architecture and weights)
+            # weights_only=False allows loading the full model object (not just state dict)
             self._model = torch.load(
                 str(self.model_dir / "vitstr_small.pt"),
-                map_location='cpu'
+                map_location='cpu',
+                weights_only=False
             )
             self._model.eval()
 
