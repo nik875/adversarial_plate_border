@@ -23,7 +23,7 @@ def download_trocr_model(output_dir="./trocr_model"):
     from transformers import (
         AutoTokenizer,
         AutoModelForImageTextToText,
-        AutoFeatureExtractor,
+        TrOCRProcessor,
     )
 
     model_name = "microsoft/trocr-small-printed"
@@ -46,11 +46,11 @@ def download_trocr_model(output_dir="./trocr_model"):
     tokenizer.save_pretrained(str(output_path / "tokenizer"))
     print(f"✓ Tokenizer saved to {output_path / 'tokenizer'}")
 
-    # Download feature extractor (for vision preprocessing)
-    print("Downloading feature extractor...")
-    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
-    feature_extractor.save_pretrained(str(output_path / "feature_extractor"))
-    print(f"✓ Feature extractor saved to {output_path / 'feature_extractor'}")
+    # Download processor (handles image preprocessing for TrOCR)
+    print("Downloading processor...")
+    processor = TrOCRProcessor.from_pretrained(model_name)
+    processor.save_pretrained(str(output_path / "processor"))
+    print(f"✓ Processor saved to {output_path / 'processor'}")
 
     print()
     print("=" * 80)
@@ -62,7 +62,7 @@ def download_trocr_model(output_dir="./trocr_model"):
     print(f"  from transformers import (")
     print(f"      AutoTokenizer,")
     print(f"      AutoModelForImageTextToText,")
-    print(f"      AutoFeatureExtractor,")
+    print(f"      TrOCRProcessor,")
     print(f"  )")
     print()
     print(f"  model_dir = '{output_path.absolute()}'")
@@ -74,8 +74,8 @@ def download_trocr_model(output_dir="./trocr_model"):
     print(f"      model_dir + '/tokenizer',")
     print(f"      local_files_only=True")
     print(f"  )")
-    print(f"  feature_extractor = AutoFeatureExtractor.from_pretrained(")
-    print(f"      model_dir + '/feature_extractor',")
+    print(f"  processor = TrOCRProcessor.from_pretrained(")
+    print(f"      model_dir + '/processor',")
     print(f"      local_files_only=True")
     print(f"  )")
     print()

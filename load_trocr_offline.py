@@ -9,13 +9,13 @@ Usage:
     from load_trocr_offline import load_trocr_model, TrOCRLoader
 
     # Simple loading
-    model, tokenizer, feature_extractor = load_trocr_model("./trocr_model")
+    model, tokenizer, processor = load_trocr_model("./trocr_model")
 
     # Or use the class-based interface
     loader = TrOCRLoader("./trocr_model")
     model = loader.model
     tokenizer = loader.tokenizer
-    feature_extractor = loader.feature_extractor
+    processor = loader.processor
 """
 
 from pathlib import Path
@@ -37,7 +37,7 @@ class TrOCRLoader:
         self._validate_directory()
         self._model = None
         self._tokenizer = None
-        self._feature_extractor = None
+        self._processor = None
 
     def _validate_directory(self) -> None:
         """Validate that all required components exist in the directory."""
@@ -47,7 +47,7 @@ class TrOCRLoader:
                 f"Please run: python download_trocr_model.py --output_dir {self.model_dir}"
             )
 
-        required_dirs = ["model", "tokenizer", "feature_extractor"]
+        required_dirs = ["model", "tokenizer", "processor"]
         missing = [d for d in required_dirs if not (self.model_dir / d).exists()]
 
         if missing:
@@ -81,18 +81,18 @@ class TrOCRLoader:
         return self._tokenizer
 
     @property
-    def feature_extractor(self):
-        """Load and cache the feature extractor."""
-        if self._feature_extractor is None:
-            from transformers import AutoFeatureExtractor
+    def processor(self):
+        """Load and cache the processor."""
+        if self._processor is None:
+            from transformers import TrOCRProcessor
 
             print(
-                f"Loading feature extractor from {self.model_dir / 'feature_extractor'}..."
+                f"Loading processor from {self.model_dir / 'processor'}..."
             )
-            self._feature_extractor = AutoFeatureExtractor.from_pretrained(
-                str(self.model_dir / "feature_extractor"), local_files_only=True
+            self._processor = TrOCRProcessor.from_pretrained(
+                str(self.model_dir / "processor"), local_files_only=True
             )
-        return self._feature_extractor
+        return self._processor
 
     def recognize_text(self, image):
         """
@@ -111,7 +111,7 @@ class TrOCRLoader:
             image = Image.open(image).convert("RGB")
 
         # Preprocess image
-        pixel_values = self.feature_extractor(image, return_tensors="pt").pixel_values
+        pixel_values = self.processor(image, return_tensors="pt").pixel_values
 
         # Generate text
         generated_ids = self.model.generate(pixel_values)
@@ -132,13 +132,13 @@ def load_trocr_model(
         model_dir: Path to directory containing model components
 
     Returns:
-        Tuple of (model, tokenizer, feature_extractor)
+        Tuple of (model, tokenizer, processor)
 
     Example:
-        model, tokenizer, feature_extractor = load_trocr_model("./trocr_model")
+        model, tokenizer, processor = load_trocr_model("./trocr_model")
     """
     loader = TrOCRLoader(model_dir)
-    return loader.model, loader.tokenizer, loader.feature_extractor
+    return loader.model, loader.tokenizer, loader.processor
 
 
 if __name__ == "__main__":
@@ -151,6 +151,6 @@ if __name__ == "__main__":
         print("✓ Successfully loaded TrOCR components")
         print(f"  Model: {loader.model.__class__.__name__}")
         print(f"  Tokenizer: {loader.tokenizer.__class__.__name__}")
-        print(f"  Feature Extractor: {loader.feature_extractor.__class__.__name__}")
+        print(f"  Processor: {loader.processor.__class__.__name__}")
     except FileNotFoundError as e:
         print(f"✗ Error: {e}")
