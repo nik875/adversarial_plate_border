@@ -556,42 +556,8 @@ def main():
     # Parse which models to profile
     models_to_profile = [m.strip().lower() for m in args.models.split(',')]
 
-    # Load training dataset from progressive_patch.py
-    # Note: We'll create model-specific datasets as needed since different models
-    # require different preprocessing
-    print("Loading training dataset...")
-    transform = T.Compose([
-        T.ToPILImage(),
-        T.ToTensor()
-    ])
-
-    # Must use batch_size=1 because images have variable sizes and can't be stacked
-    # preload=False to reduce initial overhead (images loaded on-demand)
-    train_loader, val_loader = create_dataloaders(
-        args.csv_path,
-        transform=transform,
-        preload=False,  # Don't preload - reduces initial overhead
-        batch_size=1,  # MUST be 1 - images have different sizes, can't batch
-        n_jobs=0,
-        use_all_for_train=True
-    )
-
-    print(f"Loaded dataloader with {len(train_loader)} images\n")
-
-    # Load and crop plates once (done at 64x128 which both models use)
-    print("Loading and cropping license plate regions (done once for all models)...")
-    cropped_plates = CroppedPlateDataset(
-        train_loader,
-        target_size=(64, 128),  # Standard size for both CCT and TrOCR
-        device=device
-    )
-
-    if args.limit_images > 0:
-        print(f"Limiting to {args.limit_images} images")
-        cropped_plates.images = cropped_plates.images[:args.limit_images]
-
     # STEP 1: Load all models first (fail early if any have issues)
-    print("\n" + "="*80)
+    print("="*80)
     print("STEP 1: Loading all models")
     print("="*80)
 
@@ -641,9 +607,46 @@ def main():
     for model_key in loaded_models:
         print(f"  - {model_key}")
 
-    # STEP 2: Profile all loaded models
+    # STEP 2: Load and preprocess dataset
     print("\n" + "="*80)
-    print("STEP 2: Profiling models")
+    print("STEP 2: Loading and preprocessing dataset")
+    print("="*80)
+
+    # Load training dataset from progressive_patch.py
+    print("\nLoading training dataset...")
+    transform = T.Compose([
+        T.ToPILImage(),
+        T.ToTensor()
+    ])
+
+    # Must use batch_size=1 because images have variable sizes and can't be stacked
+    # preload=False to reduce initial overhead (images loaded on-demand)
+    train_loader, val_loader = create_dataloaders(
+        args.csv_path,
+        transform=transform,
+        preload=False,  # Don't preload - reduces initial overhead
+        batch_size=1,  # MUST be 1 - images have different sizes, can't batch
+        n_jobs=0,
+        use_all_for_train=True
+    )
+
+    print(f"Loaded dataloader with {len(train_loader)} images")
+
+    # Load and crop plates once (done at 64x128 which both models use)
+    print("\nLoading and cropping license plate regions (done once for all models)...")
+    cropped_plates = CroppedPlateDataset(
+        train_loader,
+        target_size=(64, 128),  # Standard size for both CCT and TrOCR
+        device=device
+    )
+
+    if args.limit_images > 0:
+        print(f"Limiting to {args.limit_images} images")
+        cropped_plates.images = cropped_plates.images[:args.limit_images]
+
+    # STEP 3: Profile all loaded models
+    print("\n" + "="*80)
+    print("STEP 3: Profiling models")
     print("="*80)
 
     results = {}
