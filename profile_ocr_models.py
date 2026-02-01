@@ -21,6 +21,7 @@ import onnx
 import onnx2torch
 from transformers import VisionEncoderDecoderModel
 from load_trocr_offline import TrOCRLoader
+from load_doctr_offline import DoctrLoader
 import urllib.request
 import warnings
 import numpy as np
@@ -162,33 +163,36 @@ def load_cct_model(device='cuda'):
     return model, "cct_xs_v1_global"
 
 
-def load_vitstr_model(device='cuda'):
+def load_vitstr_model(device='cuda', model_dir='./doctr_model'):
     """
-    Load ViTSTR Small model from doctr.
+    Load ViTSTR Small model from local offline cache.
+
+    Args:
+        device: Device to load model on (default: 'cuda')
+        model_dir: Directory containing saved model (default: './doctr_model')
 
     Returns:
         model: PyTorch model
         model_name: String identifier
     """
     print("\n" + "="*80)
-    print("Loading ViTSTR Small Model (doctr)")
+    print("Loading ViTSTR Small Model (offline)")
     print("="*80)
 
     try:
-        from doctr.models import vitstr_small
-
-        print("Loading pretrained ViTSTR model...")
-        model = vitstr_small(pretrained=True)
+        # Load from offline cache
+        loader = DoctrLoader(model_dir)
+        model = loader.model.to(device)
         model.eval()  # Set to eval mode for profiling
-        model.to(device)
 
         print("Model loaded successfully")
         print(f"Model type: {type(model).__name__}")
         return model, "vitstr_small"
-    except ImportError:
+    except FileNotFoundError as e:
+        print(f"Error loading ViTSTR model: {e}")
         raise RuntimeError(
-            "doctr library not found. Install it with:\n"
-            "pip install python-doctr[torch]"
+            f"Failed to load ViTSTR model from {model_dir}.\n"
+            f"Please download it first: python download_doctr_model.py --output_dir {model_dir}"
         )
     except Exception as e:
         print(f"Error loading ViTSTR model: {e}")
@@ -522,6 +526,8 @@ def main():
                         help='Batch size for profiling (default: 16)')
     parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
                         help='Comma-separated list of models to profile: vitstr,cct,trocr (default: all)')
+    parser.add_argument('--doctr-dir', type=str, default='./doctr_model',
+                        help='Directory containing doctr ViTSTR model (default: ./doctr_model)')
     parser.add_argument('--trocr-dir', type=str, default='./trocr_model',
                         help='Directory containing TrOCR model (default: ./trocr_model)')
     parser.add_argument('--limit-images', type=int, default=0,
@@ -594,7 +600,7 @@ def main():
     if 'vitstr' in models_to_profile:
         try:
             print("\nLoading ViTSTR...")
-            model, model_name = load_vitstr_model(device)
+            model, model_name = load_vitstr_model(device, args.doctr_dir)
             loaded_models['vitstr'] = (model, model_name, None)
             print(f"✓ ViTSTR loaded successfully")
         except Exception as e:

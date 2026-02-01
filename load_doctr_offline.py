@@ -1,0 +1,102 @@
+"""
+Load doctr ViTSTR model from local offline cache.
+
+This module provides utilities to load the ViTSTR model from doctr from a locally saved
+directory without requiring HuggingFace API access. This is useful when running
+in offline environments or when dealing with conflicting dependency versions.
+
+Usage:
+    from load_doctr_offline import load_doctr_model, DoctrLoader
+
+    # Simple loading
+    model = load_doctr_model("./doctr_model")
+
+    # Or use the class-based interface
+    loader = DoctrLoader("./doctr_model")
+    model = loader.model
+"""
+
+from pathlib import Path
+import torch
+
+
+class DoctrLoader:
+    """Load doctr ViTSTR model from local directory."""
+
+    def __init__(self, model_dir: str = "./doctr_model"):
+        """
+        Initialize doctr loader.
+
+        Args:
+            model_dir: Path to directory containing saved model
+        """
+        self.model_dir = Path(model_dir)
+        self._validate_directory()
+        self._model = None
+
+    def _validate_directory(self) -> None:
+        """Validate that model files exist in the directory."""
+        if not self.model_dir.exists():
+            raise FileNotFoundError(
+                f"Model directory not found: {self.model_dir}\n"
+                f"Please run: python download_doctr_model.py --output_dir {self.model_dir}"
+            )
+
+        model_file = self.model_dir / "vitstr_small.pt"
+        if not model_file.exists():
+            raise FileNotFoundError(
+                f"Model file not found: {model_file}\n"
+                f"Please run: python download_doctr_model.py --output_dir {self.model_dir}"
+            )
+
+    @property
+    def model(self):
+        """Load and cache the ViTSTR model."""
+        if self._model is None:
+            from doctr.models import vitstr_small
+
+            print(f"Loading doctr ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
+
+            # Load model architecture
+            model = vitstr_small(pretrained=False)
+
+            # Load saved state dict
+            state_dict = torch.load(
+                str(self.model_dir / "vitstr_small.pt"),
+                map_location='cpu'
+            )
+            model.load_state_dict(state_dict)
+            model.eval()
+
+            self._model = model
+        return self._model
+
+
+def load_doctr_model(model_dir: str = "./doctr_model"):
+    """
+    Simple function to load doctr ViTSTR model.
+
+    Args:
+        model_dir: Path to directory containing model
+
+    Returns:
+        Loaded model
+
+    Example:
+        model = load_doctr_model("./doctr_model")
+    """
+    loader = DoctrLoader(model_dir)
+    return loader.model
+
+
+if __name__ == "__main__":
+    # Simple test
+    print("Testing doctr offline loader...")
+    print()
+
+    try:
+        loader = DoctrLoader()
+        print("✓ Successfully loaded doctr ViTSTR model")
+        print(f"  Model: {loader.model.__class__.__name__}")
+    except FileNotFoundError as e:
+        print(f"✗ Error: {e}")
