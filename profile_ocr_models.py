@@ -20,7 +20,6 @@ from torch.utils.data import Dataset
 import onnx
 import onnx2torch
 from transformers import VisionEncoderDecoderModel, TrOCRProcessor
-from load_doctr_offline import DoctrLoader
 import urllib.request
 import warnings
 import numpy as np
@@ -164,39 +163,41 @@ def load_cct_model(device='cuda'):
 
 def load_vitstr_model(device='cuda', model_dir='./doctr_model'):
     """
-    Load ViTSTR Small model from local offline cache.
+    Load ViTSTR Small model from installed doctr package.
 
     Args:
         device: Device to load model on (default: 'cuda')
-        model_dir: Directory containing saved model (default: './doctr_model')
+        model_dir: Directory containing saved model (unused, kept for compatibility)
 
     Returns:
         model: PyTorch model
         model_name: String identifier
     """
     print("\n" + "="*80)
-    print("Loading ViTSTR Small Model (offline)")
+    print("Loading ViTSTR Small Model from doctr")
     print("="*80)
 
     try:
-        # Load from offline cache
-        loader = DoctrLoader(model_dir)
-        model = loader.model.to(device)
+        # Load from installed doctr package
+        from doctr.models import vitstr_small
+
+        print("Loading vitstr_small (pretrained)...")
+        model = vitstr_small(pretrained=True)
         model.eval()  # Set to eval mode for profiling
+        model = model.to(device)
 
         print("Model loaded successfully")
         print(f"Model type: {type(model).__name__}")
         return model, "vitstr_small"
-    except FileNotFoundError as e:
-        print(f"Error loading ViTSTR model: {e}")
+    except ImportError as e:
+        print(f"Error importing doctr: {e}")
         raise RuntimeError(
-            f"Failed to load ViTSTR model from {model_dir}.\n"
-            f"Please download it first: python download_doctr_model.py --output_dir {model_dir}"
+            f"Failed to import doctr. Please install it: pip install python-doctr"
         )
     except Exception as e:
         print(f"Error loading ViTSTR model: {e}")
         raise RuntimeError(
-            f"Failed to load ViTSTR model. Error: {e}"
+            f"Failed to load ViTSTR model from doctr. Error: {e}"
         )
 
 
