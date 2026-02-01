@@ -48,20 +48,29 @@ warnings.filterwarnings("ignore")
 
 class LayerAutoencoder(nn.Module):
     """
-    4-layer autoencoder with 128-unit hidden layers.
+    Deep autoencoder with 256-unit hidden layers and dropout.
     Maps compressed layer input to compressed layer output.
     """
-    def __init__(self, input_dim, output_dim, hidden_dim=128):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, dropout_rate=0.1):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
         )
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, output_dim),
         )
 
@@ -448,45 +457,69 @@ def fit_pca_transform(data, target_dim, name="data"):
 # Autoencoder Training
 # ============================================================================
 
-def train_autoencoder(inputs, outputs, latent_dim=128, epochs=50, batch_size=32, lr=0.001, device='cuda'):
+def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32,
+                     max_lr=5e-3, min_lr=1e-6, val_split=0.2, early_stop_patience=5,
+                     device='cuda', dropout_rate=0.1):
     """
-    Train autoencoder to map inputs to outputs.
+    Train autoencoder to map inputs to outputs with validation and early stopping.
 
     Args:
         inputs: Input data [n_samples, input_dim]
         outputs: Output data [n_samples, output_dim]
         latent_dim: Hidden layer dimension
-        epochs: Number of training epochs
+        epochs: Max number of training epochs
         batch_size: Batch size for training
-        lr: Learning rate
+        max_lr: Maximum learning rate for cosine annealing
+        min_lr: Minimum learning rate for cosine annealing
+        val_split: Fraction of data to use for validation (0.2 = 20%)
+        early_stop_patience: Stop if validation loss doesn't improve for N epochs
         device: Device to train on
+        dropout_rate: Dropout rate for each layer
 
     Returns:
-        Trained autoencoder model
+        Tuple of (trained_model, best_val_loss)
     """
     input_dim = inputs.shape[1]
     output_dim = outputs.shape[1]
 
     # Create model
-    model = LayerAutoencoder(input_dim, output_dim, hidden_dim=latent_dim).to(device)
+    model = LayerAutoencoder(input_dim, output_dim, hidden_dim=latent_dim,
+                            dropout_rate=dropout_rate).to(device)
 
-    # Create dataset
+    # Create dataset and split into train/val
     inputs_tensor = torch.from_numpy(inputs).float()
     outputs_tensor = torch.from_numpy(outputs).float()
     dataset = torch.utils.data.TensorDataset(inputs_tensor, outputs_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    n_samples = len(dataset)
+    n_val = int(n_samples * val_split)
+    n_train = n_samples - n_val
+
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [n_train, n_val]
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # Optimizer and loss
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=max_lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=min_lr
+    )
     criterion = nn.MSELoss()
 
-    # Training loop
-    model.train()
+    # Training loop with early stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+
     pbar = tqdm(range(epochs), desc="    Training autoencoder", leave=False)
 
     for epoch in pbar:
-        total_loss = 0
-        for batch_inputs, batch_outputs in dataloader:
+        # Training phase
+        model.train()
+        train_loss = 0
+        for batch_inputs, batch_outputs in train_loader:
             batch_inputs = batch_inputs.to(device)
             batch_outputs = batch_outputs.to(device)
 
@@ -496,13 +529,48 @@ def train_autoencoder(inputs, outputs, latent_dim=128, epochs=50, batch_size=32,
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            train_loss += loss.item()
 
-        avg_loss = total_loss / len(dataloader)
-        pbar.set_postfix({'loss': f'{avg_loss:.6f}'})
+        avg_train_loss = train_loss / len(train_loader)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_inputs, batch_outputs in val_loader:
+                batch_inputs = batch_inputs.to(device)
+                batch_outputs = batch_outputs.to(device)
+
+                predictions = model(batch_inputs)
+                loss = criterion(predictions, batch_outputs)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        # Learning rate scheduling
+        scheduler.step()
+
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        # Update progress bar
+        pbar.set_postfix({
+            'train': f'{avg_train_loss:.6f}',
+            'val': f'{avg_val_loss:.6f}',
+            'patience': f'{patience_counter}/{early_stop_patience}'
+        })
+
+        # Early stopping
+        if patience_counter >= early_stop_patience:
+            pbar.close()
+            break
 
     model.eval()
-    return model
+    return model, best_val_loss
 
 
 # ============================================================================
@@ -511,7 +579,8 @@ def train_autoencoder(inputs, outputs, latent_dim=128, epochs=50, batch_size=32,
 
 def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                                     device='cuda', batch_size=32,
-                                    pca_dim=128, ae_epochs=50):
+                                    pca_dim=256, ae_epochs=100, max_lr=5e-3, min_lr=1e-6,
+                                    val_split=0.2, early_stop_patience=5):
     """
     Profile a model by training autoencoder surrogates for each layer.
 
@@ -571,23 +640,26 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             outputs_compressed = output_transform(outputs)
 
             # Train autoencoder
-            print(f"  Training autoencoder ({pca_dim}→{pca_dim}, {ae_epochs} epochs)...")
-            autoencoder = train_autoencoder(
+            print(f"  Training autoencoder ({pca_dim}→{pca_dim}, {ae_epochs} epochs, val_split={val_split*100:.0f}%)...")
+            autoencoder, best_val_loss = train_autoencoder(
                 inputs_compressed,
                 outputs_compressed,
-                latent_dim=128,
+                latent_dim=pca_dim,
                 epochs=ae_epochs,
                 batch_size=batch_size,
-                lr=0.001,
+                max_lr=max_lr,
+                min_lr=min_lr,
+                val_split=val_split,
+                early_stop_patience=early_stop_patience,
                 device=device
             )
 
-            # Evaluate reconstruction error
+            # Evaluate reconstruction error on training set
             with torch.no_grad():
                 test_inputs = torch.from_numpy(inputs_compressed).float().to(device)
                 predictions = autoencoder(test_inputs).cpu().numpy()
                 mse = np.mean((predictions - outputs_compressed) ** 2)
-                print(f"  Reconstruction MSE: {mse:.6f}")
+                print(f"  Final train MSE: {mse:.6f}, best val MSE: {best_val_loss:.6f}")
 
             # Save profile (only save picklable objects - not local functions)
             profile = {
@@ -599,7 +671,8 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'input_pca': input_pca,
                 'output_pca': output_pca,
                 'autoencoder': autoencoder.cpu().state_dict(),
-                'reconstruction_mse': float(mse),
+                'train_mse': float(mse),
+                'val_mse': float(best_val_loss),
             }
 
             layer_profiles[layer_name] = profile
@@ -652,10 +725,18 @@ def main():
                         help='Batch size for profiling (default: 32)')
     parser.add_argument('--num-samples', type=int, default=0,
                         help='Max number of random images to use (0=all available, default: 0)')
-    parser.add_argument('--pca-dim', type=int, default=128,
-                        help='Target dimension for PCA compression (default: 128)')
-    parser.add_argument('--ae-epochs', type=int, default=50,
-                        help='Number of epochs to train each autoencoder (default: 50)')
+    parser.add_argument('--pca-dim', type=int, default=256,
+                        help='Target dimension for PCA compression (default: 256)')
+    parser.add_argument('--ae-epochs', type=int, default=100,
+                        help='Max number of epochs to train each autoencoder (default: 100)')
+    parser.add_argument('--max-lr', type=float, default=5e-3,
+                        help='Maximum learning rate for cosine annealing (default: 5e-3)')
+    parser.add_argument('--min-lr', type=float, default=1e-6,
+                        help='Minimum learning rate for cosine annealing (default: 1e-6)')
+    parser.add_argument('--val-split', type=float, default=0.2,
+                        help='Fraction of data to use for validation (default: 0.2)')
+    parser.add_argument('--early-stop-patience', type=int, default=5,
+                        help='Stop training if validation loss doesn\'t improve for N epochs (default: 5)')
     parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
                         help='Comma-separated list of models to profile: vitstr,cct,trocr (default: all)')
     args = parser.parse_args()
@@ -678,7 +759,9 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Number of samples: {args.num_samples}")
     print(f"PCA target dimension: {args.pca_dim}")
-    print(f"Autoencoder epochs: {args.ae_epochs}")
+    print(f"Autoencoder epochs: {args.ae_epochs} (early stopping patience: {args.early_stop_patience})")
+    print(f"Learning rate: {args.max_lr} → {args.min_lr} (cosine annealing)")
+    print(f"Validation split: {args.val_split*100:.0f}%")
     print(f"Batch size: {args.batch_size}")
     print()
 
@@ -712,7 +795,8 @@ def main():
 
             profiles = profile_model_with_autoencoders(
                 model, model_name, vitstr_dataset, args.output_dir,
-                device, args.batch_size, args.pca_dim, args.ae_epochs
+                device, args.batch_size, args.pca_dim, args.ae_epochs,
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
             )
             results[model_name] = profiles
 
@@ -737,7 +821,8 @@ def main():
 
             profiles = profile_model_with_autoencoders(
                 model, model_name, cct_dataset, args.output_dir,
-                device, args.batch_size, args.pca_dim, args.ae_epochs
+                device, args.batch_size, args.pca_dim, args.ae_epochs,
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
             )
             results[model_name] = profiles
 
@@ -762,7 +847,8 @@ def main():
 
             profiles = profile_model_with_autoencoders(
                 model, model_name, trocr_dataset, args.output_dir,
-                device, args.batch_size, args.pca_dim, args.ae_epochs
+                device, args.batch_size, args.pca_dim, args.ae_epochs,
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
             )
             results[model_name] = profiles
 
