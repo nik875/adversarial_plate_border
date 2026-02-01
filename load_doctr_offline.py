@@ -53,22 +53,15 @@ class DoctrLoader:
     def model(self):
         """Load and cache the ViTSTR model."""
         if self._model is None:
-            from doctr.models import vitstr_small
-
             print(f"Loading doctr ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
 
-            # Load model architecture
-            model = vitstr_small(pretrained=False)
-
-            # Load saved state dict
-            state_dict = torch.load(
+            # Load full model (includes architecture and weights)
+            self._model = torch.load(
                 str(self.model_dir / "vitstr_small.pt"),
                 map_location='cpu'
             )
-            model.load_state_dict(state_dict)
-            model.eval()
+            self._model.eval()
 
-            self._model = model
         return self._model
 
 
