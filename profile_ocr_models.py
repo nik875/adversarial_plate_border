@@ -90,18 +90,20 @@ class OCRImageDataset(Dataset):
     Wraps a CroppedPlateDataset with different format/scale options.
     """
     def __init__(self, cropped_dataset, preprocessor=None,
-                 channels_last=False, scale_to_255=False):
+                 channels_last=False, scale_to_255=False, target_size=None):
         """
         Args:
             cropped_dataset: CroppedPlateDataset with raw plates
             preprocessor: Optional TrOCRProcessor
             channels_last: If True, output [H, W, C] instead of [C, H, W]
             scale_to_255: If True, scale values from [0,1] to [0,255]
+            target_size: Optional (height, width) to resize image to
         """
         self.cropped_dataset = cropped_dataset
         self.preprocessor = preprocessor
         self.channels_last = channels_last
         self.scale_to_255 = scale_to_255
+        self.target_size = target_size
 
     def __len__(self):
         return len(self.cropped_dataset)
@@ -121,6 +123,16 @@ class OCRImageDataset(Dataset):
             # Process with TrOCRProcessor
             processed = self.preprocessor(images=pil_img, return_tensors="pt")
             return processed.pixel_values.squeeze(0)
+
+        # Resize if needed
+        if self.target_size is not None:
+            import torch.nn.functional as F
+            img = F.interpolate(
+                img.unsqueeze(0),
+                size=self.target_size,
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
 
         # Apply format transformations for other models
         if self.channels_last:
@@ -306,6 +318,10 @@ def save_activation_statistics(activation_stats, save_path):
         stats_group = f.create_group('activation_statistics')
 
         for layer_name, stats in activation_stats.items():
+            # Skip empty layer names (can occur with ONNX models)
+            if not layer_name or layer_name.strip() == '':
+                continue
+
             layer_group = stats_group.create_group(layer_name)
 
             # Save mean and std
@@ -655,7 +671,8 @@ def main():
                 cropped_plates,
                 preprocessor=None,
                 channels_last=False,  # Use [C, H, W] format
-                scale_to_255=False    # Keep [0, 1] range
+                scale_to_255=False,   # Keep [0, 1] range
+                target_size=(32, 128)  # ViTSTR expects 32x128 input
             )
 
             rdms = profile_model(model, model_name, vitstr_dataset, args.output_dir, device, args.batch_size)
