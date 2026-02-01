@@ -584,40 +584,92 @@ def main():
         print(f"Limiting to {args.limit_images} images")
         cropped_plates.images = cropped_plates.images[:args.limit_images]
 
-    # Profile each requested model
-    # ViTSTR is profiled FIRST to catch errors early
-    results = {}
+    # STEP 1: Load all models first (fail early if any have issues)
+    print("\n" + "="*80)
+    print("STEP 1: Loading all models")
+    print("="*80)
+
+    loaded_models = {}
 
     if 'vitstr' in models_to_profile:
         try:
+            print("\nLoading ViTSTR...")
             model, model_name = load_vitstr_model(device)
+            loaded_models['vitstr'] = (model, model_name, None)
+            print(f"✓ ViTSTR loaded successfully")
+        except Exception as e:
+            print(f"✗ ERROR loading ViTSTR: {e}")
+            import traceback
+            traceback.print_exc()
+            models_to_profile.remove('vitstr')
+
+    if 'cct' in models_to_profile:
+        try:
+            print("\nLoading CCT...")
+            model, model_name = load_cct_model(device)
+            loaded_models['cct'] = (model, model_name, None)
+            print(f"✓ CCT loaded successfully")
+        except Exception as e:
+            print(f"✗ ERROR loading CCT: {e}")
+            import traceback
+            traceback.print_exc()
+            models_to_profile.remove('cct')
+
+    if 'trocr' in models_to_profile:
+        try:
+            print("\nLoading TrOCR...")
+            model, model_name, processor = load_trocr_model(device, args.trocr_dir)
+            loaded_models['trocr'] = (model, model_name, processor)
+            print(f"✓ TrOCR loaded successfully")
+        except Exception as e:
+            print(f"✗ ERROR loading TrOCR: {e}")
+            import traceback
+            traceback.print_exc()
+            models_to_profile.remove('trocr')
+
+    if not loaded_models:
+        print("\n✗ No models loaded successfully. Exiting.")
+        return
+
+    print(f"\n✓ Successfully loaded {len(loaded_models)} model(s)")
+    for model_key in loaded_models:
+        print(f"  - {model_key}")
+
+    # STEP 2: Profile all loaded models
+    print("\n" + "="*80)
+    print("STEP 2: Profiling models")
+    print("="*80)
+
+    results = {}
+
+    if 'vitstr' in loaded_models:
+        try:
+            model, model_name, _ = loaded_models['vitstr']
 
             # Create ViTSTR dataset wrapper with model-specific preprocessing
-            # ViTSTR needs 32x128, so we'll resize on-the-fly
-            print(f"\nCreating preprocessing wrapper for {model_name}...")
+            print(f"\nProfiling ViTSTR...")
             vitstr_dataset = OCRImageDataset(
                 cropped_plates,
                 preprocessor=None,
                 channels_last=False,  # Use [C, H, W] format
                 scale_to_255=False    # Keep [0, 1] range
             )
-            # Note: ViTSTR resizing is done in profile_model's extract_activations
 
             rdms = profile_model(model, model_name, vitstr_dataset, args.output_dir, device, args.batch_size)
             results[model_name] = rdms
             del model, vitstr_dataset  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling ViTSTR model: {e}")
+            print(f"\n✗ ERROR profiling ViTSTR: {e}")
             import traceback
             traceback.print_exc()
 
-    if 'cct' in models_to_profile:
+    if 'cct' in loaded_models:
         try:
-            model, model_name = load_cct_model(device)
+            model, model_name, _ = loaded_models['cct']
 
             # Create CCT-specific preprocessing wrapper
-            print(f"\nCreating preprocessing wrapper for {model_name}...")
+            print(f"\nProfiling CCT...")
             cct_dataset = OCRImageDataset(
                 cropped_plates,
                 preprocessor=None,
@@ -630,16 +682,16 @@ def main():
             del model, cct_dataset  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling CCT model: {e}")
+            print(f"\n✗ ERROR profiling CCT: {e}")
             import traceback
             traceback.print_exc()
 
-    if 'trocr' in models_to_profile:
+    if 'trocr' in loaded_models:
         try:
-            model, model_name, processor = load_trocr_model(device, args.trocr_dir)
+            model, model_name, processor = loaded_models['trocr']
 
             # Create TrOCR-specific preprocessing wrapper
-            print(f"\nCreating preprocessing wrapper for {model_name}...")
+            print(f"\nProfiling TrOCR...")
             trocr_dataset = OCRImageDataset(
                 cropped_plates,
                 preprocessor=processor,
@@ -652,7 +704,7 @@ def main():
             del model, trocr_dataset, processor  # Free memory
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
-            print(f"\nERROR profiling TrOCR model: {e}")
+            print(f"\n✗ ERROR profiling TrOCR: {e}")
             import traceback
             traceback.print_exc()
 
