@@ -159,11 +159,6 @@ def vitstr_small(pretrained: bool = False, **kwargs: Any) -> ViTSTR:
 
 
 ================================================================================
-MODULE IMPORTS AND DEPENDENCIES
-================================================================================
-File location: /home/ubuntu/miniconda3/envs/alpr/lib/python3.10/site-packages/doctr/models/recognition/vitstr/pytorch.py
-
-================================================================================
 ALL CLASSES IN MODULE
 ================================================================================
 
@@ -319,5 +314,155 @@ class ViTSTRPostProcessor(_ViTSTRPostProcessor):
 
         return list(zip(word_values, probs))
 
+
+================================================================================
+UTILITY FUNCTIONS IN MODULE
+================================================================================
+
+Function: _vitstr
+def _vitstr(
+    arch: str,
+    pretrained: bool,
+    backbone_fn: Callable[[bool], nn.Module],
+    layer: str,
+    ignore_keys: list[str] | None = None,
+    **kwargs: Any,
+) -> ViTSTR:
+    # Patch the config
+    _cfg = deepcopy(default_cfgs[arch])
+    _cfg["vocab"] = kwargs.get("vocab", _cfg["vocab"])
+    _cfg["input_shape"] = kwargs.get("input_shape", _cfg["input_shape"])
+    patch_size = kwargs.get("patch_size", (4, 8))
+
+    kwargs["vocab"] = _cfg["vocab"]
+    kwargs["input_shape"] = _cfg["input_shape"]
+
+    # Feature extractor
+    feat_extractor = IntermediateLayerGetter(
+        # NOTE: we don't use a pretrained backbone for non-rectangular patches to avoid the pos embed mismatch
+        backbone_fn(False, input_shape=_cfg["input_shape"], patch_size=patch_size),  # type: ignore[call-arg]
+        {layer: "features"},
+    )
+
+    kwargs.pop("patch_size", None)
+    kwargs.pop("pretrained_backbone", None)
+
+    # Build the model
+    model = ViTSTR(feat_extractor, cfg=_cfg, **kwargs)
+    # Load pretrained parameters
+    if pretrained:
+        # The number of classes is not the same as the number of classes in the pretrained model =>
+        # remove the last layer weights
+        _ignore_keys = ignore_keys if _cfg["vocab"] != default_cfgs[arch]["vocab"] else None
+        model.from_pretrained(default_cfgs[arch]["url"], ignore_keys=_ignore_keys)
+
+    return model
+
+
+Function: vitstr_base
+def vitstr_base(pretrained: bool = False, **kwargs: Any) -> ViTSTR:
+    """ViTSTR-Base as described in `"Vision Transformer for Fast and Efficient Scene Text Recognition"
+    <https://arxiv.org/pdf/2105.08582.pdf>`_.
+
+    >>> import torch
+    >>> from doctr.models import vitstr_base
+    >>> model = vitstr_base(pretrained=False)
+    >>> input_tensor = torch.rand((1, 3, 32, 128))
+    >>> out = model(input_tensor)
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on our text recognition dataset
+        kwargs: keyword arguments of the ViTSTR architecture
+
+    Returns:
+        text recognition architecture
+    """
+    return _vitstr(
+        "vitstr_base",
+        pretrained,
+        vit_b,
+        "1",
+        embedding_units=768,
+        patch_size=(4, 8),
+        ignore_keys=["head.weight", "head.bias"],
+        **kwargs,
+    )
+
+
+Function: vitstr_small
+def vitstr_small(pretrained: bool = False, **kwargs: Any) -> ViTSTR:
+    """ViTSTR-Small as described in `"Vision Transformer for Fast and Efficient Scene Text Recognition"
+    <https://arxiv.org/pdf/2105.08582.pdf>`_.
+
+    >>> import torch
+    >>> from doctr.models import vitstr_small
+    >>> model = vitstr_small(pretrained=False)
+    >>> input_tensor = torch.rand((1, 3, 32, 128))
+    >>> out = model(input_tensor)
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on our text recognition dataset
+        kwargs: keyword arguments of the ViTSTR architecture
+
+    Returns:
+        text recognition architecture
+    """
+    return _vitstr(
+        "vitstr_small",
+        pretrained,
+        vit_s,
+        "1",
+        embedding_units=384,
+        patch_size=(4, 8),
+        ignore_keys=["head.weight", "head.bias"],
+        **kwargs,
+    )
+
+
+================================================================================
+VIT_S BACKBONE FUNCTION
+================================================================================
+Could not extract vit_s: No module named 'doctr.models.backbones'
+
+================================================================================
+_VITSTR BASE CLASS
+================================================================================
+class _ViTSTR:
+    vocab: str
+    max_length: int
+
+    def build_target(
+        self,
+        gts: list[str],
+    ) -> tuple[np.ndarray, list[int]]:
+        """Encode a list of gts sequences into a np array and gives the corresponding*
+        sequence lengths.
+
+        Args:
+            gts: list of ground-truth labels
+
+        Returns:
+            A tuple of 2 tensors: Encoded labels and sequence lengths (for each entry of the batch)
+        """
+        encoded = encode_sequences(
+            sequences=gts,
+            vocab=self.vocab,
+            target_size=self.max_length,
+            eos=len(self.vocab),
+            sos=len(self.vocab) + 1,
+        )
+        seq_len = [len(word) for word in gts]
+        return encoded, seq_len
+
+
+================================================================================
+MODULE IMPORTS AND DEPENDENCIES
+================================================================================
+File location: /home/ubuntu/miniconda3/envs/alpr/lib/python3.10/site-packages/doctr/models/recognition/vitstr/pytorch.py
+
+Check these doctr imports that need replacing:
+- from doctr.models.utils import load_pretrained_params
+- from doctr.models.backbones.vit import vit_s
+- Doctr base classes (_ViTSTR, _ViTSTRPostProcessor)
 
 Done! Copy the output above to a file to review the architecture.
