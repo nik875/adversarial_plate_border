@@ -281,19 +281,26 @@ def compute_activation_statistics(all_activations, layer_names):
         Each array has shape [n_features]
     """
     activation_stats = {}
+    unnamed_counter = 0
 
-    for layer_name in layer_names:
-        if layer_name not in all_activations or not all_activations[layer_name]:
+    for original_layer_name in layer_names:
+        if original_layer_name not in all_activations or not all_activations[original_layer_name]:
             continue
 
+        # Use placeholder names for empty/unnamed layers
+        display_layer_name = original_layer_name
+        if not original_layer_name or original_layer_name.strip() == '':
+            display_layer_name = f"unnamed_layer_{unnamed_counter}"
+            unnamed_counter += 1
+
         # Concatenate all activations for this layer across all batches
-        layer_acts = np.concatenate(all_activations[layer_name], axis=0)  # [n_images, n_features]
+        layer_acts = np.concatenate(all_activations[original_layer_name], axis=0)  # [n_images, n_features]
 
         # Compute mean and std per neuron (across images)
         mean = layer_acts.mean(axis=0)  # [n_features]
         std = layer_acts.std(axis=0)    # [n_features]
 
-        activation_stats[layer_name] = {
+        activation_stats[display_layer_name] = {
             'mean': mean.astype(np.float32),
             'std': std.astype(np.float32),
             'n_images': layer_acts.shape[0],
@@ -317,10 +324,12 @@ def save_activation_statistics(activation_stats, save_path):
     with h5py.File(save_path, 'w') as f:
         stats_group = f.create_group('activation_statistics')
 
+        unnamed_counter = 0
         for layer_name, stats in activation_stats.items():
-            # Skip empty layer names (can occur with ONNX models)
+            # Use placeholder names for empty/unnamed layers (can occur with ONNX models)
             if not layer_name or layer_name.strip() == '':
-                continue
+                layer_name = f"unnamed_layer_{unnamed_counter}"
+                unnamed_counter += 1
 
             layer_group = stats_group.create_group(layer_name)
 
