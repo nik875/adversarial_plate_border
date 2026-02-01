@@ -129,17 +129,28 @@ class ModelSpecificDataset(Dataset):
     """
     Applies model-specific preprocessing to raw cropped plates.
     """
-    def __init__(self, base_dataset, preprocessor=None, channels_last=False, scale_to_255=False):
+    def __init__(self, base_dataset, preprocessor=None, channels_last=False, scale_to_255=False, target_size=None):
         self.base_dataset = base_dataset
         self.preprocessor = preprocessor
         self.channels_last = channels_last
         self.scale_to_255 = scale_to_255
+        self.target_size = target_size
 
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
         img = self.base_dataset[idx].clone()  # [3, H, W] in [0, 1]
+
+        # Resize if needed
+        if self.target_size is not None:
+            import torch.nn.functional as F
+            img = F.interpolate(
+                img.unsqueeze(0),
+                size=self.target_size,
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
 
         # Apply TrOCR processor if provided
         if self.preprocessor is not None:
@@ -671,7 +682,8 @@ def main():
                 base_dataset,
                 preprocessor=None,
                 channels_last=False,
-                scale_to_255=False
+                scale_to_255=False,
+                target_size=(32, 128)  # ViTSTR expects 32x128 input
             )
 
             profiles = profile_model_with_autoencoders(
