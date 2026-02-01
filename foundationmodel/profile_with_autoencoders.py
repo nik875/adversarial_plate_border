@@ -562,7 +562,7 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 mse = np.mean((predictions - outputs_compressed) ** 2)
                 print(f"  Reconstruction MSE: {mse:.6f}")
 
-            # Save profile
+            # Save profile (only save picklable objects - not local functions)
             profile = {
                 'layer_name': layer_name,
                 'layer_type': layer_module.__class__.__name__,
@@ -571,10 +571,6 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'pca_dim': pca_dim,
                 'input_pca': input_pca,
                 'output_pca': output_pca,
-                'input_transform': input_transform,
-                'input_inverse': input_inverse,
-                'output_transform': output_transform,
-                'output_inverse': output_inverse,
                 'autoencoder': autoencoder.cpu().state_dict(),
                 'reconstruction_mse': float(mse),
             }
