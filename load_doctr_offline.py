@@ -1,9 +1,9 @@
 """
-Load doctr ViTSTR model from local offline cache (TorchScript-traced PyTorch).
+Load doctr ViTSTR model from local ONNX cache (no doctr imports needed).
 
-This module provides utilities to load the ViTSTR model that has been traced
-to TorchScript, allowing it to work completely offline without doctr imports.
-The model maintains full PyTorch functionality.
+This module provides utilities to load the ViTSTR model from ONNX format
+using ONNX Runtime, allowing it to work completely offline without doctr.
+The model wrapper provides PyTorch-like functionality.
 
 Usage:
     from load_doctr_offline import load_doctr_model, DoctrLoader
@@ -18,17 +18,50 @@ Usage:
 
 from pathlib import Path
 import torch
+import numpy as np
+
+
+class ONNXModelWrapper(torch.nn.Module):
+    """PyTorch-like wrapper around ONNX Runtime model."""
+
+    def __init__(self, onnx_session):
+        super().__init__()
+        self.session = onnx_session
+        self.input_name = onnx_session.get_inputs()[0].name
+        self.output_names = [o.name for o in onnx_session.get_outputs()]
+
+    def forward(self, x):
+        """Run inference on input tensor."""
+        # Convert torch tensor to numpy
+        x_np = x.cpu().detach().numpy()
+
+        # Run ONNX inference
+        outputs = self.session.run(self.output_names, {self.input_name: x_np})
+
+        # Convert output back to torch tensor
+        # Assume single output (logits)
+        output_tensor = torch.from_numpy(outputs[0]).to(x.device)
+        return output_tensor
+
+    def eval(self):
+        """Set to eval mode (no-op for ONNX)."""
+        return self
+
+    def to(self, device):
+        """Move to device (ONNX runs on CPU, but cache output device)."""
+        self.device = device
+        return self
 
 
 class DoctrLoader:
-    """Load TorchScript-traced ViTSTR model from local directory."""
+    """Load ONNX ViTSTR model from local directory (no doctr dependency)."""
 
     def __init__(self, model_dir: str = "./doctr_model"):
         """
         Initialize doctr loader.
 
         Args:
-            model_dir: Path to directory containing saved TorchScript-traced model
+            model_dir: Path to directory containing saved ONNX model
         """
         self.model_dir = Path(model_dir)
         self._validate_directory()
@@ -42,7 +75,7 @@ class DoctrLoader:
                 f"Please run: python download_doctr_model.py --output_dir {self.model_dir}"
             )
 
-        model_file = self.model_dir / "vitstr_small.pt"
+        model_file = self.model_dir / "vitstr_small.onnx"
         if not model_file.exists():
             raise FileNotFoundError(
                 f"Model file not found: {model_file}\n"
@@ -51,16 +84,20 @@ class DoctrLoader:
 
     @property
     def model(self):
-        """Load and cache the ViTSTR model (TorchScript-traced or full PyTorch)."""
+        """Load and cache the ViTSTR model (ONNX-based)."""
         if self._model is None:
-            print(f"Loading ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
+            import onnxruntime as ort
 
-            # Load TorchScript-traced or full PyTorch model
-            self._model = torch.load(
-                str(self.model_dir / "vitstr_small.pt"),
-                map_location='cpu',
-                weights_only=False
+            print(f"Loading ViTSTR model from {self.model_dir / 'vitstr_small.onnx'}...")
+
+            # Create ONNX Runtime session
+            session = ort.InferenceSession(
+                str(self.model_dir / "vitstr_small.onnx"),
+                providers=['CPUExecutionProvider']
             )
+
+            # Wrap in PyTorch-like interface
+            self._model = ONNXModelWrapper(session)
             self._model.eval()
 
         return self._model

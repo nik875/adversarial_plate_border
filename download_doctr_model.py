@@ -94,16 +94,10 @@ def download_doctr_model(output_dir="./doctr_model"):
     )
     print(f"✓ ONNX model saved to {onnx_path}")
 
-    # Convert ONNX back to PyTorch (removes doctr class references)
-    print("Converting ONNX back to PyTorch...")
-    torch_model = onnx2torch.convert(str(onnx_path))
-    torch_model.eval()
-
-    # Save PyTorch model
-    model_path = output_path / "vitstr_small.pt"
-    print(f"Saving converted PyTorch model to {model_path}...")
-    torch.save(torch_model, str(model_path))
-    print(f"✓ PyTorch model saved to {model_path}")
+    print(f"✓ ONNX export successful!")
+    print()
+    print("Note: ONNX model saved. Use with ONNX Runtime (no doctr needed)")
+    print(f"ONNX model path: {onnx_path}")
 
     print()
     print("=" * 80)
