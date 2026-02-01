@@ -126,11 +126,11 @@ def _iter_cocotext(split: str, max_samples: int | None = None) -> Iterator[Tuple
     cache_dir = DATASETS["cocotext"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"COCO Text crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels
     labels_dict = {}
@@ -194,11 +194,11 @@ def _iter_roboflow_lpr(split: str, max_samples: int | None = None) -> Iterator[T
     cache_dir = DATASETS["roboflow_lpr"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Roboflow LPR crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels and filter by split
     labels_dict = {}
@@ -266,11 +266,11 @@ def _iter_kaggle_lp(split: str, max_samples: int | None = None) -> Iterator[Tupl
     cache_dir = DATASETS["kaggle_lp"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Kaggle LP crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels
     labels_dict = {}
@@ -332,11 +332,11 @@ def _iter_indian_plates_kaggle(split: str, max_samples: int | None = None) -> It
     cache_dir = DATASETS["indian_plates_kaggle"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Indian Plates Kaggle crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels
     labels_dict = {}
@@ -398,11 +398,11 @@ def _iter_ccpd2019_variant(dataset_name: str, split: str, max_samples: int | Non
     cache_dir = DATASETS[dataset_name]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"CCPD2019 variant crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels
     labels_dict = {}
@@ -471,11 +471,11 @@ def _iter_mercosur(split: str, max_samples: int | None = None) -> Iterator[Tuple
     cache_dir = DATASETS["mercosur"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"Mercosur crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels
     labels_dict = {}
@@ -546,11 +546,11 @@ def _iter_crpd(split: str, max_samples: int | None = None) -> Iterator[Tuple[Ima
     cache_dir = DATASETS["crpd"]["cache_dir"]
 
     if not cache_dir.exists():
-        raise FileNotFoundError(f"CRPD crops not found at: {cache_dir}")
+        return
 
     labels_file = cache_dir / "labels.txt"
     if not labels_file.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file}")
+        return
 
     # Load labels and filter by split
     labels_dict = {}
