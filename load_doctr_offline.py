@@ -1,9 +1,9 @@
 """
-Load doctr ViTSTR model from local offline cache.
+Load doctr ViTSTR model from local offline cache (ONNX-converted PyTorch).
 
-This module provides utilities to load the ViTSTR model from doctr from a locally saved
-directory without requiring HuggingFace API access. This is useful when running
-in offline environments or when dealing with conflicting dependency versions.
+This module provides utilities to load the ViTSTR model that has been converted
+from ONNX format, allowing it to work completely offline without doctr imports.
+The model maintains full PyTorch functionality.
 
 Usage:
     from load_doctr_offline import load_doctr_model, DoctrLoader
@@ -21,14 +21,14 @@ import torch
 
 
 class DoctrLoader:
-    """Load doctr ViTSTR model from local directory."""
+    """Load ONNX-converted ViTSTR model from local directory (no doctr dependency)."""
 
     def __init__(self, model_dir: str = "./doctr_model"):
         """
         Initialize doctr loader.
 
         Args:
-            model_dir: Path to directory containing saved model
+            model_dir: Path to directory containing saved ONNX-converted model
         """
         self.model_dir = Path(model_dir)
         self._validate_directory()
@@ -51,32 +51,17 @@ class DoctrLoader:
 
     @property
     def model(self):
-        """Load and cache the ViTSTR model."""
+        """Load and cache the ViTSTR model (ONNX-converted PyTorch)."""
         if self._model is None:
-            print(f"Loading doctr ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
+            print(f"Loading ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
 
-            try:
-                # Import doctr architecture (only needed once for shape)
-                from doctr.models import vitstr_small
-
-                # Create empty model architecture
-                model = vitstr_small(pretrained=False)
-
-                # Load saved weights into architecture
-                state_dict = torch.load(
-                    str(self.model_dir / "vitstr_small.pt"),
-                    map_location='cpu',
-                    weights_only=True
-                )
-                model.load_state_dict(state_dict)
-                model.eval()
-
-                self._model = model
-            except ImportError:
-                raise RuntimeError(
-                    "doctr library required to load model architecture.\n"
-                    "Install with: pip install python-doctr[torch]"
-                )
+            # Load ONNX-converted PyTorch model (no doctr import needed)
+            self._model = torch.load(
+                str(self.model_dir / "vitstr_small.pt"),
+                map_location='cpu',
+                weights_only=False
+            )
+            self._model.eval()
 
         return self._model
 

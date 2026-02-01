@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Download and save doctr ViTSTR model locally for offline use.
+Download and convert doctr ViTSTR model to ONNX + PyTorch for offline use.
 
-This script downloads the vitstr_small pretrained model from doctr and saves it
-to a local directory, allowing it to be loaded without accessing HuggingFace.
+This script:
+1. Downloads vitstr_small pretrained model from doctr
+2. Exports to ONNX format
+3. Converts ONNX back to PyTorch (removes doctr dependencies)
+4. Saves the PyTorch model for offline use
 
 Usage:
     python download_doctr_model.py [--output_dir ./doctr_model]
@@ -12,21 +15,24 @@ Usage:
 import argparse
 import torch
 from pathlib import Path
+import tempfile
 
 
 def download_doctr_model(output_dir="./doctr_model"):
     """
-    Download and save doctr ViTSTR model locally.
+    Download and save doctr ViTSTR model locally via ONNX conversion.
 
     Args:
         output_dir: Directory to save the model (default: ./doctr_model)
     """
     from doctr.models import vitstr_small
+    import onnx
+    import onnx2torch
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Downloading doctr ViTSTR model")
+    print(f"Downloading and converting doctr ViTSTR model")
     print(f"Output directory: {output_path.absolute()}")
     print()
 
@@ -35,11 +41,36 @@ def download_doctr_model(output_dir="./doctr_model"):
     model = vitstr_small(pretrained=True)
     model.eval()
 
-    # Save only state dict (no doctr class references)
+    # Export to ONNX via temporary file
+    print("Exporting to ONNX...")
+    onnx_path = output_path / "vitstr_small.onnx"
+
+    # Create a dummy input for export
+    dummy_input = torch.randn(1, 3, 32, 128)
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        str(onnx_path),
+        input_names=['input'],
+        output_names=['output'],
+        opset_version=12,
+        do_constant_folding=True,
+        verbose=False
+    )
+    print(f"✓ ONNX model saved to {onnx_path}")
+
+    # Convert ONNX back to PyTorch (removes doctr dependencies)
+    print("Converting ONNX back to PyTorch...")
+    onnx_model = onnx.load(str(onnx_path))
+    torch_model = onnx2torch.ConvertModel(onnx_model)
+    torch_model.eval()
+
+    # Save PyTorch model
     model_path = output_path / "vitstr_small.pt"
-    print(f"Saving model state dict to {model_path}...")
-    torch.save(model.state_dict(), str(model_path))
-    print(f"✓ Model state dict saved to {model_path}")
+    print(f"Saving converted PyTorch model to {model_path}...")
+    torch.save(torch_model, str(model_path))
+    print(f"✓ PyTorch model saved to {model_path}")
 
     print()
     print("=" * 80)
