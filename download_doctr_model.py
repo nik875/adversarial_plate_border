@@ -25,14 +25,25 @@ class ViTSTRLogitsWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        # Store original postprocessor
+        self.original_postprocessor = model.postprocessor
 
     def forward(self, x):
-        # Get the full model output
-        output = self.model(x)
+        # Temporarily disable postprocessor by replacing it with an identity function
+        # that just returns the logits without .numpy() conversion
+        def dummy_postprocessor(logits):
+            return logits
 
-        # Extract just the logits (tensor output), not the decoded strings
-        # The model returns {'logits': tensor, 'preds': [...]}
-        # We only want the logits for ONNX export
+        self.model.postprocessor = dummy_postprocessor
+
+        try:
+            # Call model with postprocessor disabled
+            output = self.model(x)
+        finally:
+            # Restore original postprocessor
+            self.model.postprocessor = self.original_postprocessor
+
+        # Extract just the logits (should be the raw tensor output)
         if isinstance(output, dict):
             return output.get('logits', output)
         return output
