@@ -1,69 +1,36 @@
 #!/usr/bin/env python3
 """
-Download and convert doctr ViTSTR model to ONNX for offline use.
+Download and save doctr ViTSTR model weights locally for offline use.
 
 This script:
 1. Downloads vitstr_small pretrained model from doctr
-2. Creates a wrapper that outputs logits only (no postprocessor string decoding)
-3. Exports wrapper to ONNX format
-4. Converts ONNX back to PyTorch (removes doctr dependencies)
-5. Saves the converted model
+2. Saves the model state dict (weights only)
+3. Uses local architecture code (vitstr_architecture.py) at load time
 
 Usage:
     python download_doctr_model.py [--output_dir ./doctr_model]
+
+The saved weights can be loaded with vitstr_architecture.ViTSTR without doctr.
 """
 
 import argparse
 import torch
-import torch.nn as nn
 from pathlib import Path
-
-
-class ViTSTRLogitsWrapper(nn.Module):
-    """Wrapper that outputs logits only, no postprocessor string decoding."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        # Store original postprocessor
-        self.original_postprocessor = model.postprocessor
-
-    def forward(self, x):
-        # Temporarily disable postprocessor by replacing it with an identity function
-        # that just returns the logits without .numpy() conversion
-        def dummy_postprocessor(logits):
-            return logits
-
-        self.model.postprocessor = dummy_postprocessor
-
-        try:
-            # Call model with postprocessor disabled
-            output = self.model(x)
-        finally:
-            # Restore original postprocessor
-            self.model.postprocessor = self.original_postprocessor
-
-        # Extract just the logits (should be the raw tensor output)
-        if isinstance(output, dict):
-            return output.get('logits', output)
-        return output
 
 
 def download_doctr_model(output_dir="./doctr_model"):
     """
-    Download and save doctr ViTSTR model locally via ONNX conversion.
+    Download and save doctr ViTSTR model state dict locally.
 
     Args:
         output_dir: Directory to save the model (default: ./doctr_model)
     """
     from doctr.models import vitstr_small
-    import onnx
-    import onnx2torch
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Downloading and converting doctr ViTSTR model")
+    print(f"Downloading doctr ViTSTR model")
     print(f"Output directory: {output_path.absolute()}")
     print()
 
@@ -72,32 +39,24 @@ def download_doctr_model(output_dir="./doctr_model"):
     model = vitstr_small(pretrained=True)
     model.eval()
 
-    # Wrap to output logits only (skip postprocessor string decoding)
-    print("Creating logits-only wrapper...")
-    logits_model = ViTSTRLogitsWrapper(model)
-    logits_model.eval()
+    # Save state dict (weights only, no class references)
+    state_dict_path = output_path / "vitstr_small_weights.pt"
+    print(f"Saving state dict to {state_dict_path}...")
+    torch.save(model.state_dict(), str(state_dict_path))
+    print(f"✓ State dict saved")
 
-    # Export to ONNX
-    print("Exporting to ONNX...")
-    onnx_path = output_path / "vitstr_small.onnx"
-    dummy_input = torch.randn(1, 3, 32, 128)
-
-    torch.onnx.export(
-        logits_model,
-        dummy_input,
-        str(onnx_path),
-        input_names=['input'],
-        output_names=['logits'],
-        opset_version=18,
-        do_constant_folding=True,
-        verbose=False
-    )
-    print(f"✓ ONNX model saved to {onnx_path}")
-
-    print(f"✓ ONNX export successful!")
-    print()
-    print("Note: ONNX model saved. Use with ONNX Runtime (no doctr needed)")
-    print(f"ONNX model path: {onnx_path}")
+    # Also save model config for reference
+    config_path = output_path / "model_config.txt"
+    with open(config_path, "w") as f:
+        f.write("ViTSTR Model Configuration\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Vocab size: {len(model.vocab)}\n")
+        f.write(f"Max length: {model.max_length}\n")
+        f.write(f"Vocab: {model.vocab}\n")
+        f.write(f"Config: {model.cfg}\n")
+        f.write("\nModel structure:\n")
+        f.write(str(model))
+    print(f"✓ Config saved")
 
     print()
     print("=" * 80)
