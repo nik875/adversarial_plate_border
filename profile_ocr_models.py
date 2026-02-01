@@ -19,7 +19,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import onnx
 import onnx2torch
-from transformers import VisionEncoderDecoderModel, TrOCRProcessor
+from transformers import VisionEncoderDecoderModel
+from load_trocr_offline import TrOCRLoader
 import urllib.request
 import warnings
 import numpy as np
@@ -196,12 +197,16 @@ def load_vitstr_model(device='cuda'):
         )
 
 
-def load_trocr_model(device='cuda'):
+def load_trocr_model(device='cuda', model_dir='./trocr_model'):
     """
-    Load microsoft/trocr-small-printed from HuggingFace.
+    Load microsoft/trocr-small-printed from local offline cache.
 
     This is a Vision Encoder-Decoder model for OCR. We profile the vision encoder
     which is the part that processes images into representations.
+
+    Args:
+        device: Device to load model on (default: 'cuda')
+        model_dir: Directory containing saved model (default: './trocr_model')
 
     Returns:
         model: PyTorch model (vision encoder only)
@@ -209,17 +214,18 @@ def load_trocr_model(device='cuda'):
         processor: TrOCRProcessor for image preprocessing
     """
     print("\n" + "="*80)
-    print("Loading Microsoft TrOCR Small Printed Model")
+    print("Loading Microsoft TrOCR Small Printed Model (offline)")
     print("="*80)
 
     try:
+        # Load from offline cache
+        loader = TrOCRLoader(model_dir)
+
         # Load processor for image preprocessing
-        processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+        processor = loader.processor
 
         # Load full model
-        full_model = VisionEncoderDecoderModel.from_pretrained(
-            "microsoft/trocr-small-printed"
-        ).to(device)
+        full_model = loader.model.to(device)
         full_model.eval()
 
         # Extract vision encoder (the part that processes images)
@@ -236,11 +242,16 @@ def load_trocr_model(device='cuda'):
             print(f"Expected input size: {processor.feature_extractor.size}")
 
         return model, "trocr_small_printed_encoder", processor
+    except FileNotFoundError as e:
+        print(f"Error loading TrOCR model: {e}")
+        raise RuntimeError(
+            f"Failed to load TrOCR model from {model_dir}.\n"
+            f"Please download it first: python download_trocr_model.py --output_dir {model_dir}"
+        )
     except Exception as e:
         print(f"Error loading TrOCR model: {e}")
         raise RuntimeError(
-            f"Failed to load TrOCR model from HuggingFace. Error: {e}\n"
-            "Please ensure transformers is installed: pip install transformers"
+            f"Failed to load TrOCR model. Error: {e}"
         )
 
 
@@ -511,6 +522,8 @@ def main():
                         help='Batch size for profiling (default: 16)')
     parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
                         help='Comma-separated list of models to profile: vitstr,cct,trocr (default: all)')
+    parser.add_argument('--trocr-dir', type=str, default='./trocr_model',
+                        help='Directory containing TrOCR model (default: ./trocr_model)')
     parser.add_argument('--limit-images', type=int, default=0,
                         help='Limit number of images to profile (0=all, default: 0)')
     args = parser.parse_args()
@@ -623,7 +636,7 @@ def main():
 
     if 'trocr' in models_to_profile:
         try:
-            model, model_name, processor = load_trocr_model(device)
+            model, model_name, processor = load_trocr_model(device, args.trocr_dir)
 
             # Create TrOCR-specific preprocessing wrapper
             print(f"\nCreating preprocessing wrapper for {model_name}...")
