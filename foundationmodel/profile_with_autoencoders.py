@@ -466,7 +466,7 @@ def fit_pca_transform(data, target_dim, name="data"):
 
 def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32,
                      max_lr=5e-3, min_lr=1e-6, val_split=0.2, early_stop_patience=5,
-                     device='cuda', dropout_rate=0.1):
+                     device='cuda', dropout_rate=0.2):
     """
     Train autoencoder to map inputs to outputs with validation and early stopping.
 
@@ -481,10 +481,10 @@ def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32
         val_split: Fraction of data to use for validation (0.2 = 20%)
         early_stop_patience: Stop if validation loss doesn't improve for N epochs
         device: Device to train on
-        dropout_rate: Dropout rate for each layer
+        dropout_rate: Dropout rate for each layer (default 0.2 = 20%)
 
     Returns:
-        Tuple of (trained_model, best_val_loss)
+        Tuple of (trained_model, best_val_loss, training_history)
     """
     input_dim = inputs.shape[1]
     output_dim = outputs.shape[1]
