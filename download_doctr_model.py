@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Download and convert doctr ViTSTR model to ONNX + PyTorch for offline use.
+Download and convert doctr ViTSTR model to TorchScript for offline use.
 
 This script:
 1. Downloads vitstr_small pretrained model from doctr
-2. Exports to ONNX format
-3. Converts ONNX back to PyTorch (removes doctr dependencies)
-4. Saves the PyTorch model for offline use
+2. Traces to TorchScript using torch.jit.trace (forgiving of complex ops)
+3. Saves the traced model (removes most doctr dependencies)
+4. Falls back to full model save if tracing fails
 
 Usage:
     python download_doctr_model.py [--output_dir ./doctr_model]
@@ -15,19 +15,16 @@ Usage:
 import argparse
 import torch
 from pathlib import Path
-import tempfile
 
 
 def download_doctr_model(output_dir="./doctr_model"):
     """
-    Download and save doctr ViTSTR model locally via ONNX conversion.
+    Download and save doctr ViTSTR model locally via TorchScript tracing.
 
     Args:
         output_dir: Directory to save the model (default: ./doctr_model)
     """
     from doctr.models import vitstr_small
-    import onnx
-    import onnx2torch
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -41,42 +38,30 @@ def download_doctr_model(output_dir="./doctr_model"):
     model = vitstr_small(pretrained=True)
     model.eval()
 
-    # We only use the encoder (feature extraction), not the full model with decoder
-    # This also avoids exporting the postprocessor which has compatibility issues
-    print("Extracting encoder (feature extractor)...")
-    encoder = model.feat_extractor  # Get the backbone CNN encoder
-    encoder.eval()
-
-    # Export encoder to ONNX
-    print("Exporting encoder to ONNX...")
-    onnx_path = output_path / "vitstr_encoder.onnx"
-
-    # Create a dummy input for export
+    # Trace to TorchScript (more forgiving than ONNX export for complex models)
+    print("Tracing model to TorchScript...")
     dummy_input = torch.randn(1, 3, 32, 128)
 
-    torch.onnx.export(
-        encoder,
-        dummy_input,
-        str(onnx_path),
-        input_names=['input'],
-        output_names=['output'],
-        opset_version=12,
-        do_constant_folding=True,
-        verbose=False
-    )
-    print(f"✓ ONNX encoder saved to {onnx_path}")
+    try:
+        traced_model = torch.jit.trace(model, dummy_input, strict=False)
+        print(f"✓ Model traced to TorchScript")
 
-    # Convert ONNX back to PyTorch (removes doctr dependencies)
-    print("Converting ONNX back to PyTorch...")
-    onnx_model = onnx.load(str(onnx_path))
-    torch_encoder = onnx2torch.ConvertModel(onnx_model)
-    torch_encoder.eval()
+        # Save traced model (removes doctr class references)
+        model_path = output_path / "vitstr_small.pt"
+        print(f"Saving traced PyTorch model to {model_path}...")
+        torch.save(traced_model, str(model_path))
+        print(f"✓ Traced model saved to {model_path}")
 
-    # Save PyTorch encoder
-    model_path = output_path / "vitstr_small.pt"
-    print(f"Saving converted PyTorch encoder to {model_path}...")
-    torch.save(torch_encoder, str(model_path))
-    print(f"✓ PyTorch encoder saved to {model_path}")
+    except Exception as e:
+        print(f"Warning: Tracing failed, saving full model instead...")
+        print(f"  Error: {e}")
+
+        # Fallback: save full model with weights_only=False
+        model_path = output_path / "vitstr_small.pt"
+        print(f"Saving full PyTorch model to {model_path}...")
+        torch.save(model, str(model_path))
+        print(f"✓ Full model saved to {model_path}")
+        print(f"  Note: Full model contains doctr class references")
 
     print()
     print("=" * 80)
