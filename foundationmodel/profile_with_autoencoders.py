@@ -5,12 +5,18 @@ Profile OCR Models with Autoencoder Surrogates
 For each layer of each model, trains an autoencoder surrogate that replicates its behavior.
 
 Process:
-1. Load 1024 random cropped images from load_lp_crops.py
+1. Load all available cropped images from roboflow_lpr, kaggle_lp, mercosur datasets
 2. For each layer Li:
    - Pass images through model and collect Li-1 outputs (inputs to Li) and Li outputs
-   - Apply PCA to compress/expand to fixed autoencoder size
-   - Train 4-layer autoencoder (128-128-128-128) to map compressed inputs to compressed outputs
+   - Apply PCA to compress/expand to fixed dimension (default 256)
+   - Train deep autoencoder (3-layer encoder/decoder with 256-unit hidden layers + 10% dropout)
+   - With validation split (20%), cosine annealing LR (5e-3 → 1e-6), and early stopping (patience 5)
    - Save autoencoder + PCA operators as layer profile
+   - Save detailed training history and metrics as JSON for analysis
+
+Output per layer:
+- layer_XXX_name.pkl: Full profile with autoencoder weights, PCA objects
+- layer_XXX_name_metrics.json: Training history and performance metrics
 
 Flow: Li-1 output -> Li input PCA -> autoencoder_i -> Li output inverse PCA -> Li+1 input
 """
@@ -30,6 +36,7 @@ from datetime import datetime
 from tqdm import tqdm
 import warnings
 import pickle
+import json
 from sklearn.decomposition import PCA
 from PIL import Image
 import torchvision.transforms as T
@@ -509,9 +516,15 @@ def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32
     )
     criterion = nn.MSELoss()
 
-    # Training loop with early stopping
+    # Training loop with early stopping and history tracking
     best_val_loss = float('inf')
     patience_counter = 0
+    history = {
+        'train_loss': [],
+        'val_loss': [],
+        'learning_rate': [],
+        'epoch': []
+    }
 
     pbar = tqdm(range(epochs), desc="    Training autoencoder", leave=False)
 
@@ -547,8 +560,17 @@ def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32
 
         avg_val_loss = val_loss / len(val_loader)
 
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Learning rate scheduling
         scheduler.step()
+
+        # Record history
+        history['epoch'].append(epoch)
+        history['train_loss'].append(float(avg_train_loss))
+        history['val_loss'].append(float(avg_val_loss))
+        history['learning_rate'].append(float(current_lr))
 
         # Early stopping check
         if avg_val_loss < best_val_loss:
@@ -570,7 +592,7 @@ def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32
             break
 
     model.eval()
-    return model, best_val_loss
+    return model, best_val_loss, history
 
 
 # ============================================================================
@@ -641,7 +663,7 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
 
             # Train autoencoder
             print(f"  Training autoencoder ({pca_dim}→{pca_dim}, {ae_epochs} epochs, val_split={val_split*100:.0f}%)...")
-            autoencoder, best_val_loss = train_autoencoder(
+            autoencoder, best_val_loss, train_history = train_autoencoder(
                 inputs_compressed,
                 outputs_compressed,
                 latent_dim=pca_dim,
@@ -673,6 +695,8 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'autoencoder': autoencoder.cpu().state_dict(),
                 'train_mse': float(mse),
                 'val_mse': float(best_val_loss),
+                'training_history': train_history,
+                'epochs_trained': len(train_history['epoch']),
             }
 
             layer_profiles[layer_name] = profile
@@ -682,7 +706,29 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             with open(layer_file, 'wb') as f:
                 pickle.dump(profile, f)
 
-            print(f"  ✓ Saved to {layer_file.name}")
+            # Save training metrics as JSON for easy analysis
+            metrics_file = model_output_dir / f"layer_{i:03d}_{layer_name.replace('.', '_')}_metrics.json"
+            metrics = {
+                'layer_name': layer_name,
+                'layer_type': layer_module.__class__.__name__,
+                'input_shape': list(inputs.shape),
+                'output_shape': list(outputs.shape),
+                'pca_dim': pca_dim,
+                'train_mse': float(mse),
+                'val_mse': float(best_val_loss),
+                'epochs_trained': len(train_history['epoch']),
+                'training_history': {
+                    'epoch': train_history['epoch'],
+                    'train_loss': train_history['train_loss'],
+                    'val_loss': train_history['val_loss'],
+                    'learning_rate': train_history['learning_rate']
+                }
+            }
+            with open(metrics_file, 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+            print(f"  ✓ Saved profile to {layer_file.name}")
+            print(f"    Metrics: {metrics_file.name}")
 
         except Exception as e:
             print(f"  ⚠️  Error profiling layer: {e}")
