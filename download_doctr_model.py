@@ -35,11 +35,11 @@ def download_doctr_model(output_dir="./doctr_model"):
     model = vitstr_small(pretrained=True)
     model.eval()
 
-    # Save full model (includes architecture and weights)
+    # Save only state dict (no doctr class references)
     model_path = output_path / "vitstr_small.pt"
-    print(f"Saving model to {model_path}...")
-    torch.save(model, str(model_path))
-    print(f"✓ Model saved to {model_path}")
+    print(f"Saving model state dict to {model_path}...")
+    torch.save(model.state_dict(), str(model_path))
+    print(f"✓ Model state dict saved to {model_path}")
 
     print()
     print("=" * 80)

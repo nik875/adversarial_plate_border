@@ -55,14 +55,28 @@ class DoctrLoader:
         if self._model is None:
             print(f"Loading doctr ViTSTR model from {self.model_dir / 'vitstr_small.pt'}...")
 
-            # Load full model (includes architecture and weights)
-            # weights_only=False allows loading the full model object (not just state dict)
-            self._model = torch.load(
-                str(self.model_dir / "vitstr_small.pt"),
-                map_location='cpu',
-                weights_only=False
-            )
-            self._model.eval()
+            try:
+                # Import doctr architecture (only needed once for shape)
+                from doctr.models import vitstr_small
+
+                # Create empty model architecture
+                model = vitstr_small(pretrained=False)
+
+                # Load saved weights into architecture
+                state_dict = torch.load(
+                    str(self.model_dir / "vitstr_small.pt"),
+                    map_location='cpu',
+                    weights_only=True
+                )
+                model.load_state_dict(state_dict)
+                model.eval()
+
+                self._model = model
+            except ImportError:
+                raise RuntimeError(
+                    "doctr library required to load model architecture.\n"
+                    "Install with: pip install python-doctr[torch]"
+                )
 
         return self._model
 
