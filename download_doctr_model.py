@@ -88,7 +88,7 @@ def download_doctr_model(output_dir="./doctr_model"):
         str(onnx_path),
         input_names=['input'],
         output_names=['logits'],
-        opset_version=12,
+        opset_version=18,
         do_constant_folding=True,
         verbose=False
     )
