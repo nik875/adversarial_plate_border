@@ -1,0 +1,16 @@
+# Claude Code Custom Instructions for Adversarial Plate Repository
+
+## Development Workflow
+- **All changes MUST be committed and pushed** to the repository after completion
+- User will pull changes on their compute machine and run code there
+- Do not run code locally on this development machine
+
+## Code Editing Best Practices
+- Prefer using the Read and Edit tools for file operations
+- Only use bash commands (sed, awk, cat) as a last resort
+- Read a file first before editing to ensure proper context
+- Use Edit tool for replacements, Write tool for new files
+
+## Commits
+- Include descriptive commit messages that explain the "why"
+- Always include Co-Authored-By footer: `Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>`
