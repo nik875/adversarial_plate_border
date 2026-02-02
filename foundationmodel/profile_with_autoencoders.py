@@ -846,7 +846,9 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
 def main():
     parser = argparse.ArgumentParser(description='Profile OCR Models with Autoencoder Surrogates')
     parser.add_argument('--output-dir', type=str, default='autoencoder_profiles',
-                        help='Output directory for layer profiles (default: autoencoder_profiles)')
+                        help='Base output directory for layer profiles (default: autoencoder_profiles)')
+    parser.add_argument('--unique-run', action='store_true', default=True,
+                        help='Append timestamp to output directory (default: True)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (cuda/mps/cpu). Auto-detects if not specified.')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -885,8 +887,15 @@ def main():
     print("="*80)
     print("OCR Model Autoencoder Profiler")
     print("="*80)
+    # Append timestamp to output directory for unique runs
+    if args.unique_run:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = f"{args.output_dir}_{timestamp}"
+    else:
+        output_dir = args.output_dir
+
     print(f"Device: {device}")
-    print(f"Output directory: {args.output_dir}")
+    print(f"Output directory: {output_dir}")
     print(f"Number of samples: {args.num_samples}")
     print(f"PCA memory limit: {args.max_pca_memory:.1f}GB (collects sample, then processes full dataset)")
     print(f"PCA target dimension: {args.pca_dim}")
@@ -925,7 +934,7 @@ def main():
             )
 
             profiles = profile_model_with_autoencoders(
-                model, model_name, vitstr_dataset, args.output_dir,
+                model, model_name, vitstr_dataset, output_dir,
                 device, args.batch_size, args.pca_dim, args.ae_epochs,
                 args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
                 args.max_pca_memory
