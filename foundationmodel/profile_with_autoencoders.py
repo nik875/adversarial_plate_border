@@ -412,6 +412,7 @@ def collect_layer_activations(model, dataset, layer_name, layer_module, device='
     capture.remove_hooks()
 
     if not all_inputs:
+        # No activations captured - likely hook not triggered
         return None, None
 
     inputs = np.concatenate(all_inputs, axis=0)
@@ -714,7 +715,12 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             )
 
             if inputs_sample is None or outputs_sample is None:
-                print("  ⚠️  Failed to collect activations, skipping layer")
+                reason = []
+                if inputs_sample is None:
+                    reason.append("input hook not triggered")
+                if outputs_sample is None:
+                    reason.append("output hook not triggered")
+                print(f"  ⚠️  Failed to collect activations ({', '.join(reason)}) - skipping layer")
                 continue
 
             print(f"  Sample shape: inputs {inputs_sample.shape}, outputs {outputs_sample.shape}")
@@ -740,7 +746,12 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             )
 
             if inputs_compressed is None or outputs_compressed is None:
-                print("  ⚠️  Failed to process full dataset, skipping layer")
+                reason = []
+                if inputs_compressed is None:
+                    reason.append("input PCA application failed")
+                if outputs_compressed is None:
+                    reason.append("output PCA application failed")
+                print(f"  ⚠️  Failed to process full dataset ({', '.join(reason)}) - skipping layer")
                 continue
 
             print(f"  Full dataset compressed: {inputs_compressed.shape}")
@@ -822,7 +833,14 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             print(f"    Metrics: {metrics_file.name}")
 
         except Exception as e:
-            print(f"  ⚠️  Error profiling layer: {e}")
+            error_type = type(e).__name__
+            error_msg = str(e)
+            print(f"  ⚠️  Error profiling layer: {error_type}")
+            print(f"     Details: {error_msg}")
+            if 'CUDA out of memory' in error_msg or 'RuntimeError' in error_type:
+                print(f"     Suggestion: Reduce --batch-size or --pca-dim")
+            elif 'NaN' in error_msg or 'inf' in error_msg:
+                print(f"     Suggestion: Check for exploding/vanishing gradients in activations")
             import traceback
             traceback.print_exc()
             continue
@@ -926,8 +944,36 @@ def main():
         datasets=['roboflow_lpr', 'kaggle_lp', 'mercosur']
     )
 
-    # Profile each requested model
+    # Profile each requested model (in order: cct, vitstr, trocr)
     results = {}
+
+    if 'cct' in models_to_profile:
+        try:
+            model, model_name = load_cct_model(device)
+
+            # CCT-specific preprocessing
+            print(f"\nProfiling CCT...")
+            cct_dataset = ModelSpecificDataset(
+                base_dataset,
+                preprocessor=None,
+                channels_last=True,  # CCT expects [H, W, C]
+                scale_to_255=True    # CCT expects [0, 255]
+            )
+
+            profiles = profile_model_with_autoencoders(
+                model, model_name, cct_dataset, output_dir,
+                device, args.batch_size, args.pca_dim, args.ae_epochs,
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
+                args.max_pca_memory
+            )
+            results[model_name] = profiles
+
+            del model, cct_dataset
+            torch.cuda.empty_cache() if device == 'cuda' else None
+        except Exception as e:
+            print(f"\n✗ ERROR profiling CCT: {e}")
+            import traceback
+            traceback.print_exc()
 
     if 'vitstr' in models_to_profile:
         try:
@@ -954,33 +1000,6 @@ def main():
             torch.cuda.empty_cache() if device == 'cuda' else None
         except Exception as e:
             print(f"\n⚠️  ERROR profiling ViTSTR model: {e}")
-            import traceback
-            traceback.print_exc()
-
-    if 'cct' in models_to_profile:
-        try:
-            model, model_name = load_cct_model(device)
-
-            # CCT-specific preprocessing
-            cct_dataset = ModelSpecificDataset(
-                base_dataset,
-                preprocessor=None,
-                channels_last=True,
-                scale_to_255=True
-            )
-
-            profiles = profile_model_with_autoencoders(
-                model, model_name, cct_dataset, args.output_dir,
-                device, args.batch_size, args.pca_dim, args.ae_epochs,
-                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
-                args.max_pca_memory
-            )
-            results[model_name] = profiles
-
-            del model, cct_dataset
-            torch.cuda.empty_cache() if device == 'cuda' else None
-        except Exception as e:
-            print(f"\n⚠️  ERROR profiling CCT model: {e}")
             import traceback
             traceback.print_exc()
 
