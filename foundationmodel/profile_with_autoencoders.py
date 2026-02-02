@@ -352,14 +352,27 @@ class LayerActivationCapture:
         self.activations.clear()
 
 
-def collect_layer_activations(model, dataset, layer_name, layer_module, device='cuda', batch_size=32):
+def collect_layer_activations(model, dataset, layer_name, layer_module, device='cuda',
+                             batch_size=32, max_memory_gb=2.0):
     """
     Collect input and output activations for a specific layer across the dataset.
 
+    Strategy: Collect activations up to memory limit, then return them.
+    The caller will fit PCA on this sample and apply to full dataset iteratively.
+
+    Args:
+        model: Model to profile
+        dataset: Dataset to collect from
+        layer_name: Name of layer
+        layer_module: Layer module object
+        device: Device to use
+        batch_size: Batch size for collection
+        max_memory_gb: Max memory to use for collecting activations (default 2GB)
+
     Returns:
-        Tuple of (inputs, outputs) as numpy arrays
-        - inputs: [n_samples, input_features]
-        - outputs: [n_samples, output_features]
+        Tuple of (inputs, outputs) as numpy arrays (sample for PCA fitting)
+        - inputs: [n_samples, input_features] (limited by memory)
+        - outputs: [n_samples, output_features] (limited by memory)
     """
     capture = LayerActivationCapture(model)
     capture.register_layer_hooks(layer_name, layer_module)
@@ -368,6 +381,7 @@ def collect_layer_activations(model, dataset, layer_name, layer_module, device='
 
     all_inputs = []
     all_outputs = []
+    max_memory_bytes = max_memory_gb * 1024 * 1024 * 1024
 
     with torch.no_grad():
         for batch in dataloader:
@@ -388,6 +402,11 @@ def collect_layer_activations(model, dataset, layer_name, layer_module, device='
                 all_inputs.append(input_flat)
                 all_outputs.append(output_flat)
 
+                # Check memory usage
+                current_memory = sum(x.nbytes for x in all_inputs) + sum(x.nbytes for x in all_outputs)
+                if current_memory > max_memory_bytes:
+                    break
+
             capture.clear_activations()
 
     capture.remove_hooks()
@@ -399,6 +418,58 @@ def collect_layer_activations(model, dataset, layer_name, layer_module, device='
     outputs = np.concatenate(all_outputs, axis=0)
 
     return inputs, outputs
+
+
+def apply_pca_to_dataset(model, dataset, layer_name, layer_module, input_pca, output_pca,
+                         input_transform, output_transform, device='cuda', batch_size=32):
+    """
+    Iterate through entire dataset, applying PCA compression to activations on-the-fly.
+    Returns compressed activations without storing raw activations in memory.
+
+    Returns:
+        Tuple of (compressed_inputs, compressed_outputs) as numpy arrays
+    """
+    capture = LayerActivationCapture(model)
+    capture.register_layer_hooks(layer_name, layer_module)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    all_inputs_compressed = []
+    all_outputs_compressed = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = batch.to(device)
+
+            # Forward pass
+            _ = model(batch)
+
+            if 'input' in capture.activations and 'output' in capture.activations:
+                # Flatten activations to [batch, features]
+                input_act = capture.activations['input']
+                output_act = capture.activations['output']
+
+                input_flat = input_act.reshape(input_act.shape[0], -1).cpu().numpy()
+                output_flat = output_act.reshape(output_act.shape[0], -1).cpu().numpy()
+
+                # Apply PCA immediately (no storage of raw activations)
+                input_compressed = input_transform(input_flat)
+                output_compressed = output_transform(output_flat)
+
+                all_inputs_compressed.append(input_compressed)
+                all_outputs_compressed.append(output_compressed)
+
+            capture.clear_activations()
+
+    capture.remove_hooks()
+
+    if not all_inputs_compressed:
+        return None, None
+
+    inputs_compressed = np.concatenate(all_inputs_compressed, axis=0)
+    outputs_compressed = np.concatenate(all_outputs_compressed, axis=0)
+
+    return inputs_compressed, outputs_compressed
 
 
 # ============================================================================
@@ -602,7 +673,7 @@ def train_autoencoder(inputs, outputs, latent_dim=256, epochs=100, batch_size=32
 def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                                     device='cuda', batch_size=32,
                                     pca_dim=256, ae_epochs=100, max_lr=5e-3, min_lr=1e-6,
-                                    val_split=0.2, early_stop_patience=5):
+                                    val_split=0.2, early_stop_patience=5, max_pca_memory_gb=2.0):
     """
     Profile a model by training autoencoder surrogates for each layer.
 
@@ -636,30 +707,39 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
         print(f"  Type: {layer_module.__class__.__name__}")
 
         try:
-            # Collect activations
-            print("  Collecting activations...")
-            inputs, outputs = collect_layer_activations(
-                model, dataset, layer_name, layer_module, device, batch_size
+            # PASS 1: Collect sample activations (up to memory limit) for PCA fitting
+            print("  Collecting activations sample (up to {:.1f}GB)...".format(max_pca_memory_gb))
+            inputs_sample, outputs_sample = collect_layer_activations(
+                model, dataset, layer_name, layer_module, device, batch_size, max_pca_memory_gb
             )
 
-            if inputs is None or outputs is None:
+            if inputs_sample is None or outputs_sample is None:
                 print("  ⚠️  Failed to collect activations, skipping layer")
                 continue
 
-            print(f"  Input shape: {inputs.shape}, Output shape: {outputs.shape}")
+            print(f"  Sample shape: inputs {inputs_sample.shape}, outputs {outputs_sample.shape}")
 
-            # Fit PCA transforms
+            # Fit PCA transforms on sample
             print("  Fitting PCA transforms...")
             input_pca, input_transform, input_inverse = fit_pca_transform(
-                inputs, pca_dim, name="Input"
+                inputs_sample, pca_dim, name="Input"
             )
             output_pca, output_transform, output_inverse = fit_pca_transform(
-                outputs, pca_dim, name="Output"
+                outputs_sample, pca_dim, name="Output"
             )
 
-            # Transform data
-            inputs_compressed = input_transform(inputs)
-            outputs_compressed = output_transform(outputs)
+            # PASS 2: Apply PCA to entire dataset iteratively (memory efficient)
+            print("  Applying PCA to full dataset...")
+            inputs_compressed, outputs_compressed = apply_pca_to_dataset(
+                model, dataset, layer_name, layer_module, input_pca, output_pca,
+                input_transform, output_transform, device, batch_size
+            )
+
+            if inputs_compressed is None or outputs_compressed is None:
+                print("  ⚠️  Failed to process full dataset, skipping layer")
+                continue
+
+            print(f"  Full dataset compressed: {inputs_compressed.shape}")
 
             # Train autoencoder
             print(f"  Training autoencoder ({pca_dim}→{pca_dim}, {ae_epochs} epochs, val_split={val_split*100:.0f}%)...")
@@ -687,8 +767,8 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             profile = {
                 'layer_name': layer_name,
                 'layer_type': layer_module.__class__.__name__,
-                'input_shape': inputs.shape,
-                'output_shape': outputs.shape,
+                'input_shape': inputs_compressed.shape,  # Shape after full dataset processing
+                'output_shape': outputs_compressed.shape,  # Shape after full dataset processing
                 'pca_dim': pca_dim,
                 'input_pca': input_pca,
                 'output_pca': output_pca,
@@ -711,8 +791,10 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             metrics = {
                 'layer_name': layer_name,
                 'layer_type': layer_module.__class__.__name__,
-                'input_shape': list(inputs.shape),
-                'output_shape': list(outputs.shape),
+                'input_shape_full': list(inputs_compressed.shape),  # Full dataset
+                'output_shape_full': list(outputs_compressed.shape),  # Full dataset
+                'input_shape_sample': list(inputs_sample.shape),  # Used for PCA fitting
+                'output_shape_sample': list(outputs_sample.shape),  # Used for PCA fitting
                 'pca_dim': pca_dim,
                 'train_mse': float(mse),
                 'val_mse': float(best_val_loss),
@@ -783,6 +865,8 @@ def main():
                         help='Fraction of data to use for validation (default: 0.2)')
     parser.add_argument('--early-stop-patience', type=int, default=5,
                         help='Stop training if validation loss doesn\'t improve for N epochs (default: 5)')
+    parser.add_argument('--max-pca-memory', type=float, default=2.0,
+                        help='Max memory in GB for collecting activations before PCA fitting (default: 2.0)')
     parser.add_argument('--models', type=str, default='vitstr,cct,trocr',
                         help='Comma-separated list of models to profile: vitstr,cct,trocr (default: all)')
     args = parser.parse_args()
@@ -804,6 +888,7 @@ def main():
     print(f"Device: {device}")
     print(f"Output directory: {args.output_dir}")
     print(f"Number of samples: {args.num_samples}")
+    print(f"PCA memory limit: {args.max_pca_memory:.1f}GB (collects sample, then processes full dataset)")
     print(f"PCA target dimension: {args.pca_dim}")
     print(f"Autoencoder epochs: {args.ae_epochs} (early stopping patience: {args.early_stop_patience})")
     print(f"Learning rate: {args.max_lr} → {args.min_lr} (cosine annealing)")
@@ -842,7 +927,8 @@ def main():
             profiles = profile_model_with_autoencoders(
                 model, model_name, vitstr_dataset, args.output_dir,
                 device, args.batch_size, args.pca_dim, args.ae_epochs,
-                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
+                args.max_pca_memory
             )
             results[model_name] = profiles
 
@@ -868,7 +954,8 @@ def main():
             profiles = profile_model_with_autoencoders(
                 model, model_name, cct_dataset, args.output_dir,
                 device, args.batch_size, args.pca_dim, args.ae_epochs,
-                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
+                args.max_pca_memory
             )
             results[model_name] = profiles
 
@@ -894,7 +981,8 @@ def main():
             profiles = profile_model_with_autoencoders(
                 model, model_name, trocr_dataset, args.output_dir,
                 device, args.batch_size, args.pca_dim, args.ae_epochs,
-                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience
+                args.max_lr, args.min_lr, args.val_split, args.early_stop_patience,
+                args.max_pca_memory
             )
             results[model_name] = profiles
 
