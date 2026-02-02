@@ -728,6 +728,10 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 outputs_sample, pca_dim, name="Output"
             )
 
+            # Calculate explained variance metrics
+            input_explained_var = float(input_pca.explained_variance_ratio_.sum()) if input_pca is not None else 1.0
+            output_explained_var = float(output_pca.explained_variance_ratio_.sum()) if output_pca is not None else 1.0
+
             # PASS 2: Apply PCA to entire dataset iteratively (memory efficient)
             print("  Applying PCA to full dataset...")
             inputs_compressed, outputs_compressed = apply_pca_to_dataset(
@@ -740,6 +744,7 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 continue
 
             print(f"  Full dataset compressed: {inputs_compressed.shape}")
+            print(f"  PCA quality: Input {input_explained_var:.4f} | Output {output_explained_var:.4f} variance explained")
 
             # Train autoencoder
             print(f"  Training autoencoder ({pca_dim}→{pca_dim}, {ae_epochs} epochs, val_split={val_split*100:.0f}%)...")
@@ -772,6 +777,8 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'pca_dim': pca_dim,
                 'input_pca': input_pca,
                 'output_pca': output_pca,
+                'input_pca_explained_variance': input_explained_var,
+                'output_pca_explained_variance': output_explained_var,
                 'autoencoder': autoencoder.cpu().state_dict(),
                 'train_mse': float(mse),
                 'val_mse': float(best_val_loss),
@@ -796,6 +803,8 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'input_shape_sample': list(inputs_sample.shape),  # Used for PCA fitting
                 'output_shape_sample': list(outputs_sample.shape),  # Used for PCA fitting
                 'pca_dim': pca_dim,
+                'input_pca_explained_variance': round(input_explained_var, 6),  # Proportion of variance explained
+                'output_pca_explained_variance': round(output_explained_var, 6),  # Proportion of variance explained
                 'train_mse': float(mse),
                 'val_mse': float(best_val_loss),
                 'epochs_trained': len(train_history['epoch']),
