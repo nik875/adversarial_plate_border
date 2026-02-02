@@ -800,12 +800,14 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
             layer_profiles[layer_name] = profile
 
             # Save individual layer profile
-            layer_file = model_output_dir / f"layer_{i:03d}_{layer_name.replace('.', '_')}.pkl"
+            # Sanitize layer name: replace . and / with _ to avoid filesystem issues
+            safe_layer_name = layer_name.replace('.', '_').replace('/', '_')
+            layer_file = model_output_dir / f"layer_{i:03d}_{safe_layer_name}.pkl"
             with open(layer_file, 'wb') as f:
                 pickle.dump(profile, f)
 
             # Save training metrics as JSON for easy analysis
-            metrics_file = model_output_dir / f"layer_{i:03d}_{layer_name.replace('.', '_')}_metrics.json"
+            metrics_file = model_output_dir / f"layer_{i:03d}_{safe_layer_name}_metrics.json"
             metrics = {
                 'layer_name': layer_name,
                 'layer_type': layer_module.__class__.__name__,
