@@ -1460,19 +1460,21 @@ class ProgressivePatchTrainer:
             # OCR mode: Generate multiple patches per image, process multiple images per batch
             # images_per_batch × patches_per_image = total patches in accumulation
             dataloader_iter = iter(self.train_loader)
-            num_batches = len(self.train_loader)
+            num_images = len(self.train_loader)
             images_per_batch = self.ocr_images_per_batch
             patches_per_image = self.ocr_patches_per_image
 
-            # Calculate how many images to process before updating
-            # We want to process images_per_batch images per update
+            # Calculate number of batches (groups of images_per_batch images)
+            import math
+            num_batches = math.ceil(num_images / images_per_batch)
+
             with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
-                batch_idx = 0
-                while batch_idx < num_batches:
+                img_idx = 0
+                while img_idx < num_images:
                     try:
                         # Process images_per_batch images
                         for img_in_batch in range(images_per_batch):
-                            if batch_idx >= num_batches:
+                            if img_idx >= num_images:
                                 break
 
                             # Get one image
@@ -1488,9 +1490,9 @@ class ProgressivePatchTrainer:
                                 accumulated_patches.append(patch)
                                 accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
                                                            for k, v in single_batch.items()})
-                                accumulated_indices.append(batch_idx)
+                                accumulated_indices.append(img_idx)
 
-                            batch_idx += 1
+                            img_idx += 1
                             step_count += patches_per_image
 
                     except StopIteration:
@@ -1564,7 +1566,7 @@ class ProgressivePatchTrainer:
                         'SSIMLoss': f"{avg_ssim_loss:.4f}",
                         'Updates': num_updates
                     })
-                    pbar.update(images_per_batch)  # Increment by number of images processed
+                    pbar.update(1)  # Increment by 1 batch
 
                     # Memory cleanup after update
                     del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
