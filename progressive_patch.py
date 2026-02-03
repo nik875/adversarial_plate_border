@@ -17,7 +17,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.checkpoint import checkpoint
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
 import numpy as np
 from tqdm import tqdm
 import kornia
@@ -576,20 +576,38 @@ class ProgressivePatchTrainer:
         # Load dataset (either from CSV or public OCR datasets)
         if ocr_mode and ocr_dataset:
             # OCR mode: use public datasets from load_datasets.py
-            print(f"\nUsing public OCR dataset: {ocr_dataset} (split: {ocr_dataset_split})")
+            # Support multiple datasets (comma-separated)
+            dataset_names = [name.strip() for name in ocr_dataset.split(',')]
 
-            # Validate dataset exists
-            if ocr_dataset not in DATASETS:
-                available = ', '.join(DATASETS.keys())
-                raise ValueError(f"Unknown dataset '{ocr_dataset}'. Available: {available}")
+            print(f"\nUsing public OCR dataset(s): {', '.join(dataset_names)} (split: {ocr_dataset_split})")
 
-            # Load full dataset
-            full_dataset = OCRDataset(
-                dataset_name=ocr_dataset,
-                split=ocr_dataset_split,
-                transform=self.transform,
-                max_samples=ocr_max_samples
-            )
+            # Validate all datasets exist
+            for dataset_name in dataset_names:
+                if dataset_name not in DATASETS:
+                    available = ', '.join(sorted(DATASETS.keys()))
+                    raise ValueError(
+                        f"Unknown dataset '{dataset_name}'. Available: {available}"
+                    )
+
+            # Load all datasets
+            datasets_to_combine = []
+            for dataset_name in dataset_names:
+                print(f"\nLoading {dataset_name}...")
+                dataset = OCRDataset(
+                    dataset_name=dataset_name,
+                    split=ocr_dataset_split,
+                    transform=self.transform,
+                    max_samples=ocr_max_samples
+                )
+                datasets_to_combine.append(dataset)
+                print(f"  Loaded {len(dataset)} samples from {dataset_name}")
+
+            # Combine datasets if multiple, otherwise use single dataset
+            if len(datasets_to_combine) > 1:
+                full_dataset = ConcatDataset(datasets_to_combine)
+                print(f"\nCombined {len(dataset_names)} datasets: {len(full_dataset)} total samples")
+            else:
+                full_dataset = datasets_to_combine[0]
 
             # Split into train (80%) and val (20%)
             train_size = int(0.8 * len(full_dataset))
@@ -1928,9 +1946,13 @@ def main():
                         'Removes complex perspective transform logic. '
                         'When enabled, specify dataset with --ocr-dataset.')
     parser.add_argument('--ocr-dataset', type=str, default=None,
-                        help='Public OCR dataset to use in OCR mode (e.g., iiit5k, icdar2013, icdar2015, '
-                        'cocotext, roboflow_lpr, kaggle_lp, indian_plates_kaggle, ccpd2019_base, '
-                        'mercosur, crpd). Only used when --ocr-mode is enabled.')
+                        help='Public OCR dataset(s) to use in OCR mode. '
+                        'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
+                        '(e.g., iiit5k,icdar2013,roboflow_lpr). Multiple datasets will be combined. '
+                        'Available: iiit5k, icdar2013, icdar2015, cocotext, roboflow_lpr, kaggle_lp, '
+                        'indian_plates_kaggle, ccpd2019_base, ccpd2019_blur, ccpd2019_challenge, '
+                        'ccpd2019_db, ccpd2019_fn, ccpd2019_np, ccpd2019_rotate, ccpd2019_tilt, '
+                        'ccpd2019_weather, mercosur, crpd. Only used when --ocr-mode is enabled.')
     parser.add_argument('--ocr-dataset-split', type=str, default='train',
                         help='Dataset split to use (default: train). Options: train, test, val '
                         '(availability depends on dataset). Only used when --ocr-mode is enabled.')
