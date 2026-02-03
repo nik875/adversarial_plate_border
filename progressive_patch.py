@@ -5,6 +5,7 @@ deeper layers of the OCR model, starting from early CNN features and moving
 towards final outputs.
 """
 import os
+import sys
 from typing import Tuple, List, Optional, Dict, Any
 from dataclasses import dataclass
 import logging
@@ -16,6 +17,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.checkpoint import checkpoint
+from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from tqdm import tqdm
 import kornia
@@ -26,8 +28,27 @@ import matplotlib.pyplot as plt
 from matplotlib import patches
 import onnx
 import onnx2torch
+from PIL import Image
 from dataset import create_dataloaders
 from diffusers import AutoencoderKL
+
+# Import load_datasets module from foundationmodel
+try:
+    import importlib.util
+    load_datasets_path = Path(__file__).parent / "foundationmodel" / "dataset" / "load_datasets.py"
+    spec = importlib.util.spec_from_file_location("load_datasets", load_datasets_path)
+    load_datasets = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(load_datasets)
+    iter_dataset = load_datasets.iter_dataset
+    DATASETS = load_datasets.DATASETS
+except Exception as e:
+    print(f"Warning: Could not import load_datasets: {e}")
+    print("OCR mode will not be available without this module.")
+    # Define empty placeholders to allow script to load
+    def iter_dataset(*args, **kwargs):
+        raise NotImplementedError("load_datasets not available")
+    DATASETS = {}
+
 warnings.filterwarnings("ignore")
 
 
@@ -45,6 +66,61 @@ class LayerConfig:
 
     def __repr__(self):
         return f"{self.description} ({self.name})"
+
+
+class OCRDataset(Dataset):
+    """
+    PyTorch Dataset wrapper for public OCR datasets from load_datasets.py.
+
+    Loads all samples into memory on initialization for consistent indexing.
+    Suitable for datasets like IIIT5K, ICDAR, etc.
+    """
+    def __init__(self, dataset_name: str, split: str = 'train',
+                 transform=None, max_samples: Optional[int] = None):
+        """
+        Args:
+            dataset_name: Name of dataset (e.g., 'iiit5k', 'icdar2013')
+            split: Dataset split ('train', 'test', 'val')
+            transform: Optional torchvision transforms to apply
+            max_samples: Optional limit on number of samples to load
+        """
+        self.dataset_name = dataset_name
+        self.split = split
+        self.transform = transform
+
+        # Load all samples into memory
+        print(f"Loading {dataset_name} ({split} split)...")
+        self.samples = []
+        for img, text, meta in tqdm(iter_dataset(dataset_name, split, max_samples),
+                                     desc=f"Loading {dataset_name}"):
+            self.samples.append((img, text, meta))
+
+        print(f"Loaded {len(self.samples)} samples from {dataset_name} ({split})")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img, text, meta = self.samples[idx]
+
+        # Convert PIL image to tensor
+        if self.transform:
+            # Convert to numpy array first if needed
+            if isinstance(img, Image.Image):
+                img = np.array(img)
+            img_tensor = self.transform(img)
+        else:
+            # Default: convert to tensor
+            img_tensor = T.ToTensor()(img)
+
+        # Return format compatible with progressive_patch expectations
+        # Use prep_image since we're in OCR mode (cropped plates)
+        return {
+            'prep_image': img_tensor,
+            'text': text,
+            'dataset': meta['dataset'],
+            'split': meta['split']
+        }
 
 
 def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float = 1.0,
@@ -393,7 +469,7 @@ class ProgressivePatchTrainer:
     starting from early CNN features and moving towards final outputs.
     """
     def __init__(self,
-                 csv_path: str,
+                 csv_path: str = None,
                  device: str = None,
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
@@ -408,7 +484,10 @@ class ProgressivePatchTrainer:
                  eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False,
                  use_all_for_train: bool = True,
-                 ocr_mode: bool = False):
+                 ocr_mode: bool = False,
+                 ocr_dataset: Optional[str] = None,
+                 ocr_dataset_split: str = 'train',
+                 ocr_max_samples: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -494,9 +573,63 @@ class ProgressivePatchTrainer:
         self.patch_width = PATCH_WIDTH
         self.patch_height = PATCH_HEIGHT
 
-        self.train_loader, self.val_loader = create_dataloaders(csv_path, transform=self.transform,
-                                                                preload=True, batch_size=1,
-                                                                n_jobs=0, use_all_for_train=use_all_for_train)
+        # Load dataset (either from CSV or public OCR datasets)
+        if ocr_mode and ocr_dataset:
+            # OCR mode: use public datasets from load_datasets.py
+            print(f"\nUsing public OCR dataset: {ocr_dataset} (split: {ocr_dataset_split})")
+
+            # Validate dataset exists
+            if ocr_dataset not in DATASETS:
+                available = ', '.join(DATASETS.keys())
+                raise ValueError(f"Unknown dataset '{ocr_dataset}'. Available: {available}")
+
+            # Load full dataset
+            full_dataset = OCRDataset(
+                dataset_name=ocr_dataset,
+                split=ocr_dataset_split,
+                transform=self.transform,
+                max_samples=ocr_max_samples
+            )
+
+            # Split into train (80%) and val (20%)
+            train_size = int(0.8 * len(full_dataset))
+            val_size = len(full_dataset) - train_size
+            train_dataset, val_dataset = random_split(
+                full_dataset,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(42)
+            )
+
+            # Create dataloaders
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=1,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=True if self.device == 'cuda' else False
+            )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True if self.device == 'cuda' else False
+            )
+
+            print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
+
+        elif csv_path:
+            # Standard mode: use CSV dataset
+            self.train_loader, self.val_loader = create_dataloaders(
+                csv_path,
+                transform=self.transform,
+                preload=True,
+                batch_size=1,
+                n_jobs=0,
+                use_all_for_train=use_all_for_train
+            )
+        else:
+            raise ValueError("Must provide either csv_path or (ocr_mode=True + ocr_dataset)")
 
         # Initialize generator (simple or foundation model)
         if use_simple_generator:
@@ -1788,15 +1921,43 @@ def main():
                         'Foundation model: z → adapter → VAE decoder → CNN refiner → DNN → patch. '
                         'Simple generator uses ~10x less memory but may produce lower quality patches.')
     parser.add_argument('--ocr-mode', action='store_true',
-                        help='Enable OCR mode for cropped license plate dataset (same as conditional_patch.py). '
+                        help='Enable OCR mode for cropped license plate dataset. '
                         'In OCR mode: (1) uses cropped plate images directly (prep_image), '
                         '(2) applies patch as border around plate (resizes 256x512 patch to image size, '
                         'keeps center content), (3) forces 80/20 train/val split. '
-                        'Removes complex perspective transform logic.')
+                        'Removes complex perspective transform logic. '
+                        'When enabled, specify dataset with --ocr-dataset.')
+    parser.add_argument('--ocr-dataset', type=str, default=None,
+                        help='Public OCR dataset to use in OCR mode (e.g., iiit5k, icdar2013, icdar2015, '
+                        'cocotext, roboflow_lpr, kaggle_lp, indian_plates_kaggle, ccpd2019_base, '
+                        'mercosur, crpd). Only used when --ocr-mode is enabled.')
+    parser.add_argument('--ocr-dataset-split', type=str, default='train',
+                        help='Dataset split to use (default: train). Options: train, test, val '
+                        '(availability depends on dataset). Only used when --ocr-mode is enabled.')
+    parser.add_argument('--ocr-max-samples', type=int, default=None,
+                        help='Maximum number of samples to load from OCR dataset (default: all). '
+                        'Useful for quick testing.')
     args = parser.parse_args()
 
     # Configuration
-    CSV_PATH = "preproc_labels.csv"
+    CSV_PATH = "preproc_labels.csv" if not args.ocr_mode else None
+
+    # Validate OCR mode configuration
+    if args.ocr_mode:
+        if not args.ocr_dataset:
+            available_datasets = ', '.join(sorted(DATASETS.keys()))
+            raise ValueError(
+                f"--ocr-mode requires --ocr-dataset to be specified.\n"
+                f"Available datasets: {available_datasets}"
+            )
+        print(f"\n{'='*80}")
+        print(f"OCR MODE ENABLED")
+        print(f"{'='*80}")
+        print(f"  Dataset: {args.ocr_dataset}")
+        print(f"  Split: {args.ocr_dataset_split}")
+        if args.ocr_max_samples:
+            print(f"  Max samples: {args.ocr_max_samples}")
+        print(f"{'='*80}\n")
 
     # Parse target layers if specified
     target_layers = None
@@ -1826,6 +1987,7 @@ def main():
 
     # Trainer kwargs
     trainer_kwargs = {
+        'csv_path': CSV_PATH,
         'device': 'cuda',
         'grad_accumulate': args.batch_size,
         'basis_dim': args.basis_dim,
@@ -1839,12 +2001,15 @@ def main():
         'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator,
         'use_all_for_train': not args.no_use_all_for_train,
-        'ocr_mode': args.ocr_mode
+        'ocr_mode': args.ocr_mode,
+        'ocr_dataset': args.ocr_dataset,
+        'ocr_dataset_split': args.ocr_dataset_split,
+        'ocr_max_samples': args.ocr_max_samples
     }
 
     # Training mode
     try:
-        trainer = ProgressivePatchTrainer(CSV_PATH, **trainer_kwargs)
+        trainer = ProgressivePatchTrainer(**trainer_kwargs)
 
         history = trainer.train(
             learning_rate=args.learning_rate,
