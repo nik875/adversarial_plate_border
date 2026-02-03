@@ -70,6 +70,7 @@ def classify_layer_type(layer_name: str) -> str:
 def load_profile_metrics(profile_dir: Path) -> Dict:
     """
     Load all metrics.json files from a profile directory.
+    Extracts original layer dimensions from PCA objects in .pkl files.
 
     Returns:
         Dict with structure:
@@ -80,8 +81,8 @@ def load_profile_metrics(profile_dir: Path) -> Dict:
                         'layer_name': str,
                         'layer_type': str (module class),
                         'layer_category': str (conv/dense/transformer/norm/pooling/other),
-                        'input_size': int,
-                        'output_size': int,
+                        'input_size': int (original activation features),
+                        'output_size': int (original activation features),
                         'input_pca_var': float,
                         'output_pca_var': float,
                         'train_mse_normalized': float,
@@ -92,6 +93,7 @@ def load_profile_metrics(profile_dir: Path) -> Dict:
             }
         }
     """
+    import pickle
     results = {}
 
     # Find all model directories
@@ -110,12 +112,34 @@ def load_profile_metrics(profile_dir: Path) -> Dict:
                 with open(metrics_file, 'r') as f:
                     data = json.load(f)
 
-                # Calculate layer size as product of dimensions
-                input_shape = data.get('input_shape_full', [0])
-                output_shape = data.get('output_shape_full', [0])
+                # Extract original layer sizes from PCA objects in .pkl file
+                pkl_file = metrics_file.with_suffix('.pkl')
+                input_size = None
+                output_size = None
 
-                input_size = int(np.prod(input_shape)) if input_shape else 0
-                output_size = int(np.prod(output_shape)) if output_shape else 0
+                if pkl_file.exists():
+                    try:
+                        with open(pkl_file, 'rb') as f:
+                            profile = pickle.load(f)
+
+                        # Get original feature dimensions from PCA objects
+                        input_pca = profile.get('input_pca')
+                        output_pca = profile.get('output_pca')
+
+                        if input_pca is not None and hasattr(input_pca, 'n_features_in_'):
+                            input_size = input_pca.n_features_in_
+                        if output_pca is not None and hasattr(output_pca, 'n_features_in_'):
+                            output_size = output_pca.n_features_in_
+                    except Exception as e:
+                        pass
+
+                # Fallback to compressed shape if PCA extraction fails
+                if input_size is None:
+                    input_shape = data.get('input_shape_sample', [0])
+                    input_size = int(np.prod(input_shape)) if input_shape else 0
+                if output_size is None:
+                    output_shape = data.get('output_shape_sample', [0])
+                    output_size = int(np.prod(output_shape)) if output_shape else 0
 
                 layer_info = {
                     'layer_name': data.get('layer_name', 'unknown'),
