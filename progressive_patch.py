@@ -1170,7 +1170,7 @@ class ProgressivePatchTrainer:
 
             # Always include diagonal (patch_i on image_i)
             activations = diagonal_activations[patch_idx]  # [H, W, C]
-            baseline = self.baseline_ocr_activations[baseline_indices[patch_idx]]  # [H, W, C]
+            baseline = self.get_baseline_activation(batches_list[patch_idx], baseline_indices[patch_idx])  # [H, W, C]
             delta = activations - baseline  # [H, W, C]
             activation_deltas.append(delta)
 
@@ -1179,7 +1179,7 @@ class ProgressivePatchTrainer:
                 if img_idx != patch_idx and (patch_idx, img_idx) in sampled_pairs:
                     batch = batches_list[img_idx]
                     activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=True)  # [H, W, C]
-                    baseline = self.baseline_ocr_activations[baseline_indices[img_idx]]  # [H, W, C]
+                    baseline = self.get_baseline_activation(batch, baseline_indices[img_idx])  # [H, W, C]
                     delta = activations - baseline  # [H, W, C]
                     activation_deltas.append(delta)
 
@@ -1230,55 +1230,84 @@ class ProgressivePatchTrainer:
         border_corners = center.unsqueeze(0) + (plate_corners - center.unsqueeze(0)) * border_scale
         return border_corners  # [4, 2]
 
+    def get_baseline_activation(self, batch: dict, idx: int) -> torch.Tensor:
+        """
+        Get baseline activation for an image (compute on-the-fly if needed).
+
+        In OCR mode: computes on-the-fly and caches (memory efficient).
+        In standard mode: uses pre-computed baselines.
+
+        Args:
+            batch: Batch dict with image data
+            idx: Dataset index
+
+        Returns:
+            baseline: [H, W, C] baseline activation
+        """
+        # Check if already cached
+        if idx in self.baseline_ocr_activations:
+            return self.baseline_ocr_activations[idx]
+
+        # Compute on-the-fly
+        with torch.no_grad():
+            if self.ocr_mode:
+                # OCR mode: use prep_image directly (already cropped)
+                prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
+                cropped_plate = F.interpolate(
+                    prep_image,
+                    size=self.ocr_input_shape[:2],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            else:
+                # Standard mode: use border corners with perspective transform
+                plate_corners = batch['orig_corners'].to(self.device)
+                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
+
+                # Crop plate area from original image (no patch)
+                orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+                cropped_plate = K.crop_and_resize(
+                    orig_image,
+                    corners_box,
+                    self.ocr_input_shape[:2]
+                )
+
+            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+            self.ocr(ocr_input)  # Forward pass captures activations via hook
+
+            # Extract baseline activation
+            if self.ocr_activations is not None:
+                baseline_act = self.ocr_activations.squeeze(0).detach().clone()
+                # Cache it
+                self.baseline_ocr_activations[idx] = baseline_act
+                # Clear hook reference
+                self.ocr_activations = None
+                return baseline_act
+            else:
+                # Fallback
+                if hasattr(self, 'activation_shape'):
+                    return torch.zeros(self.activation_shape, device=self.device)
+                else:
+                    return torch.zeros(1, 1, 48, device=self.device)
+
     def calculate_baseline_activations(self):
         """
         Capture baseline activations for each image (without patches).
+
+        In OCR mode: this is skipped and baselines are computed on-the-fly.
+        In standard mode: pre-computes all baselines.
         """
+        if self.ocr_mode:
+            print("OCR mode: computing baselines on-the-fly (memory efficient)")
+            return
+
         desc = "Calculating baseline activations"
         with tqdm(self.train_loader, desc=desc, leave=False) as pbar:
             with torch.no_grad():
                 for idx, batch in enumerate(pbar):
                     batch = {k: v[0] for k, v in batch.items()}
-
-                    if self.ocr_mode:
-                        # OCR mode: use prep_image directly (already cropped)
-                        prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
-                        cropped_plate = F.interpolate(
-                            prep_image,
-                            size=self.ocr_input_shape[:2],
-                            mode='bilinear',
-                            align_corners=False
-                        )
-                    else:
-                        # Standard mode: use border corners with perspective transform
-                        # Use BORDER corners (1.4x scaled) to match where patches will be applied
-                        plate_corners = batch['orig_corners'].to(self.device)
-                        border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-                        corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
-
-                        # Crop plate area from original image (no patch)
-                        orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-                        cropped_plate = K.crop_and_resize(
-                            orig_image,
-                            corners_box,
-                            self.ocr_input_shape[:2]
-                        )
-
-                    ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-                    self.ocr(ocr_input)  # Forward pass captures activations via hook
-
-                    # Capture the baseline activations from this forward pass
-                    if self.ocr_activations is not None:
-                        # Store per-image baseline: [H, W, C]
-                        baseline_act = self.ocr_activations.squeeze(0).detach().clone()
-                        self.baseline_ocr_activations[idx] = baseline_act
-
-                        # Store activation shape from first sample for fallback zeros
-                        if not hasattr(self, 'activation_shape'):
-                            self.activation_shape = baseline_act.shape
-
-                        # Clear hook reference
-                        self.ocr_activations = None
+                    self.get_baseline_activation(batch, idx)
 
         print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
 
@@ -1389,6 +1418,8 @@ class ProgressivePatchTrainer:
 
         Activation-based diversity: measures how differently each patch affects
         OCR internal representations (at the patch_extractor layer) compared to baseline.
+
+        In OCR mode: generates all patches for the SAME image to properly measure diversity.
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
@@ -1410,82 +1441,98 @@ class ProgressivePatchTrainer:
         last_ssim_loss = 0.0  # Track for display during accumulation
 
         desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
-        with tqdm(enumerate(self.train_loader), desc=desc, leave=False,
-                  total=len(self.train_loader)) as pbar:
 
-            for idx, batch in pbar:
-                # Sample coefficients and generate patch for this image
-                z = self.sample_coefficients(1)
-                patch = self.generate_patches(z)[0]  # [3, H, W]
+        if self.ocr_mode:
+            # OCR mode: Generate all patches for the same image
+            # This properly measures patch diversity on a single input
+            dataloader_iter = iter(self.train_loader)
+            num_batches = len(self.train_loader)
 
-                # Store patch and batch for diversity evaluation
-                # Keep gradients for diversity computation
-                accumulated_patches.append(patch)
-                # Detach and clone batch tensors to prevent holding references to dataloader tensors
-                accumulated_batches.append({k: v[0].detach().clone() if torch.is_tensor(v[0]) else v[0]
-                                           for k, v in batch.items()})
+            with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
+                for batch_idx in range(num_batches):
+                    try:
+                        # Get one image
+                        batch = next(dataloader_iter)
+                        single_batch = {k: v[0] for k, v in batch.items()}
 
-                # Track dataset index for baseline lookup
-                accumulated_indices.append(idx)
+                        # Generate batch_size patches for this same image
+                        for _ in range(update_every):
+                            z = self.sample_coefficients(1)
+                            patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                step_count += 1
+                            # Store patch and same batch repeated
+                            accumulated_patches.append(patch)
+                            accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
+                                                       for k, v in single_batch.items()})
+                            accumulated_indices.append(batch_idx)
 
-                # Update model every update_every steps
-                if step_count % update_every == 0:
-                    # Compute diagonal activations for diversity metric
-                    accumulated_activations = []
-                    for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
-                        diagonal_activation = self._get_activations_for_patch_image(
-                            batch_dict, patch, use_grad=True, skip_detection=True
+                        step_count += update_every
+
+                    except StopIteration:
+                        break
+
+                    # Update model after generating all patches for this image
+                    if len(accumulated_patches) > 0:
+                        # Compute diagonal activations for diversity metric
+                        accumulated_activations = []
+                        for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
+                            diagonal_activation = self._get_activations_for_patch_image(
+                                batch_dict, patch, use_grad=True, skip_detection=True
+                            )
+                            accumulated_activations.append(diagonal_activation)
+
+                        # Compute activation-based diversity score
+                        # Reuse diagonal activations, only compute off-diagonal
+                        diversity_score = self.compute_activation_diversity(
+                            accumulated_patches,
+                            accumulated_batches,
+                            accumulated_indices,
+                            accumulated_activations,
+                            use_grad=True
                         )
-                        accumulated_activations.append(diagonal_activation)
+                        diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
-                    # Compute activation-based diversity score
-                    # Reuse diagonal activations, only compute off-diagonal
-                    diversity_score = self.compute_activation_diversity(
-                        accumulated_patches,
-                        accumulated_batches,
-                        accumulated_indices,
-                        accumulated_activations,
-                        use_grad=True
-                    )
-                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
+                        # Stack patches for batch operations
+                        patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
 
-                    # Stack patches for batch operations
-                    patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+                        # Compute total variation loss on generated patches
+                        tv_loss = self.total_variation_loss(patches_stacked)
+                        tv_loss_weighted = self.tv_weight * tv_loss
 
-                    # Compute total variation loss on generated patches
-                    tv_loss = self.total_variation_loss(patches_stacked)
-                    tv_loss_weighted = self.tv_weight * tv_loss
+                        # Compute SSIM penalty (penalize structurally similar patches)
+                        ssim_loss = self.compute_ssim_loss(patches_stacked)
+                        ssim_loss_weighted = self.ssim_weight * ssim_loss
 
-                    # Compute SSIM penalty (penalize structurally similar patches)
-                    ssim_loss = self.compute_ssim_loss(patches_stacked)
-                    ssim_loss_weighted = self.ssim_weight * ssim_loss
+                        # Combined loss
+                        total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
+                        last_diversity_loss = diversity_loss.item()
+                        last_tv_loss = tv_loss_weighted.item()  # Display weighted version
+                        last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
 
-                    # Combined loss
-                    total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
-                    last_diversity_loss = diversity_loss.item()
-                    last_tv_loss = tv_loss_weighted.item()  # Display weighted version
-                    last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
+                        # Train on combined loss
+                        total_loss.backward()
 
-                    # Train on combined loss
-                    total_loss.backward()
+                        # Apply accumulated gradients
+                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
 
-                    # Apply accumulated gradients
-                    torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+                        # Track losses (store weighted version for display)
+                        total_diversity_loss += diversity_loss.item()
+                        total_tv_loss += tv_loss_weighted.item()
+                        total_ssim_loss += ssim_loss_weighted.item()
+                        num_updates += 1
 
-                    # Track losses (store weighted version for display)
-                    total_diversity_loss += diversity_loss.item()
-                    total_tv_loss += tv_loss_weighted.item()
-                    total_ssim_loss += ssim_loss_weighted.item()
-                    num_updates += 1
+                        # Clear accumulated
+                        accumulated_patches = []
+                        accumulated_batches = []
+                        accumulated_activations = []
+                        accumulated_indices = []
 
                     # Update progress bar
-                    avg_diversity_loss = total_diversity_loss / num_updates
-                    avg_tv_loss = total_tv_loss / num_updates
-                    avg_ssim_loss = total_ssim_loss / num_updates
+                    avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
+                    avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
+                    avg_ssim_loss = total_ssim_loss / num_updates if num_updates > 0 else 0
                     pbar.set_postfix({
                         'DivLoss': f"{avg_diversity_loss:.4f}",
                         'TVLoss': f"{avg_tv_loss:.4f}",
