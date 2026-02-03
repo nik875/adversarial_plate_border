@@ -407,7 +407,8 @@ class ProgressivePatchTrainer:
                  layer_configs: Optional[List[LayerConfig]] = None,
                  eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False,
-                 use_all_for_train: bool = True):
+                 use_all_for_train: bool = True,
+                 ocr_mode: bool = False):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -418,7 +419,14 @@ class ProgressivePatchTrainer:
         self.target_layer = target_layer
         self.eval_depth = eval_depth
         self.use_simple_generator = use_simple_generator
-        self.use_all_for_train = use_all_for_train
+        self.ocr_mode = ocr_mode
+
+        # In OCR mode, always use validation split
+        if ocr_mode:
+            self.use_all_for_train = False
+            print("OCR mode enabled: using 80/20 train/val split")
+        else:
+            self.use_all_for_train = use_all_for_train
 
         # Progressive layer configuration
         # Handle single values or lists for max_epochs and convergence_threshold
@@ -827,6 +835,59 @@ class ProgressivePatchTrainer:
 
         return result_image, final_mask
 
+    def apply_patch_ocr_mode(self, image: torch.Tensor, patch: torch.Tensor,
+                           center_ratio: float = 0.6) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Apply adversarial patch in OCR mode (simplified for cropped license plates).
+
+        In OCR mode, we work with cropped license plate images directly.
+        The patch is resized to match the image dimensions, then the center region
+        is cut out and replaced with the original plate content.
+
+        Args:
+            image: [B, 3, H, W] - cropped license plate images
+            patch: [3, patch_h, patch_w] - generated adversarial patch (256x512)
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
+
+        Returns:
+            result_image: [B, 3, H, W] - image with patch applied as border
+            center_mask: [B, 3, H, W] - mask showing preserved center region
+        """
+        batch_size = image.shape[0]
+        image_height, image_width = image.shape[2], image.shape[3]
+
+        # Resize patch to match image dimensions
+        # patch is [3, patch_h, patch_w], need to add batch dim and resize
+        patch_resized = F.interpolate(
+            patch.unsqueeze(0),  # [1, 3, patch_h, patch_w]
+            size=(image_height, image_width),
+            mode='bilinear',
+            align_corners=False
+        )  # [1, 3, H, W]
+
+        # Expand to batch size
+        patch_batch = patch_resized.repeat(batch_size, 1, 1, 1)  # [B, 3, H, W]
+
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
+
+        # Calculate padding to center the mask
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
+
+        # Create mask: 1 in center region, 0 elsewhere
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                                 dtype=torch.float32, device=self.device)
+        center_mask[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = 1.0
+        center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
+
+        # Blend: keep original image in center, use patch on borders
+        result_image = image * center_mask + patch_batch * (1 - center_mask)
+        result_image = torch.clamp(result_image, 0, 1)
+
+        return result_image, center_mask
+
     def _get_activations_for_patch_image(self, batch: dict, patch: torch.Tensor,
                                           use_grad: bool = False, skip_detection: bool = False) -> torch.Tensor:
         """
@@ -844,29 +905,46 @@ class ProgressivePatchTrainer:
         # Use context manager conditionally
         context = torch.no_grad() if not use_grad else torch.enable_grad()
         with context:
-            # Apply patch to original image
-            patched_image, _ = self.apply_patch_to_image(
-                batch['orig_image'].to(self.device).unsqueeze(0),
-                batch['orig_corners'].to(self.device).unsqueeze(0),
-                patch
-            )
+            if self.ocr_mode:
+                # OCR mode: work with cropped license plates directly
+                # Use prep_image (already cropped plate) instead of orig_image
+                prep_image = batch['prep_image'].to(self.device).unsqueeze(0)  # [1, 3, H, W]
 
-            orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+                # Apply patch in OCR mode (simplified: patch as border, keep center)
+                patched_image, _ = self.apply_patch_ocr_mode(prep_image, patch)
 
-            # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
-            # Plate corners would miss the patch since it's applied as a border
-            # Note: skip_detection parameter is kept for API compatibility but always uses corners
-            plate_corners = batch['orig_corners'].to(self.device)
-            border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-            corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
+                # Crop and resize to OCR input shape
+                cropped_plate = F.interpolate(
+                    patched_image,
+                    size=self.ocr_input_shape[:2],
+                    mode='bilinear',
+                    align_corners=False
+                )
+            else:
+                # Standard mode: apply patch to full image with perspective transform
+                patched_image, _ = self.apply_patch_to_image(
+                    batch['orig_image'].to(self.device).unsqueeze(0),
+                    batch['orig_corners'].to(self.device).unsqueeze(0),
+                    patch
+                )
 
-            # Crop plate from patched image and run OCR
-            cropped_plate = K.crop_and_resize(
-                patched_image,
-                corners_box,
-                self.ocr_input_shape[:2]
-            )
+                orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
 
+                # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
+                # Plate corners would miss the patch since it's applied as a border
+                # Note: skip_detection parameter is kept for API compatibility but always uses corners
+                plate_corners = batch['orig_corners'].to(self.device)
+                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
+
+                # Crop plate from patched image and run OCR
+                cropped_plate = K.crop_and_resize(
+                    patched_image,
+                    corners_box,
+                    self.ocr_input_shape[:2]
+                )
+
+            # Run OCR on cropped plate (same for both modes)
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             self.ocr(ocr_input)  # Forward pass captures activations via hook
 
@@ -1011,18 +1089,29 @@ class ProgressivePatchTrainer:
                 for idx, batch in enumerate(pbar):
                     batch = {k: v[0] for k, v in batch.items()}
 
-                    # Use BORDER corners (1.4x scaled) to match where patches will be applied
-                    plate_corners = batch['orig_corners'].to(self.device)
-                    border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-                    corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
+                    if self.ocr_mode:
+                        # OCR mode: use prep_image directly (already cropped)
+                        prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
+                        cropped_plate = F.interpolate(
+                            prep_image,
+                            size=self.ocr_input_shape[:2],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                    else:
+                        # Standard mode: use border corners with perspective transform
+                        # Use BORDER corners (1.4x scaled) to match where patches will be applied
+                        plate_corners = batch['orig_corners'].to(self.device)
+                        border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
+                        corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
 
-                    # Crop plate area from original image (no patch)
-                    orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-                    cropped_plate = K.crop_and_resize(
-                        orig_image,
-                        corners_box,
-                        self.ocr_input_shape[:2]
-                    )
+                        # Crop plate area from original image (no patch)
+                        orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
+                        cropped_plate = K.crop_and_resize(
+                            orig_image,
+                            corners_box,
+                            self.ocr_input_shape[:2]
+                        )
 
                     ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
                     self.ocr(ocr_input)  # Forward pass captures activations via hook
@@ -1455,6 +1544,7 @@ class ProgressivePatchTrainer:
         else:
             print("PROGRESSIVE LAYER ATTACK (ALL LAYERS)")
         print("="*80)
+        print(f"   Mode: {'OCR (cropped plates)' if self.ocr_mode else 'Standard (full images with perspective)'}")
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Latent dimensions: {self.basis_dim}")
@@ -1697,6 +1787,12 @@ def main():
                         'Simple generator: z → MLP[256→512→1024] → patch. '
                         'Foundation model: z → adapter → VAE decoder → CNN refiner → DNN → patch. '
                         'Simple generator uses ~10x less memory but may produce lower quality patches.')
+    parser.add_argument('--ocr-mode', action='store_true',
+                        help='Enable OCR mode for cropped license plate dataset (same as conditional_patch.py). '
+                        'In OCR mode: (1) uses cropped plate images directly (prep_image), '
+                        '(2) applies patch as border around plate (resizes 256x512 patch to image size, '
+                        'keeps center content), (3) forces 80/20 train/val split. '
+                        'Removes complex perspective transform logic.')
     args = parser.parse_args()
 
     # Configuration
@@ -1742,7 +1838,8 @@ def main():
         'target_layer': target_layers,
         'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator,
-        'use_all_for_train': not args.no_use_all_for_train
+        'use_all_for_train': not args.no_use_all_for_train,
+        'ocr_mode': args.ocr_mode
     }
 
     # Training mode
