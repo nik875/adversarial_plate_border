@@ -485,6 +485,265 @@ def create_layer_type_analysis(layers: List[Dict], output_dir: Path):
 
 
 # ============================================================================
+# Aggregate Analysis (across all models)
+# ============================================================================
+
+def create_aggregate_histograms(results: Dict, output_dir: Path):
+    """Create histograms aggregating all models together."""
+    print("\nGenerating aggregate histograms across all models...")
+
+    # Collect all layers from all models
+    all_layers = []
+    for model_name, data in results.items():
+        all_layers.extend(data['layers'])
+
+    metrics = get_metrics_by_category(all_layers)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('All Models: PCA Explained Variance & Autoencoder Performance',
+                 fontsize=14, fontweight='bold')
+
+    # Input PCA explained variance
+    axes[0, 0].hist(metrics['input_pca'], bins=25, color='steelblue', edgecolor='black', alpha=0.7)
+    axes[0, 0].set_xlabel('Explained Variance Ratio')
+    axes[0, 0].set_ylabel('Number of Layers')
+    axes[0, 0].set_title(f'Input PCA Variance (n={len(metrics["input_pca"])})')
+    axes[0, 0].axvline(metrics['input_pca'].mean(), color='red', linestyle='--', linewidth=2,
+                       label=f"Mean: {metrics['input_pca'].mean():.3f}")
+    axes[0, 0].legend()
+    axes[0, 0].grid(alpha=0.3)
+
+    # Output PCA explained variance
+    axes[0, 1].hist(metrics['output_pca'], bins=25, color='seagreen', edgecolor='black', alpha=0.7)
+    axes[0, 1].set_xlabel('Explained Variance Ratio')
+    axes[0, 1].set_ylabel('Number of Layers')
+    axes[0, 1].set_title(f'Output PCA Variance (n={len(metrics["output_pca"])})')
+    axes[0, 1].axvline(metrics['output_pca'].mean(), color='red', linestyle='--', linewidth=2,
+                       label=f"Mean: {metrics['output_pca'].mean():.3f}")
+    axes[0, 1].legend()
+    axes[0, 1].grid(alpha=0.3)
+
+    # MSE (normalized)
+    mse_nonzero = metrics['mse_normalized'][metrics['mse_normalized'] > 0]
+    axes[1, 0].hist(mse_nonzero, bins=25, color='coral', edgecolor='black', alpha=0.7)
+    axes[1, 0].set_xlabel('Normalized MSE')
+    axes[1, 0].set_ylabel('Number of Layers')
+    axes[1, 0].set_title(f'Autoencoder MSE (normalized, n={len(mse_nonzero)})')
+    axes[1, 0].axvline(mse_nonzero.mean(), color='red', linestyle='--', linewidth=2,
+                       label=f"Mean: {mse_nonzero.mean():.6f}")
+    axes[1, 0].legend()
+    axes[1, 0].grid(alpha=0.3)
+
+    # MSE log scale
+    axes[1, 1].hist(mse_nonzero, bins=25, color='coral', edgecolor='black', alpha=0.7)
+    axes[1, 1].set_xlabel('Normalized MSE')
+    axes[1, 1].set_ylabel('Number of Layers (log scale)')
+    axes[1, 1].set_title('Autoencoder MSE Distribution (log scale)')
+    axes[1, 1].set_yscale('log')
+    axes[1, 1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    file = output_dir / '00_aggregate_histograms.png'
+    plt.savefig(file, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {file}")
+    plt.close()
+
+
+def create_aggregate_scatterplots(results: Dict, output_dir: Path):
+    """Create scatterplots with different colors for each model."""
+    print("\nGenerating aggregate scatterplots across all models...")
+
+    colors = {}
+    color_palette = plt.cm.tab10(np.linspace(0, 1, len(results)))
+    for i, model_name in enumerate(sorted(results.keys())):
+        colors[model_name] = color_palette[i]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('All Models: Layer Size vs Performance', fontsize=14, fontweight='bold')
+
+    for model_name, data in results.items():
+        layers = data['layers']
+        metrics = get_metrics_by_category(layers)
+        valid_mask = metrics['output_size'] > 0
+        output_size = metrics['output_size'][valid_mask]
+        output_pca = metrics['output_pca'][valid_mask]
+        mse = metrics['mse_normalized'][valid_mask]
+
+        # Output size vs Output PCA
+        axes[0].scatter(output_size, output_pca, alpha=0.6, s=60,
+                       color=colors[model_name], label=f"{model_name} (n={len(output_size)})")
+
+        # Output size vs MSE
+        axes[1].scatter(output_size, mse, alpha=0.6, s=60,
+                       color=colors[model_name], label=f"{model_name} (n={len(output_size)})")
+
+    axes[0].set_xlabel('Layer Output Size (log scale)')
+    axes[0].set_ylabel('Output PCA Explained Variance')
+    axes[0].set_title('Size vs Output PCA Variance')
+    axes[0].set_xscale('log')
+    axes[0].legend(loc='best', fontsize=9)
+    axes[0].grid(alpha=0.3)
+
+    axes[1].set_xlabel('Layer Output Size (log scale)')
+    axes[1].set_ylabel('Normalized MSE')
+    axes[1].set_title('Size vs Autoencoder MSE')
+    axes[1].set_xscale('log')
+    axes[1].set_yscale('log')
+    axes[1].legend(loc='best', fontsize=9)
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    file = output_dir / '00_aggregate_scatterplots.png'
+    plt.savefig(file, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {file}")
+    plt.close()
+
+
+def create_aggregate_model_comparison(results: Dict, output_dir: Path):
+    """Create comparison plots between models."""
+    print("\nGenerating model comparison plots...")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Model Comparison', fontsize=14, fontweight='bold')
+
+    model_names = sorted(results.keys())
+    model_stats = {}
+
+    for model_name in model_names:
+        layers = results[model_name]['layers']
+        metrics = get_metrics_by_category(layers)
+        model_stats[model_name] = {
+            'n_layers': len(layers),
+            'input_pca': metrics['input_pca'],
+            'output_pca': metrics['output_pca'],
+            'mse': metrics['mse_normalized'],
+        }
+
+    # Output PCA variance by model
+    pca_data = [model_stats[m]['output_pca'] for m in model_names]
+    axes[0, 0].boxplot(pca_data, labels=model_names)
+    axes[0, 0].set_ylabel('Explained Variance Ratio')
+    axes[0, 0].set_title('Output PCA Variance by Model')
+    axes[0, 0].grid(alpha=0.3, axis='y')
+    plt.setp(axes[0, 0].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # MSE by model
+    mse_data = [model_stats[m]['mse'] for m in model_names]
+    axes[0, 1].boxplot(mse_data, labels=model_names)
+    axes[0, 1].set_ylabel('Normalized MSE')
+    axes[0, 1].set_title('Autoencoder MSE by Model')
+    axes[0, 1].set_yscale('log')
+    axes[0, 1].grid(alpha=0.3, axis='y')
+    plt.setp(axes[0, 1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Layer count by model
+    layer_counts = [model_stats[m]['n_layers'] for m in model_names]
+    axes[1, 0].bar(model_names, layer_counts, color='steelblue', edgecolor='black')
+    axes[1, 0].set_ylabel('Number of Layers')
+    axes[1, 0].set_title('Layer Count by Model')
+    axes[1, 0].grid(alpha=0.3, axis='y')
+    for i, v in enumerate(layer_counts):
+        axes[1, 0].text(i, v + 1, str(v), ha='center', fontweight='bold')
+    plt.setp(axes[1, 0].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Average metrics table
+    ax = axes[1, 1]
+    ax.axis('off')
+
+    table_data = [['Model', 'Layers', 'Avg Output PCA', 'Avg MSE']]
+    for model_name in model_names:
+        stats = model_stats[model_name]
+        table_data.append([
+            model_name,
+            str(stats['n_layers']),
+            f"{stats['output_pca'].mean():.4f}",
+            f"{stats['mse'].mean():.6f}"
+        ])
+
+    table = ax.table(cellText=table_data, cellLoc='center', loc='center',
+                    colWidths=[0.3, 0.15, 0.25, 0.25])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2.5)
+
+    for i in range(len(table_data[0])):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+
+    for i in range(1, len(table_data)):
+        color = '#f0f0f0' if i % 2 == 0 else 'white'
+        for j in range(len(table_data[0])):
+            table[(i, j)].set_facecolor(color)
+
+    plt.suptitle('Model Comparison', fontsize=14, fontweight='bold', y=0.98)
+    plt.tight_layout()
+    file = output_dir / '00_aggregate_model_comparison.png'
+    plt.savefig(file, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {file}")
+    plt.close()
+
+
+def create_aggregate_category_comparison(results: Dict, output_dir: Path):
+    """Compare layer categories across all models."""
+    print("\nGenerating aggregate category comparison...")
+
+    categories = ['conv', 'dense', 'transformer', 'norm', 'pooling', 'other']
+    colors = {'conv': 'blue', 'dense': 'green', 'transformer': 'red',
+              'norm': 'orange', 'pooling': 'purple', 'other': 'gray'}
+
+    # Collect all layers
+    all_layers = []
+    for model_name, data in results.items():
+        all_layers.extend(data['layers'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle('Layer Type Distribution Across All Models', fontsize=14, fontweight='bold')
+
+    # Stacked bar chart of layer type counts per model
+    model_names = sorted(results.keys())
+    category_counts = {cat: [] for cat in categories}
+
+    for model_name in model_names:
+        layers = results[model_name]['layers']
+        for cat in categories:
+            count = len([l for l in layers if l['layer_category'] == cat])
+            category_counts[cat].append(count)
+
+    bottom = np.zeros(len(model_names))
+    for cat in categories:
+        counts = category_counts[cat]
+        axes[0].bar(model_names, counts, label=cat, bottom=bottom, color=colors[cat], edgecolor='black')
+        bottom += np.array(counts)
+
+    axes[0].set_ylabel('Number of Layers')
+    axes[0].set_title('Layer Type Composition by Model')
+    axes[0].legend(loc='best')
+    axes[0].grid(alpha=0.3, axis='y')
+    plt.setp(axes[0].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # MSE by category across all models
+    for cat in categories:
+        cat_layers = [l for l in all_layers if l['layer_category'] == cat]
+        if cat_layers:
+            mse_vals = np.array([l['train_mse_normalized'] for l in cat_layers])
+            axes[1].scatter([cat] * len(mse_vals), mse_vals, alpha=0.5, s=50,
+                          color=colors[cat], label=f"{cat} (n={len(mse_vals)})")
+
+    axes[1].set_ylabel('Normalized MSE')
+    axes[1].set_title('Autoencoder MSE by Layer Type (All Models)')
+    axes[1].set_yscale('log')
+    axes[1].grid(alpha=0.3, axis='y')
+    axes[1].legend(loc='best', fontsize=9)
+    plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout()
+    file = output_dir / '00_aggregate_category_comparison.png'
+    plt.savefig(file, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {file}")
+    plt.close()
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -549,6 +808,19 @@ Examples:
         create_layer_type_analysis(layers, model_output_dir)
 
         print(f"\n✓ Saved visualizations to {model_output_dir}")
+
+    # Generate aggregate plots across all models
+    if len(results) > 1:
+        print(f"\n{'='*80}")
+        print("Generating aggregate plots across all models")
+        print('='*80)
+        create_aggregate_histograms(results, output_dir)
+        create_aggregate_scatterplots(results, output_dir)
+        create_aggregate_model_comparison(results, output_dir)
+        create_aggregate_category_comparison(results, output_dir)
+        print(f"✓ Aggregate visualizations saved to {output_dir}")
+    else:
+        print(f"\nNote: Only one model found - skipping aggregate plots")
 
     print(f"\n{'='*80}")
     print(f"Analysis complete!")
