@@ -834,17 +834,17 @@ def profile_model_with_autoencoders(model, model_name, dataset, output_dir,
                 'input_pca_explained_variance': round(input_explained_var, 6),  # Proportion of variance explained
                 'output_pca_explained_variance': round(output_explained_var, 6),  # Proportion of variance explained
                 'train_mse': float(mse),
-                'train_mse_normalized': round(normalized_mse, 6),  # MSE / output_variance
-                'output_variance': float(output_variance),  # Variance of compressed outputs
+                'train_mse_normalized': float(round(normalized_mse, 6)),  # MSE / output_variance
+                'output_variance': float(output_variance),  # Variance of compressed outputs (convert numpy to python float)
                 'val_mse': float(best_val_loss),
                 'epochs_trained': len(train_history['epoch']),
                 'training_history': {
-                    'epoch': train_history['epoch'],
-                    'train_loss': train_history['train_loss'],
-                    'val_loss': train_history['val_loss'],
-                    'train_loss_normalized': train_history['train_loss_normalized'],
-                    'val_loss_normalized': train_history['val_loss_normalized'],
-                    'learning_rate': train_history['learning_rate']
+                    'epoch': [int(e) for e in train_history['epoch']],
+                    'train_loss': [float(x) for x in train_history['train_loss']],
+                    'val_loss': [float(x) for x in train_history['val_loss']],
+                    'train_loss_normalized': [float(x) for x in train_history['train_loss_normalized']],
+                    'val_loss_normalized': [float(x) for x in train_history['val_loss_normalized']],
+                    'learning_rate': [float(x) for x in train_history['learning_rate']]
                 }
             }
             with open(metrics_file, 'w') as f:
