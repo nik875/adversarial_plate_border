@@ -1508,15 +1508,40 @@ class ProgressivePatchTrainer:
                             )
                             accumulated_activations.append(diagonal_activation)
 
-                        # Compute activation-based diversity score
-                        # Reuse diagonal activations, only compute off-diagonal
-                        diversity_score = self.compute_activation_diversity(
-                            accumulated_patches,
-                            accumulated_batches,
-                            accumulated_indices,
-                            accumulated_activations,
-                            use_grad=True
-                        )
+                        # Group patches by image
+                        from collections import defaultdict
+                        patches_by_image = defaultdict(list)
+                        batches_by_image = defaultdict(list)
+                        activations_by_image = defaultdict(list)
+
+                        for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
+                            zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
+                        ):
+                            patches_by_image[img_idx].append(patch)
+                            batches_by_image[img_idx].append(batch_dict)
+                            activations_by_image[img_idx].append(activation)
+
+                        # Compute diversity score independently for each image, then average
+                        diversity_scores = []
+                        for img_idx in sorted(patches_by_image.keys()):
+                            image_patches = patches_by_image[img_idx]
+                            image_batches = batches_by_image[img_idx]
+                            image_activations = activations_by_image[img_idx]
+                            # Use constant indices (0, 1, 2, ...) for this image's patches
+                            image_indices = list(range(len(image_patches)))
+
+                            # Compute diversity for this image's patches
+                            img_diversity_score = self.compute_activation_diversity(
+                                image_patches,
+                                image_batches,
+                                image_indices,
+                                image_activations,
+                                use_grad=True
+                            )
+                            diversity_scores.append(img_diversity_score)
+
+                        # Average diversity scores across images
+                        diversity_score = torch.stack(diversity_scores).mean()
                         diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
                         # Stack patches for batch operations
@@ -1607,15 +1632,40 @@ class ProgressivePatchTrainer:
                         )
                         accumulated_activations.append(diagonal_activation)
 
-                    # Compute activation-based diversity score
-                    # Reuse diagonal activations, only compute off-diagonal
-                    diversity_score = self.compute_activation_diversity(
-                        accumulated_patches,
-                        accumulated_batches,
-                        accumulated_indices,
-                        accumulated_activations,
-                        use_grad=True
-                    )
+                    # Group patches by image
+                    from collections import defaultdict
+                    patches_by_image = defaultdict(list)
+                    batches_by_image = defaultdict(list)
+                    activations_by_image = defaultdict(list)
+
+                    for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
+                        zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
+                    ):
+                        patches_by_image[img_idx].append(patch)
+                        batches_by_image[img_idx].append(batch_dict)
+                        activations_by_image[img_idx].append(activation)
+
+                    # Compute diversity score independently for each image, then average
+                    diversity_scores = []
+                    for img_idx in sorted(patches_by_image.keys()):
+                        image_patches = patches_by_image[img_idx]
+                        image_batches = batches_by_image[img_idx]
+                        image_activations = activations_by_image[img_idx]
+                        # Use constant indices (0, 1, 2, ...) for this image's patches
+                        image_indices = list(range(len(image_patches)))
+
+                        # Compute diversity for this image's patches
+                        img_diversity_score = self.compute_activation_diversity(
+                            image_patches,
+                            image_batches,
+                            image_indices,
+                            image_activations,
+                            use_grad=True
+                        )
+                        diversity_scores.append(img_diversity_score)
+
+                    # Average diversity scores across images
+                    diversity_score = torch.stack(diversity_scores).mean()
                     diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
 
                     # Stack patches for batch operations
@@ -1663,38 +1713,52 @@ class ProgressivePatchTrainer:
 
     def validate(self) -> float:
         """Validation pass using diversity score"""
-        diversity_scores = []
-
         with torch.no_grad():
             # Sample multiple patches for validation diversity
             num_val_samples = min(16, len(self.val_loader))
-            patches = []
-            batches = []
-            activations = []
-            indices = []
+            patches_by_image = {}
+            batches_by_image = {}
+            activations_by_image = {}
 
             for idx, batch in enumerate(self.val_loader):
                 if idx >= num_val_samples:
                     break
 
-                # Sample a patch for validation
+                batch_dict = {k: v[0] for k, v in batch.items()}
+                # Sample a single patch for this image (validation uses 1 patch per image)
                 z = self.sample_coefficients(1)
                 patch = self.generate_patches(z)[0]
-                patches.append(patch)
-                batches.append({k: v[0] for k, v in batch.items()})
-                indices.append(idx)
+
+                patches_by_image[idx] = [patch]
+                batches_by_image[idx] = [batch_dict]
 
                 # Compute activations
                 act = self._get_activations_for_patch_image(
-                    {k: v[0] for k, v in batch.items()}, patch, use_grad=False, skip_detection=True
+                    batch_dict, patch, use_grad=False, skip_detection=True
                 )
-                activations.append(act)
+                activations_by_image[idx] = [act]
 
-            # Compute diversity score
-            if len(patches) > 1:
-                diversity_score = self.compute_activation_diversity(
-                    patches, batches, indices, activations, use_grad=False
-                )
+            # Compute diversity score independently for each image, then average
+            if len(patches_by_image) > 0:
+                diversity_scores = []
+                for img_idx in sorted(patches_by_image.keys()):
+                    image_patches = patches_by_image[img_idx]
+                    image_batches = batches_by_image[img_idx]
+                    image_activations = activations_by_image[img_idx]
+                    image_indices = list(range(len(image_patches)))
+
+                    # Compute diversity for this image's patches
+                    img_diversity_score = self.compute_activation_diversity(
+                        image_patches,
+                        image_batches,
+                        image_indices,
+                        image_activations,
+                        use_grad=False
+                    )
+                    diversity_scores.append(img_diversity_score)
+
+                # Average diversity scores across images
+                diversity_score = torch.stack(diversity_scores).mean()
                 return diversity_score.item()
             else:
                 return 0.0
