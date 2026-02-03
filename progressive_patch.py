@@ -487,7 +487,9 @@ class ProgressivePatchTrainer:
                  ocr_mode: bool = False,
                  ocr_dataset: Optional[str] = None,
                  ocr_dataset_split: str = 'train',
-                 ocr_max_samples: Optional[int] = None):
+                 ocr_max_samples: Optional[int] = None,
+                 ocr_images_per_batch: int = 1,
+                 ocr_patches_per_image: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -496,6 +498,18 @@ class ProgressivePatchTrainer:
         self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
+        self.ocr_images_per_batch = ocr_images_per_batch
+
+        # In OCR mode, calculate patches per image from batch size if not specified
+        if ocr_mode:
+            if ocr_patches_per_image is None:
+                # Default: split batch_size evenly across images
+                self.ocr_patches_per_image = grad_accumulate // ocr_images_per_batch if grad_accumulate else 16 // ocr_images_per_batch
+            else:
+                self.ocr_patches_per_image = ocr_patches_per_image
+            print(f"OCR batch config: {ocr_images_per_batch} images × {self.ocr_patches_per_image} patches = {ocr_images_per_batch * self.ocr_patches_per_image} total")
+        else:
+            self.ocr_patches_per_image = ocr_patches_per_image or 16
         self.eval_depth = eval_depth
         self.use_simple_generator = use_simple_generator
         self.ocr_mode = ocr_mode
@@ -1443,35 +1457,46 @@ class ProgressivePatchTrainer:
         desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
 
         if self.ocr_mode:
-            # OCR mode: Generate all patches for the same image
-            # This properly measures patch diversity on a single input
+            # OCR mode: Generate multiple patches per image, process multiple images per batch
+            # images_per_batch × patches_per_image = total patches in accumulation
             dataloader_iter = iter(self.train_loader)
             num_batches = len(self.train_loader)
+            images_per_batch = self.ocr_images_per_batch
+            patches_per_image = self.ocr_patches_per_image
 
+            # Calculate how many images to process before updating
+            # We want to process images_per_batch images per update
             with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
-                for batch_idx in range(num_batches):
+                batch_idx = 0
+                while batch_idx < num_batches:
                     try:
-                        # Get one image
-                        batch = next(dataloader_iter)
-                        single_batch = {k: v[0] for k, v in batch.items()}
+                        # Process images_per_batch images
+                        for img_in_batch in range(images_per_batch):
+                            if batch_idx >= num_batches:
+                                break
 
-                        # Generate batch_size patches for this same image
-                        for _ in range(update_every):
-                            z = self.sample_coefficients(1)
-                            patch = self.generate_patches(z)[0]  # [3, H, W]
+                            # Get one image
+                            batch = next(dataloader_iter)
+                            single_batch = {k: v[0] for k, v in batch.items()}
 
-                            # Store patch and same batch repeated
-                            accumulated_patches.append(patch)
-                            accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
-                                                       for k, v in single_batch.items()})
-                            accumulated_indices.append(batch_idx)
+                            # Generate patches_per_image patches for this image
+                            for _ in range(patches_per_image):
+                                z = self.sample_coefficients(1)
+                                patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                        step_count += update_every
+                                # Store patch and batch
+                                accumulated_patches.append(patch)
+                                accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
+                                                           for k, v in single_batch.items()})
+                                accumulated_indices.append(batch_idx)
+
+                            batch_idx += 1
+                            step_count += patches_per_image
 
                     except StopIteration:
                         break
 
-                    # Update model after generating all patches for this image
+                    # Update model after processing images_per_batch images
                     if len(accumulated_patches) > 0:
                         # Compute diagonal activations for diversity metric
                         accumulated_activations = []
@@ -1539,7 +1564,7 @@ class ProgressivePatchTrainer:
                         'SSIMLoss': f"{avg_ssim_loss:.4f}",
                         'Updates': num_updates
                     })
-                    pbar.update(1)  # Increment progress bar
+                    pbar.update(images_per_batch)  # Increment by number of images processed
 
                     # Memory cleanup after update
                     del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
@@ -2007,6 +2032,14 @@ def main():
     parser.add_argument('--ocr-max-samples', type=int, default=None,
                         help='Maximum number of samples to load from OCR dataset (default: all). '
                         'Useful for quick testing.')
+    parser.add_argument('--ocr-images-per-batch', type=int, default=1,
+                        help='Number of images to process per gradient update in OCR mode (default: 1). '
+                        'Total patches = images_per_batch × patches_per_image. '
+                        'Higher values give more diverse gradients but use more memory.')
+    parser.add_argument('--ocr-patches-per-image', type=int, default=None,
+                        help='Number of patches to generate per image in OCR mode. '
+                        'If not specified, calculated as: batch_size / images_per_batch. '
+                        'Total patches = images_per_batch × patches_per_image.')
     args = parser.parse_args()
 
     # Configuration
@@ -2074,7 +2107,9 @@ def main():
         'ocr_mode': args.ocr_mode,
         'ocr_dataset': args.ocr_dataset,
         'ocr_dataset_split': args.ocr_dataset_split,
-        'ocr_max_samples': args.ocr_max_samples
+        'ocr_max_samples': args.ocr_max_samples,
+        'ocr_images_per_batch': args.ocr_images_per_batch,
+        'ocr_patches_per_image': args.ocr_patches_per_image
     }
 
     # Training mode
