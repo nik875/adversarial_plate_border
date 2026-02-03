@@ -141,17 +141,27 @@ def load_profile_metrics(profile_dir: Path) -> Dict:
                     output_shape = data.get('output_shape_sample', [0])
                     output_size = int(np.prod(output_shape)) if output_shape else 0
 
+                # Calculate metrics
+                input_pca_var = data.get('input_pca_explained_variance', 0.0)
+                output_pca_var = data.get('output_pca_explained_variance', 0.0)
+                train_mse_normalized = data.get('train_mse_normalized', 0.0)
+
+                # Total captured variance: input_pca * (1 - mse) * output_pca
+                # Represents variance preserved through entire pipeline
+                captured_variance = input_pca_var * (1.0 - train_mse_normalized) * output_pca_var
+
                 layer_info = {
                     'layer_name': data.get('layer_name', 'unknown'),
                     'layer_type': data.get('layer_type', 'Unknown'),
                     'layer_category': classify_layer_type(data.get('layer_name', '')),
                     'input_size': input_size,
                     'output_size': output_size,
-                    'input_pca_var': data.get('input_pca_explained_variance', 0.0),
-                    'output_pca_var': data.get('output_pca_explained_variance', 0.0),
+                    'input_pca_var': input_pca_var,
+                    'output_pca_var': output_pca_var,
                     'train_mse': data.get('train_mse', 0.0),
-                    'train_mse_normalized': data.get('train_mse_normalized', 0.0),
+                    'train_mse_normalized': train_mse_normalized,
                     'val_mse': data.get('val_mse', 0.0),
+                    'captured_variance': captured_variance,
                     'epochs_trained': data.get('epochs_trained', 0),
                 }
 
@@ -181,6 +191,7 @@ def get_metrics_by_category(layers: List[Dict], category: str = None) -> Dict[st
         'input_pca': np.array([l['input_pca_var'] for l in layers]),
         'output_pca': np.array([l['output_pca_var'] for l in layers]),
         'mse_normalized': np.array([l['train_mse_normalized'] for l in layers]),
+        'captured_variance': np.array([l.get('captured_variance', 0.0) for l in layers]),
         'input_size': np.array([l['input_size'] for l in layers]),
         'output_size': np.array([l['output_size'] for l in layers]),
     }
@@ -743,6 +754,86 @@ def create_aggregate_category_comparison(results: Dict, output_dir: Path):
     plt.close()
 
 
+def create_captured_variance_analysis(results: Dict, output_dir: Path):
+    """Analyze total captured variance across models and layer types.
+
+    Captured variance = input_pca * (1 - mse) * output_pca
+    Represents variance preserved through the entire pipeline.
+    """
+    print("\nGenerating captured variance analysis...")
+
+    # Collect all layers
+    all_layers = []
+    model_names = sorted(results.keys())
+
+    for model_name in model_names:
+        all_layers.extend(results[model_name]['layers'])
+
+    metrics = get_metrics_by_category(all_layers)
+    captured_var = metrics['captured_variance']
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Total Captured Variance Analysis\n(input_pca × (1 - MSE) × output_pca)',
+                 fontsize=14, fontweight='bold')
+
+    # Histogram of captured variance
+    axes[0, 0].hist(captured_var, bins=25, color='purple', edgecolor='black', alpha=0.7)
+    axes[0, 0].set_xlabel('Captured Variance')
+    axes[0, 0].set_ylabel('Number of Layers')
+    axes[0, 0].set_title(f'Distribution of Captured Variance (n={len(captured_var)})')
+    axes[0, 0].axvline(captured_var.mean(), color='red', linestyle='--', linewidth=2,
+                       label=f"Mean: {captured_var.mean():.4f}")
+    axes[0, 0].legend()
+    axes[0, 0].grid(alpha=0.3)
+
+    # Captured variance by model (boxplot)
+    model_captured = [np.array([l.get('captured_variance', 0.0) for l in results[m]['layers']])
+                      for m in model_names]
+    axes[0, 1].boxplot(model_captured, labels=model_names)
+    axes[0, 1].set_ylabel('Captured Variance')
+    axes[0, 1].set_title('Captured Variance by Model')
+    axes[0, 1].grid(alpha=0.3, axis='y')
+    plt.setp(axes[0, 1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Layer size vs captured variance
+    valid_mask = metrics['output_size'] > 0
+    output_size = metrics['output_size'][valid_mask]
+    captured_var_valid = captured_var[valid_mask]
+
+    axes[1, 0].scatter(output_size, captured_var_valid, alpha=0.6, s=60, color='purple')
+    axes[1, 0].set_xlabel('Layer Output Size (log scale)')
+    axes[1, 0].set_ylabel('Captured Variance')
+    axes[1, 0].set_title('Layer Size vs Captured Variance')
+    axes[1, 0].set_xscale('log')
+    axes[1, 0].grid(alpha=0.3)
+
+    # Captured variance by layer category
+    categories = ['conv', 'dense', 'transformer', 'norm', 'pooling', 'other']
+    colors_cat = {'conv': 'blue', 'dense': 'green', 'transformer': 'red',
+                  'norm': 'orange', 'pooling': 'purple', 'other': 'gray'}
+
+    cat_captured = []
+    cat_labels = []
+    for cat in categories:
+        cat_layers = [l for l in all_layers if l['layer_category'] == cat]
+        if cat_layers:
+            cat_var = np.array([l.get('captured_variance', 0.0) for l in cat_layers])
+            cat_captured.append(cat_var)
+            cat_labels.append(cat)
+
+    axes[1, 1].boxplot(cat_captured, labels=cat_labels)
+    axes[1, 1].set_ylabel('Captured Variance')
+    axes[1, 1].set_title('Captured Variance by Layer Type')
+    axes[1, 1].grid(alpha=0.3, axis='y')
+    plt.setp(axes[1, 1].xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout()
+    file = output_dir / '00_captured_variance_analysis.png'
+    plt.savefig(file, dpi=150, bbox_inches='tight')
+    print(f"  Saved: {file}")
+    plt.close()
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -818,6 +909,7 @@ Examples:
         create_aggregate_scatterplots(results, output_dir)
         create_aggregate_model_comparison(results, output_dir)
         create_aggregate_category_comparison(results, output_dir)
+        create_captured_variance_analysis(results, output_dir)
         print(f"✓ Aggregate visualizations saved to {output_dir}")
     else:
         print(f"\nNote: Only one model found - skipping aggregate plots")
