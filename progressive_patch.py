@@ -1539,6 +1539,7 @@ class ProgressivePatchTrainer:
                         'SSIMLoss': f"{avg_ssim_loss:.4f}",
                         'Updates': num_updates
                     })
+                    pbar.update(1)  # Increment progress bar
 
                     # Memory cleanup after update
                     del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
