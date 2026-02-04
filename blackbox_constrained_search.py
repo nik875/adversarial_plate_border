@@ -689,7 +689,11 @@ class BlackBoxPatchOptimizer:
                 if fitness_values[best_idx] < best_fitness_ever:
                     best_fitness_ever = fitness_values[best_idx]
                     best_z_ever = solutions[best_idx].copy()
-                    plateau_count = 0  # Reset plateau counter
+                    # Initialize plateau count based on fitness quality
+                    if best_fitness_ever > self.blur_threshold:
+                        plateau_count = 1  # Start counting—we're already stuck at bad fitness
+                    else:
+                        plateau_count = 0
                     success_count += 1
 
                     # Save checkpoint if checkpoint directory specified
