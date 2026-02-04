@@ -705,10 +705,10 @@ class BlackBoxPatchOptimizer:
                 if self.enable_plate_blur:
                     if best_fitness_ever > 0.95:
                         # Stuck at bad fitness: increase blur
-                        self.plate_blur_sigma = min(self.plate_blur_sigma + 0.5, 10.0)
+                        self.plate_blur_sigma = min(self.plate_blur_sigma + 1.0, 10.0)
                     elif best_fitness_ever < 0.8:
                         # Doing well: decrease blur
-                        self.plate_blur_sigma = max(self.plate_blur_sigma - 0.5, 0.0)
+                        self.plate_blur_sigma = max(self.plate_blur_sigma - 1.0, 0.0)
 
                 # Update progress
                 iteration += 1
