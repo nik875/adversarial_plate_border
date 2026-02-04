@@ -1696,8 +1696,7 @@ class ProgressivePatchTrainer:
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
 
-    def train(self, learning_rate: float = 0.01,
-              warmup_epochs: int = 5, lr_min: float = 1e-5):
+    def train(self, learning_rate: float = 0.01, lr_min: float = 1e-5):
         """
         Progressive layer training loop.
 
@@ -1779,7 +1778,7 @@ class ProgressivePatchTrainer:
         print(f"   TV weight: {self.tv_weight}")
         print(f"   SSIM weight: {self.ssim_weight}")
         print(f"   Device: {self.device}")
-        print(f"   LR: {learning_rate} (warmup {warmup_epochs} epochs, min {lr_min})")
+        print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
 
         if self.target_layer is None:
             print(f"\nLayer Progression ({len(self.layer_configs)} layers total):")
@@ -1805,32 +1804,12 @@ class ProgressivePatchTrainer:
             for param_group in optimizer.param_groups:
                 param_group['lr'] = learning_rate
 
-            # Create schedulers for this layer
-            if warmup_epochs > 0:
-                # Warmup + Cosine annealing
-                warmup_scheduler = optim.lr_scheduler.LinearLR(
-                    optimizer,
-                    start_factor=lr_min / learning_rate,
-                    end_factor=1.0,
-                    total_iters=warmup_epochs
-                )
-                cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=current_config.max_epochs - warmup_epochs,
-                    eta_min=lr_min
-                )
-                scheduler = optim.lr_scheduler.SequentialLR(
-                    optimizer,
-                    schedulers=[warmup_scheduler, cosine_scheduler],
-                    milestones=[warmup_epochs]
-                )
-            else:
-                # No warmup: start directly at learning_rate, cosine down to lr_min
-                scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=current_config.max_epochs,
-                    eta_min=lr_min
-                )
+            # Create cosine annealing scheduler
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=current_config.max_epochs,
+                eta_min=lr_min
+            )
 
             # Train on current layer until convergence or max epochs
             while True:
@@ -1948,12 +1927,9 @@ def main():
     parser.add_argument('--ssim-weight', type=float, default=1.0,
                         help='Weight for SSIM penalty to prevent structural similarity (default: 1.0)')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
-                        help='Peak learning rate after warmup (default: 5e-3)')
+                        help='Learning rate (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
-                        help='Minimum learning rate (initial and final, default: 1e-5). '
-                        'Used as start of warmup and end of cosine annealing.')
-    parser.add_argument('--warmup-epochs', type=int, default=5,
-                        help='Number of epochs for linear warmup (default: 5)')
+                        help='Minimum learning rate for cosine annealing (default: 1e-5)')
     parser.add_argument('--max-epochs-per-layer', type=str, default='50',
                         help='Maximum epochs to train on each layer (default: 50). '
                         'Can be a single value or comma-separated list (e.g., "30,50,100" for queued layers). '
@@ -2074,7 +2050,6 @@ def main():
 
         history = trainer.train(
             learning_rate=args.learning_rate,
-            warmup_epochs=args.warmup_epochs,
             lr_min=args.lr_min
         )
 
