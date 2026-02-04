@@ -522,6 +522,7 @@ class ProgressivePatchTrainer:
                  diversity_weight: float = 1.0,
                  tv_weight: float = 2.5,
                  ssim_weight: float = 1.0,
+                 cascade_weight: float = 0.25,
                  max_epochs_per_layer = 50,
                  final_layer_epochs: Optional[int] = None,
                  convergence_threshold = 1.0,
@@ -536,6 +537,7 @@ class ProgressivePatchTrainer:
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
         self.ssim_weight = ssim_weight
+        self.cascade_weight = cascade_weight
         self.max_epochs_per_layer = max_epochs_per_layer
         self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
@@ -1802,7 +1804,7 @@ class ProgressivePatchTrainer:
             else:
                 return 0.0
 
-    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True):
+    def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True, layer_idx: Optional[int] = None):
         """Save current generator state and sample patches
 
         Args:
@@ -1810,6 +1812,7 @@ class ProgressivePatchTrainer:
             save_dir: Directory to save to
             num_samples: Number of sample patches to generate and save (default 5)
             save_generator: Whether to save the generator model (default True). Set to False to save only sample patches.
+            layer_idx: Target layer index (optional). If provided, includes in filename and generates samples with that layer embedding.
         """
         Path(save_dir).mkdir(exist_ok=True)
 
@@ -1825,11 +1828,24 @@ class ProgressivePatchTrainer:
 
             # Sample and save example patches
             z_samples = self.sample_coefficients(num_samples)
+
+            # If layer_idx specified, embed layer information into seeds
+            if layer_idx is not None:
+                layer_indices = torch.full((num_samples,), layer_idx, dtype=torch.long, device=self.device)
+                z_samples = self.generator.embed_layer_info(z_samples, layer_indices)
+
             sample_patches = self.generate_patches(z_samples)
+
+            # Create filename based on whether layer is specified
+            if layer_idx is not None:
+                layer_name = self.layer_configs[layer_idx].description.replace(" ", "_") if layer_idx < len(self.layer_configs) else f"layer_{layer_idx}"
+                filename_template = f"sample_{{i}}_layer{layer_idx}_{layer_name}_epoch_{epoch:04d}.png"
+            else:
+                filename_template = f"sample_{{i}}_epoch_{epoch:04d}.png"
 
             for i, patch in enumerate(sample_patches):
                 patch_pil = T.ToPILImage()(patch.cpu())
-                patch_pil.save(f"{save_dir}/sample_{i}_epoch_{epoch:04d}.png")
+                patch_pil.save(f"{save_dir}/{filename_template.format(i=i)}")
 
     def train(self, learning_rate: float = 0.01, lr_min: float = 1e-5):
         """
@@ -2061,6 +2077,9 @@ def main():
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--ssim-weight', type=float, default=1.0,
                         help='Weight for SSIM penalty to prevent structural similarity (default: 1.0)')
+    parser.add_argument('--cascade-weight', type=float, default=0.25,
+                        help='Weight for cascade penalty on prior layers (default: 0.25). '
+                        'Penalizes patch impact on layers before target layer to prevent learning shallow attacks.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
                         help='Learning rate (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
@@ -2168,6 +2187,7 @@ def main():
         'diversity_weight': args.diversity_weight,
         'tv_weight': args.tv_weight,
         'ssim_weight': args.ssim_weight,
+        'cascade_weight': args.cascade_weight,
         'max_epochs_per_layer': max_epochs_per_layer,
         'final_layer_epochs': args.final_layer_epochs,
         'convergence_threshold': convergence_threshold,
