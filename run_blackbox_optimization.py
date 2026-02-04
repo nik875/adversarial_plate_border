@@ -246,6 +246,11 @@ def main():
         default=None,
         help="Directory to save checkpoints at each best fitness (default: None)"
     )
+    parser.add_argument(
+        "--disable-homography",
+        action="store_true",
+        help="Disable homography-based insertion, use simple rectangular blending instead"
+    )
 
     args = parser.parse_args()
 
@@ -259,6 +264,7 @@ def main():
     print(f"Mode: {'Disruption' if args.target_plate is None else 'Impersonation'}")
     if args.target_plate:
         print(f"Target plate: {args.target_plate}")
+    print(f"Patch insertion: {'Rectangular (simple blending)' if args.disable_homography else 'Homography (perspective-aware)'}")
     print(f"CMA-ES parameters: sigma0={args.sigma0}, max_iterations={args.max_iterations}, ", end="")
     print(f"population_size={args.population_size or 'auto'}, seed={args.seed or 'None'}")
     print("=" * 70)
@@ -275,7 +281,8 @@ def main():
         csv_path=args.csv,
         target_plate=args.target_plate,
         disruption_mode=(args.target_plate is None),
-        test_image_subset=args.test_image_subset
+        test_image_subset=args.test_image_subset,
+        use_homography=not args.disable_homography
     )
 
     # Create fast-alpr oracle

@@ -66,7 +66,8 @@ class BlackBoxPatchOptimizer:
                  csv_path: Optional[str] = None,
                  target_plate: Optional[str] = None,
                  disruption_mode: bool = True,
-                 test_image_subset: Optional[int] = None):
+                 test_image_subset: Optional[int] = None,
+                 use_homography: bool = True):
         """
         Args:
             generator_checkpoint: Path to generator .pt file
@@ -77,7 +78,9 @@ class BlackBoxPatchOptimizer:
             csv_path: CSV file with image paths and corners (alternative to test_images_dir)
             target_plate: Target plate text for impersonation (None for disruption)
             disruption_mode: If True, optimize for detection failure. If False, impersonation.
+            use_homography: If True, apply patch via homography transform. If False, use simple rectangular insertion.
         """
+        self.use_homography = use_homography
 
         if device is None:
             if torch.cuda.is_available():
@@ -304,6 +307,14 @@ class BlackBoxPatchOptimizer:
         Returns:
             patched_image: [H, W, 3] numpy array, uint8, range [0, 255]
         """
+        if self.use_homography:
+            return self._apply_patch_homography(image, corners, patch)
+        else:
+            return self._apply_patch_rectangular(image, corners, patch)
+
+    def _apply_patch_homography(self, image: np.ndarray, corners: np.ndarray,
+                                patch: torch.Tensor) -> np.ndarray:
+        """Apply patch using homography transform (perspective-aware insertion)."""
         H, W = image.shape[:2]
 
         # Convert image to tensor
@@ -359,6 +370,42 @@ class BlackBoxPatchOptimizer:
         result_np = (result.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
         return result_np
+
+    def _apply_patch_rectangular(self, image: np.ndarray, corners: np.ndarray,
+                                 patch: torch.Tensor) -> np.ndarray:
+        """Apply patch as simple rectangular insertion in bounding box region."""
+        import cv2
+
+        H, W = image.shape[:2]
+        result = image.copy()
+
+        # Compute bounding box from corners
+        corners_np = corners.astype(np.float32)
+        x_min, x_max = int(corners_np[:, 0].min()), int(corners_np[:, 0].max())
+        y_min, y_max = int(corners_np[:, 1].min()), int(corners_np[:, 1].max())
+
+        # Clamp to image bounds
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(W, x_max)
+        y_max = min(H, y_max)
+
+        bbox_h = y_max - y_min
+        bbox_w = x_max - x_min
+
+        if bbox_h <= 0 or bbox_w <= 0:
+            return result
+
+        # Resize patch to fit bounding box
+        patch_np = (patch.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        patch_resized = cv2.resize(patch_np, (bbox_w, bbox_h), interpolation=cv2.INTER_LINEAR)
+
+        # Simple blending: alpha blend the patch into the region
+        patch_region = result[y_min:y_max, x_min:x_max]
+        blended = (patch_resized * 0.7 + patch_region * 0.3).astype(np.uint8)
+        result[y_min:y_max, x_min:x_max] = blended
+
+        return result
 
     def evaluate_fitness(self, z: np.ndarray, oracle: BaseBlackBoxOracle) -> float:
         """
