@@ -1466,49 +1466,95 @@ class ProgressivePatchTrainer:
 
         return True
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int) -> float:
-        """Train for one epoch with gradient accumulation and activation-based diversity loss
+    def _get_multi_layer_activations(self, batch: dict, patch: torch.Tensor, layer_indices: List[int],
+                                      use_grad: bool = False) -> Dict[int, torch.Tensor]:
+        """
+        Get activations from multiple layers in a single forward pass.
 
-        Unlike offensive_patch.py which optimizes a single patch parameter,
-        basis optimization generates different patches per image (p = Uz).
+        Args:
+            batch: Single unbatched batch item from dataloader
+            patch: [3, H, W] patch tensor
+            layer_indices: List of layer indices to capture activations from
+            use_grad: If True, compute with gradients
 
-        Activation-based diversity: measures how differently each patch affects
-        OCR internal representations (at the patch_extractor layer) compared to baseline.
+        Returns:
+            Dictionary mapping layer_idx -> activation tensor [H, W, C]
+        """
+        context = torch.no_grad() if not use_grad else torch.enable_grad()
+        with context:
+            # Apply patch
+            prep_image = batch['prep_image'].to(self.device).unsqueeze(0)
+            patched_image, _ = self.apply_patch_ocr_mode(prep_image, patch)
 
-        In OCR mode: generates all patches for the SAME image to properly measure diversity.
+            # Crop and resize to OCR input shape
+            cropped_plate = F.interpolate(
+                patched_image,
+                size=self.ocr_input_shape[:2],
+                mode='bilinear',
+                align_corners=False
+            )
+
+            # Register hooks on all requested layers
+            activations_dict = {}
+            hooks = []
+
+            for layer_idx in layer_indices:
+                if layer_idx >= len(self.layer_configs):
+                    continue
+
+                def make_hook(idx):
+                    def hook(module, input, output):
+                        if isinstance(output, torch.Tensor):
+                            activations_dict[idx] = output.squeeze(0).detach().clone() if not use_grad else output.squeeze(0)
+                    return hook
+
+                layer_config = self.layer_configs[layer_idx]
+                layer_module = self._find_layer_by_name(layer_config.name)
+                if layer_module is not None:
+                    hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+
+            # Forward pass
+            ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+            self.ocr(ocr_input)
+
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+
+            # Clear global activation reference
+            self.ocr_activations = None
+
+            return activations_dict
+
+    def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int, target_layer_idx: Optional[int] = None) -> Tuple[float, float, float]:
+        """Train for one epoch with random layer sampling and cascade penalty.
+
+        For each image, samples a random target layer and trains patches to:
+        1. Maximize diversity at that layer (diversity score)
+        2. Achieve high quality score at that layer (quality = tanh(delta/std_dev/2))
+        3. Minimize impact on prior layers (cascade penalty with exponential decay)
+
+        Loss = -(diversity * quality - cascade_penalty) where:
+        - diversity: log determinant of gram matrix of activation deltas
+        - quality: tanh-bounded quality score at target layer
+        - cascade_penalty: exponentially decaying penalty on prior layers
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
         total_ssim_loss = 0.0
-        step_count = 0
         num_updates = 0
 
-        # Determine update frequency
-        update_every = len(
-            self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
-
-        # Storage for patches and activations in current accumulation window
-        accumulated_patches = []
-        accumulated_batches = []
-        accumulated_activations = []
-        accumulated_indices = []
-        last_diversity_loss = 0.0  # Track for display during accumulation
-        last_tv_loss = 0.0  # Track for display during accumulation
-        last_ssim_loss = 0.0  # Track for display during accumulation
-
-        desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
-
         # OCR mode: Generate multiple patches per image, process multiple images per batch
-        # images_per_batch × patches_per_image = total patches in accumulation
         dataloader_iter = iter(self.train_loader)
         num_images = len(self.train_loader)
         images_per_batch = self.ocr_images_per_batch
         patches_per_image = self.ocr_patches_per_image
 
-        # Calculate number of batches (groups of images_per_batch images)
+        # Calculate number of batches
         import math
         num_batches = math.ceil(num_images / images_per_batch)
 
+        desc = f"Epoch {epoch} - Training"
         with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
             img_idx = 0
             while img_idx < num_images:
@@ -1522,105 +1568,174 @@ class ProgressivePatchTrainer:
                         batch = next(dataloader_iter)
                         single_batch = {k: v[0] for k, v in batch.items()}
 
+                        # Sample random target layer for this image
+                        if target_layer_idx is None:
+                            sampled_layer_idx = np.random.randint(0, len(self.layer_configs))
+                        else:
+                            sampled_layer_idx = target_layer_idx
+
                         # Generate patches_per_image patches for this image
-                        for _ in range(patches_per_image):
+                        accumulated_patches = []
+                        accumulated_batches = []
+                        layer_indices_to_capture = list(range(sampled_layer_idx + 1))  # 0 to sampled_layer_idx
+
+                        for patch_num in range(patches_per_image):
                             z = self.sample_coefficients(1)
                             patch = self.generate_patches(z)[0]  # [3, H, W]
-
-                            # Store patch and batch
                             accumulated_patches.append(patch)
                             accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
                                                        for k, v in single_batch.items()})
-                            accumulated_indices.append(img_idx)
+
+                        # Compute baseline activations for all layers (without patch)
+                        baseline_activations = {}  # layer_idx -> activation
+                        prep_image = single_batch['prep_image'].to(self.device).unsqueeze(0)
+                        cropped_plate = F.interpolate(
+                            prep_image,
+                            size=self.ocr_input_shape[:2],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        baseline_hooks = []
+                        baseline_activations_dict = {}
+
+                        for layer_idx in layer_indices_to_capture:
+                            def make_hook(idx):
+                                def hook(module, input, output):
+                                    if isinstance(output, torch.Tensor):
+                                        baseline_activations_dict[idx] = output.squeeze(0).detach().clone()
+                                return hook
+                            layer_config = self.layer_configs[layer_idx]
+                            layer_module = self._find_layer_by_name(layer_config.name)
+                            if layer_module is not None:
+                                baseline_hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+
+                        # Forward pass without patch
+                        ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+                        self.ocr(ocr_input)
+                        baseline_activations = baseline_activations_dict.copy()
+
+                        # Remove baseline hooks
+                        for hook in baseline_hooks:
+                            hook.remove()
+
+                        # Get activations for all patches at all layers
+                        patch_activations_per_layer = {idx: [] for idx in layer_indices_to_capture}
+                        for patch in accumulated_patches:
+                            activations_dict = self._get_multi_layer_activations(
+                                single_batch, patch, layer_indices_to_capture, use_grad=True
+                            )
+                            for layer_idx in layer_indices_to_capture:
+                                patch_activations_per_layer[layer_idx].append(activations_dict.get(layer_idx))
+
+                        # Compute diversity at target layer
+                        target_layer_activations = patch_activations_per_layer[sampled_layer_idx]
+
+                        # Compute diversity score
+                        image_indices = list(range(len(accumulated_patches)))
+                        diversity_score = self.compute_activation_diversity(
+                            accumulated_patches,
+                            accumulated_batches,
+                            image_indices,
+                            target_layer_activations,
+                            use_grad=True
+                        )
+
+                        # Compute quality score at target layer
+                        quality_scores = []
+                        if sampled_layer_idx in self.layer_activation_stddev:
+                            std_dev = self.layer_activation_stddev[sampled_layer_idx]
+                            baseline_target = baseline_activations[sampled_layer_idx]
+                            for patch_act in target_layer_activations:
+                                if patch_act is not None:
+                                    # Compute delta
+                                    delta = patch_act - baseline_target
+                                    delta_flat = delta.flatten()
+
+                                    # Normalize by std_dev
+                                    normalized_delta = delta_flat / (std_dev + 1e-8)
+                                    normalized_delta_norm = torch.norm(normalized_delta)
+
+                                    # Quality score: tanh(norm / 2)
+                                    quality = torch.tanh(normalized_delta_norm / 2.0)
+                                    quality_scores.append(quality)
+                        else:
+                            # If no stddev profiling, use ones
+                            quality_scores = [torch.tensor(1.0, device=self.device) for _ in accumulated_patches]
+
+                        quality_score = torch.stack(quality_scores).mean() if quality_scores else torch.tensor(1.0, device=self.device)
+
+                        # Compute cascade penalty on prior layers
+                        cascade_penalty = 0.0
+                        if sampled_layer_idx > 0:
+                            # Calculate exponential decay factor k such that e^(-k*(i-1)) = 0.01
+                            k = np.log(100.0) / (sampled_layer_idx - 1) if sampled_layer_idx > 1 else 1.0
+
+                            for prior_layer_idx in range(sampled_layer_idx):
+                                weight = np.exp(-k * prior_layer_idx)
+
+                                # Compute quality score for prior layer
+                                if prior_layer_idx in self.layer_activation_stddev:
+                                    std_dev_prior = self.layer_activation_stddev[prior_layer_idx]
+                                    baseline_prior = baseline_activations.get(prior_layer_idx)
+                                    prior_acts = patch_activations_per_layer.get(prior_layer_idx, [])
+
+                                    if baseline_prior is not None and prior_acts:
+                                        prior_quality_scores = []
+                                        for prior_act in prior_acts:
+                                            if prior_act is not None:
+                                                delta_prior = prior_act - baseline_prior
+                                                delta_flat_prior = delta_prior.flatten()
+                                                normalized_delta_prior = delta_flat_prior / (std_dev_prior + 1e-8)
+                                                normalized_delta_norm_prior = torch.norm(normalized_delta_prior)
+                                                quality_prior = torch.tanh(normalized_delta_norm_prior / 2.0)
+                                                prior_quality_scores.append(quality_prior)
+
+                                        if prior_quality_scores:
+                                            quality_prior_avg = torch.stack(prior_quality_scores).mean()
+                                            cascade_penalty = cascade_penalty + weight * quality_prior_avg
+
+                        cascade_penalty = self.cascade_weight * cascade_penalty
+
+                        # Combined diversity-quality loss
+                        combined_diversity_quality_loss = diversity_score * quality_score
+                        total_loss = -(combined_diversity_quality_loss - cascade_penalty)
+
+                        # Stack patches for batch operations
+                        patches_stacked = torch.stack(accumulated_patches, dim=0)
+
+                        # Compute TV loss
+                        tv_loss = self.total_variation_loss(patches_stacked)
+                        tv_loss_weighted = self.tv_weight * tv_loss
+
+                        # Compute SSIM loss
+                        ssim_loss = self.compute_ssim_loss(patches_stacked)
+                        ssim_loss_weighted = self.ssim_weight * ssim_loss
+
+                        # Final combined loss
+                        final_loss = total_loss + tv_loss_weighted + ssim_loss_weighted
+
+                        # Backward and optimization
+                        final_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                        # Track losses
+                        total_diversity_loss += total_loss.item()
+                        total_tv_loss += tv_loss_weighted.item()
+                        total_ssim_loss += ssim_loss_weighted.item()
+                        num_updates += 1
+
+                        # Memory cleanup
+                        if self.device == 'cuda':
+                            torch.cuda.empty_cache()
+                        elif self.device == 'mps':
+                            torch.mps.empty_cache()
 
                         img_idx += 1
-                        step_count += patches_per_image
 
                 except StopIteration:
                     break
-
-                # Update model after processing images_per_batch images
-                if len(accumulated_patches) > 0:
-                    # Compute diagonal activations for diversity metric
-                    accumulated_activations = []
-                    for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
-                        diagonal_activation = self._get_activations_for_patch_image(
-                            batch_dict, patch, use_grad=True, skip_detection=True
-                        )
-                        accumulated_activations.append(diagonal_activation)
-
-                    # Group patches by image
-                    from collections import defaultdict
-                    patches_by_image = defaultdict(list)
-                    batches_by_image = defaultdict(list)
-                    activations_by_image = defaultdict(list)
-
-                    for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
-                        zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
-                    ):
-                        patches_by_image[img_idx].append(patch)
-                        batches_by_image[img_idx].append(batch_dict)
-                        activations_by_image[img_idx].append(activation)
-
-                    # Compute diversity score independently for each image, then average
-                    diversity_scores = []
-                    for img_idx in sorted(patches_by_image.keys()):
-                        image_patches = patches_by_image[img_idx]
-                        image_batches = batches_by_image[img_idx]
-                        image_activations = activations_by_image[img_idx]
-                        # Use constant indices (0, 1, 2, ...) for this image's patches
-                        image_indices = list(range(len(image_patches)))
-
-                        # Compute diversity for this image's patches
-                        img_diversity_score = self.compute_activation_diversity(
-                            image_patches,
-                            image_batches,
-                            image_indices,
-                            image_activations,
-                            use_grad=True
-                        )
-                        diversity_scores.append(img_diversity_score)
-
-                    # Average diversity scores across images
-                    diversity_score = torch.stack(diversity_scores).mean()
-                    diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-
-                    # Stack patches for batch operations
-                    patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
-
-                    # Compute total variation loss on generated patches
-                    tv_loss = self.total_variation_loss(patches_stacked)
-                    tv_loss_weighted = self.tv_weight * tv_loss
-
-                    # Compute SSIM penalty (penalize structurally similar patches)
-                    ssim_loss = self.compute_ssim_loss(patches_stacked)
-                    ssim_loss_weighted = self.ssim_weight * ssim_loss
-
-                    # Combined loss
-                    total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
-                    last_diversity_loss = diversity_loss.item()
-                    last_tv_loss = tv_loss_weighted.item()  # Display weighted version
-                    last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
-
-                    # Train on combined loss
-                    total_loss.backward()
-
-                    # Apply accumulated gradients
-                    torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                    # Track losses (store weighted version for display)
-                    total_diversity_loss += diversity_loss.item()
-                    total_tv_loss += tv_loss_weighted.item()
-                    total_ssim_loss += ssim_loss_weighted.item()
-                    num_updates += 1
-
-                    # Clear accumulated
-                    accumulated_patches = []
-                    accumulated_batches = []
-                    accumulated_activations = []
-                    accumulated_indices = []
 
                 # Update progress bar
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
@@ -1632,119 +1747,7 @@ class ProgressivePatchTrainer:
                     'SSIMLoss': f"{avg_ssim_loss:.4f}",
                     'Updates': num_updates
                 })
-                pbar.update(1)  # Increment by 1 batch
-
-                # Memory cleanup after update
-                del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
-                # Clear accumulated lists and their contents
-                for patch in accumulated_patches:
-                    del patch
-                for act in accumulated_activations:
-                    del act
-                accumulated_patches = []
-                accumulated_batches = []
-                accumulated_activations = []
-                accumulated_indices = []
-                # Clear hook-stored activations
-                self.ocr_activations = None
-
-                if self.device == 'cuda':
-                    torch.cuda.empty_cache()
-                elif self.device == 'mps':
-                    torch.mps.empty_cache()
-
-            else:
-                # Show accumulation progress
-                pbar.set_postfix({
-                    'DivLoss': f"{last_diversity_loss:.4f}",
-                    'TVLoss': f"{last_tv_loss:.4f}",
-                    'SSIMLoss': f"{last_ssim_loss:.4f}",
-                    'Progress': f"{step_count % update_every}/{update_every}"
-                })
-
-        # Handle remaining accumulated samples
-        if step_count % update_every != 0 and self.grad_accumulate is not None:
-            if len(accumulated_patches) > 0:
-                # Compute diagonal activations for diversity metric
-                accumulated_activations = []
-                for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
-                    diagonal_activation = self._get_activations_for_patch_image(
-                        batch_dict, patch, use_grad=True, skip_detection=True
-                    )
-                    accumulated_activations.append(diagonal_activation)
-
-                # Group patches by image
-                from collections import defaultdict
-                patches_by_image = defaultdict(list)
-                batches_by_image = defaultdict(list)
-                activations_by_image = defaultdict(list)
-
-                for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
-                    zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
-                ):
-                    patches_by_image[img_idx].append(patch)
-                    batches_by_image[img_idx].append(batch_dict)
-                    activations_by_image[img_idx].append(activation)
-
-                # Compute diversity score independently for each image, then average
-                diversity_scores = []
-                for img_idx in sorted(patches_by_image.keys()):
-                    image_patches = patches_by_image[img_idx]
-                    image_batches = batches_by_image[img_idx]
-                    image_activations = activations_by_image[img_idx]
-                    # Use constant indices (0, 1, 2, ...) for this image's patches
-                    image_indices = list(range(len(image_patches)))
-
-                    # Compute diversity for this image's patches
-                    img_diversity_score = self.compute_activation_diversity(
-                        image_patches,
-                        image_batches,
-                        image_indices,
-                        image_activations,
-                        use_grad=True
-                    )
-                    diversity_scores.append(img_diversity_score)
-
-                # Average diversity scores across images
-                diversity_score = torch.stack(diversity_scores).mean()
-                diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-
-                # Stack patches for batch operations
-                patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
-
-                # Compute total variation loss on generated patches
-                tv_loss = self.total_variation_loss(patches_stacked)
-                tv_loss_weighted = self.tv_weight * tv_loss
-
-                # Compute SSIM penalty (penalize structurally similar patches)
-                ssim_loss = self.compute_ssim_loss(patches_stacked)
-                ssim_loss_weighted = self.ssim_weight * ssim_loss
-
-                # Combined loss
-                total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
-                total_loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-                total_diversity_loss += diversity_loss.item()
-                total_tv_loss += tv_loss_weighted.item()
-                total_ssim_loss += ssim_loss_weighted.item()
-                num_updates += 1
-
-                # Memory cleanup for remaining samples
-                del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
-                for patch in accumulated_patches:
-                    del patch
-                for act in accumulated_activations:
-                    del act
-                self.ocr_activations = None
-
-            if self.device == 'cuda':
-                torch.cuda.empty_cache()
-            elif self.device == 'mps':
-                torch.mps.empty_cache()
+                pbar.update(1)
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
@@ -1847,19 +1850,20 @@ class ProgressivePatchTrainer:
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/{filename_template.format(i=i)}")
 
-    def train(self, learning_rate: float = 0.01, lr_min: float = 1e-5):
+    def train(self, learning_rate: float = 0.01, lr_min: float = 1e-5, max_epochs: int = 50):
         """
-        Progressive layer training loop.
+        Random layer sampling training with cascade penalty.
 
-        Trains by progressively targeting deeper layers, starting from early CNN
-        features and moving towards final outputs. Each layer is trained until
-        convergence or max epochs.
+        Trains patches by:
+        1. Profiling layer activations for normalization
+        2. Looping over epochs (not layers)
+        3. For each epoch, randomly sampling target layers per image
+        4. Training with cascade penalty to prevent early-layer attacks
 
         Saves:
         - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
         - checkpoints/{run_id}/best_progressive_patch/: Best model across all training
-        - checkpoints/{run_id}/final_layer_checkpoint_epoch_*/: Checkpoint every epoch on final layer
-        - checkpoints/{run_id}/layer*_complete_*/: Model after completing each layer (10 samples each)
+        - checkpoints/{run_id}/layer{i}_samples_epoch_*/: Sample patches for each layer (10 per layer)
         """
         from datetime import datetime
 
@@ -1870,31 +1874,37 @@ class ProgressivePatchTrainer:
         print(f"\nRun ID: {self.run_id}")
         print(f"Checkpoint directory: {self.checkpoint_base}\n")
 
+        # Profile layer activations upfront for normalization
+        print("\n" + "="*80)
+        print("LAYER ACTIVATION PROFILING")
+        print("="*80)
+        self.profile_layer_activations(num_samples=1024)
+        print("="*80 + "\n")
+
         # Initialize optimizer
         optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
 
-        # Global training history
-        global_history = {
-            'layer_idx': [],
-            'layer_name': [],
+        # Create cosine annealing scheduler
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max_epochs,
+            eta_min=lr_min
+        )
+
+        # Training history
+        history = {
             'epoch': [],
             'diversity_loss': [],
             'tv_loss': [],
             'ssim_loss': [],
-            'val_diversity': [],
             'learning_rate': []
         }
 
-        best_diversity = -float('inf')  # Higher diversity is better (for validation)
-        best_train_loss = float('inf')  # Lower loss is better (for training-only mode)
-        global_epoch = 0
+        best_train_loss = float('inf')
+        best_epoch = 0
 
         print("\n" + "="*80)
-        if self.target_layer is not None:
-            print("PROGRESSIVE LAYER ATTACK (QUEUED LAYERS)")
-            print(f"Training layers: {self.target_layer}")
-        else:
-            print("PROGRESSIVE LAYER ATTACK (ALL LAYERS)")
+        print("RANDOM LAYER SAMPLING TRAINING WITH CASCADE PENALTY")
         print("="*80)
         print(f"   Mode: OCR (cropped plates)")
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
@@ -1908,163 +1918,78 @@ class ProgressivePatchTrainer:
         else:
             vae_latent_dim = self.generator.vae_latent_dim
             print(f"   Generator: FoundationPatchGenerator (VAE-based, high quality)")
-            print(f"     Main path:")
-            print(f"       Adapter (trainable): z[{self.basis_dim}] -> 512 -> 1024 -> 2048 -> VAE latent[{vae_latent_dim}]")
-            print(f"       VAE decoder (trainable): latent[4×32×64] -> features[3×{self.patch_height}×{self.patch_width}]")
-            print(f"     Skip connection:")
-            print(f"       Skip projection (trainable): z[{self.basis_dim}] -> 512 -> spatial[1×{self.patch_height}×{self.patch_width}]")
-            print(f"     CNN refiner (trainable):")
-            print(f"       Input: concat(VAE output, skip)[4 channels]")
-            print(f"       Block1: Conv[4→64] + Conv[64→64]")
-            print(f"       Block2: Conv[64→128] + Conv[128→128]")
-            print(f"       Block3: Conv[128→64] + Conv[64→64]")
-            print(f"       Output: [64 channels]")
-            print(f"     DNN block (trainable):")
-            print(f"       Input: concat(CNN output[64], skip[1])[65 channels]")
-            print(f"       Global pool: 65×{self.patch_height}×{self.patch_width} → 65×8×16")
-            print(f"       Dense: {self.generator.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * self.patch_height * self.patch_width}")
-            print(f"       Output: patch[3×{self.patch_height}×{self.patch_width}]")
+            print(f"     Architecture: z[{self.basis_dim}] → adapter → VAE → CNN refiner → patch[3×{self.patch_height}×{self.patch_width}]")
 
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   TV weight: {self.tv_weight}")
         print(f"   SSIM weight: {self.ssim_weight}")
+        print(f"   Cascade weight: {self.cascade_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
-
-        if self.target_layer is None:
-            print(f"\nLayer Progression ({len(self.layer_configs)} layers total):")
-            for i, config in enumerate(self.layer_configs, 1):
-                print(f"   {i:2d}. {config.description:35s} (max {config.max_epochs} epochs)")
+        print(f"   Max epochs: {max_epochs}")
+        print(f"   Layers available: {len(self.layer_configs)}")
         print("="*80 + "\n")
 
-        # Progressive layer training loop
-        while self.current_layer_idx < len(self.layer_configs):
-            current_config = self.layer_configs[self.current_layer_idx]
-            # Get original layer index for display
-            display_layer_idx = (self.original_layer_indices[self.current_layer_idx]
-                                if self.original_layer_indices is not None
-                                else self.current_layer_idx)
+        # Main training loop over epochs
+        for epoch in range(1, max_epochs + 1):
+            current_lr = optimizer.param_groups[0]['lr']
 
-            print(f"\n{'='*80}")
-            print(f"LAYER {display_layer_idx + 1}/{len(self.layer_configs)} ({self.current_layer_idx + 1}/{len(self.layer_configs)} in queue): {current_config.description}")
-            if self.current_layer_idx == len(self.layer_configs) - 1:
-                print(f"(Final layer - convergence threshold disabled, will train full {current_config.max_epochs} epochs)")
-            print(f"{'='*80}\n")
+            # Training
+            train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, epoch, target_layer_idx=None)
 
-            # Reset optimizer learning rate for this layer (scheduler will start from this value)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = learning_rate
+            # Learning rate scheduling
+            scheduler.step()
 
-            # Create cosine annealing scheduler
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=current_config.max_epochs,
-                eta_min=lr_min
-            )
+            # Record history
+            history['epoch'].append(epoch)
+            history['diversity_loss'].append(train_diversity_loss)
+            history['tv_loss'].append(train_tv_loss)
+            history['ssim_loss'].append(train_ssim_loss)
+            history['learning_rate'].append(current_lr)
 
-            # Train on current layer until convergence or max epochs
-            while True:
-                self.current_layer_epoch += 1
-                global_epoch += 1
+            # Print epoch summary
+            epoch_summary = (f"Epoch {epoch:3d}/{max_epochs} | "
+                            f"DivLoss: {train_diversity_loss:.4f} | "
+                            f"TVLoss: {train_tv_loss:.4f} | "
+                            f"SSIMLoss: {train_ssim_loss:.4f} | "
+                            f"LR: {current_lr:.2e}")
+            print(epoch_summary)
 
-                # Get current LR before training (before scheduler updates it)
-                current_lr = optimizer.param_groups[0]['lr']
+            # Save best model
+            if train_diversity_loss < best_train_loss:
+                best_train_loss = train_diversity_loss
+                best_epoch = epoch
+                best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
+                self.save_basis(epoch, best_dir, num_samples=10, save_generator=True)
+                print(f"   ✓ New best training loss: {best_train_loss:.4f}")
 
-                # Training
-                train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, global_epoch)
-
-                # Validation (skip if using all data for training)
-                if self.use_all_for_train:
-                    val_diversity_score = 0.0
-                else:
-                    val_diversity_score = self.validate()
-
-                # Learning rate scheduling (after training, updates LR for next epoch)
-                scheduler.step()
-
-                # Record history
-                global_history['layer_idx'].append(self.current_layer_idx)
-                global_history['layer_name'].append(current_config.name)
-                global_history['epoch'].append(global_epoch)
-                global_history['diversity_loss'].append(train_diversity_loss)
-                global_history['tv_loss'].append(train_tv_loss)
-                global_history['ssim_loss'].append(train_ssim_loss)
-                global_history['val_diversity'].append(val_diversity_score)
-                global_history['learning_rate'].append(current_lr)
-
-                # Print epoch summary
-                epoch_summary = (f"[L{display_layer_idx+1}] Epoch {self.current_layer_epoch:3d}/{current_config.max_epochs} | "
-                                f"DivLoss: {train_diversity_loss:.4f} | "
-                                f"TVLoss: {train_tv_loss:.4f} | "
-                                f"SSIMLoss: {train_ssim_loss:.4f}")
-                if not self.use_all_for_train:
-                    epoch_summary += f" | Val: {val_diversity_score:.3f}"
-                epoch_summary += f" | LR: {current_lr:.2e}"
-                print(epoch_summary)
-
-                # Save example patches every epoch for final layer (without generator model)
-                is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
-                if is_final_layer:
-                    final_layer_save_dir = os.path.join(self.checkpoint_base, f"final_layer_checkpoint_epoch_{self.current_layer_epoch:04d}")
-                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10, save_generator=True)
-                    print(f"   ✓ Saved final layer checkpoint at epoch {self.current_layer_epoch}")
-
-                # Save best model globally
-                if self.use_all_for_train:
-                    # Training-only mode: track best by lowest training loss
-                    if train_diversity_loss < best_train_loss:
-                        best_train_loss = train_diversity_loss
-                        best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
-                        self.save_basis(global_epoch, best_dir)
-                        print(f"   ✓ New best training loss: {best_train_loss:.4f}")
-                else:
-                    # Validation mode: track best by highest validation diversity
-                    if val_diversity_score > best_diversity:
-                        best_diversity = val_diversity_score
-                        best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
-                        self.save_basis(global_epoch, best_dir)
-                        print(f"   ✓ New best diversity: {best_diversity:.4f}")
-
-                # Check if should continue on current layer
-                if not self.should_continue_current_layer(train_diversity_loss):
-                    break
-
-            # Advance to next layer (or finish if at final layer)
-            if not self.advance_to_next_layer():
-                break
+            # Save samples per layer periodically (every 10 epochs)
+            if epoch % 10 == 0:
+                for layer_idx in range(len(self.layer_configs)):
+                    layer_name = self.layer_configs[layer_idx].description.replace(" ", "_")
+                    layer_save_dir = os.path.join(self.checkpoint_base, f"layer{layer_idx}_{layer_name}_epoch_{epoch:04d}")
+                    self.save_basis(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx)
 
         print("\n" + "="*80)
-        if self.target_layer is not None:
-            print("PROGRESSIVE TRAINING COMPLETED (QUEUED LAYERS)!")
-        else:
-            print("PROGRESSIVE TRAINING COMPLETED (ALL LAYERS)!")
+        print("TRAINING COMPLETED!")
         print("="*80)
-        if self.use_all_for_train:
-            print(f"   Best training loss: {best_train_loss:.4f}")
-        else:
-            print(f"   Best diversity: {best_diversity:.4f}")
-        print(f"   Total epochs: {global_epoch}")
-
-        if len(self.layer_history) > 0:
-            print(f"\nLayer progression summary:")
-            for record in self.layer_history:
-                layer_num = record['original_layer_idx'] + 1
-                print(f"   Layer {layer_num:2d}: {record['description']:35s} - {record['epochs_trained']} epochs")
+        print(f"   Best training loss: {best_train_loss:.4f} (epoch {best_epoch})")
+        print(f"   Total epochs: {max_epochs}")
         print("="*80 + "\n")
 
-        # Save final model after all training is complete
+        # Save final model
         print("Saving final trained model...")
         final_save_dir = os.path.join(self.checkpoint_base, "training_complete_final_model")
-        self.save_basis(global_epoch, final_save_dir, num_samples=20, save_generator=True)
+        self.save_basis(max_epochs, final_save_dir, num_samples=20, save_generator=True)
         print(f"\n{'='*80}")
         print(f"FINAL MODEL SAVED TO: {final_save_dir}/")
         print(f"{'='*80}")
-        print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{global_epoch:04d}.pt")
+        print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{max_epochs:04d}.pt")
         print(f"  Sample patches: 20 PNG files in {final_save_dir}/")
         print(f"  All checkpoints: {self.checkpoint_base}/")
         print(f"{'='*80}\n")
 
-        return global_history
+        return history
 
 
 def main():
