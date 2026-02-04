@@ -619,6 +619,11 @@ class BlackBoxPatchOptimizer:
         opts = {
             'bounds': [0, 1],  # Constrain z to [0, 1]
             'verbose': -1,  # Suppress CMA-ES output (we'll use tqdm)
+            # Disable early stopping criteria to allow optimization to continue even with plateaued fitness
+            'tolfun': -1,  # Disable fitness convergence stopping
+            'tolx': -1,  # Disable parameter convergence stopping
+            'tolhistfun': -1,  # Disable history-based stopping
+            'maxfevals': float('inf'),  # No limit on function evaluations (use max_iterations instead)
         }
 
         if population_size is not None:
@@ -658,18 +663,36 @@ class BlackBoxPatchOptimizer:
         success_window = 10
 
         with tqdm(total=max_iterations, desc="CMA-ES") as pbar:
-            while not es.stop() and iteration < max_iterations:
-                # Ask for new candidate solutions
-                solutions = es.ask()
+            while iteration < max_iterations:
+                try:
+                    # Check if CMA-ES wants to stop (but allow override with plate blur)
+                    if es.stop() and not self.enable_plate_blur:
+                        print(f"\nCMA-ES stopping criteria met")
+                        break
+                    elif es.stop() and self.enable_plate_blur and best_fitness_ever > self.blur_threshold:
+                        # Continue if blur is enabled and fitness is still bad
+                        pass
+                    elif es.stop():
+                        break
 
-                # Evaluate fitness for each solution
-                fitness_values = []
-                for z in solutions:
-                    fitness = self.evaluate_fitness(z, oracle)
-                    fitness_values.append(fitness)
+                    # Ask for new candidate solutions
+                    solutions = es.ask()
 
-                # Tell CMA-ES the results
-                es.tell(solutions, fitness_values)
+                    # Evaluate fitness for each solution
+                    fitness_values = []
+                    for z in solutions:
+                        try:
+                            fitness = self.evaluate_fitness(z, oracle)
+                            fitness_values.append(fitness)
+                        except Exception as e:
+                            print(f"Warning: Fitness evaluation failed: {e}")
+                            fitness_values.append(float('inf'))
+
+                    # Tell CMA-ES the results
+                    es.tell(solutions, fitness_values)
+                except Exception as e:
+                    print(f"Warning: CMA-ES step failed: {e}, continuing with next iteration")
+                    continue
 
                 # Track best
                 best_idx = np.argmin(fitness_values)
