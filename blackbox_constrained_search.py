@@ -620,9 +620,9 @@ class BlackBoxPatchOptimizer:
             'bounds': [0, 1],  # Constrain z to [0, 1]
             'verbose': -1,  # Suppress CMA-ES output (we'll use tqdm)
             # Disable early stopping criteria to allow optimization to continue even with plateaued fitness
-            'tolfun': -1,  # Disable fitness convergence stopping
-            'tolx': -1,  # Disable parameter convergence stopping
-            'tolhistfun': -1,  # Disable history-based stopping
+            'tolfun': 0,  # Disable fitness convergence stopping
+            'tolx': 0,  # Disable parameter convergence stopping
+            'tolfunhist': 0,  # Disable history-based stopping
             'maxfevals': float('inf'),  # No limit on function evaluations (use max_iterations instead)
         }
 
