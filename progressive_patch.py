@@ -1077,14 +1077,11 @@ class ProgressivePatchTrainer:
                                       diagonal_activations: List[torch.Tensor],
                                       use_grad: bool = False) -> torch.Tensor:
         """
-        Compute diversity via average activation impact across sampled images.
+        Compute diversity as the determinant of the gram matrix of patch activation deltas.
 
-        For each patch, evaluate it on a subset of images (always diagonal,
-        randomly sample off-diagonal) and compute the average activation delta.
-
-        The eval_depth parameter controls the total number of (patch, image)
-        evaluations: always includes batch_size diagonal, randomly samples
-        remaining off-diagonal pairs from the budget.
+        For each patch, compute the activation delta (activation with patch - baseline without patch)
+        on its corresponding image. Then measure diversity as how different these deltas are
+        in activation space via the log determinant of the gram matrix.
 
         Args:
             patches_list: List of [3, H, W] patches (one per image)
@@ -1098,52 +1095,21 @@ class ProgressivePatchTrainer:
         """
         batch_size = len(patches_list)
 
-        # Build set of all off-diagonal pairs for full gram matrix computation
-        off_diag_pairs = []
+        # Compute activation delta for each patch: delta_i = activation_i - baseline
+        deltas = []
         for patch_idx in range(batch_size):
-            for img_idx in range(batch_size):
-                if patch_idx != img_idx:
-                    off_diag_pairs.append((patch_idx, img_idx))
-
-        # Include all off-diagonal pairs
-        sampled_pairs = set(off_diag_pairs)
-
-        # For each patch, compute average activation delta across sampled images
-        patch_avg_deltas = []
-
-        for patch_idx, patch in enumerate(patches_list):
-            activation_deltas = []
-
-            # Always include diagonal (patch_i on image_i)
             activations = diagonal_activations[patch_idx]  # [H, W, C]
             baseline = self.get_baseline_activation(batches_list[patch_idx], baseline_indices[patch_idx])  # [H, W, C]
             delta = activations - baseline  # [H, W, C]
-            activation_deltas.append(delta)
+            deltas.append(delta)
 
-            # Include sampled off-diagonal pairs involving this patch
-            for img_idx in range(batch_size):
-                if img_idx != patch_idx and (patch_idx, img_idx) in sampled_pairs:
-                    batch = batches_list[img_idx]
-                    activations = self._get_activations_for_patch_image(batch, patch, use_grad=use_grad, skip_detection=True)  # [H, W, C]
-                    baseline = self.get_baseline_activation(batch, baseline_indices[img_idx])  # [H, W, C]
-                    delta = activations - baseline  # [H, W, C]
-                    activation_deltas.append(delta)
+        # Stack deltas: [batch_size, H, W, C]
+        deltas_stacked = torch.stack(deltas, dim=0)
+        # Flatten: [batch_size, H*W*C]
+        deltas_flat = deltas_stacked.reshape(batch_size, -1)
 
-            # Average deltas for this patch over sampled images
-            stacked_deltas = torch.stack(activation_deltas, dim=0)
-            avg_delta = stacked_deltas.mean(dim=0)  # [H, W, C]
-            patch_avg_deltas.append(avg_delta)
-            # Clean up intermediate tensors
-            del stacked_deltas, activation_deltas
-
-        # Stack averaged deltas: [batch_size, H, W, C]
-        avg_deltas_stacked = torch.stack(patch_avg_deltas, dim=0)
-        # Clean up intermediate list
-        del patch_avg_deltas
-        avg_deltas_flat = avg_deltas_stacked.reshape(batch_size, -1)  # [batch_size, H*W*C]
-
-        # L2 normalize each patch's average delta vector
-        normalized = F.normalize(avg_deltas_flat, p=2, dim=1)  # [batch_size, H*W*C]
+        # L2 normalize each delta vector to unit length
+        normalized = F.normalize(deltas_flat, p=2, dim=1)  # [batch_size, H*W*C]
 
         # Compute Gram matrix: [batch_size, batch_size]
         gram = normalized @ normalized.t()
