@@ -186,6 +186,42 @@ def _apply_patch_homography(image: np.ndarray, corners: np.ndarray, patch: torch
     return result_np
 
 
+def crop_to_border_region(image: np.ndarray, corners: np.ndarray, border_scale: float = 1.4):
+    """
+    Crop image to border region (scaled from corners).
+
+    Args:
+        image: [H, W, 3] numpy array
+        corners: [4, 2] plate corner coordinates
+        border_scale: Scale factor for border
+
+    Returns:
+        cropped_image: Cropped region
+        crop_corners: Adjusted corner coordinates in cropped region
+    """
+    # Compute border corners
+    corners_array = corners.astype(np.float32)
+    center_x = corners_array[:, 0].mean()
+    center_y = corners_array[:, 1].mean()
+    center = np.array([center_x, center_y])
+
+    border_corners = center + (corners_array - center) * border_scale
+
+    # Compute bounding box from border corners
+    x_min = max(0, int(np.floor(border_corners[:, 0].min())))
+    x_max = min(image.shape[1], int(np.ceil(border_corners[:, 0].max())))
+    y_min = max(0, int(np.floor(border_corners[:, 1].min())))
+    y_max = min(image.shape[0], int(np.ceil(border_corners[:, 1].max())))
+
+    # Crop image
+    cropped_image = image[y_min:y_max, x_min:x_max]
+
+    # Adjust corners to cropped region
+    crop_corners = corners_array - np.array([x_min, y_min])
+
+    return cropped_image, crop_corners
+
+
 def _apply_patch_rectangular(image: np.ndarray, corners: np.ndarray, patch: torch.Tensor) -> np.ndarray:
     """Apply patch as simple rectangular insertion in bounding box region."""
     result = image.copy()
@@ -280,6 +316,17 @@ def main():
         action='store_true',
         help='Disable homography-based insertion, use simple rectangular blending instead'
     )
+    parser.add_argument(
+        '--ocr-mode',
+        action='store_true',
+        help='Crop to border region (1.4x scaled corners) for OCR-only evaluation'
+    )
+    parser.add_argument(
+        '--border-scale',
+        type=float,
+        default=1.4,
+        help='Scale factor for border region when using --ocr-mode (default: 1.4)'
+    )
 
     args = parser.parse_args()
 
@@ -344,6 +391,10 @@ def main():
             [row['p3_x'], row['p3_y']],
             [row['p4_x'], row['p4_y']]
         ], dtype=np.float32)
+
+        # Crop to border region if in OCR mode
+        if args.ocr_mode:
+            image, corners = crop_to_border_region(image, corners, border_scale=args.border_scale)
 
         # Apply patch (or use original image if no patch provided)
         if patch is not None:
