@@ -704,6 +704,7 @@ class ProgressivePatchTrainer:
         self.ocr_activations = None  # Current activations from forward hook
         self.baseline_ocr_activations = {}  # Dict mapping image index to baseline activations
         self.activation_hook = None  # Handle for the forward hook
+        self.layer_activation_stddev = {}  # Dict mapping layer_idx to std_dev of activations
 
         # Load OCR model for diversity computation
         self.load_ocr_model()
@@ -1265,6 +1266,97 @@ class ProgressivePatchTrainer:
                     return torch.zeros(self.activation_shape, device=self.device)
                 else:
                     return torch.zeros(1, 1, 48, device=self.device)
+
+    def profile_layer_activations(self, num_samples: int = 1024):
+        """
+        Profile activation magnitudes at each layer by computing standard deviations.
+
+        Samples random images from the dataset, runs them through the OCR model without patches,
+        and computes the standard deviation of each activation element across all samples.
+        These std_devs are used to normalize activation deltas during training.
+
+        Args:
+            num_samples: Number of images to sample for profiling (default: 1024)
+        """
+        print(f"\nProfiling layer activations on {num_samples} random images...")
+
+        num_samples = min(num_samples, len(self.train_loader))
+        all_layer_activations = {}  # layer_idx -> list of [H*W*C] activations
+
+        # Sample random images from training set
+        self.ocr.eval()
+        with torch.no_grad():
+            for sample_idx in range(num_samples):
+                if sample_idx % 100 == 0:
+                    print(f"  Profiling: {sample_idx}/{num_samples}")
+
+                # Get random sample
+                batch_idx = np.random.randint(0, len(self.train_loader))
+                batch = list(self.train_loader)[batch_idx]
+                batch_dict = {k: v[0] for k, v in batch.items()}
+
+                # Run through model and capture activations for all layers
+                prep_image = batch_dict['prep_image'].unsqueeze(0).to(self.device)
+                cropped_plate = F.interpolate(
+                    prep_image,
+                    size=self.ocr_input_shape[:2],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
+                activations_dict = {}
+
+                # Temporarily hook all target layers
+                hooks = []
+                for layer_idx, layer_config in enumerate(self.layer_configs):
+                    def make_hook(idx):
+                        def hook(module, input, output):
+                            # Flatten the output and store
+                            if isinstance(output, torch.Tensor):
+                                activations_dict[idx] = output.squeeze(0).reshape(-1).detach().cpu()
+                        return hook
+
+                    # Find and hook the layer
+                    layer_module = self._find_layer_by_name(layer_config.name)
+                    if layer_module is not None:
+                        hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+
+                # Forward pass
+                self.ocr(ocr_input)
+
+                # Remove hooks
+                for hook in hooks:
+                    hook.remove()
+
+                # Store activations
+                for layer_idx, activation in activations_dict.items():
+                    if layer_idx not in all_layer_activations:
+                        all_layer_activations[layer_idx] = []
+                    all_layer_activations[layer_idx].append(activation)
+
+        # Compute std_dev for each layer
+        self.layer_activation_stddev = {}
+        for layer_idx in sorted(all_layer_activations.keys()):
+            activations_list = all_layer_activations[layer_idx]
+            # Stack all activations: [num_samples, num_elements]
+            stacked = torch.stack(activations_list, dim=0)
+            # Compute std_dev along sample axis
+            std_dev = stacked.std(dim=0)  # [num_elements]
+            # Avoid division by zero
+            std_dev = torch.clamp(std_dev, min=1e-6)
+            self.layer_activation_stddev[layer_idx] = std_dev.to(self.device)
+
+        print(f"✓ Profiled {len(self.layer_activation_stddev)} layers")
+        for layer_idx, std_dev in self.layer_activation_stddev.items():
+            print(f"  Layer {layer_idx}: {std_dev.shape} activations, mean_std={std_dev.mean():.6f}")
+
+    def _find_layer_by_name(self, layer_name: str):
+        """Find a module in the OCR model by its name."""
+        for name, module in self.ocr.named_modules():
+            if name == layer_name or layer_name in name:
+                return module
+        return None
 
     def calculate_baseline_activations(self):
         """
