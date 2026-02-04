@@ -469,7 +469,7 @@ class ProgressivePatchTrainer:
     starting from early CNN features and moving towards final outputs.
     """
     def __init__(self,
-                 csv_path: str = None,
+                 ocr_dataset: str,
                  device: str = None,
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
@@ -481,15 +481,11 @@ class ProgressivePatchTrainer:
                  convergence_threshold = 1.0,
                  target_layer: Optional[List[int]] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
-                 eval_depth: Optional[int] = None,
                  use_simple_generator: bool = False,
-                 use_all_for_train: bool = True,
-                 ocr_mode: bool = False,
-                 ocr_dataset: Optional[str] = None,
                  ocr_dataset_split: str = 'train',
                  ocr_max_samples: Optional[int] = None,
                  ocr_images_per_batch: int = 1,
-                 ocr_patches_per_image: Optional[int] = None):
+                 ocr_patches_per_image: int = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -499,27 +495,16 @@ class ProgressivePatchTrainer:
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
         self.ocr_images_per_batch = ocr_images_per_batch
-
-        # In OCR mode, calculate patches per image from batch size if not specified
-        if ocr_mode:
-            if ocr_patches_per_image is None:
-                # Default: split batch_size evenly across images
-                self.ocr_patches_per_image = grad_accumulate // ocr_images_per_batch if grad_accumulate else 16 // ocr_images_per_batch
-            else:
-                self.ocr_patches_per_image = ocr_patches_per_image
-            print(f"OCR batch config: {ocr_images_per_batch} images × {self.ocr_patches_per_image} patches = {ocr_images_per_batch * self.ocr_patches_per_image} total")
-        else:
-            self.ocr_patches_per_image = ocr_patches_per_image or 16
-        self.eval_depth = eval_depth
         self.use_simple_generator = use_simple_generator
-        self.ocr_mode = ocr_mode
 
-        # In OCR mode, always use validation split
-        if ocr_mode:
-            self.use_all_for_train = False
-            print("OCR mode enabled: using 80/20 train/val split")
-        else:
-            self.use_all_for_train = use_all_for_train
+        # Require ocr_patches_per_image
+        if ocr_patches_per_image is None:
+            raise ValueError("ocr_patches_per_image is required")
+        self.ocr_patches_per_image = ocr_patches_per_image
+        print(f"OCR batch config: {ocr_images_per_batch} images × {self.ocr_patches_per_image} patches = {ocr_images_per_batch * self.ocr_patches_per_image} total")
+
+        # Always use 80/20 validation split in OCR mode
+        self.use_all_for_train = False
 
         # Progressive layer configuration
         # Handle single values or lists for max_epochs and convergence_threshold
@@ -587,81 +572,65 @@ class ProgressivePatchTrainer:
         self.patch_width = PATCH_WIDTH
         self.patch_height = PATCH_HEIGHT
 
-        # Load dataset (either from CSV or public OCR datasets)
-        if ocr_mode and ocr_dataset:
-            # OCR mode: use public datasets from load_datasets.py
-            # Support multiple datasets (comma-separated)
-            dataset_names = [name.strip() for name in ocr_dataset.split(',')]
+        # Load OCR datasets
+        dataset_names = [name.strip() for name in ocr_dataset.split(',')]
 
-            print(f"\nUsing public OCR dataset(s): {', '.join(dataset_names)} (split: {ocr_dataset_split})")
+        print(f"\nUsing public OCR dataset(s): {', '.join(dataset_names)} (split: {ocr_dataset_split})")
 
-            # Validate all datasets exist
-            for dataset_name in dataset_names:
-                if dataset_name not in DATASETS:
-                    available = ', '.join(sorted(DATASETS.keys()))
-                    raise ValueError(
-                        f"Unknown dataset '{dataset_name}'. Available: {available}"
-                    )
-
-            # Load all datasets
-            datasets_to_combine = []
-            for dataset_name in dataset_names:
-                print(f"\nLoading {dataset_name}...")
-                dataset = OCRDataset(
-                    dataset_name=dataset_name,
-                    split=ocr_dataset_split,
-                    transform=self.transform,
-                    max_samples=ocr_max_samples
+        # Validate all datasets exist
+        for dataset_name in dataset_names:
+            if dataset_name not in DATASETS:
+                available = ', '.join(sorted(DATASETS.keys()))
+                raise ValueError(
+                    f"Unknown dataset '{dataset_name}'. Available: {available}"
                 )
-                datasets_to_combine.append(dataset)
-                print(f"  Loaded {len(dataset)} samples from {dataset_name}")
 
-            # Combine datasets if multiple, otherwise use single dataset
-            if len(datasets_to_combine) > 1:
-                full_dataset = ConcatDataset(datasets_to_combine)
-                print(f"\nCombined {len(dataset_names)} datasets: {len(full_dataset)} total samples")
-            else:
-                full_dataset = datasets_to_combine[0]
-
-            # Split into train (80%) and val (20%)
-            train_size = int(0.8 * len(full_dataset))
-            val_size = len(full_dataset) - train_size
-            train_dataset, val_dataset = random_split(
-                full_dataset,
-                [train_size, val_size],
-                generator=torch.Generator().manual_seed(42)
-            )
-
-            # Create dataloaders
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=True if self.device == 'cuda' else False
-            )
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=True if self.device == 'cuda' else False
-            )
-
-            print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
-
-        elif csv_path:
-            # Standard mode: use CSV dataset
-            self.train_loader, self.val_loader = create_dataloaders(
-                csv_path,
+        # Load all datasets
+        datasets_to_combine = []
+        for dataset_name in dataset_names:
+            print(f"\nLoading {dataset_name}...")
+            dataset = OCRDataset(
+                dataset_name=dataset_name,
+                split=ocr_dataset_split,
                 transform=self.transform,
-                preload=True,
-                batch_size=1,
-                n_jobs=0,
-                use_all_for_train=use_all_for_train
+                max_samples=ocr_max_samples
             )
+            datasets_to_combine.append(dataset)
+            print(f"  Loaded {len(dataset)} samples from {dataset_name}")
+
+        # Combine datasets if multiple, otherwise use single dataset
+        if len(datasets_to_combine) > 1:
+            full_dataset = ConcatDataset(datasets_to_combine)
+            print(f"\nCombined {len(dataset_names)} datasets: {len(full_dataset)} total samples")
         else:
-            raise ValueError("Must provide either csv_path or (ocr_mode=True + ocr_dataset)")
+            full_dataset = datasets_to_combine[0]
+
+        # Split into train (80%) and val (20%)
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+        # Create dataloaders
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True if self.device == 'cuda' else False
+        )
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True if self.device == 'cuda' else False
+        )
+
+        print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
 
         # Initialize generator (simple or foundation model)
         if use_simple_generator:
@@ -1070,46 +1039,22 @@ class ProgressivePatchTrainer:
         # Use context manager conditionally
         context = torch.no_grad() if not use_grad else torch.enable_grad()
         with context:
-            if self.ocr_mode:
-                # OCR mode: work with cropped license plates directly
-                # Use prep_image (already cropped plate) instead of orig_image
-                prep_image = batch['prep_image'].to(self.device).unsqueeze(0)  # [1, 3, H, W]
+            # OCR mode: work with cropped license plates directly
+            # Use prep_image (already cropped plate) instead of orig_image
+            prep_image = batch['prep_image'].to(self.device).unsqueeze(0)  # [1, 3, H, W]
 
-                # Apply patch in OCR mode (simplified: patch as border, keep center)
-                patched_image, _ = self.apply_patch_ocr_mode(prep_image, patch)
+            # Apply patch in OCR mode (simplified: patch as border, keep center)
+            patched_image, _ = self.apply_patch_ocr_mode(prep_image, patch)
 
-                # Crop and resize to OCR input shape
-                cropped_plate = F.interpolate(
-                    patched_image,
-                    size=self.ocr_input_shape[:2],
-                    mode='bilinear',
-                    align_corners=False
-                )
-            else:
-                # Standard mode: apply patch to full image with perspective transform
-                patched_image, _ = self.apply_patch_to_image(
-                    batch['orig_image'].to(self.device).unsqueeze(0),
-                    batch['orig_corners'].to(self.device).unsqueeze(0),
-                    patch
-                )
+            # Crop and resize to OCR input shape
+            cropped_plate = F.interpolate(
+                patched_image,
+                size=self.ocr_input_shape[:2],
+                mode='bilinear',
+                align_corners=False
+            )
 
-                orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-
-                # Use BORDER corners (1.4x scaled) - this is where the patch actually is!
-                # Plate corners would miss the patch since it's applied as a border
-                # Note: skip_detection parameter is kept for API compatibility but always uses corners
-                plate_corners = batch['orig_corners'].to(self.device)
-                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
-
-                # Crop plate from patched image and run OCR
-                cropped_plate = K.crop_and_resize(
-                    patched_image,
-                    corners_box,
-                    self.ocr_input_shape[:2]
-                )
-
-            # Run OCR on cropped plate (same for both modes)
+            # Run OCR on cropped plate
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             self.ocr(ocr_input)  # Forward pass captures activations via hook
 
@@ -1153,28 +1098,15 @@ class ProgressivePatchTrainer:
         """
         batch_size = len(patches_list)
 
-        # Determine actual eval_depth (default to full matrix if not specified)
-        actual_eval_depth = self.eval_depth if self.eval_depth is not None else batch_size ** 2
-        actual_eval_depth = min(actual_eval_depth, batch_size ** 2)  # Cap at max possible
-
-        # Build set of off-diagonal pairs
+        # Build set of all off-diagonal pairs for full gram matrix computation
         off_diag_pairs = []
         for patch_idx in range(batch_size):
             for img_idx in range(batch_size):
                 if patch_idx != img_idx:
                     off_diag_pairs.append((patch_idx, img_idx))
 
-        # Calculate off-diagonal budget (eval_depth - diagonal evaluations)
-        diagonal_count = batch_size
-        off_diag_budget = max(0, actual_eval_depth - diagonal_count)
-
-        # Randomly sample off-diagonal pairs
-        if off_diag_budget > 0 and len(off_diag_pairs) > 0:
-            num_to_sample = min(off_diag_budget, len(off_diag_pairs))
-            sampled_indices = np.random.choice(len(off_diag_pairs), size=num_to_sample, replace=False)
-            sampled_pairs = set((off_diag_pairs[i][0], off_diag_pairs[i][1]) for i in sampled_indices)
-        else:
-            sampled_pairs = set()
+        # Include all off-diagonal pairs
+        sampled_pairs = set(off_diag_pairs)
 
         # For each patch, compute average activation delta across sampled images
         patch_avg_deltas = []
@@ -1264,28 +1196,14 @@ class ProgressivePatchTrainer:
 
         # Compute on-the-fly
         with torch.no_grad():
-            if self.ocr_mode:
-                # OCR mode: use prep_image directly (already cropped)
-                prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
-                cropped_plate = F.interpolate(
-                    prep_image,
-                    size=self.ocr_input_shape[:2],
-                    mode='bilinear',
-                    align_corners=False
-                )
-            else:
-                # Standard mode: use border corners with perspective transform
-                plate_corners = batch['orig_corners'].to(self.device)
-                border_corners = self.get_border_corners(plate_corners, border_scale=1.4)
-                corners_box = border_corners.unsqueeze(0)  # [1, 4, 2]
-
-                # Crop plate area from original image (no patch)
-                orig_image = batch['orig_image'].unsqueeze(0).to(self.device)
-                cropped_plate = K.crop_and_resize(
-                    orig_image,
-                    corners_box,
-                    self.ocr_input_shape[:2]
-                )
+            # OCR mode: use prep_image directly (already cropped)
+            prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
+            cropped_plate = F.interpolate(
+                prep_image,
+                size=self.ocr_input_shape[:2],
+                mode='bilinear',
+                align_corners=False
+            )
 
             ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
             self.ocr(ocr_input)  # Forward pass captures activations via hook
@@ -1307,23 +1225,9 @@ class ProgressivePatchTrainer:
 
     def calculate_baseline_activations(self):
         """
-        Capture baseline activations for each image (without patches).
-
-        In OCR mode: this is skipped and baselines are computed on-the-fly.
-        In standard mode: pre-computes all baselines.
+        Baselines are computed on-the-fly in OCR mode (memory efficient).
         """
-        if self.ocr_mode:
-            print("OCR mode: computing baselines on-the-fly (memory efficient)")
-            return
-
-        desc = "Calculating baseline activations"
-        with tqdm(self.train_loader, desc=desc, leave=False) as pbar:
-            with torch.no_grad():
-                for idx, batch in enumerate(pbar):
-                    batch = {k: v[0] for k, v in batch.items()}
-                    self.get_baseline_activation(batch, idx)
-
-        print(f"✓ Stored baseline activations for {len(self.baseline_ocr_activations)} images")
+        print("Computing baselines on-the-fly (memory efficient)")
 
     def check_convergence(self, diversity_score: float) -> bool:
         """
@@ -1457,173 +1361,48 @@ class ProgressivePatchTrainer:
 
         desc = f"Epoch {epoch} - Training (AccumSteps={update_every})"
 
-        if self.ocr_mode:
-            # OCR mode: Generate multiple patches per image, process multiple images per batch
-            # images_per_batch × patches_per_image = total patches in accumulation
-            dataloader_iter = iter(self.train_loader)
-            num_images = len(self.train_loader)
-            images_per_batch = self.ocr_images_per_batch
-            patches_per_image = self.ocr_patches_per_image
+        # OCR mode: Generate multiple patches per image, process multiple images per batch
+        # images_per_batch × patches_per_image = total patches in accumulation
+        dataloader_iter = iter(self.train_loader)
+        num_images = len(self.train_loader)
+        images_per_batch = self.ocr_images_per_batch
+        patches_per_image = self.ocr_patches_per_image
 
-            # Calculate number of batches (groups of images_per_batch images)
-            import math
-            num_batches = math.ceil(num_images / images_per_batch)
+        # Calculate number of batches (groups of images_per_batch images)
+        import math
+        num_batches = math.ceil(num_images / images_per_batch)
 
-            with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
-                img_idx = 0
-                while img_idx < num_images:
-                    try:
-                        # Process images_per_batch images
-                        for img_in_batch in range(images_per_batch):
-                            if img_idx >= num_images:
-                                break
+        with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
+            img_idx = 0
+            while img_idx < num_images:
+                try:
+                    # Process images_per_batch images
+                    for img_in_batch in range(images_per_batch):
+                        if img_idx >= num_images:
+                            break
 
-                            # Get one image
-                            batch = next(dataloader_iter)
-                            single_batch = {k: v[0] for k, v in batch.items()}
+                        # Get one image
+                        batch = next(dataloader_iter)
+                        single_batch = {k: v[0] for k, v in batch.items()}
 
-                            # Generate patches_per_image patches for this image
-                            for _ in range(patches_per_image):
-                                z = self.sample_coefficients(1)
-                                patch = self.generate_patches(z)[0]  # [3, H, W]
+                        # Generate patches_per_image patches for this image
+                        for _ in range(patches_per_image):
+                            z = self.sample_coefficients(1)
+                            patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                                # Store patch and batch
-                                accumulated_patches.append(patch)
-                                accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
-                                                           for k, v in single_batch.items()})
-                                accumulated_indices.append(img_idx)
+                            # Store patch and batch
+                            accumulated_patches.append(patch)
+                            accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
+                                                       for k, v in single_batch.items()})
+                            accumulated_indices.append(img_idx)
 
-                            img_idx += 1
-                            step_count += patches_per_image
+                        img_idx += 1
+                        step_count += patches_per_image
 
-                    except StopIteration:
-                        break
+                except StopIteration:
+                    break
 
-                    # Update model after processing images_per_batch images
-                    if len(accumulated_patches) > 0:
-                        # Compute diagonal activations for diversity metric
-                        accumulated_activations = []
-                        for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
-                            diagonal_activation = self._get_activations_for_patch_image(
-                                batch_dict, patch, use_grad=True, skip_detection=True
-                            )
-                            accumulated_activations.append(diagonal_activation)
-
-                        # Group patches by image
-                        from collections import defaultdict
-                        patches_by_image = defaultdict(list)
-                        batches_by_image = defaultdict(list)
-                        activations_by_image = defaultdict(list)
-
-                        for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
-                            zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
-                        ):
-                            patches_by_image[img_idx].append(patch)
-                            batches_by_image[img_idx].append(batch_dict)
-                            activations_by_image[img_idx].append(activation)
-
-                        # Compute diversity score independently for each image, then average
-                        diversity_scores = []
-                        for img_idx in sorted(patches_by_image.keys()):
-                            image_patches = patches_by_image[img_idx]
-                            image_batches = batches_by_image[img_idx]
-                            image_activations = activations_by_image[img_idx]
-                            # Use constant indices (0, 1, 2, ...) for this image's patches
-                            image_indices = list(range(len(image_patches)))
-
-                            # Compute diversity for this image's patches
-                            img_diversity_score = self.compute_activation_diversity(
-                                image_patches,
-                                image_batches,
-                                image_indices,
-                                image_activations,
-                                use_grad=True
-                            )
-                            diversity_scores.append(img_diversity_score)
-
-                        # Average diversity scores across images
-                        diversity_score = torch.stack(diversity_scores).mean()
-                        diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
-
-                        # Stack patches for batch operations
-                        patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
-
-                        # Compute total variation loss on generated patches
-                        tv_loss = self.total_variation_loss(patches_stacked)
-                        tv_loss_weighted = self.tv_weight * tv_loss
-
-                        # Compute SSIM penalty (penalize structurally similar patches)
-                        ssim_loss = self.compute_ssim_loss(patches_stacked)
-                        ssim_loss_weighted = self.ssim_weight * ssim_loss
-
-                        # Combined loss
-                        total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
-                        last_diversity_loss = diversity_loss.item()
-                        last_tv_loss = tv_loss_weighted.item()  # Display weighted version
-                        last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
-
-                        # Train on combined loss
-                        total_loss.backward()
-
-                        # Apply accumulated gradients
-                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                        # Track losses (store weighted version for display)
-                        total_diversity_loss += diversity_loss.item()
-                        total_tv_loss += tv_loss_weighted.item()
-                        total_ssim_loss += ssim_loss_weighted.item()
-                        num_updates += 1
-
-                        # Clear accumulated
-                        accumulated_patches = []
-                        accumulated_batches = []
-                        accumulated_activations = []
-                        accumulated_indices = []
-
-                    # Update progress bar
-                    avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
-                    avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
-                    avg_ssim_loss = total_ssim_loss / num_updates if num_updates > 0 else 0
-                    pbar.set_postfix({
-                        'DivLoss': f"{avg_diversity_loss:.4f}",
-                        'TVLoss': f"{avg_tv_loss:.4f}",
-                        'SSIMLoss': f"{avg_ssim_loss:.4f}",
-                        'Updates': num_updates
-                    })
-                    pbar.update(1)  # Increment by 1 batch
-
-                    # Memory cleanup after update
-                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
-                    # Clear accumulated lists and their contents
-                    for patch in accumulated_patches:
-                        del patch
-                    for act in accumulated_activations:
-                        del act
-                    accumulated_patches = []
-                    accumulated_batches = []
-                    accumulated_activations = []
-                    accumulated_indices = []
-                    # Clear hook-stored activations
-                    self.ocr_activations = None
-
-                    if self.device == 'cuda':
-                        torch.cuda.empty_cache()
-                    elif self.device == 'mps':
-                        torch.mps.empty_cache()
-
-                else:
-                    # Show accumulation progress
-                    pbar.set_postfix({
-                        'DivLoss': f"{last_diversity_loss:.4f}",
-                        'TVLoss': f"{last_tv_loss:.4f}",
-                        'SSIMLoss': f"{last_ssim_loss:.4f}",
-                        'Progress': f"{step_count % update_every}/{update_every}"
-                    })
-
-            # Handle remaining accumulated samples
-            if step_count % update_every != 0 and self.grad_accumulate is not None:
+                # Update model after processing images_per_batch images
                 if len(accumulated_patches) > 0:
                     # Compute diagonal activations for diversity metric
                     accumulated_activations = []
@@ -1682,29 +1461,153 @@ class ProgressivePatchTrainer:
 
                     # Combined loss
                     total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
+                    last_diversity_loss = diversity_loss.item()
+                    last_tv_loss = tv_loss_weighted.item()  # Display weighted version
+                    last_ssim_loss = ssim_loss_weighted.item()  # Display weighted version
+
+                    # Train on combined loss
                     total_loss.backward()
 
+                    # Apply accumulated gradients
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
+                    # Track losses (store weighted version for display)
                     total_diversity_loss += diversity_loss.item()
                     total_tv_loss += tv_loss_weighted.item()
                     total_ssim_loss += ssim_loss_weighted.item()
                     num_updates += 1
 
-                    # Memory cleanup for remaining samples
-                    del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
-                    for patch in accumulated_patches:
-                        del patch
-                    for act in accumulated_activations:
-                        del act
-                    self.ocr_activations = None
+                    # Clear accumulated
+                    accumulated_patches = []
+                    accumulated_batches = []
+                    accumulated_activations = []
+                    accumulated_indices = []
+
+                # Update progress bar
+                avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
+                avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
+                avg_ssim_loss = total_ssim_loss / num_updates if num_updates > 0 else 0
+                pbar.set_postfix({
+                    'DivLoss': f"{avg_diversity_loss:.4f}",
+                    'TVLoss': f"{avg_tv_loss:.4f}",
+                    'SSIMLoss': f"{avg_ssim_loss:.4f}",
+                    'Updates': num_updates
+                })
+                pbar.update(1)  # Increment by 1 batch
+
+                # Memory cleanup after update
+                del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
+                # Clear accumulated lists and their contents
+                for patch in accumulated_patches:
+                    del patch
+                for act in accumulated_activations:
+                    del act
+                accumulated_patches = []
+                accumulated_batches = []
+                accumulated_activations = []
+                accumulated_indices = []
+                # Clear hook-stored activations
+                self.ocr_activations = None
 
                 if self.device == 'cuda':
                     torch.cuda.empty_cache()
                 elif self.device == 'mps':
                     torch.mps.empty_cache()
+
+            else:
+                # Show accumulation progress
+                pbar.set_postfix({
+                    'DivLoss': f"{last_diversity_loss:.4f}",
+                    'TVLoss': f"{last_tv_loss:.4f}",
+                    'SSIMLoss': f"{last_ssim_loss:.4f}",
+                    'Progress': f"{step_count % update_every}/{update_every}"
+                })
+
+        # Handle remaining accumulated samples
+        if step_count % update_every != 0 and self.grad_accumulate is not None:
+            if len(accumulated_patches) > 0:
+                # Compute diagonal activations for diversity metric
+                accumulated_activations = []
+                for i, (patch, batch_dict) in enumerate(zip(accumulated_patches, accumulated_batches)):
+                    diagonal_activation = self._get_activations_for_patch_image(
+                        batch_dict, patch, use_grad=True, skip_detection=True
+                    )
+                    accumulated_activations.append(diagonal_activation)
+
+                # Group patches by image
+                from collections import defaultdict
+                patches_by_image = defaultdict(list)
+                batches_by_image = defaultdict(list)
+                activations_by_image = defaultdict(list)
+
+                for patch_idx, (patch, batch_dict, img_idx, activation) in enumerate(
+                    zip(accumulated_patches, accumulated_batches, accumulated_indices, accumulated_activations)
+                ):
+                    patches_by_image[img_idx].append(patch)
+                    batches_by_image[img_idx].append(batch_dict)
+                    activations_by_image[img_idx].append(activation)
+
+                # Compute diversity score independently for each image, then average
+                diversity_scores = []
+                for img_idx in sorted(patches_by_image.keys()):
+                    image_patches = patches_by_image[img_idx]
+                    image_batches = batches_by_image[img_idx]
+                    image_activations = activations_by_image[img_idx]
+                    # Use constant indices (0, 1, 2, ...) for this image's patches
+                    image_indices = list(range(len(image_patches)))
+
+                    # Compute diversity for this image's patches
+                    img_diversity_score = self.compute_activation_diversity(
+                        image_patches,
+                        image_batches,
+                        image_indices,
+                        image_activations,
+                        use_grad=True
+                    )
+                    diversity_scores.append(img_diversity_score)
+
+                # Average diversity scores across images
+                diversity_score = torch.stack(diversity_scores).mean()
+                diversity_loss = -self.diversity_weight * (1.0 / len(accumulated_patches)) * diversity_score
+
+                # Stack patches for batch operations
+                patches_stacked = torch.stack(accumulated_patches, dim=0)  # [batch_size, 3, H, W]
+
+                # Compute total variation loss on generated patches
+                tv_loss = self.total_variation_loss(patches_stacked)
+                tv_loss_weighted = self.tv_weight * tv_loss
+
+                # Compute SSIM penalty (penalize structurally similar patches)
+                ssim_loss = self.compute_ssim_loss(patches_stacked)
+                ssim_loss_weighted = self.ssim_weight * ssim_loss
+
+                # Combined loss
+                total_loss = diversity_loss + tv_loss_weighted + ssim_loss_weighted
+                total_loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                total_diversity_loss += diversity_loss.item()
+                total_tv_loss += tv_loss_weighted.item()
+                total_ssim_loss += ssim_loss_weighted.item()
+                num_updates += 1
+
+                # Memory cleanup for remaining samples
+                del diversity_score, diversity_loss, tv_loss, tv_loss_weighted, ssim_loss, ssim_loss_weighted, total_loss, patches_stacked
+                for patch in accumulated_patches:
+                    del patch
+                for act in accumulated_activations:
+                    del act
+                self.ocr_activations = None
+
+            if self.device == 'cuda':
+                torch.cuda.empty_cache()
+            elif self.device == 'mps':
+                torch.mps.empty_cache()
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
@@ -1843,7 +1746,7 @@ class ProgressivePatchTrainer:
         else:
             print("PROGRESSIVE LAYER ATTACK (ALL LAYERS)")
         print("="*80)
-        print(f"   Mode: {'OCR (cropped plates)' if self.ocr_mode else 'Standard (full images with perspective)'}")
+        print(f"   Mode: OCR (cropped plates)")
         print(f"   Dataset: {len(self.train_loader) + len(self.val_loader)} images")
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Latent dimensions: {self.basis_dim}")
@@ -2044,9 +1947,6 @@ def main():
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--ssim-weight', type=float, default=1.0,
                         help='Weight for SSIM penalty to prevent structural similarity (default: 1.0)')
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Gradient accumulation steps / effective batch size (default: 16). '
-                        'Reduce if OOM, increase if you have more VRAM.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
                         help='Peak learning rate after warmup (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
@@ -2071,11 +1971,6 @@ def main():
                         '0=Conv1(32ch), 1=Conv2(48ch), 2=Conv3(64ch), 3=Conv4(80ch), 4=Conv5(96ch), '
                         '5=PatchExtractor(384ch), 6=Transformer1, 7=Transformer2, 8=Transformer3, '
                         '9=Transformer4, 10=FinalOutput. If not specified, trains all layers progressively.')
-    parser.add_argument('--eval-depth', type=int, default=None,
-                        help='Maximum number of (patch, image) evaluations for diversity computation. '
-                        'Default: batch_size^2 (evaluate all pairs). '
-                        'Always includes batch_size diagonal evaluations, randomly samples remaining off-diagonal. '
-                        'Upper bound: batch_size^2. Use to reduce memory usage with large batch sizes.')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2084,14 +1979,7 @@ def main():
                         'Simple generator: z → MLP[256→512→1024] → patch. '
                         'Foundation model: z → adapter → VAE decoder → CNN refiner → DNN → patch. '
                         'Simple generator uses ~10x less memory but may produce lower quality patches.')
-    parser.add_argument('--ocr-mode', action='store_true',
-                        help='Enable OCR mode for cropped license plate dataset. '
-                        'In OCR mode: (1) uses cropped plate images directly (prep_image), '
-                        '(2) applies patch as border around plate (resizes 256x512 patch to image size, '
-                        'keeps center content), (3) forces 80/20 train/val split. '
-                        'Removes complex perspective transform logic. '
-                        'When enabled, specify dataset with --ocr-dataset.')
-    parser.add_argument('--ocr-dataset', type=str, default=None,
+    parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
                         '(e.g., iiit5k,icdar2013,roboflow_lpr). Multiple datasets will be combined. '
@@ -2109,31 +1997,30 @@ def main():
                         help='Number of images to process per gradient update in OCR mode (default: 1). '
                         'Total patches = images_per_batch × patches_per_image. '
                         'Higher values give more diverse gradients but use more memory.')
-    parser.add_argument('--ocr-patches-per-image', type=int, default=None,
+    parser.add_argument('--ocr-patches-per-image', type=int, required=True,
                         help='Number of patches to generate per image in OCR mode. '
-                        'If not specified, calculated as: batch_size / images_per_batch. '
                         'Total patches = images_per_batch × patches_per_image.')
     args = parser.parse_args()
 
-    # Configuration
-    CSV_PATH = "preproc_labels.csv" if not args.ocr_mode else None
-
-    # Validate OCR mode configuration
-    if args.ocr_mode:
-        if not args.ocr_dataset:
+    # Validate dataset argument
+    dataset_list = [d.strip() for d in args.ocr_dataset.split(',')]
+    for dataset_name in dataset_list:
+        if dataset_name not in DATASETS:
             available_datasets = ', '.join(sorted(DATASETS.keys()))
             raise ValueError(
-                f"--ocr-mode requires --ocr-dataset to be specified.\n"
-                f"Available datasets: {available_datasets}"
+                f"Unknown dataset '{dataset_name}'. Available: {available_datasets}"
             )
-        print(f"\n{'='*80}")
-        print(f"OCR MODE ENABLED")
-        print(f"{'='*80}")
-        print(f"  Dataset: {args.ocr_dataset}")
-        print(f"  Split: {args.ocr_dataset_split}")
-        if args.ocr_max_samples:
-            print(f"  Max samples: {args.ocr_max_samples}")
-        print(f"{'='*80}\n")
+
+    print(f"\n{'='*80}")
+    print(f"OCR MODE (cropped license plates)")
+    print(f"{'='*80}")
+    print(f"  Dataset: {args.ocr_dataset}")
+    print(f"  Split: {args.ocr_dataset_split}")
+    print(f"  Images per batch: {args.ocr_images_per_batch}")
+    print(f"  Patches per image: {args.ocr_patches_per_image}")
+    if args.ocr_max_samples:
+        print(f"  Max samples: {args.ocr_max_samples}")
+    print(f"{'='*80}\n")
 
     # Parse target layers if specified
     target_layers = None
@@ -2163,9 +2050,9 @@ def main():
 
     # Trainer kwargs
     trainer_kwargs = {
-        'csv_path': CSV_PATH,
+        'ocr_dataset': args.ocr_dataset,
         'device': 'cuda',
-        'grad_accumulate': args.batch_size,
+        'grad_accumulate': 16,  # Default gradient accumulation steps
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
         'tv_weight': args.tv_weight,
@@ -2174,11 +2061,7 @@ def main():
         'final_layer_epochs': args.final_layer_epochs,
         'convergence_threshold': convergence_threshold,
         'target_layer': target_layers,
-        'eval_depth': args.eval_depth,
         'use_simple_generator': args.simple_generator,
-        'use_all_for_train': not args.no_use_all_for_train,
-        'ocr_mode': args.ocr_mode,
-        'ocr_dataset': args.ocr_dataset,
         'ocr_dataset_split': args.ocr_dataset_split,
         'ocr_max_samples': args.ocr_max_samples,
         'ocr_images_per_batch': args.ocr_images_per_batch,
