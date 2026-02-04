@@ -183,7 +183,7 @@ def main():
         "--generator-type",
         choices=["simple", "foundation"],
         default="simple",
-        help="Generator architecture type"
+        help="Generator architecture type (default: simple, auto-detected from checkpoint if mismatch detected)"
     )
     parser.add_argument(
         "--csv",
