@@ -355,11 +355,20 @@ def main():
 
     # Initialize ALPR
     print("\nInitializing fast-alpr...")
-    alpr = ALPR(
-        detector_model="yolo-v9-s-608-license-plate-end2end",
-        ocr_model="cct-s-v1-global-model",
-    )
-    print("fast-alpr loaded")
+    if args.ocr_mode:
+        # OCR-only mode: skip YOLO detector
+        alpr = ALPR(
+            detector=None,
+            ocr_model="cct-s-v1-global-model",
+        )
+        print("fast-alpr loaded (OCR-only mode)")
+    else:
+        # Standard mode: full pipeline with YOLO + OCR
+        alpr = ALPR(
+            detector_model="yolo-v9-s-608-license-plate-end2end",
+            ocr_model="cct-s-v1-global-model",
+        )
+        print("fast-alpr loaded (full pipeline)")
 
     # Process each image
     results = []
@@ -403,42 +412,47 @@ def main():
         else:
             patched_image = image
 
-        # Convert to BGR for fast-alpr
-        patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
-
         # Query ALPR
         try:
-            predictions = alpr.predict(patched_bgr)
+            if args.ocr_mode:
+                # OCR-only mode: run OCR directly on cropped image
+                # Image is already cropped to border region
+                ocr_result = alpr.ocr.predict(patched_image)
+                detected_text = ocr_result.text if ocr_result is not None else None
+            else:
+                # Standard mode: full pipeline with YOLO detection + OCR
+                patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
+                predictions = alpr.predict(patched_bgr)
+
+                if predictions and len(predictions) > 0:
+                    # Select detection with highest IoU to ground truth corners
+                    best_pred = None
+                    best_iou = 0.0
+
+                    for pred in predictions:
+                        if pred.detection is None:
+                            continue
+
+                        # Convert detection bbox to corners
+                        det_corners = bbox_to_corners(pred.detection)
+
+                        # Calculate IoU with ground truth corners
+                        iou = polygon_iou(det_corners, corners)
+
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_pred = pred
+
+                    # If no detection has reasonable IoU, treat as no detection
+                    if best_iou < 0.1 or best_pred is None or best_pred.ocr is None:
+                        detected_text = None
+                    else:
+                        detected_text = best_pred.ocr.text
+                else:
+                    detected_text = None
         except Exception as e:
             print(f"Warning: ALPR failed on image {idx}: {e}")
             detected_text = None
-        else:
-            if predictions and len(predictions) > 0:
-                # Select detection with highest IoU to ground truth corners
-                best_pred = None
-                best_iou = 0.0
-
-                for pred in predictions:
-                    if pred.detection is None:
-                        continue
-
-                    # Convert detection bbox to corners
-                    det_corners = bbox_to_corners(pred.detection)
-
-                    # Calculate IoU with ground truth corners
-                    iou = polygon_iou(det_corners, corners)
-
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_pred = pred
-
-                # If no detection has reasonable IoU, treat as no detection
-                if best_iou < 0.1 or best_pred is None or best_pred.ocr is None:
-                    detected_text = None
-                else:
-                    detected_text = best_pred.ocr.text
-            else:
-                detected_text = None
 
         # Categorize result
         category = categorize_result(detected_text, args.true_plate, args.impersonation_target)

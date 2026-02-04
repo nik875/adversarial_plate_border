@@ -77,12 +77,13 @@ def bbox_to_corners(detection) -> np.ndarray:
 class FastALPROracle(BaseBlackBoxOracle):
     """Black-box oracle using fast-alpr for license plate detection and recognition."""
 
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, ocr_only: bool = False):
         """
         Initialize fast-alpr oracle.
 
         Args:
             device: Device to use (ignored, fast-alpr manages its own)
+            ocr_only: If True, skip YOLO detector and run OCR-only
         """
         if ALPR is None:
             raise ImportError(
@@ -90,74 +91,87 @@ class FastALPROracle(BaseBlackBoxOracle):
             )
 
         print("Loading fast-alpr (true black box)...")
+        self.ocr_only = ocr_only
 
-        self.alpr = ALPR(
-            detector_model="yolo-v9-s-608-license-plate-end2end",
-            ocr_model="cct-s-v1-global-model",
-        )
-
-        print("fast-alpr loaded successfully")
+        if ocr_only:
+            self.alpr = ALPR(
+                detector=None,
+                ocr_model="cct-s-v1-global-model",
+            )
+            print("fast-alpr loaded (OCR-only mode)")
+        else:
+            self.alpr = ALPR(
+                detector_model="yolo-v9-s-608-license-plate-end2end",
+                ocr_model="cct-s-v1-global-model",
+            )
+            print("fast-alpr loaded (full pipeline)")
 
     def query(self, image: np.ndarray, corners: Optional[np.ndarray] = None) -> Optional[str]:
         """
-        Query fast-alpr for license plate detection and recognition.
+        Query fast-alpr for license plate recognition.
 
         Args:
             image: RGB image [H, W, 3], uint8, range [0, 255]
+                   In OCR-only mode: should be pre-cropped to plate region
             corners: Optional [4, 2] array of ground truth plate corners for IoU-based selection
+                     (only used in full pipeline mode)
 
         Returns:
-            Detected license plate text, or None if no detection
+            Detected license plate text, or None if no detection/recognition
         """
         import cv2
 
-        # Convert RGB to BGR for OpenCV/fast-alpr
-        image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
         try:
-            predictions = self.alpr.predict(image_bgr)
+            if self.ocr_only:
+                # OCR-only mode: image should be pre-cropped, run OCR directly
+                ocr_result = self.alpr.ocr.predict(image)
+                return ocr_result.text if ocr_result is not None else None
+            else:
+                # Full pipeline mode: YOLO detection + OCR
+                image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                predictions = self.alpr.predict(image_bgr)
+
+                if not predictions:
+                    return None
+
+                # If corners provided, select detection with highest IoU to ground truth
+                if corners is not None:
+                    best_pred = None
+                    best_iou = 0.0
+
+                    for pred in predictions:
+                        if pred.detection is None:
+                            continue
+
+                        # Convert detection bbox to corners
+                        det_corners = bbox_to_corners(pred.detection)
+
+                        # Calculate IoU with ground truth corners
+                        iou = polygon_iou(det_corners, corners)
+
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_pred = pred
+
+                    # If no detection has reasonable IoU, treat as no detection
+                    if best_iou < 0.1:  # Threshold for minimum overlap
+                        return None
+
+                else:
+                    # Fallback: use highest-confidence detection if no corners provided
+                    best_pred = max(
+                        predictions,
+                        key=lambda p: p.ocr.confidence if p.ocr else 0.0,
+                        default=None
+                    )
+
+                if best_pred is None or best_pred.ocr is None:
+                    return None
+
+                return best_pred.ocr.text
         except Exception as e:
             print(f"Warning: ALPR inference failed: {e}")
             return None
-
-        if not predictions:
-            return None
-
-        # If corners provided, select detection with highest IoU to ground truth
-        if corners is not None:
-            best_pred = None
-            best_iou = 0.0
-
-            for pred in predictions:
-                if pred.detection is None:
-                    continue
-
-                # Convert detection bbox to corners
-                det_corners = bbox_to_corners(pred.detection)
-
-                # Calculate IoU with ground truth corners
-                iou = polygon_iou(det_corners, corners)
-
-                if iou > best_iou:
-                    best_iou = iou
-                    best_pred = pred
-
-            # If no detection has reasonable IoU, treat as no detection
-            if best_iou < 0.1:  # Threshold for minimum overlap
-                return None
-
-        else:
-            # Fallback: use highest-confidence detection if no corners provided
-            best_pred = max(
-                predictions,
-                key=lambda p: p.ocr.confidence if p.ocr else 0.0,
-                default=None
-            )
-
-        if best_pred is None or best_pred.ocr is None:
-            return None
-
-        return best_pred.ocr.text
 
 
 def main():
@@ -303,7 +317,7 @@ def main():
 
     # Create fast-alpr oracle
     print("Initializing fast-alpr oracle...")
-    oracle = FastALPROracle()
+    oracle = FastALPROracle(ocr_only=args.ocr_mode)
 
     # Run optimization
     print("\n" + "=" * 70)
