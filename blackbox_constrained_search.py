@@ -70,10 +70,7 @@ class BlackBoxPatchOptimizer:
                  use_homography: bool = True,
                  ocr_mode: bool = False,
                  border_scale: float = 1.4,
-                 enable_plate_blur: bool = False,
-                 blur_threshold: float = 0.95,
-                 blur_plateau_iters: int = 5,
-                 blur_success_target: float = 0.80):
+                 enable_plate_blur: bool = False):
         """
         Args:
             generator_checkpoint: Path to generator .pt file
@@ -87,20 +84,13 @@ class BlackBoxPatchOptimizer:
             use_homography: If True, apply patch via homography transform. If False, use simple rectangular insertion.
             ocr_mode: If True, crop to border region and evaluate on cropped plates only.
             border_scale: Scale factor for border region (default: 1.4, used in ocr_mode).
-            enable_plate_blur: If True, add adaptive Gaussian blur to plate when stuck.
-            blur_threshold: Fitness threshold for activating blur (default: 0.95).
-            blur_plateau_iters: Iterations without improvement before adding blur (default: 5).
-            blur_success_target: Success rate for reducing blur (default: 0.80).
+            enable_plate_blur: If True, add adaptive Gaussian blur to plate (increases at fitness>0.95, decreases at fitness<0.8).
         """
         self.use_homography = use_homography
         self.ocr_mode = ocr_mode
         self.border_scale = border_scale
         self.enable_plate_blur = enable_plate_blur
-        self.blur_threshold = blur_threshold
-        self.blur_plateau_iters = blur_plateau_iters
-        self.blur_success_target = blur_success_target
         self.plate_blur_sigma = 0.0  # Gaussian blur on plate area (0 = no blur)
-        self.plateau_iterations = 0  # Track iterations without improvement
 
         if device is None:
             if torch.cuda.is_available():
@@ -657,10 +647,7 @@ class BlackBoxPatchOptimizer:
         iteration = 0
         best_fitness_ever = float('inf')
         best_z_ever = initial_z.copy()
-        prev_best_fitness = float('inf')
-        plateau_count = 0
         success_count = 0
-        success_window = 10
 
         with tqdm(total=max_iterations, desc="CMA-ES") as pbar:
             while iteration < max_iterations:
@@ -714,28 +701,14 @@ class BlackBoxPatchOptimizer:
                             if not self.disruption_mode:
                                 f.write(f"Target plate: {self.target_plate}\n")
 
-                # Update plateau count based on fitness quality (decoupled from improvement)
-                if best_fitness_ever > self.blur_threshold:
-                    plateau_count += 1  # Always increment when stuck at bad fitness
-                else:
-                    plateau_count = 0  # Reset when fitness is good
-
-                # Adaptive blur: add blur if stuck, reduce if improving
+                # Simple adaptive blur based on fitness thresholds
                 if self.enable_plate_blur:
-                    if best_fitness_ever > self.blur_threshold:
-                        # Stuck: add blur to make clean plate harder to read
-                        if plateau_count > self.blur_plateau_iters:
-                            self.plate_blur_sigma = min(self.plate_blur_sigma + 0.5, 10.0)
-                            if plateau_count == self.blur_plateau_iters + 1:
-                                print(f"\n→ Optimization stuck (fitness={best_fitness_ever:.3f}), adding plate blur (σ={self.plate_blur_sigma:.1f})")
-                    else:
-                        # Improving: reduce blur once we hit success target
-                        if self.plate_blur_sigma > 0:
-                            success_rate = success_count / max(iteration + 1, 1)
-                            if success_rate >= self.blur_success_target:
-                                self.plate_blur_sigma = max(self.plate_blur_sigma - 0.5, 0.0)
-                                if self.plate_blur_sigma == 0:
-                                    print(f"\n→ Achieving good success ({success_rate:.1%}), removing plate blur")
+                    if best_fitness_ever > 0.95:
+                        # Stuck at bad fitness: increase blur
+                        self.plate_blur_sigma = min(self.plate_blur_sigma + 0.5, 10.0)
+                    elif best_fitness_ever < 0.8:
+                        # Doing well: decrease blur
+                        self.plate_blur_sigma = max(self.plate_blur_sigma - 0.5, 0.0)
 
                 # Update progress
                 iteration += 1

@@ -279,25 +279,7 @@ def main():
     parser.add_argument(
         "--enable-plate-blur",
         action="store_true",
-        help="Enable adaptive Gaussian blur on plate area when optimization gets stuck (fitness > 0.95)"
-    )
-    parser.add_argument(
-        "--blur-threshold",
-        type=float,
-        default=0.95,
-        help="Fitness threshold for activating adaptive blur (default: 0.95)"
-    )
-    parser.add_argument(
-        "--blur-plateau-iters",
-        type=int,
-        default=5,
-        help="Number of iterations without improvement before adding blur (default: 5)"
-    )
-    parser.add_argument(
-        "--blur-success-target",
-        type=float,
-        default=0.80,
-        help="Success rate target for reducing blur (default: 0.80)"
+        help="Enable adaptive Gaussian blur on plate area (increases at fitness>0.95, decreases at fitness<0.8)"
     )
 
     args = parser.parse_args()
@@ -316,10 +298,7 @@ def main():
     if args.target_plate:
         print(f"Target plate: {args.target_plate}")
     print(f"Patch insertion: {'Rectangular (simple blending)' if args.disable_homography else 'Homography (perspective-aware)'}")
-    if args.enable_plate_blur:
-        print(f"Adaptive plate blur: enabled (threshold={args.blur_threshold}, plateau={args.blur_plateau_iters} iters, success_target={args.blur_success_target})")
-    else:
-        print(f"Adaptive plate blur: disabled")
+    print(f"Adaptive plate blur: {'enabled (increases at fitness>0.95, decreases at fitness<0.8)' if args.enable_plate_blur else 'disabled'}")
     print(f"CMA-ES parameters: sigma0={args.sigma0}, max_iterations={args.max_iterations}, ", end="")
     print(f"population_size={args.population_size or 'auto'}, seed={args.seed or 'None'}")
     print("=" * 70)
@@ -340,10 +319,7 @@ def main():
         use_homography=not args.disable_homography,
         ocr_mode=args.ocr_mode,
         border_scale=args.border_scale,
-        enable_plate_blur=args.enable_plate_blur,
-        blur_threshold=args.blur_threshold,
-        blur_plateau_iters=args.blur_plateau_iters,
-        blur_success_target=args.blur_success_target
+        enable_plate_blur=args.enable_plate_blur
     )
 
     # Create fast-alpr oracle
