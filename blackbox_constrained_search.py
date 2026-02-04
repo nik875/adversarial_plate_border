@@ -67,7 +67,9 @@ class BlackBoxPatchOptimizer:
                  target_plate: Optional[str] = None,
                  disruption_mode: bool = True,
                  test_image_subset: Optional[int] = None,
-                 use_homography: bool = True):
+                 use_homography: bool = True,
+                 ocr_mode: bool = False,
+                 border_scale: float = 1.4):
         """
         Args:
             generator_checkpoint: Path to generator .pt file
@@ -79,8 +81,12 @@ class BlackBoxPatchOptimizer:
             target_plate: Target plate text for impersonation (None for disruption)
             disruption_mode: If True, optimize for detection failure. If False, impersonation.
             use_homography: If True, apply patch via homography transform. If False, use simple rectangular insertion.
+            ocr_mode: If True, crop to border region and evaluate on cropped plates only.
+            border_scale: Scale factor for border region (default: 1.4, used in ocr_mode).
         """
         self.use_homography = use_homography
+        self.ocr_mode = ocr_mode
+        self.border_scale = border_scale
 
         if device is None:
             if torch.cuda.is_available():
@@ -294,6 +300,40 @@ class BlackBoxPatchOptimizer:
             else:
                 return base_patch
 
+    def crop_to_border_region(self, image: np.ndarray, corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Crop image to border region (scaled from corners).
+
+        Args:
+            image: [H, W, 3] numpy array
+            corners: [4, 2] plate corner coordinates
+
+        Returns:
+            cropped_image: Cropped region as [H_crop, W_crop, 3] numpy array
+            crop_corners: Adjusted corner coordinates in the cropped region [4, 2]
+        """
+        # Compute border corners
+        corners_array = corners.astype(np.float32)
+        center_x = corners_array[:, 0].mean()
+        center_y = corners_array[:, 1].mean()
+        center = np.array([center_x, center_y])
+
+        border_corners = center + (corners_array - center) * self.border_scale
+
+        # Compute bounding box from border corners
+        x_min = max(0, int(np.floor(border_corners[:, 0].min())))
+        x_max = min(image.shape[1], int(np.ceil(border_corners[:, 0].max())))
+        y_min = max(0, int(np.floor(border_corners[:, 1].min())))
+        y_max = min(image.shape[0], int(np.ceil(border_corners[:, 1].max())))
+
+        # Crop image
+        cropped_image = image[y_min:y_max, x_min:x_max]
+
+        # Adjust corners to cropped region
+        crop_corners = corners_array - np.array([x_min, y_min])
+
+        return cropped_image, crop_corners
+
     def apply_patch_to_image(self, image: np.ndarray, corners: np.ndarray,
                             patch: torch.Tensor) -> np.ndarray:
         """
@@ -436,11 +476,18 @@ class BlackBoxPatchOptimizer:
         results = []
 
         for image, corners in zip(test_images, test_corners):
+            # Crop to border region if in OCR mode
+            if self.ocr_mode:
+                image, corners = self.crop_to_border_region(image, corners)
+
             # Apply patch
             patched_image = self.apply_patch_to_image(image, corners, patch)
 
-            # Query oracle (pass corners for IoU-based detection selection)
-            detected_text = oracle.query(patched_image, corners)
+            # Query oracle
+            # In OCR mode, corners are relative to cropped region, so pass them
+            # In standard mode, pass corners for IoU-based detection selection
+            oracle_corners = corners if self.ocr_mode else corners
+            detected_text = oracle.query(patched_image, oracle_corners)
 
             if self.disruption_mode:
                 # Disruption: want no detection (None)

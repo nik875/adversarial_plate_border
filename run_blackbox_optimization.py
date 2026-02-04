@@ -251,6 +251,17 @@ def main():
         action="store_true",
         help="Disable homography-based insertion, use simple rectangular blending instead"
     )
+    parser.add_argument(
+        "--ocr-mode",
+        action="store_true",
+        help="Crop to border region (1.4x scaled corners) for OCR-only evaluation"
+    )
+    parser.add_argument(
+        "--border-scale",
+        type=float,
+        default=1.4,
+        help="Scale factor for border region when using --ocr-mode (default: 1.4)"
+    )
 
     args = parser.parse_args()
 
@@ -261,7 +272,10 @@ def main():
     if args.refinement_checkpoint:
         print(f"Refinement checkpoint: {args.refinement_checkpoint}")
     print(f"CSV file: {args.csv}")
-    print(f"Mode: {'Disruption' if args.target_plate is None else 'Impersonation'}")
+    print(f"Evaluation mode: {'OCR (cropped plates)' if args.ocr_mode else 'Standard (full images)'}")
+    if args.ocr_mode:
+        print(f"  Border scale: {args.border_scale}")
+    print(f"Attack mode: {'Disruption' if args.target_plate is None else 'Impersonation'}")
     if args.target_plate:
         print(f"Target plate: {args.target_plate}")
     print(f"Patch insertion: {'Rectangular (simple blending)' if args.disable_homography else 'Homography (perspective-aware)'}")
@@ -282,7 +296,9 @@ def main():
         target_plate=args.target_plate,
         disruption_mode=(args.target_plate is None),
         test_image_subset=args.test_image_subset,
-        use_homography=not args.disable_homography
+        use_homography=not args.disable_homography,
+        ocr_mode=args.ocr_mode,
+        border_scale=args.border_scale
     )
 
     # Create fast-alpr oracle
