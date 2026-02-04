@@ -689,11 +689,6 @@ class BlackBoxPatchOptimizer:
                 if fitness_values[best_idx] < best_fitness_ever:
                     best_fitness_ever = fitness_values[best_idx]
                     best_z_ever = solutions[best_idx].copy()
-                    # Initialize plateau count based on fitness quality
-                    if best_fitness_ever > self.blur_threshold:
-                        plateau_count = 1  # Start counting—we're already stuck at bad fitness
-                    else:
-                        plateau_count = 0
                     success_count += 1
 
                     # Save checkpoint if checkpoint directory specified
@@ -718,8 +713,12 @@ class BlackBoxPatchOptimizer:
                             f.write(f"Mode: {'Disruption' if self.disruption_mode else 'Impersonation'}\n")
                             if not self.disruption_mode:
                                 f.write(f"Target plate: {self.target_plate}\n")
+
+                # Update plateau count based on fitness quality (decoupled from improvement)
+                if best_fitness_ever > self.blur_threshold:
+                    plateau_count += 1  # Always increment when stuck at bad fitness
                 else:
-                    plateau_count += 1
+                    plateau_count = 0  # Reset when fitness is good
 
                 # Adaptive blur: add blur if stuck, reduce if improving
                 if self.enable_plate_blur:
