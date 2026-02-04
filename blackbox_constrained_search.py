@@ -665,16 +665,6 @@ class BlackBoxPatchOptimizer:
         with tqdm(total=max_iterations, desc="CMA-ES") as pbar:
             while iteration < max_iterations:
                 try:
-                    # Check if CMA-ES wants to stop (but allow override with plate blur)
-                    if es.stop() and not self.enable_plate_blur:
-                        print(f"\nCMA-ES stopping criteria met")
-                        break
-                    elif es.stop() and self.enable_plate_blur and best_fitness_ever > self.blur_threshold:
-                        # Continue if blur is enabled and fitness is still bad
-                        pass
-                    elif es.stop():
-                        break
-
                     # Ask for new candidate solutions
                     solutions = es.ask()
 
@@ -752,7 +742,7 @@ class BlackBoxPatchOptimizer:
                     'current_best': f'{fitness_values[best_idx]:.4f}',
                     'sigma': f'{es.sigma:.4f}'
                 }
-                if self.plate_blur_sigma > 0:
+                if self.enable_plate_blur:
                     postfix['blur'] = f'{self.plate_blur_sigma:.1f}'
                 pbar.set_postfix(postfix)
 
