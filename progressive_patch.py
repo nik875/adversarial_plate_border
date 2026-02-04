@@ -224,13 +224,22 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
 class SimplePatchGenerator(nn.Module):
     """Simple MLP patch generator (memory-efficient alternative to FoundationPatchGenerator)"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512,
-                 hidden_dims: List[int] = None):
+                 hidden_dims: List[int] = None, num_layers: int = 11):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
         self.patch_dim = 3 * patch_height * patch_width
+        self.num_layers = num_layers
+
+        # Layer embedding layer: embeds target layer information into the seed
+        self.layer_embedding = nn.Sequential(
+            nn.Linear(latent_dim + num_layers, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, latent_dim),
+            nn.Sigmoid()  # Constrain output to [0, 1]
+        )
 
         # Default hidden dimensions if not specified
         if hidden_dims is None:
@@ -261,6 +270,32 @@ class SimplePatchGenerator(nn.Module):
 
         print(f"Simple generator initialized: {latent_dim} → {' → '.join(map(str, hidden_dims))} → {self.patch_dim}")
 
+    def embed_layer_info(self, z: torch.Tensor, layer_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Embed target layer information into the seed.
+
+        Args:
+            z: Latent codes [batch_size, basis_dim]
+            layer_indices: Target layer indices [batch_size], each in [0, num_layers-1]
+
+        Returns:
+            z_embedded: Modified latent codes [batch_size, basis_dim] with layer info embedded
+        """
+        batch_size = z.shape[0]
+        device = z.device
+
+        # Create one-hot encoding of layer indices
+        one_hot_layers = torch.zeros(batch_size, self.num_layers, device=device)
+        one_hot_layers.scatter_(1, layer_indices.unsqueeze(1), 1.0)
+
+        # Concatenate seed with one-hot layer encoding
+        z_with_layer = torch.cat([z, one_hot_layers], dim=1)
+
+        # Pass through layer embedding to get modified seed
+        z_embedded = self.layer_embedding(z_with_layer)
+
+        return z_embedded
+
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -275,12 +310,23 @@ class SimplePatchGenerator(nn.Module):
 
 class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
-    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512):
+    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
+        self.num_layers = num_layers
+
+        # Layer embedding layer: embeds target layer information into the seed
+        # Takes concatenation of (seed + one_hot_layer_encoding) and outputs modified seed
+        # Uses sigmoid to constrain output to [0, 1] for better search space conditioning
+        self.layer_embedding = nn.Sequential(
+            nn.Linear(latent_dim + num_layers, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, latent_dim),
+            nn.Sigmoid()  # Constrain output to [0, 1]
+        )
 
         # SD VAE expects latents of shape [B, 4, H/8, W/8]
         # For 256×512 output, latent is [B, 4, 32, 64]
@@ -633,12 +679,16 @@ class ProgressivePatchTrainer:
         print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
 
         # Initialize generator (simple or foundation model)
+        # num_layers is fixed at 11 for the OCR model
+        num_layers = len(all_layer_configs)
+
         if use_simple_generator:
             # Simple MLP generator (memory-efficient)
             self.generator = SimplePatchGenerator(
                 latent_dim=basis_dim,
                 patch_height=self.patch_height,
-                patch_width=self.patch_width
+                patch_width=self.patch_width,
+                num_layers=num_layers
             ).to(self.device)
         else:
             # Foundation model generator with trainable VAE
@@ -646,7 +696,8 @@ class ProgressivePatchTrainer:
             self.generator = FoundationPatchGenerator(
                 latent_dim=basis_dim,
                 patch_height=self.patch_height,
-                patch_width=self.patch_width
+                patch_width=self.patch_width,
+                num_layers=num_layers
             ).to(self.device)
 
         # Activation capture for diversity metric
@@ -739,6 +790,32 @@ class ProgressivePatchTrainer:
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
         """Sample z ~ Uniform(0, 1) for generating patches"""
         return torch.rand(batch_size, self.basis_dim, device=self.device)
+
+    def embed_layer_info(self, z: torch.Tensor, layer_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Embed target layer information into the seed.
+
+        Args:
+            z: Latent codes [batch_size, basis_dim]
+            layer_indices: Target layer indices [batch_size], each in [0, num_layers-1]
+
+        Returns:
+            z_embedded: Modified latent codes [batch_size, basis_dim] with layer info embedded
+        """
+        batch_size = z.shape[0]
+        device = z.device
+
+        # Create one-hot encoding of layer indices
+        one_hot_layers = torch.zeros(batch_size, self.num_layers, device=device)
+        one_hot_layers.scatter_(1, layer_indices.unsqueeze(1), 1.0)
+
+        # Concatenate seed with one-hot layer encoding
+        z_with_layer = torch.cat([z, one_hot_layers], dim=1)  # [batch_size, basis_dim + num_layers]
+
+        # Pass through layer embedding to get modified seed
+        z_embedded = self.layer_embedding(z_with_layer)  # [batch_size, basis_dim]
+
+        return z_embedded
 
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
