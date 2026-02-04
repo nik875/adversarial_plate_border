@@ -316,6 +316,80 @@ class LicensePlateCornerDetectorBatch:
         
         return best_mask, corners
     
+    def process_from_csv(
+        self,
+        csv_path: str,
+        output_csv: str = "plate_corners.csv",
+        visualize: bool = True,
+        vis_dir: str = "visualizations",
+        use_points: bool = False,
+        filename_column: str = None
+    ) -> pd.DataFrame:
+        """
+        Batch process images from CSV file containing filenames
+        
+        Args:
+            csv_path: Path to CSV file with image filenames
+            output_csv: Path to output CSV file
+            visualize: Create visualizations
+            vis_dir: Directory for visualizations
+            use_points: Use point prompts for SAM
+            filename_column: Column name containing filenames (auto-detect if None)
+            
+        Returns:
+            DataFrame with all results
+        """
+        print(f"Loading image paths from CSV: {csv_path}")
+        
+        # Read CSV
+        df_input = pd.read_csv(csv_path)
+        
+        # Auto-detect filename column if not specified
+        if filename_column is None:
+            # Try common column names
+            common_names = ['filename', 'image', 'image_path', 'path', 'file', 'image_file']
+            
+            # If only one column, use that
+            if len(df_input.columns) == 1:
+                filename_column = df_input.columns[0]
+                print(f"  Using only column: '{filename_column}'")
+            else:
+                # Try to find a matching column name
+                for name in common_names:
+                    if name in df_input.columns:
+                        filename_column = name
+                        print(f"  Auto-detected column: '{filename_column}'")
+                        break
+                
+                if filename_column is None:
+                    print(f"\nAvailable columns: {list(df_input.columns)}")
+                    raise ValueError(
+                        f"Could not auto-detect filename column. "
+                        f"Please specify with --filename-column"
+                    )
+        else:
+            if filename_column not in df_input.columns:
+                print(f"\nAvailable columns: {list(df_input.columns)}")
+                raise ValueError(f"Column '{filename_column}' not found in CSV")
+            print(f"  Using specified column: '{filename_column}'")
+        
+        # Get image paths
+        image_paths = df_input[filename_column].tolist()
+        
+        # Filter out any NaN or empty values
+        image_paths = [str(p) for p in image_paths if pd.notna(p) and str(p).strip()]
+        
+        print(f"  Found {len(image_paths)} image paths in CSV")
+        
+        # Process using the batch processing logic
+        return self._process_image_list(
+            image_paths=image_paths,
+            output_csv=output_csv,
+            visualize=visualize,
+            vis_dir=vis_dir,
+            use_points=use_points
+        )
+    
     def process_directory_batch(
         self,
         input_dir: str,
@@ -351,6 +425,38 @@ class LicensePlateCornerDetectorBatch:
         image_paths = sorted(set(str(p) for p in image_paths))
         
         print(f"Found {len(image_paths)} images in {input_dir}")
+        
+        # Process using shared logic
+        return self._process_image_list(
+            image_paths=image_paths,
+            output_csv=output_csv,
+            visualize=visualize,
+            vis_dir=vis_dir,
+            use_points=use_points
+        )
+    
+    def _process_image_list(
+        self,
+        image_paths: List[str],
+        output_csv: str,
+        visualize: bool,
+        vis_dir: str,
+        use_points: bool
+    ) -> pd.DataFrame:
+        """
+        Internal method: Process a list of image paths
+        
+        Args:
+            image_paths: List of image file paths
+            output_csv: Path to output CSV file
+            visualize: Create visualizations
+            vis_dir: Directory for visualizations
+            use_points: Use point prompts for SAM
+            
+        Returns:
+            DataFrame with all results
+        """
+        
         print(f"Processing with batch size: {self.batch_size}")
         
         all_results = []
@@ -393,6 +499,171 @@ class LicensePlateCornerDetectorBatch:
                             'corners': corners,
                             'mask': mask,
                             'image': img  # Store for visualization
+                        })
+                
+                # Visualize if requested
+                if visualize and len([r for r in all_results if r['image_path'] == img_path]) > 0:
+                    img_results = [r for r in all_results if r['image_path'] == img_path]
+                    self._visualize_results(img, img_results, img_path, vis_dir)
+        
+        # Convert to DataFrame
+        if all_results:
+            df_data = []
+            for result in all_results:
+                corners = result['corners']
+                df_data.append({
+                    'image_path': result['image_path'],
+                    'detection_idx': result['detection_idx'],
+                    'yolo_x1': result['yolo_box'][0],
+                    'yolo_y1': result['yolo_box'][1],
+                    'yolo_x2': result['yolo_box'][2],
+                    'yolo_y2': result['yolo_box'][3],
+                    'yolo_confidence': result['yolo_confidence'],
+                    'yolo_class': result['yolo_class'],
+                    'top_left_x': corners[0, 0],
+                    'top_left_y': corners[0, 1],
+                    'top_right_x': corners[1, 0],
+                    'top_right_y': corners[1, 1],
+                    'bottom_right_x': corners[2, 0],
+                    'bottom_right_y': corners[2, 1],
+                    'bottom_left_x': corners[3, 0],
+                    'bottom_left_y': corners[3, 1],
+                })
+            
+            df = pd.DataFrame(df_data)
+            
+            # Save to CSV
+            df.to_csv(output_csv, index=False)
+            print(f"\n✓ Results saved to: {output_csv}")
+            print(f"  Total detections: {len(df)}")
+            
+            # Show class distribution
+            if 'yolo_class' in df.columns:
+                print(f"\nDetected classes:")
+                for class_name, count in df['yolo_class'].value_counts().items():
+                    print(f"  {class_name}: {count}")
+            
+            return df
+        else:
+            print("⚠ No plates detected in any images!")
+            return pd.DataFrame()
+    
+    def process_from_csv(
+        self,
+        csv_path: str,
+        output_csv: str = "plate_corners.csv",
+        visualize: bool = True,
+        vis_dir: str = "visualizations",
+        use_points: bool = False,
+        filename_column: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Process images from a CSV file containing image paths
+        
+        Args:
+            csv_path: Path to CSV file with image filenames
+            output_csv: Path to output CSV file
+            visualize: Create visualizations
+            vis_dir: Directory for visualizations
+            use_points: Use point prompts for SAM
+            filename_column: Column name containing filenames (auto-detect if None)
+            
+        Returns:
+            DataFrame with all results
+        """
+        # Load CSV
+        if not Path(csv_path).exists():
+            raise FileNotFoundError(f"CSV file not found: {csv_path}")
+        
+        input_df = pd.read_csv(csv_path)
+        
+        print(f"Loaded CSV with {len(input_df)} rows and columns: {list(input_df.columns)}")
+        
+        # Auto-detect filename column if not specified
+        if filename_column is None:
+            # Common column names for image paths
+            possible_columns = ['image_path', 'filepath', 'file_path', 'filename', 
+                              'image', 'path', 'img_path', 'image_file']
+            
+            # Check if any common column exists
+            for col in possible_columns:
+                if col in input_df.columns:
+                    filename_column = col
+                    print(f"Auto-detected filename column: '{filename_column}'")
+                    break
+            
+            # If still not found, use first column
+            if filename_column is None:
+                filename_column = input_df.columns[0]
+                print(f"Using first column as filename: '{filename_column}'")
+        
+        # Validate column exists
+        if filename_column not in input_df.columns:
+            raise ValueError(
+                f"Column '{filename_column}' not found in CSV. "
+                f"Available columns: {list(input_df.columns)}"
+            )
+        
+        # Get image paths
+        image_paths = input_df[filename_column].tolist()
+        
+        # Filter out NaN/None values
+        image_paths = [str(p) for p in image_paths if pd.notna(p)]
+        
+        print(f"Found {len(image_paths)} image paths in column '{filename_column}'")
+        print(f"Processing with batch size: {self.batch_size}")
+        
+        all_results = []
+        
+        # Process in batches
+        num_batches = (len(image_paths) + self.batch_size - 1) // self.batch_size
+        
+        for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
+            batch_start = batch_idx * self.batch_size
+            batch_end = min(batch_start + self.batch_size, len(image_paths))
+            batch_paths = image_paths[batch_start:batch_end]
+            
+            # Verify paths exist
+            valid_batch_paths = []
+            for img_path in batch_paths:
+                if Path(img_path).exists():
+                    valid_batch_paths.append(img_path)
+                else:
+                    print(f"Warning: File not found: {img_path}")
+            
+            if not valid_batch_paths:
+                continue
+            
+            # YOLO batch inference
+            batch_detections = self.detect_plates_batch(valid_batch_paths)
+            
+            # Process each image's detections with SAM
+            for img_path, detections in zip(valid_batch_paths, batch_detections):
+                # Load image for SAM processing
+                img = cv2.imread(img_path)
+                if img is None:
+                    print(f"Warning: Could not load {img_path}")
+                    continue
+                
+                # Process each detection
+                for det_idx, detection in enumerate(detections):
+                    box = detection['box']
+                    conf = detection['confidence']
+                    class_name = detection['class_name']
+                    
+                    # Segment with SAM
+                    mask, corners = self.segment_plate_sam(img, box, use_points=use_points)
+                    
+                    if corners is not None:
+                        all_results.append({
+                            'image_path': img_path,
+                            'detection_idx': det_idx,
+                            'yolo_box': box,
+                            'yolo_confidence': conf,
+                            'yolo_class': class_name,
+                            'corners': corners,
+                            'mask': mask,
+                            'image': img
                         })
                 
                 # Visualize if requested
@@ -565,6 +836,12 @@ Examples:
   # Batch process directory with YOLOv8 license plate model
   python sam_plate_corners_batch.py --input-dir ./plates --yolo-model license_plate.pt --batch-size 8 --output corners.csv
   
+  # Process from CSV file with image filenames
+  python sam_plate_corners_batch.py --input-csv image_list.csv --yolo-model license_plate.pt --output results.csv
+  
+  # CSV with specific column name
+  python sam_plate_corners_batch.py --input-csv dataset.csv --filename-column image_path --yolo-model plates.pt
+  
   # Single image processing
   python sam_plate_corners_batch.py --image plate.jpg --yolo-model license_plate.pt --visualize
   
@@ -572,7 +849,19 @@ Examples:
   python sam_plate_corners_batch.py --input-dir ./plates --yolo-model plates.pt --sam-model vit_b --batch-size 16
   
   # No visualizations for maximum speed
-  python sam_plate_corners_batch.py --input-dir ./plates --yolo-model plates.pt --batch-size 32 --no-visualize
+  python sam_plate_corners_batch.py --input-csv images.csv --yolo-model plates.pt --batch-size 32 --no-visualize
+
+CSV FILE FORMAT:
+  Option 1 - Single column with filenames:
+    filename
+    image1.jpg
+    image2.jpg
+    /path/to/image3.png
+  
+  Option 2 - Multiple columns (auto-detects filename column):
+    image_path,label,split
+    img1.jpg,car,train
+    img2.jpg,truck,val
 
 IMPORTANT: You must provide a YOLOv8 .pt model trained on license plates!
   Train your own: yolo train data=plates.yaml model=yolov8n.pt epochs=100
@@ -583,6 +872,9 @@ IMPORTANT: You must provide a YOLOv8 .pt model trained on license plates!
     # Input/output
     parser.add_argument('--image', type=str, help='Single image to process')
     parser.add_argument('--input-dir', type=str, help='Directory of images to process')
+    parser.add_argument('--input-csv', type=str, help='CSV file with image filenames (one column)')
+    parser.add_argument('--filename-column', type=str, default=None,
+                       help='Column name in CSV containing filenames (auto-detect if not specified)')
     parser.add_argument('--output', type=str, default='plate_corners.csv',
                        help='Output CSV file (default: plate_corners.csv)')
     parser.add_argument('--vis-dir', type=str, default='visualizations',
@@ -616,8 +908,8 @@ IMPORTANT: You must provide a YOLOv8 .pt model trained on license plates!
     args = parser.parse_args()
     
     # Validate inputs
-    if not args.image and not args.input_dir:
-        parser.error("Must specify either --image or --input-dir")
+    if not args.image and not args.input_dir and not args.input_csv:
+        parser.error("Must specify either --image, --input-dir, or --input-csv")
     
     # Download SAM checkpoint if needed
     if args.sam_checkpoint is None:
@@ -713,6 +1005,29 @@ IMPORTANT: You must provide a YOLOv8 .pt model trained on license plates!
             
             print(f"\n✓ Processing complete!")
             print(f"  Use corners.csv for adversarial patch training")
+    
+    elif args.input_csv:
+        print(f"Processing from CSV: {args.input_csv}\n")
+        df = detector.process_from_csv(
+            csv_path=args.input_csv,
+            output_csv=args.output,
+            visualize=not args.no_visualize,
+            vis_dir=args.vis_dir,
+            use_points=args.use_points,
+            filename_column=args.filename_column
+        )
+        
+        if not df.empty:
+            print(f"\n✓ Summary:")
+            print(f"  Images with plates: {df['image_path'].nunique()}")
+            print(f"  Total plates: {len(df)}")
+            print(f"  Avg confidence: {df['yolo_confidence'].mean():.3f}")
+            
+            if not args.no_visualize:
+                print(f"  Visualizations: {args.vis_dir}")
+            
+            print(f"\n✓ Processing complete!")
+            print(f"  Use {args.output} for adversarial patch training")
 
 
 if __name__ == "__main__":
