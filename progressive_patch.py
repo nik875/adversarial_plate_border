@@ -1370,7 +1370,8 @@ class ProgressivePatchTrainer:
 
         # Save checkpoint after completing this layer (with 10 sample patches)
         layer_checkpoint_name = f"layer{original_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
-        self.save_basis(self.current_layer_epoch, layer_checkpoint_name, num_samples=10)
+        layer_checkpoint_path = os.path.join(self.checkpoint_base, layer_checkpoint_name)
+        self.save_basis(self.current_layer_epoch, layer_checkpoint_path, num_samples=10)
         print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion (with 10 sample patches)")
 
         # Move to next layer
@@ -1802,11 +1803,19 @@ class ProgressivePatchTrainer:
         convergence or max epochs.
 
         Saves:
-        - training_complete_final_model/: Final model after all training (20 samples)
-        - best_progressive_patch/: Best model across all training
-        - final_layer_checkpoint_epoch_*/: Checkpoint every 25 epochs on final layer
-        - layer*_complete_*/: Model after completing each layer (10 samples each)
+        - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
+        - checkpoints/{run_id}/best_progressive_patch/: Best model across all training
+        - checkpoints/{run_id}/final_layer_checkpoint_epoch_*/: Checkpoint every epoch on final layer
+        - checkpoints/{run_id}/layer*_complete_*/: Model after completing each layer (10 samples each)
         """
+        from datetime import datetime
+
+        # Create unique run ID based on timestamp
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.checkpoint_base = os.path.join("checkpoints", self.run_id)
+        os.makedirs(self.checkpoint_base, exist_ok=True)
+        print(f"\nRun ID: {self.run_id}")
+        print(f"Checkpoint directory: {self.checkpoint_base}\n")
 
         # Initialize optimizer
         optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -1963,27 +1972,24 @@ class ProgressivePatchTrainer:
                 # Save example patches every epoch for final layer (without generator model)
                 is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
                 if is_final_layer:
-                    final_layer_save_dir = f"final_layer_patches_epoch_{self.current_layer_epoch:04d}"
-                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10, save_generator=False)
-
-                    # Save full checkpoint every 25 epochs on final layer
-                    if self.current_layer_epoch > 0 and self.current_layer_epoch % 25 == 0:
-                        checkpoint_dir = f"final_layer_checkpoint_epoch_{self.current_layer_epoch:04d}"
-                        self.save_basis(global_epoch, checkpoint_dir, num_samples=10, save_generator=True)
-                        print(f"   ✓ Saved final layer checkpoint at epoch {self.current_layer_epoch}")
+                    final_layer_save_dir = os.path.join(self.checkpoint_base, f"final_layer_checkpoint_epoch_{self.current_layer_epoch:04d}")
+                    self.save_basis(global_epoch, final_layer_save_dir, num_samples=10, save_generator=True)
+                    print(f"   ✓ Saved final layer checkpoint at epoch {self.current_layer_epoch}")
 
                 # Save best model globally
                 if self.use_all_for_train:
                     # Training-only mode: track best by lowest training loss
                     if train_diversity_loss < best_train_loss:
                         best_train_loss = train_diversity_loss
-                        self.save_basis(global_epoch, "best_progressive_patch")
+                        best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
+                        self.save_basis(global_epoch, best_dir)
                         print(f"   ✓ New best training loss: {best_train_loss:.4f}")
                 else:
                     # Validation mode: track best by highest validation diversity
                     if val_diversity_score > best_diversity:
                         best_diversity = val_diversity_score
-                        self.save_basis(global_epoch, "best_progressive_patch")
+                        best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
+                        self.save_basis(global_epoch, best_dir)
                         print(f"   ✓ New best diversity: {best_diversity:.4f}")
 
                 # Check if should continue on current layer
@@ -2015,13 +2021,14 @@ class ProgressivePatchTrainer:
 
         # Save final model after all training is complete
         print("Saving final trained model...")
-        final_save_dir = "training_complete_final_model"
+        final_save_dir = os.path.join(self.checkpoint_base, "training_complete_final_model")
         self.save_basis(global_epoch, final_save_dir, num_samples=20, save_generator=True)
         print(f"\n{'='*80}")
         print(f"FINAL MODEL SAVED TO: {final_save_dir}/")
         print(f"{'='*80}")
         print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{global_epoch:04d}.pt")
         print(f"  Sample patches: 20 PNG files in {final_save_dir}/")
+        print(f"  All checkpoints: {self.checkpoint_base}/")
         print(f"{'='*80}\n")
 
         return global_history
