@@ -87,6 +87,8 @@ class BlackBoxPatchOptimizer:
         self.use_homography = use_homography
         self.ocr_mode = ocr_mode
         self.border_scale = border_scale
+        self.plate_blur_sigma = 0.0  # Gaussian blur on plate area (0 = no blur)
+        self.plateau_iterations = 0  # Track iterations without improvement
 
         if device is None:
             if torch.cuda.is_available():
@@ -300,6 +302,40 @@ class BlackBoxPatchOptimizer:
             else:
                 return base_patch
 
+    def apply_plate_blur(self, image: np.ndarray, corners: np.ndarray, blur_sigma: float) -> np.ndarray:
+        """
+        Apply Gaussian blur only to the plate area (not the patch border).
+
+        Args:
+            image: [H, W, 3] numpy array
+            corners: [4, 2] plate corner coordinates
+            blur_sigma: Standard deviation for Gaussian blur (0 = no blur)
+
+        Returns:
+            Blurred image
+        """
+        if blur_sigma <= 0:
+            return image
+
+        import cv2
+
+        result = image.copy().astype(np.float32) / 255.0
+
+        # Create plate mask (not border, just the plate area)
+        plate_corners = corners.astype(np.int32)
+        mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+        cv2.fillPoly(mask, [plate_corners], 1)
+
+        # Apply Gaussian blur
+        kernel_size = int(blur_sigma * 6) | 1  # Make odd
+        blurred = cv2.GaussianBlur(image.astype(np.float32) / 255.0, (kernel_size, kernel_size), blur_sigma)
+
+        # Apply mask: blur only in plate region
+        mask_3d = np.repeat(mask[:, :, np.newaxis], 3, axis=2)
+        result = result * (1 - mask_3d) + blurred * mask_3d
+
+        return (result * 255).astype(np.uint8)
+
     def crop_to_border_region(self, image: np.ndarray, corners: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Crop image to border region (scaled from corners).
@@ -483,6 +519,10 @@ class BlackBoxPatchOptimizer:
             # Apply patch
             patched_image = self.apply_patch_to_image(image, corners, patch)
 
+            # Apply plate blur if enabled (helps when optimization is stuck)
+            if self.plate_blur_sigma > 0:
+                patched_image = self.apply_plate_blur(patched_image, corners, self.plate_blur_sigma)
+
             # Query oracle
             # In OCR mode, corners are relative to cropped region, so pass them
             # In standard mode, pass corners for IoU-based detection selection
@@ -600,6 +640,10 @@ class BlackBoxPatchOptimizer:
         iteration = 0
         best_fitness_ever = float('inf')
         best_z_ever = initial_z.copy()
+        prev_best_fitness = float('inf')
+        plateau_count = 0
+        success_count = 0
+        success_window = 10
 
         with tqdm(total=max_iterations, desc="CMA-ES") as pbar:
             while not es.stop() and iteration < max_iterations:
@@ -620,10 +664,12 @@ class BlackBoxPatchOptimizer:
                 if fitness_values[best_idx] < best_fitness_ever:
                     best_fitness_ever = fitness_values[best_idx]
                     best_z_ever = solutions[best_idx].copy()
+                    plateau_count = 0  # Reset plateau counter
+                    success_count += 1
 
                     # Save checkpoint if checkpoint directory specified
                     if checkpoint_dir is not None:
-                        checkpoint_path = Path(checkpoint_dir) / f"checkpoint_iter{iteration:04d}_fitness{best_fitness_ever:.6f}"
+                        checkpoint_path = Path(checkpoint_dir) / f"checkpoint_iter{iteration:04d}_fitness{best_fitness_ever:.6f}_blur{self.plate_blur_sigma:.2f}"
                         checkpoint_path.mkdir(exist_ok=True)
 
                         # Save patch
@@ -639,18 +685,40 @@ class BlackBoxPatchOptimizer:
                         with open(metadata_path, 'w') as f:
                             f.write(f"Iteration: {iteration}\n")
                             f.write(f"Fitness: {best_fitness_ever:.6f}\n")
+                            f.write(f"Plate blur sigma: {self.plate_blur_sigma:.2f}\n")
                             f.write(f"Mode: {'Disruption' if self.disruption_mode else 'Impersonation'}\n")
                             if not self.disruption_mode:
                                 f.write(f"Target plate: {self.target_plate}\n")
+                else:
+                    plateau_count += 1
+
+                # Adaptive blur: add blur if stuck, reduce if improving
+                if best_fitness_ever > 0.95:
+                    # Stuck: add blur to make clean plate harder to read
+                    if plateau_count > 5:  # After 5 iterations without improvement
+                        self.plate_blur_sigma = min(self.plate_blur_sigma + 0.5, 10.0)
+                        if plateau_count == 6:
+                            print(f"\n→ Optimization stuck (fitness={best_fitness_ever:.3f}), adding plate blur (σ={self.plate_blur_sigma:.1f})")
+                else:
+                    # Improving: reduce blur once we hit 80% success rate
+                    if self.plate_blur_sigma > 0:
+                        success_rate = success_count / max(iteration + 1, 1)
+                        if success_rate >= 0.80:
+                            self.plate_blur_sigma = max(self.plate_blur_sigma - 0.5, 0.0)
+                            if self.plate_blur_sigma == 0:
+                                print(f"\n→ Achieving good success ({success_rate:.1%}), removing plate blur")
 
                 # Update progress
                 iteration += 1
                 pbar.update(1)
-                pbar.set_postfix({
+                postfix = {
                     'best_fitness': f'{best_fitness_ever:.4f}',
                     'current_best': f'{fitness_values[best_idx]:.4f}',
                     'sigma': f'{es.sigma:.4f}'
-                })
+                }
+                if self.plate_blur_sigma > 0:
+                    postfix['blur'] = f'{self.plate_blur_sigma:.1f}'
+                pbar.set_postfix(postfix)
 
         print(f"\nOptimization complete!")
         print(f"  Best fitness: {best_fitness_ever:.4f}")
