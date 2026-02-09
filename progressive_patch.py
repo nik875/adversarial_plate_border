@@ -950,7 +950,7 @@ class ProgressivePatchTrainer:
         z_with_layer = torch.cat([z, one_hot_layers], dim=1)  # [batch_size, basis_dim + num_layers]
 
         # Pass through layer embedding to get modified seed
-        z_embedded = self.layer_embedding(z_with_layer)  # [batch_size, basis_dim]
+        z_embedded = self.generator.layer_embedding(z_with_layer)  # [batch_size, basis_dim]
 
         return z_embedded
 
