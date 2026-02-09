@@ -769,7 +769,7 @@ class ProgressivePatchTrainer:
 
         # Initialize generator (simple or foundation model)
         # num_layers is fixed at 11 for the OCR model
-        num_layers = len(all_layer_configs)
+        num_layers = len(self.layer_configs)
 
         if use_simple_generator:
             # Simple MLP generator (memory-efficient)
