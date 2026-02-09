@@ -475,26 +475,13 @@ class FoundationPatchGenerator(nn.Module):
         print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
-        # Using deeper network for better expressiveness
-        self.adapter = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
-            nn.LayerNorm(1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 2048),
-            nn.LayerNorm(2048),
-            nn.ReLU(inplace=True),
-            nn.Linear(2048, self.vae_latent_dim),
-        )
+        # Simple linear projection since layer_embedding already encodes layer information
+        self.adapter = nn.Linear(latent_dim, self.vae_latent_dim)
 
         # Initialize adapter weights
-        for m in self.adapter.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        nn.init.kaiming_normal_(self.adapter.weight, mode='fan_out', nonlinearity='relu')
+        if self.adapter.bias is not None:
+            nn.init.constant_(self.adapter.bias, 0)
 
         # Skip connection: per-channel scaling modulation
         # Simple linear layer to learn a scalar scale factor from latent code
