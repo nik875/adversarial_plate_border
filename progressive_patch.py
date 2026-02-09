@@ -157,9 +157,11 @@ PATCH_HEIGHT = 256
 
 @dataclass
 class LayerConfig:
-    """Configuration for a target layer"""
+    """Configuration for a target layer in progressive attack"""
     name: str  # Layer name in the model
     description: str  # Human-readable description
+    max_epochs: int = 50  # Maximum epochs to train on this layer
+    convergence_threshold: float = 1.0  # Diversity score threshold for early stopping
 
     def __repr__(self):
         return f"{self.description} ({self.name})"
@@ -227,67 +229,100 @@ class OCRDataset(Dataset):
         }
 
 
-def get_ocr_layer_progression() -> List[LayerConfig]:
+def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float = 1.0,
+                              final_layer_epochs: Optional[int] = None) -> List[LayerConfig]:
     """
-    Define the OCR model layers available for random layer sampling.
+    Define the layer progression for the OCR model.
 
-    Layers:
-    0-4: Conv stem layers (4 convolutional layers with increasing channels: 32 → 48 → 64 → 80 → 96 channels)
-    5: Patch extractor (visual→sequence transformation, 384 channels)
+    Progression:
+    1-4: Conv stem layers (4 convolutional layers with increasing channels)
+    5: Patch extractor (visual→sequence transformation)
     6-9: Transformer blocks (4 transformer encoder blocks)
     10: Final output (vocab projection softmax)
 
+    Args:
+        max_epochs: Maximum epochs per layer (default 50)
+        convergence_threshold: Diversity threshold for convergence. Use 0 or negative to disable (default 1.0)
+        final_layer_epochs: Maximum epochs for final layer. If None, defaults to 2x max_epochs (default None)
+
     Returns:
-        List of LayerConfig objects defining available layers
+        List of LayerConfig objects defining the attack progression
     """
+    # Final layer gets more epochs and stricter convergence if convergence is enabled
+    if final_layer_epochs is None:
+        final_layer_epochs = max_epochs * 2 if max_epochs < 100 else max_epochs
+    final_convergence = convergence_threshold * 0.5 if convergence_threshold > 0 else convergence_threshold
+
     return [
         # Conv stem layers (32 → 48 → 64 → 80 → 96 channels)
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_1/BiasAdd",
-            description="Conv Layer 1 (32ch)"
+            description="Conv Layer 1 (32ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_1_2/BiasAdd",
-            description="Conv Layer 2 (48ch)"
+            description="Conv Layer 2 (48ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_2_1/BiasAdd",
-            description="Conv Layer 3 (64ch)"
+            description="Conv Layer 3 (64ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_3_1/BiasAdd",
-            description="Conv Layer 4 (80ch)"
+            description="Conv Layer 4 (80ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/conv_stem_1/conv2d_4_1/BiasAdd",
-            description="Conv Layer 5 (96ch)"
+            description="Conv Layer 5 (96ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Patch extractor (visual→sequence)
         LayerConfig(
             name="CCT_OCR_1/patch_extractor_1/convolution",
-            description="Patch Extractor (384ch)"
+            description="Patch Extractor (384ch)",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Transformer blocks (4 blocks)
         LayerConfig(
             name="CCT_OCR_1/transformer_block_1_1/add_9_1/Add",
-            description="Transformer Block 1 Output"
+            description="Transformer Block 1 Output",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_2_1/add_11_1/Add",
-            description="Transformer Block 2 Output"
+            description="Transformer Block 2 Output",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_3_1/add_13_1/Add",
-            description="Transformer Block 3 Output"
+            description="Transformer Block 3 Output",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         LayerConfig(
             name="CCT_OCR_1/transformer_block_4_1/add_15_1/Add",
-            description="Transformer Block 4 Output"
+            description="Transformer Block 4 Output",
+            max_epochs=max_epochs,
+            convergence_threshold=convergence_threshold
         ),
         # Final output
         LayerConfig(
             name="CCT_OCR_1/vocab_projection_1/dense_9_1/Softmax",
-            description="Final Output (Vocab Softmax)"
+            description="Final Output (Vocab Softmax)",
+            max_epochs=final_layer_epochs,
+            convergence_threshold=final_convergence
         ),
     ]
 
@@ -639,10 +674,13 @@ class ProgressivePatchTrainer:
         # Always use 80/20 validation split in OCR mode
         self.use_all_for_train = False
 
-        # Layer configuration (for random layer sampling)
-        # In random layer sampling mode, all layers are available for sampling
+        # Progressive layer configuration
+        # Get layer configs for random layer sampling
+        # (No longer using progressive layer-by-layer training)
         self.layer_configs = layer_configs or get_ocr_layer_progression()
-        self.original_layer_indices = None
+
+        self.current_layer_epoch = 0
+        self.layer_history = []  # Track training history for each layer
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -784,7 +822,10 @@ class ProgressivePatchTrainer:
         for param in self.ocr.parameters():
             param.requires_grad = False
 
-        # Calculate baseline activations for diversity computation (for all layers)
+        # Setup activation capture
+        self.setup_activation_hook()
+
+        # Calculate baseline activations for diversity computation
         self.calculate_baseline_activations()
 
     def _save_train_val_split(self, full_dataset, train_dataset, val_dataset, datasets_list):
@@ -1485,7 +1526,91 @@ class ProgressivePatchTrainer:
             return False
         return diversity_score < current_config.convergence_threshold
 
-def _get_multi_layer_activations(self, batch: dict, patch: torch.Tensor, layer_indices: List[int],
+    def advance_to_next_layer(self) -> bool:
+        """
+        Advance to the next layer in the progression.
+
+        Returns:
+            True if advanced successfully, False if already at final layer
+        """
+        if self.current_layer_idx >= len(self.layer_configs) - 1:
+            print("\n" + "="*80)
+            print("✓ Reached final layer - training complete!")
+            print("="*80 + "\n")
+            return False
+
+        # Record completion of current layer
+        current_config = self.layer_configs[self.current_layer_idx]
+        # Get original layer index if using queued layers
+        original_idx = (self.original_layer_indices[self.current_layer_idx]
+                       if self.original_layer_indices is not None
+                       else self.current_layer_idx)
+        self.layer_history.append({
+            'layer_idx': self.current_layer_idx,
+            'original_layer_idx': original_idx,
+            'layer_name': current_config.name,
+            'description': current_config.description,
+            'epochs_trained': self.current_layer_epoch
+        })
+
+        # Save checkpoint after completing this layer (with 10 sample patches)
+        layer_checkpoint_name = f"layer{original_idx + 1}_complete_{current_config.description.replace(' ', '_').replace('(', '').replace(')', '')}"
+        layer_checkpoint_path = os.path.join(self.checkpoint_base, layer_checkpoint_name)
+        self.save_basis(self.current_layer_epoch, layer_checkpoint_path, num_samples=10)
+        print(f"\n✓ Saved checkpoint after layer {original_idx + 1} completion (with 10 sample patches)")
+
+        # Move to next layer
+        self.current_layer_idx += 1
+        self.current_layer_epoch = 0
+
+        # Setup hook for new layer
+        next_config = self.layer_configs[self.current_layer_idx]
+        print("\n" + "="*80)
+        print(f"ADVANCING TO NEXT LAYER: {next_config.description}")
+        print(f"Layer {self.current_layer_idx + 1}/{len(self.layer_configs)}")
+        print("="*80 + "\n")
+
+        # Re-register activation hook for new layer
+        self.setup_activation_hook()
+
+        # Re-calculate baseline activations for new layer
+        print("Recalculating baseline activations for new layer...")
+        self.baseline_ocr_activations.clear()
+        self.activation_shape = None  # Reset shape tracking
+        self.calculate_baseline_activations()
+
+        return True
+
+    def should_continue_current_layer(self, diversity_score: float) -> bool:
+        """
+        Determine if training should continue on current layer.
+
+        Args:
+            diversity_score: Current diversity score
+
+        Returns:
+            True if should continue, False if should advance to next layer
+        """
+        current_config = self.layer_configs[self.current_layer_idx]
+        is_final_layer = self.current_layer_idx == len(self.layer_configs) - 1
+
+        # Check max epochs
+        if self.current_layer_epoch >= current_config.max_epochs:
+            print(f"\n→ Reached max epochs ({current_config.max_epochs}) for {current_config.description}")
+            return False
+
+        # For final layer, ignore convergence threshold and always train full epochs
+        if is_final_layer:
+            return True
+
+        # Check convergence (skipped for final layer)
+        if self.check_convergence(diversity_score):
+            print(f"\n→ Converged (diversity={diversity_score:.4f} < {current_config.convergence_threshold:.2f}) on {current_config.description}")
+            return False
+
+        return True
+
+    def _get_multi_layer_activations(self, batch: dict, patch: torch.Tensor, layer_indices: List[int],
                                       use_grad: bool = False) -> Dict[int, torch.Tensor]:
         """
         Get activations from multiple layers in a single forward pass.
@@ -2055,8 +2180,6 @@ def main():
                         help='Learning rate (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
                         help='Minimum learning rate for cosine annealing (default: 1e-5)')
-    parser.add_argument('--max-epochs', type=int, default=50,
-                        help='Maximum number of training epochs (default: 50)')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2116,7 +2239,6 @@ def main():
         print(f"  Max samples: {args.ocr_max_samples}")
     print(f"{'='*80}\n")
 
-
     # Trainer kwargs
     trainer_kwargs = {
         'ocr_dataset': args.ocr_dataset,
@@ -2143,8 +2265,7 @@ def main():
 
         history = trainer.train(
             learning_rate=args.learning_rate,
-            lr_min=args.lr_min,
-            max_epochs=args.max_epochs
+            lr_min=args.lr_min
         )
 
         # Save training history as CSV
