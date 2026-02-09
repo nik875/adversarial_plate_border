@@ -806,7 +806,7 @@ class ProgressivePatchTrainer:
         # (Dynamic hooks are registered per-layer during training via _get_multi_layer_activations)
         self.calculate_baseline_activations()
 
-    def _save_train_val_split(self, full_dataset, train_dataset, val_dataset, datasets_list):
+    def _save_train_val_split(self, full_dataset, train_dataset, val_dataset, datasets_list, save_dir=None):
         """
         Save train/val split mapping to CSV file for tracking which images are used.
 
@@ -815,6 +815,7 @@ class ProgressivePatchTrainer:
             train_dataset: Training subset (result of random_split)
             val_dataset: Validation subset (result of random_split)
             datasets_list: List of OCRDataset objects that were combined
+            save_dir: Optional directory to save CSV to (default: current directory)
         """
         import csv
         from datetime import datetime
@@ -851,12 +852,19 @@ class ProgressivePatchTrainer:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_filename = f'train_val_split_{timestamp}.csv'
 
-        with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+        # If save_dir provided, use it; otherwise use current directory
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            csv_filepath = os.path.join(save_dir, csv_filename)
+        else:
+            csv_filepath = csv_filename
+
+        with open(csv_filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=['index', 'split', 'dataset', 'text'])
             writer.writeheader()
             writer.writerows(split_data)
 
-        print(f"\nTrain/Val split mapping saved to: {csv_filename}")
+        print(f"\nTrain/Val split mapping saved to: {csv_filepath}")
         print(f"  Train samples: {len(train_indices)}")
         print(f"  Val samples: {len(val_indices)}")
 
@@ -1964,6 +1972,15 @@ class ProgressivePatchTrainer:
         os.makedirs(self.checkpoint_base, exist_ok=True)
         print(f"\nRun ID: {self.run_id}")
         print(f"Checkpoint directory: {self.checkpoint_base}\n")
+
+        # Save train/val split CSV to checkpoint directory
+        self._save_train_val_split(
+            self.full_dataset,
+            self.train_loader.dataset,
+            self.val_loader.dataset,
+            [],
+            save_dir=self.checkpoint_base
+        )
 
         # Profile layer activations upfront for normalization
         print("\n" + "="*80)
