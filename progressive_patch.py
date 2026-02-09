@@ -1627,6 +1627,12 @@ class ProgressivePatchTrainer:
             img_idx = 0
             while img_idx < num_images:
                 try:
+                    # Accumulate losses for this batch
+                    batch_diversity_loss = 0.0
+                    batch_tv_loss = 0.0
+                    batch_ssim_loss = 0.0
+                    batch_count = 0
+
                     # Process images_per_batch images
                     for img_in_batch in range(images_per_batch):
                         if img_idx >= num_images:
@@ -1784,17 +1790,14 @@ class ProgressivePatchTrainer:
                         # Final combined loss
                         final_loss = total_loss + tv_loss_weighted + ssim_loss_weighted
 
-                        # Backward and optimization
+                        # Backward (accumulate gradients)
                         final_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
 
-                        # Track losses
-                        total_diversity_loss += total_loss.item()
-                        total_tv_loss += tv_loss_weighted.item()
-                        total_ssim_loss += ssim_loss_weighted.item()
-                        num_updates += 1
+                        # Accumulate losses for batch
+                        batch_diversity_loss += total_loss.item()
+                        batch_tv_loss += tv_loss_weighted.item()
+                        batch_ssim_loss += ssim_loss_weighted.item()
+                        batch_count += 1
 
                         # Memory cleanup
                         if self.device == 'cuda':
@@ -1803,6 +1806,18 @@ class ProgressivePatchTrainer:
                             torch.mps.empty_cache()
 
                         img_idx += 1
+
+                    # Update weights after processing all images in batch
+                    if batch_count > 0:
+                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        num_updates += 1
+
+                        # Track average losses for batch
+                        total_diversity_loss += batch_diversity_loss / batch_count
+                        total_tv_loss += batch_tv_loss / batch_count
+                        total_ssim_loss += batch_ssim_loss / batch_count
 
                 except StopIteration:
                     break
