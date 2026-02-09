@@ -1862,10 +1862,14 @@ class ProgressivePatchTrainer:
                 if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
                     save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
                     # Generate 10 samples for each targetable layer (total: num_layers * 10)
+                    saved_count = 0
                     for layer_idx in range(len(self.layer_configs)):
                         layer_name = self.layer_configs[layer_idx].description.replace(" ", "_").replace("(", "").replace(")", "")
                         layer_save_dir = os.path.join(save_subdir, f"layer{layer_idx}_{layer_name}")
-                        self.save_basis(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx)
+                        if self.save_basis_safe(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx):
+                            saved_count += 1
+                    if saved_count > 0:
+                        print(f"   ✓ Saved periodic samples: {saved_count}/{len(self.layer_configs)} layers")
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
@@ -1924,6 +1928,21 @@ class ProgressivePatchTrainer:
                 return diversity_score.item()
             else:
                 return 0.0
+
+    def save_basis_safe(self, epoch: int, save_dir: str, num_samples: int = 5, save_generator: bool = True, layer_idx: Optional[int] = None) -> bool:
+        """Safely save basis with error handling. Returns True if successful, False if failed.
+
+        This wrapper prevents training from crashing due to save failures, allowing training
+        to continue even if checkpointing fails. All errors are logged.
+        """
+        try:
+            self.save_basis(epoch, save_dir, num_samples, save_generator, layer_idx)
+            return True
+        except Exception as e:
+            print(f"\n⚠️  WARNING: Failed to save checkpoint to {save_dir}")
+            print(f"   Error: {type(e).__name__}: {str(e)}")
+            print(f"   Continuing training without saving this checkpoint...\n")
+            return False
 
     def save_basis(self, epoch: int, save_dir: str = "foundation_basis_activation_patches", num_samples: int = 5, save_generator: bool = True, layer_idx: Optional[int] = None):
         """Save current generator state and sample patches
@@ -2119,15 +2138,21 @@ class ProgressivePatchTrainer:
                 best_train_loss = train_diversity_loss
                 best_epoch = epoch
                 best_dir = os.path.join(self.checkpoint_base, "best_progressive_patch")
-                self.save_basis(epoch, best_dir, num_samples=10, save_generator=True)
-                print(f"   ✓ New best training loss: {best_train_loss:.4f}")
+                if self.save_basis_safe(epoch, best_dir, num_samples=10, save_generator=True):
+                    print(f"   ✓ New best training loss: {best_train_loss:.4f} (saved)")
+                else:
+                    print(f"   ✓ New best training loss: {best_train_loss:.4f} (save failed, continuing)")
 
             # Save samples per layer periodically (every 10 epochs)
             if epoch % 10 == 0:
+                saved_count = 0
                 for layer_idx in range(len(self.layer_configs)):
                     layer_name = self.layer_configs[layer_idx].description.replace(" ", "_")
                     layer_save_dir = os.path.join(self.checkpoint_base, f"layer{layer_idx}_{layer_name}_epoch_{epoch:04d}")
-                    self.save_basis(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx)
+                    if self.save_basis_safe(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx):
+                        saved_count += 1
+                if saved_count > 0:
+                    print(f"   ✓ Saved per-layer checkpoint: {saved_count}/{len(self.layer_configs)} layers")
 
         print("\n" + "="*80)
         print("TRAINING COMPLETED!")
@@ -2136,17 +2161,35 @@ class ProgressivePatchTrainer:
         print(f"   Total epochs: {max_epochs}")
         print("="*80 + "\n")
 
-        # Save final model
-        print("Saving final trained model...")
+        # Save final model (critical save - retry if needed)
+        print("\nSaving final trained model...")
         final_save_dir = os.path.join(self.checkpoint_base, "training_complete_final_model")
-        self.save_basis(max_epochs, final_save_dir, num_samples=20, save_generator=True)
-        print(f"\n{'='*80}")
-        print(f"FINAL MODEL SAVED TO: {final_save_dir}/")
-        print(f"{'='*80}")
-        print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{max_epochs:04d}.pt")
-        print(f"  Sample patches: 20 PNG files in {final_save_dir}/")
-        print(f"  All checkpoints: {self.checkpoint_base}/")
-        print(f"{'='*80}\n")
+        max_retries = 3
+        saved_successfully = False
+
+        for attempt in range(1, max_retries + 1):
+            if self.save_basis_safe(max_epochs, final_save_dir, num_samples=20, save_generator=True):
+                saved_successfully = True
+                break
+            elif attempt < max_retries:
+                print(f"   Retrying final save (attempt {attempt + 1}/{max_retries})...")
+
+        if saved_successfully:
+            print(f"\n{'='*80}")
+            print(f"✓ FINAL MODEL SAVED SUCCESSFULLY TO: {final_save_dir}/")
+            print(f"{'='*80}")
+            print(f"  Generator checkpoint: {final_save_dir}/generator_epoch_{max_epochs:04d}.pt")
+            print(f"  Sample patches: 20 PNG files in {final_save_dir}/")
+            print(f"  All checkpoints: {self.checkpoint_base}/")
+            print(f"{'='*80}\n")
+        else:
+            print(f"\n{'='*80}")
+            print(f"⚠️  CRITICAL: Final model save failed after {max_retries} attempts!")
+            print(f"{'='*80}")
+            print(f"  Training completed but final checkpoint could not be saved.")
+            print(f"  Check disk space and permissions at: {self.checkpoint_base}/")
+            print(f"  Best model checkpoint available at: {self.checkpoint_base}/best_progressive_patch/")
+            print(f"{'='*80}\n")
 
         return history
 
