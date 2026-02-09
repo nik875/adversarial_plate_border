@@ -1207,7 +1207,7 @@ class ProgressivePatchTrainer:
 
     def compute_activation_diversity(self, patches_list: List[torch.Tensor],
                                       batches_list: List[dict],
-                                      baseline_indices: List[int],
+                                      baseline_activations: List[torch.Tensor],
                                       diagonal_activations: List[torch.Tensor],
                                       use_grad: bool = False) -> torch.Tensor:
         """
@@ -1220,7 +1220,7 @@ class ProgressivePatchTrainer:
         Args:
             patches_list: List of [3, H, W] patches (one per image)
             batches_list: List of batch dicts (one per image)
-            baseline_indices: List of dataset indices for baseline activations
+            baseline_activations: List of [H, W, C] baseline activations (pre-computed)
             diagonal_activations: List of [H, W, C] activations from (patch_i, image_i) pairs
             use_grad: If True, compute with gradients (needed for diversity-only mode)
 
@@ -1233,7 +1233,7 @@ class ProgressivePatchTrainer:
         deltas = []
         for patch_idx in range(batch_size):
             activations = diagonal_activations[patch_idx]  # [H, W, C]
-            baseline = self.get_baseline_activation(batches_list[patch_idx], baseline_indices[patch_idx])  # [H, W, C]
+            baseline = baseline_activations[patch_idx]  # [H, W, C]
             delta = activations - baseline  # [H, W, C]
             deltas.append(delta)
 
@@ -1684,12 +1684,14 @@ class ProgressivePatchTrainer:
                         # Compute diversity at target layer
                         target_layer_activations = patch_activations_per_layer[sampled_layer_idx]
 
+                        # Create baseline list for target layer (one per accumulated patch)
+                        baseline_for_diversity = [baseline_activations[sampled_layer_idx]] * len(accumulated_patches)
+
                         # Compute diversity score
-                        image_indices = list(range(len(accumulated_patches)))
                         diversity_score = self.compute_activation_diversity(
                             accumulated_patches,
                             accumulated_batches,
-                            image_indices,
+                            baseline_for_diversity,
                             target_layer_activations,
                             use_grad=True
                         )
