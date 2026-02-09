@@ -51,6 +51,105 @@ except Exception as e:
 
 warnings.filterwarnings("ignore")
 
+import math
+
+
+# LoRA Classes for VAE Decoder
+class LoRALinear(nn.Module):
+    """Linear layer with LoRA adaptation"""
+    def __init__(self, linear_layer: nn.Linear, r: int = 8, lora_alpha: int = 16):
+        super().__init__()
+        self.base_layer = linear_layer
+        self.r = r
+        self.lora_alpha = lora_alpha
+
+        # Freeze base
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        # LoRA matrices
+        self.lora_A = nn.Parameter(torch.zeros(r, linear_layer.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(linear_layer.out_features, r))
+        self.scaling = lora_alpha / r
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = F.linear(x, self.base_layer.weight, self.base_layer.bias)
+        lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        return result + lora_out
+
+
+class LoRAConv2d(nn.Module):
+    """Conv2d with LoRA using 1×1 convolutions"""
+    def __init__(self, conv_layer: nn.Conv2d, r: int = 8, lora_alpha: int = 16):
+        super().__init__()
+        self.base_layer = conv_layer
+        self.r = r
+        self.lora_alpha = lora_alpha
+
+        # Freeze base
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        # LoRA 1×1 convs
+        self.lora_down = nn.Conv2d(conv_layer.in_channels, r, kernel_size=1, bias=False)
+        self.lora_up = nn.Conv2d(r, conv_layer.out_channels, kernel_size=1, bias=False)
+        self.scaling = lora_alpha / r
+
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(x)
+        lora_out = self.lora_up(self.lora_down(x)) * self.scaling
+        return result + lora_out
+
+
+def _wrap_module_conv_and_attention(module, prefix, lora_modules, r, lora_alpha):
+    """Recursively wrap Conv2d and attention Linear layers"""
+    for name, child in module.named_children():
+        full_name = f"{prefix}.{name}"
+
+        if isinstance(child, nn.Conv2d):
+            wrapped = LoRAConv2d(child, r, lora_alpha)
+            setattr(module, name, wrapped)
+            lora_modules[full_name] = wrapped
+        elif isinstance(child, nn.Linear) and any(x in name for x in ['to_q', 'to_k', 'to_v', 'to_out']):
+            wrapped = LoRALinear(child, r, lora_alpha)
+            setattr(module, name, wrapped)
+            lora_modules[full_name] = wrapped
+        elif len(list(child.children())) > 0:
+            _wrap_module_conv_and_attention(child, full_name, lora_modules, r, lora_alpha)
+
+
+def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
+    """Inject LoRA into VAE decoder Conv2d and attention Linear layers"""
+    lora_modules = {}
+
+    # Wrap conv_in and conv_out
+    if hasattr(vae.decoder, 'conv_in'):
+        vae.decoder.conv_in = LoRAConv2d(vae.decoder.conv_in, r, lora_alpha)
+        lora_modules['decoder.conv_in'] = vae.decoder.conv_in
+
+    if hasattr(vae.decoder, 'conv_out'):
+        vae.decoder.conv_out = LoRAConv2d(vae.decoder.conv_out, r, lora_alpha)
+        lora_modules['decoder.conv_out'] = vae.decoder.conv_out
+
+    # Wrap mid_block
+    if hasattr(vae.decoder, 'mid_block'):
+        _wrap_module_conv_and_attention(vae.decoder.mid_block, 'decoder.mid_block', lora_modules, r, lora_alpha)
+
+    # Wrap up_blocks
+    if hasattr(vae.decoder, 'up_blocks'):
+        for i, up_block in enumerate(vae.decoder.up_blocks):
+            _wrap_module_conv_and_attention(up_block, f'decoder.up_blocks.{i}', lora_modules, r, lora_alpha)
+
+    return lora_modules
+
 
 PATCH_WIDTH = 512
 PATCH_HEIGHT = 256
@@ -310,7 +409,8 @@ class SimplePatchGenerator(nn.Module):
 
 class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
-    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11):
+    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11,
+                 use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -338,14 +438,32 @@ class FoundationPatchGenerator(nn.Module):
         # Load SD VAE decoder (trainable)
         print("Loading Stable Diffusion VAE decoder...")
         self.vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",  # Smaller, optimized VAE
+            "stabilityai/sdxl-vae",  # Official SDXL VAE (no fp16 modifications needed)
             torch_dtype=torch.float32
         )
 
-        # VAE parameters are trainable (fine-tune pretrained weights)
+        # LoRA configuration
+        self.use_vae_lora = use_vae_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+
+        if self.use_vae_lora:
+            print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
+            self.vae_lora_modules = inject_lora_into_vae_decoder(self.vae, r=self.lora_rank, lora_alpha=self.lora_alpha)
+
+            vae_base_params = sum(p.numel() for p in self.vae.parameters() if not p.requires_grad)
+            vae_lora_params = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
+            print(f"  LoRA injected into {len(self.vae_lora_modules)} modules")
+            print(f"  VAE base (frozen): {vae_base_params:,}")
+            print(f"  VAE LoRA (trainable): {vae_lora_params:,}")
+            print(f"  Reduction: {100 * (1 - vae_lora_params / vae_base_params):.2f}%")
+        else:
+            print("VAE full fine-tuning enabled")
+            self.vae_lora_modules = None
+
         self.vae.train()
 
-        print(f"VAE loaded (trainable). Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
+        print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
         # Using deeper network for better expressiveness
@@ -384,26 +502,26 @@ class FoundationPatchGenerator(nn.Module):
         self.cnn_refiner = nn.Sequential(
             # Block 1
             nn.Conv2d(4, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
 
             # Block 2
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),
             nn.ReLU(inplace=True),
 
             # Block 3
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),
             nn.ReLU(inplace=True),
         )
 
@@ -413,9 +531,6 @@ class FoundationPatchGenerator(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
         # DNN block: combines CNN output (64 channels) + skip features (1 channel) = 65 channels
         # Uses global average pooling to reduce spatial dimensions before dense layers
@@ -532,7 +647,10 @@ class ProgressivePatchTrainer:
                  ocr_dataset_split: str = 'train',
                  ocr_max_samples: Optional[int] = None,
                  ocr_images_per_batch: int = 1,
-                 ocr_patches_per_image: int = None):
+                 ocr_patches_per_image: int = None,
+                 use_vae_lora: bool = True,
+                 lora_rank: int = 8,
+                 lora_alpha: int = 16):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
@@ -544,6 +662,9 @@ class ProgressivePatchTrainer:
         self.target_layer = target_layer
         self.ocr_images_per_batch = ocr_images_per_batch
         self.use_simple_generator = use_simple_generator
+        self.use_vae_lora = use_vae_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
 
         # Require ocr_patches_per_image
         if ocr_patches_per_image is None:
@@ -699,7 +820,10 @@ class ProgressivePatchTrainer:
                 latent_dim=basis_dim,
                 patch_height=self.patch_height,
                 patch_width=self.patch_width,
-                num_layers=num_layers
+                num_layers=num_layers,
+                use_vae_lora=use_vae_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha
             ).to(self.device)
 
         # Activation capture for diversity metric
@@ -1822,12 +1946,16 @@ class ProgressivePatchTrainer:
         with torch.no_grad():
             # Save generator network (if requested)
             if save_generator:
-                torch.save({
+                checkpoint = {
                     'generator_state_dict': self.generator.state_dict(),
                     'epoch': epoch,
                     'basis_dim': self.basis_dim,
-                    'patch_size': (self.patch_height, self.patch_width)
-                }, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
+                    'patch_size': (self.patch_height, self.patch_width),
+                    'use_vae_lora': getattr(self.generator, 'use_vae_lora', False),
+                    'lora_rank': getattr(self.generator, 'lora_rank', None),
+                    'lora_alpha': getattr(self.generator, 'lora_alpha', None),
+                }
+                torch.save(checkpoint, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 
             # Sample and save example patches
             z_samples = self.sample_coefficients(num_samples)
@@ -1882,7 +2010,30 @@ class ProgressivePatchTrainer:
         print("="*80 + "\n")
 
         # Initialize optimizer
-        optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
+        # Collect trainable parameters
+        if self.use_simple_generator:
+            optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
+        else:
+            trainable_params = []
+
+            # VAE parameters (LoRA only if enabled)
+            if hasattr(self.generator, 'use_vae_lora') and self.generator.use_vae_lora:
+                vae_lora_params = [p for p in self.generator.vae.parameters() if p.requires_grad]
+                trainable_params.append({'params': vae_lora_params, 'lr': learning_rate, 'name': 'vae_lora'})
+                print(f"Optimizer: VAE LoRA parameters: {sum(p.numel() for p in vae_lora_params):,}")
+            else:
+                vae_params = list(self.generator.vae.parameters())
+                trainable_params.append({'params': vae_params, 'lr': learning_rate, 'name': 'vae_full'})
+                print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,}")
+
+            # Other components (always trainable)
+            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'dnn_block', 'layer_embedding']:
+                module = getattr(self.generator, name)
+                params = list(module.parameters())
+                trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
+                print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,}")
+
+            optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=1e-4)
 
         # Create cosine annealing scheduler
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -2055,6 +2206,14 @@ def main():
     parser.add_argument('--ocr-patches-per-image', type=int, required=True,
                         help='Number of patches to generate per image in OCR mode. '
                         'Total patches = images_per_batch × patches_per_image.')
+    parser.add_argument('--use-vae-lora', action='store_true', default=True, dest='use_vae_lora',
+                        help='Use LoRA for VAE decoder (default: True)')
+    parser.add_argument('--no-vae-lora', action='store_false', dest='use_vae_lora',
+                        help='Disable LoRA, use full VAE fine-tuning')
+    parser.add_argument('--lora-rank', type=int, default=8,
+                        help='LoRA rank (default: 8)')
+    parser.add_argument('--lora-alpha', type=int, default=16,
+                        help='LoRA alpha (default: 16)')
     args = parser.parse_args()
 
     # Validate dataset argument
@@ -2121,7 +2280,10 @@ def main():
         'ocr_dataset_split': args.ocr_dataset_split,
         'ocr_max_samples': args.ocr_max_samples,
         'ocr_images_per_batch': args.ocr_images_per_batch,
-        'ocr_patches_per_image': args.ocr_patches_per_image
+        'ocr_patches_per_image': args.ocr_patches_per_image,
+        'use_vae_lora': args.use_vae_lora,
+        'lora_rank': args.lora_rank,
+        'lora_alpha': args.lora_alpha
     }
 
     # Training mode
