@@ -1842,7 +1842,11 @@ class ProgressivePatchTrainer:
                 batch_count_global += 1
                 if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
                     save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
-                    self.save_basis(epoch, save_subdir, num_samples=5, save_generator=False)
+                    # Generate 10 samples for each targetable layer (total: num_layers * 10)
+                    for layer_idx in range(len(self.layer_configs)):
+                        layer_name = self.layer_configs[layer_idx].description.replace(" ", "_").replace("(", "").replace(")", "")
+                        layer_save_dir = os.path.join(save_subdir, f"layer{layer_idx}_{layer_name}")
+                        self.save_basis(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx)
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
