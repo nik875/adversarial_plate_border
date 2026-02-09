@@ -822,10 +822,8 @@ class ProgressivePatchTrainer:
         for param in self.ocr.parameters():
             param.requires_grad = False
 
-        # Setup activation capture
-        self.setup_activation_hook()
-
         # Calculate baseline activations for diversity computation
+        # (Dynamic hooks are registered per-layer during training via _get_multi_layer_activations)
         self.calculate_baseline_activations()
 
     def _save_train_val_split(self, full_dataset, train_dataset, val_dataset, datasets_list):
