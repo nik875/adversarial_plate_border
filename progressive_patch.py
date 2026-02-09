@@ -496,13 +496,14 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        # Skip connection projection: z → spatial feature map
-        # Project z to a feature map that can be concatenated with VAE output
+        # Skip connection: per-channel scaling modulation
+        # Simple linear layer to learn a scalar scale factor from latent code
+        # This provides a learned modulation that influences the CNN refiner and patch projector
         self.skip_projection = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(512, patch_height * patch_width),
-            nn.ReLU(inplace=True)
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Keep scaling factor in [0, 1] for stability
         )
 
         # CNN refinement module - deeper conv architecture
@@ -597,11 +598,12 @@ class FoundationPatchGenerator(nn.Module):
                 align_corners=True
             )
 
-        # Skip connection: z → spatial feature map
-        skip_features = self.skip_projection(z)  # [B, H*W]
-        skip_features = skip_features.view(
-            batch_size, 1, self.patch_height, self.patch_width
-        )  # [B, 1, H, W]
+        # Skip connection: per-channel scaling modulation
+        skip_scale = self.skip_projection(z)  # [B, 1] - learned scale factor
+        skip_scale = skip_scale.view(batch_size, 1, 1, 1)  # [B, 1, 1, 1] for broadcasting
+
+        # Expand skip_scale to match spatial dimensions for concatenation
+        skip_features = skip_scale.expand(batch_size, 1, self.patch_height, self.patch_width)  # [B, 1, H, W]
 
         # Concatenate VAE output with skip connection for CNN input
         cnn_input = torch.cat([vae_output, skip_features], dim=1)  # [B, 4, H, W]
@@ -609,7 +611,7 @@ class FoundationPatchGenerator(nn.Module):
         # Process through CNN refiner
         cnn_output = self.cnn_refiner(cnn_input)  # [B, 64, H, W]
 
-        # Concatenate CNN output with skip features
+        # Concatenate CNN output with skip features (now just the broadcast scalar)
         projector_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 65, H, W]
 
         # Project to patch using 1x1 convolutions
