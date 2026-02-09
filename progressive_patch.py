@@ -658,6 +658,7 @@ class ProgressivePatchTrainer:
         # Get layer configs for random layer sampling
         # (No longer using progressive layer-by-layer training)
         self.layer_configs = layer_configs or get_ocr_layer_progression()
+        self.num_layers = len(self.layer_configs)
 
         self.current_layer_epoch = 0
         self.layer_history = []  # Track training history for each layer
