@@ -1070,6 +1070,9 @@ class ProgressivePatchTrainer:
         between adjacent pixels. Uses L2 norm of gradients in both horizontal and
         vertical directions.
 
+        Only computes TV on the visible border region (excludes center plate region
+        that gets obscured when patch is applied).
+
         Args:
             patches: [batch_size, 3, H, W] patch tensor
 
@@ -1080,21 +1083,34 @@ class ProgressivePatchTrainer:
         batch_size = patches.shape[0]
         total_tv_loss = 0.0
 
+        # Create border mask (same for all patches)
+        _, _, H, W = patches.shape
+        border_mask = self.create_border_mask(H, W, border_scale=1.4).to(patches.device)  # [1, 1, H, W]
+
         for i in range(batch_size):
-            patch = patches[i]  # [3, H, W]
-            C, H, W = patch.shape
+            patch = patches[i:i+1]  # [1, 3, H, W]
+            C, H, W = patch.shape[1:]
 
             # Horizontal total variation: differences along width dimension
-            tv_h = torch.pow(patch[:, :, 1:] - patch[:, :, :-1], 2).sum()
+            tv_h = torch.pow(patch[:, :, :, 1:] - patch[:, :, :, :-1], 2)
 
             # Vertical total variation: differences along height dimension
-            tv_v = torch.pow(patch[:, 1:, :] - patch[:, :-1, :], 2).sum()
+            tv_v = torch.pow(patch[:, :, 1:, :] - patch[:, :, :-1, :], 2)
 
-            # Number of comparisons: C × (H×(W-1) + (H-1)×W)
-            num_comparisons = C * (H * (W - 1) + (H - 1) * W)
+            # Apply border mask to both TV components
+            # Mask is [1, 1, H, W], need to match dimensions for masking
+            mask_h = border_mask[:, :, :, :-1]  # [1, 1, H, W-1]
+            mask_v = border_mask[:, :, :-1, :]  # [1, 1, H-1, W]
 
-            # Normalize by number of comparisons
-            patch_tv_loss = (tv_h + tv_v) / num_comparisons
+            tv_h_masked = (tv_h * mask_h).sum()
+            tv_v_masked = (tv_v * mask_v).sum()
+
+            # Count only visible pixels in the border region
+            num_visible_h = mask_h.sum()
+            num_visible_v = mask_v.sum()
+
+            # Normalize by number of visible comparisons
+            patch_tv_loss = (tv_h_masked + tv_v_masked) / (num_visible_h + num_visible_v) if (num_visible_h + num_visible_v) > 0 else torch.tensor(0.0, device=patches.device)
 
             # Scale by 2.5x to keep loss in reasonable range
             patch_tv_loss = patch_tv_loss * 2.5
