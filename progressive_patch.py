@@ -631,12 +631,14 @@ class ProgressivePatchTrainer:
                  ocr_patches_per_image: int = None,
                  use_vae_lora: bool = True,
                  lora_rank: int = 8,
-                 lora_alpha: int = 16):
+                 lora_alpha: int = 16,
+                 save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
         self.tv_weight = tv_weight
         self.ssim_weight = ssim_weight
         self.cascade_weight = cascade_weight
+        self.save_examples_every = save_examples_every
         self.ocr_images_per_batch = ocr_images_per_batch
         self.use_simple_generator = use_simple_generator
         self.use_vae_lora = use_vae_lora
@@ -1599,6 +1601,14 @@ class ProgressivePatchTrainer:
         num_batches = math.ceil(num_images / images_per_batch)
 
         desc = f"Epoch {epoch} - Training"
+
+        # Create example samples directory if needed
+        example_samples_dir = None
+        if self.save_examples_every is not None:
+            example_samples_dir = os.path.join(self.checkpoint_base, "example_samples")
+            os.makedirs(example_samples_dir, exist_ok=True)
+
+        batch_count_global = 0
         with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
             img_idx = 0
             while img_idx < num_images:
@@ -1809,6 +1819,12 @@ class ProgressivePatchTrainer:
                     'Updates': num_updates
                 })
                 pbar.update(1)
+
+                # Save example patches periodically if configured
+                batch_count_global += 1
+                if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
+                    save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
+                    self.save_basis(epoch, save_subdir, num_samples=5, save_generator=False)
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
@@ -2097,6 +2113,10 @@ def main():
     parser.add_argument('--cascade-weight', type=float, default=0.25,
                         help='Weight for cascade penalty on prior layers (default: 0.25). '
                         'Penalizes patch impact on layers before target layer to prevent learning shallow attacks.')
+    parser.add_argument('--save-examples-every', type=int, default=None,
+                        help='Save example patches every N batches during training (default: disabled). '
+                        'Saves 5 sample patches to checkpoints/{run_id}/example_samples/. '
+                        'Example: --save-examples-every 100 saves samples every 100 batches.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
                         help='Learning rate (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
@@ -2177,7 +2197,8 @@ def main():
         'ocr_patches_per_image': args.ocr_patches_per_image,
         'use_vae_lora': args.use_vae_lora,
         'lora_rank': args.lora_rank,
-        'lora_alpha': args.lora_alpha
+        'lora_alpha': args.lora_alpha,
+        'save_examples_every': args.save_examples_every
     }
 
     # Training mode
