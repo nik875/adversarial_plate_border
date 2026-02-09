@@ -645,10 +645,6 @@ class ProgressivePatchTrainer:
                  tv_weight: float = 2.5,
                  ssim_weight: float = 1.0,
                  cascade_weight: float = 0.25,
-                 max_epochs_per_layer = 50,
-                 final_layer_epochs: Optional[int] = None,
-                 convergence_threshold = 1.0,
-                 target_layer: Optional[List[int]] = None,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  use_simple_generator: bool = False,
                  ocr_dataset_split: str = 'train',
@@ -663,8 +659,6 @@ class ProgressivePatchTrainer:
         self.tv_weight = tv_weight
         self.ssim_weight = ssim_weight
         self.cascade_weight = cascade_weight
-        self.max_epochs_per_layer = max_epochs_per_layer
-        self.final_layer_epochs = final_layer_epochs
         self.convergence_threshold = convergence_threshold
         self.target_layer = target_layer
         self.ocr_images_per_batch = ocr_images_per_batch
@@ -682,54 +676,10 @@ class ProgressivePatchTrainer:
         # Always use 80/20 validation split in OCR mode
         self.use_all_for_train = False
 
-        # Progressive layer configuration
-        # Handle single values or lists for max_epochs and convergence_threshold
-        if not isinstance(max_epochs_per_layer, list):
-            max_epochs_per_layer = [max_epochs_per_layer]
-        if not isinstance(convergence_threshold, list):
-            convergence_threshold = [convergence_threshold]
-
-        all_layer_configs = layer_configs or get_ocr_layer_progression(
-            max_epochs=max_epochs_per_layer[0],
-            convergence_threshold=convergence_threshold[0],
-            final_layer_epochs=final_layer_epochs
-        )
-
-        # If target_layer specified, filter to only those layers
-        if target_layer is not None:
-            # Validate all indices
-            for idx in target_layer:
-                if idx < 0 or idx >= len(all_layer_configs):
-                    raise ValueError(f"target_layer index {idx} out of range (must be 0-{len(all_layer_configs)-1})")
-
-            # Filter layer configs to only specified indices (in order)
-            sorted_indices = sorted(target_layer)
-            self.layer_configs = [all_layer_configs[i] for i in sorted_indices]
-
-            # Update max_epochs and convergence_threshold for queued layers if lists provided
-            num_queued = len(self.layer_configs)
-            if len(max_epochs_per_layer) > 1:
-                if len(max_epochs_per_layer) != num_queued:
-                    raise ValueError(f"max_epochs_per_layer list length ({len(max_epochs_per_layer)}) must match number of queued layers ({num_queued})")
-                for i, config in enumerate(self.layer_configs):
-                    config.max_epochs = max_epochs_per_layer[i]
-
-            if len(convergence_threshold) > 1:
-                if len(convergence_threshold) != num_queued:
-                    raise ValueError(f"convergence_threshold list length ({len(convergence_threshold)}) must match number of queued layers ({num_queued})")
-                for i, config in enumerate(self.layer_configs):
-                    config.convergence_threshold = convergence_threshold[i]
-
-            self.original_layer_indices = sorted_indices  # Track original indices for display
-            self.current_layer_idx = 0
-            print(f"Progressive training queued for {len(self.layer_configs)} layers: {sorted_indices}")
-        else:
-            self.layer_configs = all_layer_configs
-            self.original_layer_indices = None  # All layers, use natural indices
-            self.current_layer_idx = 0
-
-        self.current_layer_epoch = 0
-        self.layer_history = []  # Track training history for each layer
+        # Layer configuration (for random layer sampling)
+        # In random layer sampling mode, all layers are available for sampling
+        self.layer_configs = layer_configs or get_ocr_layer_progression()
+        self.original_layer_indices = None
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -2229,23 +2179,8 @@ def main():
                         help='Learning rate (default: 5e-3)')
     parser.add_argument('--lr-min', type=float, default=1e-5,
                         help='Minimum learning rate for cosine annealing (default: 1e-5)')
-    parser.add_argument('--max-epochs-per-layer', type=str, default='50',
-                        help='Maximum epochs to train on each layer (default: 50). '
-                        'Can be a single value or comma-separated list (e.g., "30,50,100" for queued layers). '
-                        'Set to high value like 1000 to disable max epoch stopping.')
-    parser.add_argument('--final-layer-epochs', type=int, default=None,
-                        help='Maximum epochs for the final layer in the progression (default: 2x max-epochs-per-layer). '
-                        'The final layer typically gets more training time for refinement.')
-    parser.add_argument('--convergence-threshold', type=str, default='1.0',
-                        help='Diversity score threshold for convergence. Training on a layer stops when diversity < threshold. '
-                        '(default: 1.0). Can be a single value or comma-separated list (e.g., "1.0,0.5,0.0" for queued layers). '
-                        'Set to 0 or negative to disable convergence checking and train full max-epochs.')
-    parser.add_argument('--target-layer', type=str, default=None,
-                        help='Queue specific layers for progressive training (comma-separated, e.g., "0,3,5,10"). '
-                        'Training will progress through only these layers. '
-                        '0=Conv1(32ch), 1=Conv2(48ch), 2=Conv3(64ch), 3=Conv4(80ch), 4=Conv5(96ch), '
-                        '5=PatchExtractor(384ch), 6=Transformer1, 7=Transformer2, 8=Transformer3, '
-                        '9=Transformer4, 10=FinalOutput. If not specified, trains all layers progressively.')
+    parser.add_argument('--max-epochs', type=int, default=50,
+                        help='Maximum number of training epochs (default: 50)')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2305,31 +2240,6 @@ def main():
         print(f"  Max samples: {args.ocr_max_samples}")
     print(f"{'='*80}\n")
 
-    # Parse target layers if specified
-    target_layers = None
-    if args.target_layer is not None:
-        try:
-            target_layers = [int(x.strip()) for x in args.target_layer.split(',')]
-        except ValueError:
-            raise ValueError(f"Invalid target-layer format: '{args.target_layer}'. Expected comma-separated integers (e.g., '0,3,5,10')")
-
-    # Parse max_epochs_per_layer (can be single value or comma-separated list)
-    try:
-        if ',' in args.max_epochs_per_layer:
-            max_epochs_per_layer = [int(x.strip()) for x in args.max_epochs_per_layer.split(',')]
-        else:
-            max_epochs_per_layer = int(args.max_epochs_per_layer)
-    except ValueError:
-        raise ValueError(f"Invalid max-epochs-per-layer format: '{args.max_epochs_per_layer}'. Expected integer or comma-separated integers (e.g., '30,50,100')")
-
-    # Parse convergence_threshold (can be single value or comma-separated list)
-    try:
-        if ',' in args.convergence_threshold:
-            convergence_threshold = [float(x.strip()) for x in args.convergence_threshold.split(',')]
-        else:
-            convergence_threshold = float(args.convergence_threshold)
-    except ValueError:
-        raise ValueError(f"Invalid convergence-threshold format: '{args.convergence_threshold}'. Expected float or comma-separated floats (e.g., '1.0,0.5,0.0')")
 
     # Trainer kwargs
     trainer_kwargs = {
@@ -2341,10 +2251,6 @@ def main():
         'tv_weight': args.tv_weight,
         'ssim_weight': args.ssim_weight,
         'cascade_weight': args.cascade_weight,
-        'max_epochs_per_layer': max_epochs_per_layer,
-        'final_layer_epochs': args.final_layer_epochs,
-        'convergence_threshold': convergence_threshold,
-        'target_layer': target_layers,
         'use_simple_generator': args.simple_generator,
         'ocr_dataset_split': args.ocr_dataset_split,
         'ocr_max_samples': args.ocr_max_samples,
@@ -2361,7 +2267,8 @@ def main():
 
         history = trainer.train(
             learning_rate=args.learning_rate,
-            lr_min=args.lr_min
+            lr_min=args.lr_min,
+            max_epochs=args.max_epochs
         )
 
         # Save training history as CSV
