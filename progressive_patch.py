@@ -1732,11 +1732,14 @@ class ProgressivePatchTrainer:
                         # Compute cascade penalty on prior layers
                         cascade_penalty = 0.0
                         if sampled_layer_idx > 0:
-                            # Calculate exponential decay factor k such that e^(-k*(i-1)) = 0.01
-                            k = np.log(100.0) / (sampled_layer_idx - 1) if sampled_layer_idx > 1 else 1.0
+                            # Cosine decay: stays high for most layers, drops sharply near target
+                            # weight[i] = cos(π * i / (2 * (num_prior_layers)))
+                            # Layer 0: cos(0) = 1.0 (100%)
+                            # Last layer: cos(π/2) ≈ 0.0 (0%)
+                            num_prior_layers = sampled_layer_idx
 
                             for prior_layer_idx in range(sampled_layer_idx):
-                                weight = np.exp(-k * prior_layer_idx)
+                                weight = np.cos(np.pi * prior_layer_idx / (2.0 * num_prior_layers))
 
                                 # Compute quality score for prior layer
                                 if prior_layer_idx in self.layer_activation_stddev:
