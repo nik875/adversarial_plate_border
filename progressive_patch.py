@@ -541,33 +541,25 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        # DNN block: combines CNN output (64 channels) + skip features (1 channel) = 65 channels
-        # Uses global average pooling to reduce spatial dimensions before dense layers
-        self.global_pool = nn.AdaptiveAvgPool2d((8, 16))  # Downsample to 8x16 spatial
-        self.dnn_input_dim = 65 * 8 * 16  # 8320
-
-        self.dnn_block = nn.Sequential(
-            nn.Linear(self.dnn_input_dim, 2048),
+        # Patch projection: simple 1x1 convolutions
+        # Input: CNN output (64 channels) + skip features (1 channel) = 65 channels
+        # Output: 3 RGB channels
+        self.patch_projector = nn.Sequential(
+            nn.Conv2d(65, 32, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(2048, 2048),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(2048, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 3 * patch_height * patch_width),
+            nn.Conv2d(32, 3, kernel_size=1),
             nn.Sigmoid()  # Ensure output is in [0, 1]
         )
 
-        # Initialize DNN weights
-        for m in self.dnn_block.modules():
-            if isinstance(m, nn.Linear):
+        # Initialize projector weights
+        for m in self.patch_projector.modules():
+            if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
         print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
-        print(f"DNN block (with global pooling): {self.dnn_input_dim} → 2048 → 2048 → 1024 → {3 * patch_height * patch_width}")
+        print(f"Patch projector: 65 → 32 → 3 channels (1x1 convolutions, ~2.2K parameters)")
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -617,16 +609,11 @@ class FoundationPatchGenerator(nn.Module):
         # Process through CNN refiner
         cnn_output = self.cnn_refiner(cnn_input)  # [B, 64, H, W]
 
-        # Concatenate CNN output with skip features for DNN input
-        dnn_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 65, H, W]
+        # Concatenate CNN output with skip features
+        projector_input = torch.cat([cnn_output, skip_features], dim=1)  # [B, 65, H, W]
 
-        # Apply global pooling to reduce spatial dimensions
-        dnn_input_pooled = self.global_pool(dnn_input)  # [B, 65, 8, 16]
-        dnn_input_flat = dnn_input_pooled.view(batch_size, -1)  # [B, 65*8*16]
-
-        # Process through DNN block
-        patch_flat = self.dnn_block(dnn_input_flat)  # [B, 3*H*W]
-        patches = patch_flat.view(batch_size, 3, self.patch_height, self.patch_width)  # [B, 3, H, W]
+        # Project to patch using 1x1 convolutions
+        patches = self.patch_projector(projector_input)  # [B, 3, H, W]
 
         return patches
 
@@ -967,7 +954,7 @@ class ProgressivePatchTrainer:
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
         Generate patches from latent codes using foundation model:
-        z → adapter → frozen VAE decoder → CNN refiner → DNN block (with pooling) → patch
+        z → adapter → frozen VAE decoder → CNN refiner → patch projector (1×1 convs) → patch
 
         Args:
             z: Latent codes [batch_size, basis_dim]
@@ -1988,7 +1975,7 @@ class ProgressivePatchTrainer:
                 print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,}")
 
             # Other components (always trainable)
-            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'dnn_block', 'layer_embedding']:
+            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector', 'layer_embedding']:
                 module = getattr(self.generator, name)
                 params = list(module.parameters())
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
@@ -2127,7 +2114,7 @@ def main():
     parser.add_argument('--simple-generator', action='store_true',
                         help='Use simple MLP generator instead of foundation model (VAE-based). '
                         'Simple generator: z → MLP[256→512→1024] → patch. '
-                        'Foundation model: z → adapter → VAE decoder → CNN refiner → DNN → patch. '
+                        'Foundation model: z → adapter → VAE decoder → CNN refiner → patch projector (1×1 convs) → patch. '
                         'Simple generator uses ~10x less memory but may produce lower quality patches.')
     parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
@@ -2384,7 +2371,7 @@ Generator architectures:
   * Use case: Quick prototyping, limited GPU memory, faster iterations
 
 - FoundationPatchGenerator (default):
-  * Complex architecture: Adapter → VAE decoder → CNN refiner → DNN block
+  * Complex architecture: Adapter → VAE decoder → CNN refiner → patch projector (1×1 convs)
   * Memory: High (requires SD VAE decoder with many parameters)
   * Speed: Slower due to VAE and multiple refinement stages
   * Quality: Higher quality, more realistic patches
