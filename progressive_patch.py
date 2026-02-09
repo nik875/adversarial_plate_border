@@ -1970,6 +1970,10 @@ class ProgressivePatchTrainer:
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
                 print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,}")
 
+            # Print total trainable parameters
+            total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
+            print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
+
             optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=1e-4)
 
         # Create cosine annealing scheduler
