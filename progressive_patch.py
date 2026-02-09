@@ -1588,6 +1588,7 @@ class ProgressivePatchTrainer:
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
         total_ssim_loss = 0.0
+        total_cascade_penalty = 0.0
         num_updates = 0
 
         # OCR mode: Generate multiple patches per image, process multiple images per batch
@@ -1618,6 +1619,7 @@ class ProgressivePatchTrainer:
                     batch_diversity_loss = 0.0
                     batch_tv_loss = 0.0
                     batch_ssim_loss = 0.0
+                    batch_cascade_penalty = 0.0
                     batch_count = 0
 
                     # Process images_per_batch images
@@ -1784,6 +1786,7 @@ class ProgressivePatchTrainer:
                         batch_diversity_loss += total_loss.item()
                         batch_tv_loss += tv_loss_weighted.item()
                         batch_ssim_loss += ssim_loss_weighted.item()
+                        batch_cascade_penalty = cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
                         batch_count += 1
 
                         # Memory cleanup
@@ -1805,6 +1808,7 @@ class ProgressivePatchTrainer:
                         total_diversity_loss += batch_diversity_loss / batch_count
                         total_tv_loss += batch_tv_loss / batch_count
                         total_ssim_loss += batch_ssim_loss / batch_count
+                        total_cascade_penalty += batch_cascade_penalty
 
                 except StopIteration:
                     break
@@ -1813,10 +1817,12 @@ class ProgressivePatchTrainer:
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
                 avg_ssim_loss = total_ssim_loss / num_updates if num_updates > 0 else 0
+                avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 pbar.set_postfix({
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
                     'SSIMLoss': f"{avg_ssim_loss:.4f}",
+                    'Cascade': f"{avg_cascade_penalty:.4f}",
                     'Updates': num_updates
                 })
                 pbar.update(1)
