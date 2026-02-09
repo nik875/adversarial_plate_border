@@ -109,44 +109,32 @@ class LoRAConv2d(nn.Module):
         return result + lora_out
 
 
-def _wrap_module_conv_and_attention(module, prefix, lora_modules, r, lora_alpha):
-    """Recursively wrap Conv2d and attention Linear layers"""
-    for name, child in module.named_children():
-        full_name = f"{prefix}.{name}"
-
-        if isinstance(child, nn.Conv2d):
-            wrapped = LoRAConv2d(child, r, lora_alpha)
-            setattr(module, name, wrapped)
-            lora_modules[full_name] = wrapped
-        elif isinstance(child, nn.Linear) and any(x in name for x in ['to_q', 'to_k', 'to_v', 'to_out']):
-            wrapped = LoRALinear(child, r, lora_alpha)
-            setattr(module, name, wrapped)
-            lora_modules[full_name] = wrapped
-        elif len(list(child.children())) > 0:
-            _wrap_module_conv_and_attention(child, full_name, lora_modules, r, lora_alpha)
-
-
 def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
-    """Inject LoRA into VAE decoder Conv2d and attention Linear layers"""
+    """Inject LoRA into ALL Conv2d and attention Linear layers in VAE decoder"""
     lora_modules = {}
 
-    # Wrap conv_in and conv_out
-    if hasattr(vae.decoder, 'conv_in'):
-        vae.decoder.conv_in = LoRAConv2d(vae.decoder.conv_in, r, lora_alpha)
-        lora_modules['decoder.conv_in'] = vae.decoder.conv_in
+    # Recursively wrap all Conv2d and attention Linear layers in the entire decoder
+    def wrap_all_conv_and_attention(module, prefix):
+        """Recursively wrap Conv2d and attention Linear layers"""
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
 
-    if hasattr(vae.decoder, 'conv_out'):
-        vae.decoder.conv_out = LoRAConv2d(vae.decoder.conv_out, r, lora_alpha)
-        lora_modules['decoder.conv_out'] = vae.decoder.conv_out
+            if isinstance(child, nn.Conv2d):
+                # Wrap all Conv2d layers
+                wrapped = LoRAConv2d(child, r, lora_alpha)
+                setattr(module, name, wrapped)
+                lora_modules[full_name] = wrapped
+            elif isinstance(child, nn.Linear):
+                # Wrap all Linear layers (not just attention)
+                wrapped = LoRALinear(child, r, lora_alpha)
+                setattr(module, name, wrapped)
+                lora_modules[full_name] = wrapped
+            else:
+                # Recurse into child modules
+                wrap_all_conv_and_attention(child, full_name)
 
-    # Wrap mid_block
-    if hasattr(vae.decoder, 'mid_block'):
-        _wrap_module_conv_and_attention(vae.decoder.mid_block, 'decoder.mid_block', lora_modules, r, lora_alpha)
-
-    # Wrap up_blocks
-    if hasattr(vae.decoder, 'up_blocks'):
-        for i, up_block in enumerate(vae.decoder.up_blocks):
-            _wrap_module_conv_and_attention(up_block, f'decoder.up_blocks.{i}', lora_modules, r, lora_alpha)
+    # Start wrapping from decoder root
+    wrap_all_conv_and_attention(vae.decoder, 'decoder')
 
     return lora_modules
 
