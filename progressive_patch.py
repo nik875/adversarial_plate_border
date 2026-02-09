@@ -1957,7 +1957,7 @@ class ProgressivePatchTrainer:
             # If layer_idx specified, embed layer information into seeds
             if layer_idx is not None:
                 layer_indices = torch.full((num_samples,), layer_idx, dtype=torch.long, device=self.device)
-                z_samples = self.generator.embed_layer_info(z_samples, layer_indices)
+                z_samples = self.embed_layer_info(z_samples, layer_indices)
 
             sample_patches = self.generate_patches(z_samples)
 
