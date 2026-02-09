@@ -110,12 +110,16 @@ class LoRAConv2d(nn.Module):
 
 
 def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
-    """Inject LoRA into ALL Conv2d and attention Linear layers in VAE decoder"""
+    """Inject LoRA into ALL Conv2d and Linear layers in VAE decoder"""
     lora_modules = {}
 
-    # Recursively wrap all Conv2d and attention Linear layers in the entire decoder
+    # First, freeze ALL VAE decoder parameters
+    for param in vae.decoder.parameters():
+        param.requires_grad = False
+
+    # Recursively wrap all Conv2d and Linear layers in the entire decoder
     def wrap_all_conv_and_attention(module, prefix):
-        """Recursively wrap Conv2d and attention Linear layers"""
+        """Recursively wrap Conv2d and Linear layers"""
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
 
@@ -125,7 +129,7 @@ def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
                 setattr(module, name, wrapped)
                 lora_modules[full_name] = wrapped
             elif isinstance(child, nn.Linear):
-                # Wrap all Linear layers (not just attention)
+                # Wrap all Linear layers
                 wrapped = LoRALinear(child, r, lora_alpha)
                 setattr(module, name, wrapped)
                 lora_modules[full_name] = wrapped
