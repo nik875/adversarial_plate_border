@@ -1,0 +1,1 @@
+python progressive_patch.py --ocr-dataset roboflow_lpr,kaggle_lp,indian_plates_kaggle,mercosur --cascade-weight 0.25 --basis-dim 32 --ocr-patches-per-image 8 --ocr-images-per-batch 32 --tv-weight 15 --diversity-weight 0.2 --ssim-weight 1 --learning-rate 1e-4 --save-examples-every 10
