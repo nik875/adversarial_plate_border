@@ -1764,9 +1764,9 @@ class ProgressivePatchTrainer:
 
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
-                        # Combined diversity-quality loss
+                        # Combined diversity-quality loss (scaled by diversity_weight)
                         combined_diversity_quality_loss = diversity_score * quality_score
-                        total_loss = -(combined_diversity_quality_loss - cascade_penalty)
+                        total_loss = -(self.diversity_weight * combined_diversity_quality_loss - cascade_penalty)
 
                         # Stack patches for batch operations
                         patches_stacked = torch.stack(accumulated_patches, dim=0)
