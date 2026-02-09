@@ -1358,10 +1358,10 @@ class ProgressivePatchTrainer:
                 if sample_idx % 100 == 0:
                     print(f"  Profiling: {sample_idx}/{num_samples}")
 
-                # Get random sample
-                batch_idx = np.random.randint(0, len(self.train_loader))
-                batch = list(self.train_loader)[batch_idx]
-                batch_dict = {k: v[0] for k, v in batch.items()}
+                # Get random sample from training set
+                batch_idx = np.random.randint(0, len(self.train_loader.dataset))
+                batch_item = self.train_loader.dataset[batch_idx]
+                batch_dict = batch_item
 
                 # Run through model and capture activations for all layers
                 prep_image = batch_dict['prep_image'].unsqueeze(0).to(self.device)
