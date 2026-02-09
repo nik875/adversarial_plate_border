@@ -1935,7 +1935,7 @@ class ProgressivePatchTrainer:
             save_generator: Whether to save the generator model (default True). Set to False to save only sample patches.
             layer_idx: Target layer index (optional). If provided, includes in filename and generates samples with that layer embedding.
         """
-        Path(save_dir).mkdir(exist_ok=True)
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
 
         with torch.no_grad():
             # Save generator network (if requested)
