@@ -444,6 +444,10 @@ class FoundationPatchGenerator(nn.Module):
             torch_dtype=torch.float32
         )
 
+        # We only use the decoder, delete encoder to save memory
+        del self.vae.encoder
+        self.vae.encoder = None
+
         # LoRA configuration
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
@@ -452,10 +456,6 @@ class FoundationPatchGenerator(nn.Module):
         if self.use_vae_lora:
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
             self.vae_lora_modules = inject_lora_into_vae_decoder(self.vae, r=self.lora_rank, lora_alpha=self.lora_alpha)
-
-            # Freeze encoder and all base decoder weights (only LoRA weights trainable)
-            for param in self.vae.encoder.parameters():
-                param.requires_grad = False
 
             # Count LoRA trainable parameters
             vae_lora_params = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
