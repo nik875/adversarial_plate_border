@@ -190,9 +190,16 @@ class OCRDataset(Dataset):
         # Load all samples into memory
         print(f"Loading {dataset_name} ({split} split)...")
         self.samples = []
+        self.sample_metadata = []  # Track dataset source and index for each sample
         for img, text, meta in tqdm(iter_dataset(dataset_name, split, max_samples),
                                      desc=f"Loading {dataset_name}"):
             self.samples.append((img, text, meta))
+            # Store metadata for tracking: (dataset_name, sample_index, text_label)
+            self.sample_metadata.append({
+                'dataset': dataset_name,
+                'global_idx': len(self.samples) - 1,
+                'text': text
+            })
 
         print(f"Loaded {len(self.samples)} samples from {dataset_name} ({split})")
 
@@ -783,6 +790,14 @@ class ProgressivePatchTrainer:
             generator=torch.Generator().manual_seed(42)
         )
 
+        # Save train/val split mapping to CSV (immediately)
+        self._save_train_val_split(
+            full_dataset,
+            train_dataset,
+            val_dataset,
+            datasets_to_combine
+        )
+
         # Create dataloaders
         self.train_loader = DataLoader(
             train_dataset,
@@ -861,6 +876,60 @@ class ProgressivePatchTrainer:
 
         # Calculate baseline activations for diversity computation
         self.calculate_baseline_activations()
+
+    def _save_train_val_split(self, full_dataset, train_dataset, val_dataset, datasets_list):
+        """
+        Save train/val split mapping to CSV file for tracking which images are used.
+
+        Args:
+            full_dataset: Combined dataset (ConcatDataset or single dataset)
+            train_dataset: Training subset (result of random_split)
+            val_dataset: Validation subset (result of random_split)
+            datasets_list: List of OCRDataset objects that were combined
+        """
+        import csv
+        from datetime import datetime
+
+        # Get indices from the random_split
+        train_indices = set(train_dataset.indices) if hasattr(train_dataset, 'indices') else set()
+        val_indices = set(val_dataset.indices) if hasattr(val_dataset, 'indices') else set()
+
+        # Build metadata for all samples
+        split_data = []
+
+        for idx in range(len(full_dataset)):
+            # Determine which split this index belongs to
+            if idx in train_indices:
+                split_type = 'train'
+            elif idx in val_indices:
+                split_type = 'val'
+            else:
+                split_type = 'unknown'
+
+            # Get sample information
+            sample = full_dataset[idx]
+            text = sample.get('text', '')
+            dataset_name = sample.get('dataset', 'unknown')
+
+            split_data.append({
+                'index': idx,
+                'split': split_type,
+                'dataset': dataset_name,
+                'text': text
+            })
+
+        # Save to CSV
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_filename = f'train_val_split_{timestamp}.csv'
+
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['index', 'split', 'dataset', 'text'])
+            writer.writeheader()
+            writer.writerows(split_data)
+
+        print(f"\nTrain/Val split mapping saved to: {csv_filename}")
+        print(f"  Train samples: {len(train_indices)}")
+        print(f"  Val samples: {len(val_indices)}")
 
     def setup_activation_hook(self, layer_name: Optional[str] = None):
         """
