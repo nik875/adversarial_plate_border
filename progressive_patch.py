@@ -1599,6 +1599,7 @@ class ProgressivePatchTrainer:
         # Calculate number of batches
         import math
         num_batches = math.ceil(num_images / images_per_batch)
+        print(f"  Train epoch {epoch}: {num_images} images / {images_per_batch} per batch = {num_batches} batches")
 
         desc = f"Epoch {epoch} - Training"
 
