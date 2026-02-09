@@ -59,14 +59,15 @@ class LoRALinear(nn.Module):
     """Linear layer with LoRA adaptation"""
     def __init__(self, linear_layer: nn.Linear, r: int = 8, lora_alpha: int = 16):
         super().__init__()
-        self.base_layer = linear_layer
         self.r = r
         self.lora_alpha = lora_alpha
 
-        # Freeze base
-        self.base_layer.weight.requires_grad = False
-        if self.base_layer.bias is not None:
-            self.base_layer.bias.requires_grad = False
+        # Store base weights as buffers (not as submodule to avoid parameter registration)
+        self.register_buffer('weight', linear_layer.weight.detach())
+        if linear_layer.bias is not None:
+            self.register_buffer('bias', linear_layer.bias.detach())
+        else:
+            self.register_buffer('bias', None)
 
         # LoRA matrices
         self.lora_A = nn.Parameter(torch.zeros(r, linear_layer.in_features))
@@ -77,7 +78,7 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = F.linear(x, self.base_layer.weight, self.base_layer.bias)
+        result = F.linear(x, self.weight, self.bias)
         lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
         return result + lora_out
 
@@ -86,14 +87,19 @@ class LoRAConv2d(nn.Module):
     """Conv2d with LoRA using 1×1 convolutions"""
     def __init__(self, conv_layer: nn.Conv2d, r: int = 8, lora_alpha: int = 16):
         super().__init__()
-        self.base_layer = conv_layer
         self.r = r
         self.lora_alpha = lora_alpha
+        self.padding = conv_layer.padding
+        self.stride = conv_layer.stride
+        self.dilation = conv_layer.dilation
+        self.groups = conv_layer.groups
 
-        # Freeze base
-        self.base_layer.weight.requires_grad = False
-        if self.base_layer.bias is not None:
-            self.base_layer.bias.requires_grad = False
+        # Store base weights as buffers (not as submodule to avoid parameter registration)
+        self.register_buffer('weight', conv_layer.weight.detach())
+        if conv_layer.bias is not None:
+            self.register_buffer('bias', conv_layer.bias.detach())
+        else:
+            self.register_buffer('bias', None)
 
         # LoRA 1×1 convs
         self.lora_down = nn.Conv2d(conv_layer.in_channels, r, kernel_size=1, bias=False)
@@ -104,22 +110,19 @@ class LoRAConv2d(nn.Module):
         nn.init.zeros_(self.lora_up.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = self.base_layer(x)
+        result = F.conv2d(x, self.weight, self.bias, stride=self.stride, padding=self.padding,
+                         dilation=self.dilation, groups=self.groups)
         lora_out = self.lora_up(self.lora_down(x)) * self.scaling
         return result + lora_out
 
 
 def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
-    """Inject LoRA into ALL Conv2d and Linear layers in VAE decoder"""
+    """Inject LoRA into ALL Conv2d and attention Linear layers in VAE decoder"""
     lora_modules = {}
 
-    # First, freeze ALL VAE decoder parameters
-    for param in vae.decoder.parameters():
-        param.requires_grad = False
-
-    # Recursively wrap all Conv2d and Linear layers in the entire decoder
+    # Recursively wrap all Conv2d and attention Linear layers in the entire decoder
     def wrap_all_conv_and_attention(module, prefix):
-        """Recursively wrap Conv2d and Linear layers"""
+        """Recursively wrap Conv2d and attention Linear layers"""
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
 
@@ -129,7 +132,7 @@ def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16):
                 setattr(module, name, wrapped)
                 lora_modules[full_name] = wrapped
             elif isinstance(child, nn.Linear):
-                # Wrap all Linear layers
+                # Wrap all Linear layers (not just attention)
                 wrapped = LoRALinear(child, r, lora_alpha)
                 setattr(module, name, wrapped)
                 lora_modules[full_name] = wrapped
