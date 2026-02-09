@@ -1945,7 +1945,8 @@ class ProgressivePatchTrainer:
             # Create filename based on whether layer is specified
             if layer_idx is not None:
                 layer_name = self.layer_configs[layer_idx].description.replace(" ", "_") if layer_idx < len(self.layer_configs) else f"layer_{layer_idx}"
-                filename_template = f"sample_{{i}}_layer{layer_idx}_{layer_name}_epoch_{epoch:04d}.png"
+                # Very clear filename: [TARGET_LAYER_X] [LayerName] sample_[NUM].png
+                filename_template = f"[TARGET_LAYER_{layer_idx}]_{layer_name}__sample_{{i}}.png"
             else:
                 filename_template = f"sample_{{i}}_epoch_{epoch:04d}.png"
 
