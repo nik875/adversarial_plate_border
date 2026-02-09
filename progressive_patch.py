@@ -712,6 +712,9 @@ class ProgressivePatchTrainer:
         else:
             full_dataset = datasets_to_combine[0]
 
+        # Store for later use in train()
+        self.full_dataset = full_dataset
+
         # Split into train (80%) and val (20%)
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
