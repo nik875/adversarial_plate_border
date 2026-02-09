@@ -453,12 +453,15 @@ class FoundationPatchGenerator(nn.Module):
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
             self.vae_lora_modules = inject_lora_into_vae_decoder(self.vae, r=self.lora_rank, lora_alpha=self.lora_alpha)
 
-            vae_base_params = sum(p.numel() for p in self.vae.parameters() if not p.requires_grad)
+            # Count LoRA trainable parameters
             vae_lora_params = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
+            # Count base weights stored as buffers (frozen)
+            vae_base_params = sum(b.numel() for b in self.vae.buffers())
             print(f"  LoRA injected into {len(self.vae_lora_modules)} modules")
             print(f"  VAE base (frozen): {vae_base_params:,}")
             print(f"  VAE LoRA (trainable): {vae_lora_params:,}")
-            print(f"  Reduction: {100 * (1 - vae_lora_params / vae_base_params):.2f}%")
+            if vae_base_params > 0:
+                print(f"  Reduction: {100 * (1 - vae_lora_params / vae_base_params):.2f}%")
         else:
             print("VAE full fine-tuning enabled")
             self.vae_lora_modules = None
