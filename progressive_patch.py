@@ -758,6 +758,7 @@ class ProgressivePatchTrainer:
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
                  use_bottleneck_refiner: bool = False,
+                 target_layer: Optional[str] = None,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
@@ -788,6 +789,23 @@ class ProgressivePatchTrainer:
         # (No longer using progressive layer-by-layer training)
         self.layer_configs = layer_configs or get_ocr_layer_progression()
         self.num_layers = len(self.layer_configs)
+
+        # Parse target layers if specified
+        self.target_layer_indices = None
+        if target_layer is not None:
+            try:
+                layer_indices = [int(x.strip()) for x in target_layer.split(',')]
+                # Validate indices
+                invalid_indices = [idx for idx in layer_indices if idx < 0 or idx >= self.num_layers]
+                if invalid_indices:
+                    raise ValueError(
+                        f"Invalid layer indices: {invalid_indices}. Valid range: 0-{self.num_layers-1}"
+                    )
+                self.target_layer_indices = layer_indices
+                layer_names = [self.layer_configs[idx].description for idx in layer_indices]
+                print(f"Target layers specified: {layer_indices} ({', '.join(layer_names)})")
+            except ValueError as e:
+                raise ValueError(f"Error parsing --target-layer: {str(e)}")
 
         self.current_layer_epoch = 0
         self.layer_history = []  # Track training history for each layer
@@ -1791,7 +1809,11 @@ class ProgressivePatchTrainer:
 
                         # Sample random target layer for this image
                         if target_layer_idx is None:
-                            sampled_layer_idx = np.random.randint(0, len(self.layer_configs))
+                            # Use specified target layers if available, otherwise sample from all
+                            if self.target_layer_indices is not None:
+                                sampled_layer_idx = np.random.choice(self.target_layer_indices)
+                            else:
+                                sampled_layer_idx = np.random.randint(0, len(self.layer_configs))
                         else:
                             sampled_layer_idx = target_layer_idx
 
@@ -2406,6 +2428,11 @@ def main():
                         help='LoRA rank (default: 8)')
     parser.add_argument('--lora-alpha', type=int, default=16,
                         help='LoRA alpha (default: 16)')
+    parser.add_argument('--target-layer', type=str, default=None,
+                        help='Comma-separated list of target layer indices to train on (default: all layers). '
+                        'Example: --target-layer "0,5,10" trains only on layers 0, 5, and 10. '
+                        'Layer indices: 0=Conv1, 1=Conv2, 2=Conv3, 3=Conv4, 4=Conv5, '
+                        '5=PatchExtractor, 6-9=TransformerBlocks, 10=FinalOutput')
     args = parser.parse_args()
 
     # Validate dataset argument
@@ -2449,6 +2476,7 @@ def main():
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
         'use_bottleneck_refiner': args.use_bottleneck_refiner,
+        'target_layer': args.target_layer,
         'save_examples_every': args.save_examples_every
     }
 
