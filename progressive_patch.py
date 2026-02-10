@@ -517,7 +517,7 @@ class BottleneckDenseRefiner(nn.Module):
         # This keeps original patch structure but allows aggressive refinement
         # refined is already in [-1, 1] from tanh in expand module
         # Sigmoid ensures smooth gradient flow (unlike clamping which creates dead zones)
-        refined_patches = torch.sigmoid(patches + 0.8 * refined)
+        refined_patches = torch.sigmoid(patches + 1.0 * refined)
 
         return refined_patches
 
