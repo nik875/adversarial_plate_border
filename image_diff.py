@@ -89,7 +89,10 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
     zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
 
-    overlay = (img1.astype(np.float32) * 0.6 + zone_colored * 0.4).astype(np.uint8)
+    # Zero out red channel in background image
+    img1_no_red = img1.astype(np.float32).copy()
+    img1_no_red[:, :, 0] = 0
+    overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
     axes[1, 1].axis('off')
@@ -172,7 +175,10 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
     zone_norm = np.clip(zone_heatmap / np.max(zone_heatmap), 0, 1)
     zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
     zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
-    overlay = (img1.astype(np.float32) * 0.6 + zone_colored * 0.4).astype(np.uint8)
+    # Zero out red channel in background image
+    img1_no_red = img1.astype(np.float32).copy()
+    img1_no_red[:, :, 0] = 0
+    overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
     axes[1, 1].axis('off')
