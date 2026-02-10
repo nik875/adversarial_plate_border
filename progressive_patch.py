@@ -2190,6 +2190,13 @@ class ProgressivePatchTrainer:
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
                 print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,}")
 
+            # Bottleneck refiner (optional, only if enabled)
+            if self.use_bottleneck_refiner and hasattr(self.generator, 'bottleneck_refiner') and self.generator.bottleneck_refiner is not None:
+                module = self.generator.bottleneck_refiner
+                params = list(module.parameters())
+                trainable_params.append({'params': params, 'lr': learning_rate, 'name': 'bottleneck_refiner'})
+                print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,}")
+
             # Print total trainable parameters
             total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
             print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
