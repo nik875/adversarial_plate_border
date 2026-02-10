@@ -1855,7 +1855,7 @@ class ProgressivePatchTrainer:
 
             return activations_dict
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer, epoch: int, target_layer_idx: Optional[int] = None) -> Tuple[float, float, float]:
+    def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LambdaLR, epoch: int, target_layer_idx: Optional[int] = None) -> Tuple[float, float, float]:
         """Train for one epoch with random layer sampling and cascade penalty.
 
         For each image, samples a random target layer and trains patches to:
@@ -2094,6 +2094,7 @@ class ProgressivePatchTrainer:
                     if batch_count > 0:
                         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                         optimizer.step()
+                        scheduler.step()  # Step-based learning rate scheduling (per batch)
                         optimizer.zero_grad()
                         num_updates += 1
 
@@ -2257,10 +2258,12 @@ class ProgressivePatchTrainer:
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/{filename_template.format(i=i)}")
 
-    def _create_cosine_scheduler(self, optimizer, vae_lr, custom_lr, lr_min, max_epochs):
+    def _create_cosine_scheduler(self, optimizer, vae_lr, custom_lr, lr_min, max_epochs, total_steps):
         """
         Create a cosine annealing scheduler that handles different initial learning rates
         for VAE and custom layers, both decaying to the same minimum learning rate.
+
+        Uses step-based scheduling (updates after each batch) for smoother learning rate decay.
 
         Args:
             optimizer: PyTorch optimizer with parameter groups
@@ -2268,15 +2271,16 @@ class ProgressivePatchTrainer:
             custom_lr: Initial learning rate for custom layers
             lr_min: Minimum learning rate (same for all groups)
             max_epochs: Maximum number of epochs for scheduling
+            total_steps: Total number of training steps (batches) across all epochs
 
         Returns:
-            Scheduler that applies cosine annealing to each group independently
+            Scheduler that applies cosine annealing to each group independently, updated per step
         """
         import math
 
-        def cosine_decay(initial_lr, epoch):
-            """Cosine annealing from initial_lr to lr_min"""
-            return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * epoch / max_epochs)) / 2) / initial_lr
+        def cosine_decay(initial_lr, step):
+            """Cosine annealing from initial_lr to lr_min, based on step count"""
+            return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * step / total_steps)) / 2) / initial_lr
 
         # Create lambda functions for each parameter group
         # Group 0: VAE (or all params if simple generator)
@@ -2284,9 +2288,9 @@ class ProgressivePatchTrainer:
         lambda_funcs = []
         for group in optimizer.param_groups:
             if group['name'] in ['vae_lora', 'vae_full']:
-                lambda_funcs.append(lambda epoch, lr=vae_lr: cosine_decay(lr, epoch))
+                lambda_funcs.append(lambda step, lr=vae_lr: cosine_decay(lr, step))
             else:
-                lambda_funcs.append(lambda epoch, lr=custom_lr: cosine_decay(lr, epoch))
+                lambda_funcs.append(lambda step, lr=custom_lr: cosine_decay(lr, step))
 
         return optim.lr_scheduler.LambdaLR(optimizer, lambda_funcs)
 
@@ -2373,14 +2377,23 @@ class ProgressivePatchTrainer:
 
             optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
 
+        # Calculate total training steps for step-based scheduling
+        num_images = len(self.train_loader)
+        batches_per_epoch = num_images // self.ocr_images_per_batch
+        if num_images % self.ocr_images_per_batch != 0:
+            batches_per_epoch += 1
+        total_steps = max_epochs * batches_per_epoch
+        print(f"Step-based scheduling: {batches_per_epoch} batches/epoch × {max_epochs} epochs = {total_steps} total steps")
+
         # Create custom cosine annealing scheduler that handles different initial LRs
-        # Both VAE and custom layers decay to the same lr_min
+        # Both VAE and custom layers decay to the same lr_min via step-based scheduling
         scheduler = self._create_cosine_scheduler(
             optimizer,
             vae_learning_rate,
             learning_rate,
             lr_min,
-            max_epochs
+            max_epochs,
+            total_steps
         )
 
         # Training history
@@ -2426,11 +2439,8 @@ class ProgressivePatchTrainer:
         for epoch in range(1, max_epochs + 1):
             current_lr = optimizer.param_groups[0]['lr']
 
-            # Training
-            train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, epoch, target_layer_idx=None)
-
-            # Learning rate scheduling
-            scheduler.step()
+            # Training (scheduler.step() is called per batch inside train_epoch)
+            train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
 
             # Record history
             history['epoch'].append(epoch)
