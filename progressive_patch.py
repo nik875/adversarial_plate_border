@@ -460,13 +460,28 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
-        # Learnable combination of original patch and refined patch
-        # Concatenates both along channel axis, then learns optimal combination via 1x1 conv
-        self.combine_conv = nn.Sequential(
-            nn.Conv2d(6, 32, kernel_size=1),  # 6 channels (3 original + 3 refined) → 32
+        # Spatial propagation layers (same padding to preserve size)
+        # Process concatenated patches/refined to propagate information spatially
+        self.spatial_layers = nn.Sequential(
+            nn.Conv2d(6, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 3, kernel_size=1),  # 32 → 3 channels (RGB output)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
         )
+
+        # Multi-scale regional decomposition
+        # Different scales capture different contextual information
+        self.scales = [8, 16, 32, 64]  # Patch sizes
+        self.scale_convs = nn.ModuleDict()
+        for scale in self.scales:
+            # Each scale gets its own 1x1 conv to compress 32 → 3 channels
+            self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
+
+        # Learnable weights for combining multi-scale outputs
+        # Softmax is applied during forward pass for normalized weighting
+        self.scale_weights = nn.Parameter(torch.ones(len(self.scales)))
 
         # Initialize weights
         for m in self.modules():
@@ -521,17 +536,69 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
-        # Concatenate original and refined patches along channel axis
-        # Let the learnable 1x1 conv learn the optimal combination
+        # Multi-scale regional decomposition
+        # Concatenate original and refined patches
         combined = torch.cat([patches, refined], dim=1)  # [B, 6, H, W]
 
-        # Process through learnable combination convolution
-        combined_output = self.combine_conv(combined)  # [B, 3, H, W]
+        # Spatial propagation: propagate information without changing size
+        spatial_features = self.spatial_layers(combined)  # [B, 32, H, W]
+
+        # Process at multiple scales
+        scale_outputs = []
+        weights = torch.softmax(self.scale_weights, dim=0)  # Normalize weights
+
+        for scale_idx, scale in enumerate(self.scales):
+            # Extract spatial patches of this scale
+            scale_output = self._process_scale(spatial_features, scale, batch_size)
+            scale_outputs.append(scale_output)
+
+        # Weighted average of all scales
+        refined_patches = torch.zeros_like(patches)  # [B, 3, H, W]
+        for scale_idx, scale_output in enumerate(scale_outputs):
+            refined_patches = refined_patches + weights[scale_idx] * scale_output
 
         # Apply sigmoid to bound to [0, 1]
-        refined_patches = torch.sigmoid(combined_output)
+        refined_patches = torch.sigmoid(refined_patches)
 
         return refined_patches
+
+    def _process_scale(self, spatial_features: torch.Tensor, scale: int, batch_size: int) -> torch.Tensor:
+        """
+        Process features at a specific scale.
+
+        Args:
+            spatial_features: [B, 32, H, W] propagated features
+            scale: Patch size (8, 16, 32, or 64)
+            batch_size: Batch size
+
+        Returns:
+            output: [B, 3, H, W] refined patch at this scale
+        """
+        B, C, H, W = spatial_features.shape
+        device = spatial_features.device
+
+        # Calculate patch grid dimensions
+        num_patches_h = H // scale
+        num_patches_w = W // scale
+
+        # Unfold into patches: [B, C, num_patches_h, scale, num_patches_w, scale]
+        patches = spatial_features.unfold(2, scale, scale).unfold(3, scale, scale)
+        # Reshape to [B, C, num_patches_h, num_patches_w, scale, scale]
+        patches = patches.permute(0, 1, 2, 4, 3, 5).contiguous()
+        # Reshape to [B*num_patches_h*num_patches_w, C, scale, scale]
+        num_total_patches = num_patches_h * num_patches_w
+        patches = patches.view(B * num_total_patches, C, scale, scale)
+
+        # Apply scale-specific 1x1 conv to compress to 3 channels
+        conv_layer = self.scale_convs[str(scale)]
+        patch_output = conv_layer(patches)  # [B*num_patches, 3, scale, scale]
+
+        # Reshape back to full image
+        patch_output = patch_output.view(B, num_patches_h, num_patches_w, 3, scale, scale)
+        patch_output = patch_output.permute(0, 3, 1, 4, 2, 5).contiguous()
+        patch_output = patch_output.view(B, 3, H, W)
+
+        return patch_output
 
 
 class FoundationPatchGenerator(nn.Module):
