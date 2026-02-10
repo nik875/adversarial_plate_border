@@ -457,6 +457,7 @@ class BottleneckDenseRefiner(nn.Module):
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4, padding=0),  # 8x16 → 64x128
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(32, 3, kernel_size=4, stride=4, padding=0),  # 64x128 → 256x512
+            nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
         # Initialize weights
@@ -514,8 +515,9 @@ class BottleneckDenseRefiner(nn.Module):
 
         # Residual connection with learnable weight, then sigmoid for smooth bounding
         # This keeps original patch structure but allows aggressive refinement
+        # refined is already in [-1, 1] from tanh in expand module
         # Sigmoid ensures smooth gradient flow (unlike clamping which creates dead zones)
-        refined_patches = torch.sigmoid(patches + 0.8 * torch.tanh(refined))
+        refined_patches = torch.sigmoid(patches + 0.8 * refined)
 
         return refined_patches
 
