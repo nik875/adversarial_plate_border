@@ -620,6 +620,7 @@ class ProgressivePatchTrainer:
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
+                 diversity_exponent: float = 1.0,
                  tv_weight: float = 2.5,
                  ssim_weight: float = 1.0,
                  cascade_weight: float = 0.25,
@@ -635,6 +636,7 @@ class ProgressivePatchTrainer:
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
+        self.diversity_exponent = diversity_exponent
         self.tv_weight = tv_weight
         self.ssim_weight = ssim_weight
         self.cascade_weight = cascade_weight
@@ -1793,7 +1795,9 @@ class ProgressivePatchTrainer:
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
                         # Combined diversity-quality loss (scaled by diversity_weight)
-                        combined_diversity_quality_loss = diversity_score * quality_score
+                        # Apply exponential emphasis to diversity component if specified
+                        diversity_score_emphasized = diversity_score ** self.diversity_exponent
+                        combined_diversity_quality_loss = diversity_score_emphasized * quality_score
                         total_loss = -(self.diversity_weight * combined_diversity_quality_loss - cascade_penalty)
 
                         # Stack patches for batch operations
@@ -2201,6 +2205,10 @@ def main():
                         help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity loss (default: 1.0)')
+    parser.add_argument('--diversity-exponent', type=float, default=1.0,
+                        help='Exponential emphasis on diversity component (default: 1.0 = no emphasis). '
+                        'Values > 1.0 emphasize high diversity more (e.g., 2.0 squares diversity). '
+                        'Values < 1.0 compress diversity scores (e.g., 0.5 takes sqrt).')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--ssim-weight', type=float, default=1.0,
@@ -2282,6 +2290,7 @@ def main():
         'grad_accumulate': 16,  # Default gradient accumulation steps
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
+        'diversity_exponent': args.diversity_exponent,
         'tv_weight': args.tv_weight,
         'ssim_weight': args.ssim_weight,
         'cascade_weight': args.cascade_weight,
