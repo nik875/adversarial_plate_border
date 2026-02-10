@@ -337,7 +337,7 @@ class SimplePatchGenerator(nn.Module):
         # Layer embedding layer: embeds target layer information into the seed
         self.layer_embedding = nn.Sequential(
             nn.Linear(latent_dim + num_layers, 256),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(256, latent_dim),
             nn.Sigmoid()  # Constrain output to [0, 1]
         )
@@ -353,7 +353,7 @@ class SimplePatchGenerator(nn.Module):
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.SiLU(inplace=True))
             prev_dim = hidden_dim
 
         # Output layer
@@ -429,9 +429,9 @@ class BottleneckDenseRefiner(nn.Module):
         # Compress spatial dimensions with strided convolutions
         self.compress = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, stride=4, padding=1),  # 256x512 → 64x128
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 64x128 → 32x64
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
         )
 
         # Global context and dense processing
@@ -443,19 +443,19 @@ class BottleneckDenseRefiner(nn.Module):
         # Bottleneck size: 128 * 4 * 8 = 4096
         self.dense = nn.Sequential(
             nn.Linear(4096, 512),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(256, 4096),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
         )
 
         # Expand back to full spatial resolution
         self.expand = nn.Sequential(
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 4x8 → 8x16
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4, padding=0),  # 8x16 → 64x128
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.ConvTranspose2d(32, 3, kernel_size=4, stride=4, padding=0),  # 64x128 → 256x512
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
@@ -464,9 +464,9 @@ class BottleneckDenseRefiner(nn.Module):
         # Progressively larger kernels (3 → 7 → 9) to smooth the output
         self.post_expansion_smooth = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),  # kernel 3, maintain size
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
         )
 
@@ -474,11 +474,11 @@ class BottleneckDenseRefiner(nn.Module):
         # Process concatenated patches/refined to propagate information spatially
         self.spatial_layers = nn.Sequential(
             nn.Conv2d(6, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
         )
 
         # Multi-scale regional decomposition
@@ -631,7 +631,7 @@ class FoundationPatchGenerator(nn.Module):
         # Uses sigmoid to constrain output to [0, 1] for better search space conditioning
         self.layer_embedding = nn.Sequential(
             nn.Linear(latent_dim + num_layers, 256),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(256, latent_dim),
             nn.Sigmoid()  # Constrain output to [0, 1]
         )
@@ -694,7 +694,7 @@ class FoundationPatchGenerator(nn.Module):
         # This provides a learned modulation that influences the CNN refiner and patch projector
         self.skip_projection = nn.Sequential(
             nn.Linear(latent_dim, 64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Linear(64, 1),
             nn.Sigmoid()  # Keep scaling factor in [0, 1] for stability
         )
@@ -706,26 +706,26 @@ class FoundationPatchGenerator(nn.Module):
             # Block 1
             nn.Conv2d(4, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
 
             # Block 2
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.GroupNorm(8, 128),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.GroupNorm(8, 128),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
 
             # Block 3
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
         )
 
         # Initialize CNN weights
@@ -740,7 +740,7 @@ class FoundationPatchGenerator(nn.Module):
         # Output: 3 RGB channels
         self.patch_projector = nn.Sequential(
             nn.Conv2d(65, 32, kernel_size=1),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(32, 3, kernel_size=1),
             nn.Sigmoid()  # Ensure output is in [0, 1]
         )
