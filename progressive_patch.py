@@ -420,11 +420,12 @@ class BottleneckDenseRefiner(nn.Module):
     256x512x3 → Conv stride 4 → 64x128x64 → Conv stride 2 → 64x128x128
     → GlobalAvgPool → Dense layers → Upsample back to 256x512x3
     """
-    def __init__(self, patch_height: int = 256, patch_width: int = 512):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512, use_residual: bool = True):
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
+        self.use_residual = use_residual
 
         # Compress spatial dimensions with strided convolutions
         self.compress = nn.Sequential(
@@ -514,10 +515,14 @@ class BottleneckDenseRefiner(nn.Module):
             )
 
         # Residual connection with learnable weight, then sigmoid for smooth bounding
-        # This keeps original patch structure but allows aggressive refinement
         # refined is already in [-1, 1] from tanh in expand module
         # Sigmoid ensures smooth gradient flow (unlike clamping which creates dead zones)
-        refined_patches = torch.sigmoid(patches + 1.0 * refined)
+        if self.use_residual:
+            # Keep original patch structure but allow aggressive refinement (default)
+            refined_patches = torch.sigmoid(patches + 1.0 * refined)
+        else:
+            # Use refiner output directly, replacing VAE output completely
+            refined_patches = torch.sigmoid(refined)
 
         return refined_patches
 
@@ -526,7 +531,7 @@ class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11,
                  use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16,
-                 use_bottleneck_refiner: bool = False):
+                 use_bottleneck_refiner: bool = False, dense_refiner_residual: bool = True):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -663,8 +668,9 @@ class FoundationPatchGenerator(nn.Module):
         # Optional: bottleneck dense refiner for final refinement
         self.use_bottleneck_refiner = use_bottleneck_refiner
         if use_bottleneck_refiner:
-            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width)
-            print(f"Bottleneck dense refiner enabled for final patch refinement")
+            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, use_residual=dense_refiner_residual)
+            residual_mode = "residual (adds to VAE output)" if dense_refiner_residual else "direct (replaces VAE output)"
+            print(f"Bottleneck dense refiner enabled for final patch refinement ({residual_mode})")
         else:
             self.bottleneck_refiner = None
 
@@ -761,6 +767,7 @@ class ProgressivePatchTrainer:
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
                  use_bottleneck_refiner: bool = False,
+                 dense_refiner_residual: bool = True,
                  target_layer: Optional[str] = None,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
@@ -777,6 +784,7 @@ class ProgressivePatchTrainer:
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.use_bottleneck_refiner = use_bottleneck_refiner
+        self.dense_refiner_residual = dense_refiner_residual
 
         # Require ocr_patches_per_image
         if ocr_patches_per_image is None:
@@ -924,7 +932,8 @@ class ProgressivePatchTrainer:
                 use_vae_lora=use_vae_lora,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
-                use_bottleneck_refiner=use_bottleneck_refiner
+                use_bottleneck_refiner=use_bottleneck_refiner,
+                dense_refiner_residual=dense_refiner_residual
             ).to(self.device)
 
         # Activation capture for diversity metric
@@ -2429,6 +2438,11 @@ def main():
                         'Architecture: Spatial compress (stride 4,2) → Dense bottleneck → Spatial expand. '
                         'Parameters: ~50-100K (vs 300M+ for full dense). '
                         'Benefits: Dense processing of patch features with minimal parameters through spatial reduction.')
+    parser.add_argument('--no-dense-refiner-residual', action='store_true',
+                        help='Disable residual connection in dense refiner (only with --use-bottleneck-refiner). '
+                        'Default: patches + refiner_output (residual, preserves VAE structure). '
+                        'With flag: refiner_output only (direct replacement of VAE output). '
+                        'Use when you want the refiner to completely replace the VAE patch.')
     parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
@@ -2506,6 +2520,7 @@ def main():
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
         'use_bottleneck_refiner': args.use_bottleneck_refiner,
+        'dense_refiner_residual': not args.no_dense_refiner_residual,
         'target_layer': args.target_layer,
         'save_examples_every': args.save_examples_every
     }
