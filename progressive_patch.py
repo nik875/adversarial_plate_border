@@ -516,6 +516,9 @@ class BottleneckDenseRefiner(nn.Module):
         # This keeps the original patch structure but allows refinement
         refined_patches = patches + 0.8 * torch.tanh(refined)  # Stronger refinement weight
 
+        # Clamp to valid image space [0, 1]
+        refined_patches = torch.clamp(refined_patches, 0.0, 1.0)
+
         return refined_patches
 
 
