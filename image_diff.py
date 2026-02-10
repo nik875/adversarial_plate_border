@@ -111,17 +111,24 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     axes[1, 0].axis('off')
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    # Zone overlay on first image - use only red channel for differences
-    zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
-    zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
-    zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
+    # Greyscale with red highlighting for top 25% threshold
+    grey = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+    grey_rgb = np.stack([grey, grey, grey], axis=2).astype(np.float32)
 
-    # Zero out red channel in background image and darken the masked region
-    img1_no_red = img1.astype(np.float32).copy()
-    img1_no_red[:, :, 0] = 0
-    # Darken the center masked region
-    img1_no_red = img1_no_red * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
-    overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
+    # Calculate 75th percentile threshold (top 25%)
+    threshold = np.percentile(zone_heatmap, 75)
+
+    # Normalize heatmap for red intensity
+    zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
+
+    # Apply mask darkening to greyscale
+    grey_rgb = grey_rgb * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+
+    # Set red channel for high difference areas
+    high_diff_mask = zone_heatmap > threshold
+    grey_rgb[high_diff_mask, 0] = zone_norm[high_diff_mask] * 255
+
+    overlay = grey_rgb.astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
     axes[1, 1].axis('off')
@@ -204,16 +211,24 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
     axes[1, 0].axis('off')
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    # Zone overlay - use only red channel for differences
+    # Greyscale with red highlighting for top 25% threshold
+    grey = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
+    grey_rgb = np.stack([grey, grey, grey], axis=2).astype(np.float32)
+
+    # Calculate 75th percentile threshold (top 25%)
+    threshold = np.percentile(zone_heatmap, 75)
+
+    # Normalize heatmap for red intensity
     zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
-    zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
-    zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
-    # Zero out red channel in background image and darken the masked region
-    img1_no_red = img1.astype(np.float32).copy()
-    img1_no_red[:, :, 0] = 0
-    # Darken the center masked region
-    img1_no_red = img1_no_red * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
-    overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
+
+    # Apply mask darkening to greyscale
+    grey_rgb = grey_rgb * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+
+    # Set red channel for high difference areas
+    high_diff_mask = zone_heatmap > threshold
+    grey_rgb[high_diff_mask, 0] = zone_norm[high_diff_mask] * 255
+
+    overlay = grey_rgb.astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
     axes[1, 1].axis('off')
