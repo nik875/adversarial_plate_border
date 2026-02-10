@@ -940,12 +940,37 @@ class ProgressivePatchTrainer:
         self.epoch_stats = []
 
     def load_ocr_model(self):
-        """Load OCR model for diversity computation only"""
+        """Load OCR model for diversity computation only. Auto-initializes if missing."""
         print("Loading OCR model for diversity computation...")
         ocr_path = Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
         if not ocr_path.exists():
-            raise FileNotFoundError(f"OCR model not found at: {ocr_path}")
+            print(f"⚠️  OCR model not found at: {ocr_path}")
+            print(f"📥 Auto-initializing OCR model (downloading models)...")
+            try:
+                # Import and run init_alpr.py logic to download models
+                import sys
+                current_dir = Path(__file__).parent
+                sys.path.insert(0, str(current_dir))
+                from fast_alpr import ALPR
+                # Creating ALPR triggers model downloads
+                alpr = ALPR(
+                    detector_model="yolo-v9-t-384-license-plate-end2end",
+                    ocr_model="cct-xs-v1-global-model",
+                )
+                print(f"✓ OCR model downloaded successfully")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to auto-initialize OCR model: {str(e)}\n"
+                    f"Please ensure fast_alpr is installed: pip install fast-alpr"
+                )
+
+        # Verify model exists after initialization attempt
+        if not ocr_path.exists():
+            raise FileNotFoundError(
+                f"OCR model still not found at: {ocr_path}\n"
+                f"Try manually running: python init_alpr.py"
+            )
 
         ocr_model = onnx.load(str(ocr_path))
         self.ocr_input_shape = (64, 128, 3)
