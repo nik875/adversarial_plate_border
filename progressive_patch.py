@@ -2551,6 +2551,9 @@ def main():
     parser.add_argument('--lr-min', type=float, default=1e-5,
                         help='Minimum learning rate for cosine annealing (default: 1e-5). '
                         'Both VAE and custom layers decay to this value.')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of epochs to train for (default: 50). '
+                        'Learning rate decays over this many epochs via cosine annealing.')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2652,7 +2655,8 @@ def main():
         history = trainer.train(
             learning_rate=args.learning_rate,
             vae_learning_rate=args.vae_learning_rate,
-            lr_min=args.lr_min
+            lr_min=args.lr_min,
+            max_epochs=args.epochs
         )
 
         # Save training history as CSV
