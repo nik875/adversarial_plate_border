@@ -512,12 +512,10 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
-        # Residual connection with learnable weight
-        # This keeps the original patch structure but allows refinement
-        refined_patches = patches + 0.8 * torch.tanh(refined)  # Stronger refinement weight
-
-        # Clamp to valid image space [0, 1]
-        refined_patches = torch.clamp(refined_patches, 0.0, 1.0)
+        # Residual connection with learnable weight, then sigmoid for smooth bounding
+        # This keeps original patch structure but allows aggressive refinement
+        # Sigmoid ensures smooth gradient flow (unlike clamping which creates dead zones)
+        refined_patches = torch.sigmoid(patches + 0.8 * torch.tanh(refined))
 
         return refined_patches
 
