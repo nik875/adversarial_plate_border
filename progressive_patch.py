@@ -460,6 +460,16 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
+        # Post-expansion smoothing with progressive kernel sizes
+        # Progressively larger kernels (3 → 7 → 9) to smooth the output
+        self.post_expansion_smooth = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # kernel 3, maintain size
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
+        )
+
         # Spatial propagation layers (same padding to preserve size)
         # Process concatenated patches/refined to propagate information spatially
         self.spatial_layers = nn.Sequential(
@@ -559,6 +569,9 @@ class BottleneckDenseRefiner(nn.Module):
 
         # Apply sigmoid to bound to [0, 1]
         refined_patches = torch.sigmoid(refined_patches)
+
+        # Apply post-multi-scale smoothing with progressive kernel sizes
+        refined_patches = self.post_expansion_smooth(refined_patches)  # [B, 3, H, W]
 
         return refined_patches
 
