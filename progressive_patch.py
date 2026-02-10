@@ -514,7 +514,7 @@ class BottleneckDenseRefiner(nn.Module):
 
         # Residual connection with learnable weight
         # This keeps the original patch structure but allows refinement
-        refined_patches = patches + 0.1 * torch.tanh(refined)  # Small residual weight
+        refined_patches = patches + 0.8 * torch.tanh(refined)  # Stronger refinement weight
 
         return refined_patches
 
