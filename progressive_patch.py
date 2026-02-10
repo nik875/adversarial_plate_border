@@ -2257,7 +2257,40 @@ class ProgressivePatchTrainer:
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/{filename_template.format(i=i)}")
 
-    def train(self, learning_rate: float = 0.01, lr_min: float = 1e-5, max_epochs: int = 50):
+    def _create_cosine_scheduler(self, optimizer, vae_lr, custom_lr, lr_min, max_epochs):
+        """
+        Create a cosine annealing scheduler that handles different initial learning rates
+        for VAE and custom layers, both decaying to the same minimum learning rate.
+
+        Args:
+            optimizer: PyTorch optimizer with parameter groups
+            vae_lr: Initial learning rate for VAE
+            custom_lr: Initial learning rate for custom layers
+            lr_min: Minimum learning rate (same for all groups)
+            max_epochs: Maximum number of epochs for scheduling
+
+        Returns:
+            Scheduler that applies cosine annealing to each group independently
+        """
+        import math
+
+        def cosine_decay(initial_lr, epoch):
+            """Cosine annealing from initial_lr to lr_min"""
+            return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * epoch / max_epochs)) / 2) / initial_lr
+
+        # Create lambda functions for each parameter group
+        # Group 0: VAE (or all params if simple generator)
+        # Groups 1+: Custom layers
+        lambda_funcs = []
+        for group in optimizer.param_groups:
+            if group['name'] in ['vae_lora', 'vae_full']:
+                lambda_funcs.append(lambda epoch, lr=vae_lr: cosine_decay(lr, epoch))
+            else:
+                lambda_funcs.append(lambda epoch, lr=custom_lr: cosine_decay(lr, epoch))
+
+        return optim.lr_scheduler.LambdaLR(optimizer, lambda_funcs)
+
+    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50):
         """
         Random layer sampling training with cascade penalty.
 
@@ -2298,6 +2331,10 @@ class ProgressivePatchTrainer:
         print("="*80 + "\n")
 
         # Initialize optimizer
+        # Use separate learning rate for VAE if specified, otherwise use custom learning rate
+        if vae_learning_rate is None:
+            vae_learning_rate = learning_rate
+
         # Collect trainable parameters
         if self.use_simple_generator:
             optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -2307,38 +2344,43 @@ class ProgressivePatchTrainer:
             # VAE parameters (LoRA only if enabled)
             if hasattr(self.generator, 'use_vae_lora') and self.generator.use_vae_lora:
                 vae_lora_params = [p for p in self.generator.vae.parameters() if p.requires_grad]
-                trainable_params.append({'params': vae_lora_params, 'lr': learning_rate, 'name': 'vae_lora'})
-                print(f"Optimizer: VAE LoRA parameters: {sum(p.numel() for p in vae_lora_params):,}")
+                trainable_params.append({'params': vae_lora_params, 'lr': vae_learning_rate, 'name': 'vae_lora'})
+                print(f"Optimizer: VAE LoRA parameters: {sum(p.numel() for p in vae_lora_params):,} (lr={vae_learning_rate})")
             else:
                 vae_params = list(self.generator.vae.parameters())
-                trainable_params.append({'params': vae_params, 'lr': learning_rate, 'name': 'vae_full'})
-                print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,}")
+                trainable_params.append({'params': vae_params, 'lr': vae_learning_rate, 'name': 'vae_full'})
+                print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,} (lr={vae_learning_rate})")
 
-            # Other components (always trainable)
+            # Other components (always trainable) - use custom learning rate
             for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector', 'layer_embedding']:
                 module = getattr(self.generator, name)
                 params = list(module.parameters())
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
-                print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,}")
+                print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
 
-            # Bottleneck refiner (optional, only if enabled)
+            # Bottleneck refiner (optional, only if enabled) - use custom learning rate
             if self.use_bottleneck_refiner and hasattr(self.generator, 'bottleneck_refiner') and self.generator.bottleneck_refiner is not None:
                 module = self.generator.bottleneck_refiner
                 params = list(module.parameters())
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': 'bottleneck_refiner'})
-                print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,}")
+                print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
 
             # Print total trainable parameters
             total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
             print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
+            print(f"Optimizer: VAE learning rate: {vae_learning_rate}, Custom layers learning rate: {learning_rate}")
+            print(f"Optimizer: Both decay to lr_min={lr_min} via cosine annealing")
 
-            optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=1e-4)
+            optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
 
-        # Create cosine annealing scheduler
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        # Create custom cosine annealing scheduler that handles different initial LRs
+        # Both VAE and custom layers decay to the same lr_min
+        scheduler = self._create_cosine_scheduler(
             optimizer,
-            T_max=max_epochs,
-            eta_min=lr_min
+            vae_learning_rate,
+            learning_rate,
+            lr_min,
+            max_epochs
         )
 
         # Training history
@@ -2492,9 +2534,13 @@ def main():
                         'Saves 5 sample patches to checkpoints/{run_id}/example_samples/. '
                         'Example: --save-examples-every 100 saves samples every 100 batches.')
     parser.add_argument('--learning-rate', type=float, default=5e-3,
-                        help='Learning rate (default: 5e-3)')
+                        help='Learning rate for custom layers (adapter, CNN refiner, etc.) (default: 5e-3)')
+    parser.add_argument('--vae-learning-rate', type=float, default=None,
+                        help='Learning rate for VAE (default: same as --learning-rate). '
+                        'Both decay to --lr-min via cosine annealing.')
     parser.add_argument('--lr-min', type=float, default=1e-5,
-                        help='Minimum learning rate for cosine annealing (default: 1e-5)')
+                        help='Minimum learning rate for cosine annealing (default: 1e-5). '
+                        'Both VAE and custom layers decay to this value.')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2595,6 +2641,7 @@ def main():
 
         history = trainer.train(
             learning_rate=args.learning_rate,
+            vae_learning_rate=args.vae_learning_rate,
             lr_min=args.lr_min
         )
 
