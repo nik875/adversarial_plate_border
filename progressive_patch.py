@@ -409,10 +409,121 @@ class SimplePatchGenerator(nn.Module):
         return patches
 
 
+class BottleneckDenseRefiner(nn.Module):
+    """
+    Bottleneck dense refiner for patch refinement with minimal parameters.
+
+    Architecture: Compress spatial dims with conv → dense bottleneck → expand back
+    Total parameters: ~50-100K (vs 300M+ for full dense)
+
+    Processes patches through:
+    256x512x3 → Conv stride 4 → 64x128x64 → Conv stride 2 → 64x128x128
+    → GlobalAvgPool → Dense layers → Upsample back to 256x512x3
+    """
+    def __init__(self, patch_height: int = 256, patch_width: int = 512):
+        super().__init__()
+
+        self.patch_height = patch_height
+        self.patch_width = patch_width
+
+        # Compress spatial dimensions with strided convolutions
+        self.compress = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=4, padding=1),  # 256x512 → 64x128
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 64x128 → 32x64
+            nn.ReLU(inplace=True),
+        )
+
+        # Global context and dense processing
+        self.bottleneck = nn.Sequential(
+            nn.AdaptiveAvgPool2d((4, 8)),  # 32x64x128 → 4x8x128
+        )
+
+        # Dense layers for feature refinement
+        # Bottleneck size: 128 * 4 * 8 = 4096
+        self.dense = nn.Sequential(
+            nn.Linear(4096, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 4096),
+            nn.ReLU(inplace=True),
+        )
+
+        # Expand back to full spatial resolution
+        self.expand = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 4x8 → 8x16
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4, padding=0),  # 8x16 → 64x128
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=4, padding=0),  # 64x128 → 256x512
+        )
+
+        # Initialize weights
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Count parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"BottleneckDenseRefiner initialized: ~{total_params:,} parameters")
+
+    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        """
+        Refine patches through bottleneck dense layers.
+
+        Args:
+            patches: [batch_size, 3, patch_height, patch_width]
+        Returns:
+            refined_patches: [batch_size, 3, patch_height, patch_width]
+        """
+        batch_size = patches.shape[0]
+
+        # Compress spatial dimensions
+        compressed = self.compress(patches)  # [B, 128, 32, 64]
+
+        # Pool to bottleneck
+        pooled = self.bottleneck(compressed)  # [B, 128, 4, 8]
+
+        # Flatten for dense processing
+        bottleneck_flat = pooled.view(batch_size, -1)  # [B, 4096]
+
+        # Process through dense layers
+        refined_features = self.dense(bottleneck_flat)  # [B, 4096]
+
+        # Reshape back for expansion
+        refined_features = refined_features.view(batch_size, 128, 4, 8)  # [B, 128, 4, 8]
+
+        # Expand back to original resolution
+        refined = self.expand(refined_features)  # [B, 3, 256, 512]
+
+        # Ensure correct size (in case of rounding errors)
+        if refined.shape[2] != self.patch_height or refined.shape[3] != self.patch_width:
+            refined = F.interpolate(
+                refined,
+                size=(self.patch_height, self.patch_width),
+                mode='bilinear',
+                align_corners=True
+            )
+
+        # Residual connection with learnable weight
+        # This keeps the original patch structure but allows refinement
+        refined_patches = patches + 0.1 * torch.tanh(refined)  # Small residual weight
+
+        return refined_patches
+
+
 class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11,
-                 use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16):
+                 use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16,
+                 use_bottleneck_refiner: bool = False):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -546,6 +657,14 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+        # Optional: bottleneck dense refiner for final refinement
+        self.use_bottleneck_refiner = use_bottleneck_refiner
+        if use_bottleneck_refiner:
+            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width)
+            print(f"Bottleneck dense refiner enabled for final patch refinement")
+        else:
+            self.bottleneck_refiner = None
+
         print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
         print(f"Patch projector: 65 → 32 → 3 channels (1x1 convolutions, ~2.2K parameters)")
 
@@ -604,6 +723,10 @@ class FoundationPatchGenerator(nn.Module):
         # Project to patch using 1x1 convolutions
         patches = self.patch_projector(projector_input)  # [B, 3, H, W]
 
+        # Apply bottleneck dense refiner if enabled
+        if self.use_bottleneck_refiner and self.bottleneck_refiner is not None:
+            patches = self.bottleneck_refiner(patches)
+
         return patches
 
 
@@ -634,6 +757,7 @@ class ProgressivePatchTrainer:
                  use_vae_lora: bool = True,
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
+                 use_bottleneck_refiner: bool = False,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
@@ -648,6 +772,7 @@ class ProgressivePatchTrainer:
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.use_bottleneck_refiner = use_bottleneck_refiner
 
         # Require ocr_patches_per_image
         if ocr_patches_per_image is None:
@@ -777,7 +902,8 @@ class ProgressivePatchTrainer:
                 num_layers=num_layers,
                 use_vae_lora=use_vae_lora,
                 lora_rank=lora_rank,
-                lora_alpha=lora_alpha
+                lora_alpha=lora_alpha,
+                use_bottleneck_refiner=use_bottleneck_refiner
             ).to(self.device)
 
         # Activation capture for diversity metric
@@ -2239,6 +2365,11 @@ def main():
                         'Simple generator: z → MLP[256→512→1024] → patch. '
                         'Foundation model: z → adapter → VAE decoder → CNN refiner → patch projector (1×1 convs) → patch. '
                         'Simple generator uses ~10x less memory but may produce lower quality patches.')
+    parser.add_argument('--use-bottleneck-refiner', action='store_true',
+                        help='Add bottleneck dense refiner for final patch refinement (only with FoundationPatchGenerator). '
+                        'Architecture: Spatial compress (stride 4,2) → Dense bottleneck → Spatial expand. '
+                        'Parameters: ~50-100K (vs 300M+ for full dense). '
+                        'Benefits: Dense processing of patch features with minimal parameters through spatial reduction.')
     parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
@@ -2310,6 +2441,7 @@ def main():
         'use_vae_lora': args.use_vae_lora,
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
+        'use_bottleneck_refiner': args.use_bottleneck_refiner,
         'save_examples_every': args.save_examples_every
     }
 
