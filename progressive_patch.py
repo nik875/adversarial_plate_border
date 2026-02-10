@@ -2017,15 +2017,17 @@ class ProgressivePatchTrainer:
                 batch_count_global += 1
                 if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
                     save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
-                    # Generate 10 samples for each targetable layer (total: num_layers * 10)
+                    # Generate 10 samples for each layer (respect target_layer if specified)
+                    layers_to_sample = self.target_layer_indices if self.target_layer_indices is not None else range(len(self.layer_configs))
                     saved_count = 0
-                    for layer_idx in range(len(self.layer_configs)):
+                    for layer_idx in layers_to_sample:
                         layer_name = self.layer_configs[layer_idx].description.replace(" ", "_").replace("(", "").replace(")", "")
                         layer_save_dir = os.path.join(save_subdir, f"layer{layer_idx}_{layer_name}")
                         if self.save_basis_safe(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx):
                             saved_count += 1
+                    total_layers = len(layers_to_sample)
                     if saved_count > 0:
-                        print(f"   ✓ Saved periodic samples: {saved_count}/{len(self.layer_configs)} layers")
+                        print(f"   ✓ Saved periodic samples: {saved_count}/{total_layers} layers")
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
