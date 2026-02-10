@@ -489,9 +489,13 @@ class BottleneckDenseRefiner(nn.Module):
             # Each scale gets its own 1x1 conv to compress 32 → 3 channels
             self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
 
-        # Learnable weights for combining multi-scale outputs
-        # Softmax is applied during forward pass for normalized weighting
-        self.scale_weights = nn.Parameter(torch.ones(len(self.scales)))
+        # Per-pixel scale attention: learns spatially-varying weights for each scale
+        # Takes spatial_features [B, 32, H, W] and outputs [B, num_scales, H, W]
+        self.scale_attention = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(64, len(self.scales), kernel_size=1),
+        )
 
         # Initialize weights
         for m in self.modules():
@@ -555,17 +559,22 @@ class BottleneckDenseRefiner(nn.Module):
 
         # Process at multiple scales
         scale_outputs = []
-        weights = torch.softmax(self.scale_weights, dim=0)  # Normalize weights
 
         for scale_idx, scale in enumerate(self.scales):
             # Extract spatial patches of this scale
             scale_output = self._process_scale(spatial_features, scale, batch_size)
             scale_outputs.append(scale_output)
 
-        # Weighted average of all scales
+        # Compute per-pixel scale weights
+        spatial_scale_weights = self.scale_attention(spatial_features)  # [B, num_scales, H, W]
+        spatial_scale_weights = torch.softmax(spatial_scale_weights, dim=1)  # Normalize over scales per pixel
+
+        # Weighted average of all scales with per-pixel weights
         refined_patches = torch.zeros_like(patches)  # [B, 3, H, W]
         for scale_idx, scale_output in enumerate(scale_outputs):
-            refined_patches = refined_patches + weights[scale_idx] * scale_output
+            # scale_output: [B, 3, H, W]
+            # spatial_scale_weights[:, scale_idx:scale_idx+1]: [B, 1, H, W]
+            refined_patches = refined_patches + spatial_scale_weights[:, scale_idx:scale_idx+1] * scale_output
 
         # Apply sigmoid to bound to [0, 1]
         refined_patches = torch.sigmoid(refined_patches)
