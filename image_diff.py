@@ -40,19 +40,42 @@ def compute_diff(img1, img2):
     return diff, mse
 
 
-def compute_average_diff_zones(diff_map, gaussian_sigma=2):
+def create_center_mask(height, width):
+    """Create a mask that zeros out the middle 60% of the image."""
+    mask = np.ones((height, width), dtype=np.float32)
+
+    # Calculate dimensions of the center 60% region
+    center_h = int(height * 0.6)
+    center_w = int(width * 0.6)
+
+    # Calculate start coordinates for centered rectangle
+    start_h = (height - center_h) // 2
+    start_w = (width - center_w) // 2
+
+    # Zero out the center region
+    mask[start_h:start_h + center_h, start_w:start_w + center_w] = 0
+
+    return mask
+
+
+def compute_average_diff_zones(diff_map, gaussian_sigma=2, mask=None):
     """
     Compute per-pixel difference heatmap at original image resolution.
 
     Args:
         diff_map: HxWx3 difference map
         gaussian_sigma: sigma for smoothing the heatmap
+        mask: Optional HxW mask to exclude regions from computation
 
     Returns:
         zone_heatmap: HxW heatmap of differences at full image resolution
     """
     # Compute mean magnitude of difference per pixel
     zone_heatmap = np.mean(diff_map, axis=2)
+
+    # Apply mask if provided
+    if mask is not None:
+        zone_heatmap = zone_heatmap * mask
 
     # Smooth the heatmap for better visualization
     zone_heatmap = gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
@@ -62,8 +85,12 @@ def compute_average_diff_zones(diff_map, gaussian_sigma=2):
 
 def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     """Display images side by side with zone-based difference visualization."""
-    # Compute zone heatmap
-    zone_heatmap = compute_average_diff_zones(diff)
+    # Create center mask to exclude middle 60%
+    h, w = diff.shape[:2]
+    center_mask = create_center_mask(h, w)
+
+    # Compute zone heatmap with mask
+    zone_heatmap = compute_average_diff_zones(diff, mask=center_mask)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
@@ -85,13 +112,15 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
     # Zone overlay on first image - use only red channel for differences
-    zone_norm = np.clip(zone_heatmap / np.max(zone_heatmap), 0, 1)
+    zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
     zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
     zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
 
-    # Zero out red channel in background image
+    # Zero out red channel in background image and darken the masked region
     img1_no_red = img1.astype(np.float32).copy()
     img1_no_red[:, :, 0] = 0
+    # Darken the center masked region
+    img1_no_red = img1_no_red * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
     overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
@@ -150,7 +179,11 @@ def compute_average_diff_across_images(images_list):
 
 def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=None):
     """Display comparison with zone-based visualization."""
-    zone_heatmap = compute_average_diff_zones(diff)
+    # Create center mask to exclude middle 60%
+    h, w = diff.shape[:2]
+    center_mask = create_center_mask(h, w)
+
+    zone_heatmap = compute_average_diff_zones(diff, mask=center_mask)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
@@ -172,12 +205,14 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
     # Zone overlay - use only red channel for differences
-    zone_norm = np.clip(zone_heatmap / np.max(zone_heatmap), 0, 1)
+    zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
     zone_colored = np.zeros((*zone_norm.shape, 3), dtype=np.float32)
     zone_colored[:, :, 0] = zone_norm * 255  # Red channel represents differences
-    # Zero out red channel in background image
+    # Zero out red channel in background image and darken the masked region
     img1_no_red = img1.astype(np.float32).copy()
     img1_no_red[:, :, 0] = 0
+    # Darken the center masked region
+    img1_no_red = img1_no_red * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
     overlay = (img1_no_red * 0.6 + zone_colored * 0.4).astype(np.uint8)
     axes[1, 1].imshow(overlay)
     axes[1, 1].set_title('Difference Zones Highlighted')
@@ -275,9 +310,11 @@ Examples:
             print("Computing across-layer average differences...")
             across_layer_diff = compute_average_diff_across_images(images1 + images2)
 
-            # Compute zone heatmaps
-            within_zone = compute_average_diff_zones(within_layer_diff) if within_layer_diff is not None else None
-            across_zone = compute_average_diff_zones(across_layer_diff) if across_layer_diff is not None else None
+            # Compute zone heatmaps with center mask
+            h, w = within_layer_diff.shape[:2] if within_layer_diff is not None else across_layer_diff.shape[:2]
+            center_mask = create_center_mask(h, w)
+            within_zone = compute_average_diff_zones(within_layer_diff, mask=center_mask) if within_layer_diff is not None else None
+            across_zone = compute_average_diff_zones(across_layer_diff, mask=center_mask) if across_layer_diff is not None else None
 
             if within_zone is not None and across_zone is not None:
                 display_diff_of_diffs(within_zone, across_zone, args.outfile)
