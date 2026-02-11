@@ -2176,14 +2176,16 @@ class ProgressivePatchTrainer:
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
                         # Additive diversity-quality loss: both terms independently incentivized
-                        # combined = diversity_weight * diversity_score + quality_weight * log(quality_score)
-                        # Loss = -(performance_weight * combined) + cascade_penalty
+                        # Loss = -(performance_weight * diversity_weight * diversity_score) + performance_weight * quality_weight * log(quality_score) + cascade_penalty
+                        # Equivalently: performance_weight * (-diversity_weight * diversity_score + quality_weight * log(quality_score)) + cascade_penalty
                         # diversity_score is negative (log-det: min at -inf, max at 0)
-                        # quality_score is positive (normalized activation delta RMS)
-                        # To minimize loss: maximize -diversity_score (diversity_score → 0) AND minimize log(quality_score)
+                        # log(quality_score) is always defined for positive quality_score
+                        # To minimize loss: maximize diversity_score (toward 0) AND minimize log(quality_score)
                         log_quality_score = torch.log(quality_score + 1e-8)  # Add epsilon to avoid log(0)
-                        combined_diversity_quality_loss = self.diversity_weight * diversity_score - self.quality_weight * log_quality_score
-                        total_loss = -(self.performance_weight * combined_diversity_quality_loss) + cascade_penalty
+                        diversity_term = -self.diversity_weight * diversity_score  # Negate so maximizing diversity reduces loss
+                        quality_term = self.quality_weight * log_quality_score     # Minimize this
+                        combined_loss = diversity_term + quality_term
+                        total_loss = self.performance_weight * combined_loss + cascade_penalty
 
                         # Stack patches for batch operations
                         patches_stacked = torch.stack(accumulated_patches, dim=0)
