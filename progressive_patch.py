@@ -1690,15 +1690,15 @@ class ProgressivePatchTrainer:
 
     def profile_layer_activations(self, num_samples: int = 1024):
         """
-        Profile activation deltas from VAE-generated patches vs neutral baseline.
+        Profile activation deltas from uniform random pixel patches vs neutral baseline.
 
         For each image, computes activations with:
         1. Neutral border (baseline)
-        2. Uniformly random VAE-generated patch applied as border (matching training)
+        2. Uniform random pixel patch applied as border (matching training spatial layout)
 
-        Then computes mean and std_dev of the delta between patched and baseline.
-        This captures the typical magnitude of activation changes from patches,
-        used to appropriately scale quality scores during training.
+        Uses torch.rand pixel patches (not generator output) to ensure maximum diversity
+        and proper activation scale calibration. Generator-initialized patches would all
+        be nearly identical, yielding near-zero std and blown-up normalized quality scores.
 
         Args:
             num_samples: Number of images to sample for profiling (default: 1024)
@@ -1732,10 +1732,9 @@ class ProgressivePatchTrainer:
                 ocr_input_baseline = cropped_baseline.permute(0, 2, 3, 1) * 255
                 baseline_acts = self._capture_activations(ocr_input_baseline)
 
-                # 2. Generate uniformly random patch from VAE and apply as border (matching training)
-                # Sample from uniform distribution in latent space
-                z = self.sample_coefficients(1)
-                random_patch = self.generate_patches(z)[0]  # [3, H, W]
+                # 2. Generate uniform random pixel patch and apply as border
+                # Use torch.rand (not generator) to ensure maximum patch diversity
+                random_patch = torch.rand(3, self.patch_height, self.patch_width, device=self.device)
 
                 # Apply patch as border using the same method as training
                 prep_image_patched, _ = self.apply_patch_ocr_mode(prep_image, random_patch)
