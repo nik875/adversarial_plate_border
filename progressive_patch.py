@@ -383,12 +383,16 @@ class BottleneckDenseRefiner(nn.Module):
     Processes patches through:
     256x512x3 → Conv stride 4 → 64x128x64 → Conv stride 2 → 64x128x128
     → GlobalAvgPool → Dense layers → Upsample back to 256x512x3
+
+    Seed conditioning: Latent seed z is projected and concatenated at bottleneck
+    to provide learned guidance to the refinement process.
     """
-    def __init__(self, patch_height: int = 256, patch_width: int = 512):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512, latent_dim: int = 16):
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
+        self.latent_dim = latent_dim
 
         # Compress spatial dimensions with strided convolutions
         self.compress = nn.Sequential(
@@ -403,10 +407,21 @@ class BottleneckDenseRefiner(nn.Module):
             nn.AdaptiveAvgPool2d((4, 8)),  # 32x64x128 → 4x8x128
         )
 
+        # Project latent seed to bottleneck embedding
+        # Maps from latent_dim to seed_embed_dim for concatenation
+        self.seed_embed_dim = 64
+        self.seed_projection = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.SiLU(inplace=True),
+            nn.Linear(128, self.seed_embed_dim),
+        )
+
         # Dense layers for feature refinement
         # Bottleneck size: 128 * 4 * 8 = 4096
+        # With seed: 4096 + seed_embed_dim = 4160
+        bottleneck_with_seed_dim = 4096 + self.seed_embed_dim
         self.dense = nn.Sequential(
-            nn.Linear(4096, 512),
+            nn.Linear(bottleneck_with_seed_dim, 512),
             nn.SiLU(inplace=True),
             nn.Linear(512, 256),
             nn.SiLU(inplace=True),
@@ -476,12 +491,13 @@ class BottleneckDenseRefiner(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"BottleneckDenseRefiner initialized: ~{total_params:,} parameters")
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+    def forward(self, patches: torch.Tensor, z: torch.Tensor = None) -> torch.Tensor:
         """
-        Refine patches through bottleneck dense layers.
+        Refine patches through bottleneck dense layers with optional seed conditioning.
 
         Args:
             patches: [batch_size, 3, patch_height, patch_width]
+            z: Optional latent seed [batch_size, latent_dim] for conditioning
         Returns:
             refined_patches: [batch_size, 3, patch_height, patch_width]
         """
@@ -496,8 +512,15 @@ class BottleneckDenseRefiner(nn.Module):
         # Flatten for dense processing
         bottleneck_flat = pooled.view(batch_size, -1)  # [B, 4096]
 
+        # Concatenate seed conditioning if provided
+        if z is not None:
+            seed_embed = self.seed_projection(z)  # [B, seed_embed_dim]
+            bottleneck_with_seed = torch.cat([bottleneck_flat, seed_embed], dim=1)  # [B, 4096 + seed_embed_dim]
+        else:
+            bottleneck_with_seed = bottleneck_flat  # [B, 4096]
+
         # Process through dense layers
-        refined_features = self.dense(bottleneck_flat)  # [B, 4096]
+        refined_features = self.dense(bottleneck_with_seed)  # [B, 4096]
 
         # Reshape back for expansion
         refined_features = refined_features.view(batch_size, 128, 4, 8)  # [B, 128, 4, 8]
@@ -717,8 +740,8 @@ class FoundationPatchGenerator(nn.Module):
         # Optional: bottleneck dense refiner for final refinement
         self.use_bottleneck_refiner = use_bottleneck_refiner
         if use_bottleneck_refiner:
-            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width)
-            print(f"Bottleneck dense refiner enabled for final patch refinement")
+            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim)
+            print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning)")
         else:
             self.bottleneck_refiner = None
 
@@ -780,9 +803,9 @@ class FoundationPatchGenerator(nn.Module):
         # Project to patch using 1x1 convolutions
         patches = self.patch_projector(projector_input)  # [B, 3, H, W]
 
-        # Apply bottleneck dense refiner if enabled
+        # Apply bottleneck dense refiner if enabled (with seed conditioning)
         if self.use_bottleneck_refiner and self.bottleneck_refiner is not None:
-            patches = self.bottleneck_refiner(patches)
+            patches = self.bottleneck_refiner(patches, z)
 
         return patches
 
