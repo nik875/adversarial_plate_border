@@ -2650,7 +2650,6 @@ def main():
         'use_vae_lora': args.use_vae_lora,
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
-        'use_bottleneck_refiner': True,
         'bottleneck_dim': args.bottleneck_dim,
         'save_examples_every': args.save_examples_every
     }
