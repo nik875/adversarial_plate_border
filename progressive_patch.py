@@ -1690,19 +1690,23 @@ class ProgressivePatchTrainer:
 
     def profile_layer_activations(self, num_samples: int = 1024):
         """
-        Profile activation magnitudes at each layer by computing standard deviations.
+        Profile activation deltas from random patches vs neutral baseline.
 
-        Samples random images from the dataset, runs them through the OCR model without patches,
-        and computes the standard deviation of each activation element across all samples.
-        These std_devs are used to normalize activation deltas during training.
+        For each image, computes activations with:
+        1. Neutral border (baseline)
+        2. Random patch applied at random location
+
+        Then computes mean and std_dev of the delta between random patch and baseline.
+        This captures the typical magnitude of activation changes from patches,
+        used to appropriately scale quality scores during training.
 
         Args:
             num_samples: Number of images to sample for profiling (default: 1024)
         """
-        print(f"\nProfiling layer activations on {num_samples} random images...")
+        print(f"\nProfiling patch-induced activation deltas on {num_samples} random images...")
 
         num_samples = min(num_samples, len(self.train_loader))
-        all_layer_activations = {}  # layer_idx -> list of [H*W*C] activations
+        all_layer_deltas = {}  # layer_idx -> list of delta vectors
 
         # Sample random images from training set
         self.ocr.eval()
@@ -1715,67 +1719,93 @@ class ProgressivePatchTrainer:
                 batch_idx = np.random.randint(0, len(self.train_loader.dataset))
                 batch_item = self.train_loader.dataset[batch_idx]
                 batch_dict = batch_item
-
-                # Run through model and capture activations for all layers
                 prep_image = batch_dict['prep_image'].unsqueeze(0).to(self.device)
 
-                # Apply the exact same preprocessing as during training (neutral border)
-                # This ensures stddev is computed on the same activation distribution
-                prep_image_with_border = self.apply_neutral_border_ocr_mode(prep_image)
-
-                cropped_plate = F.interpolate(
-                    prep_image_with_border,
+                # 1. Get baseline activations (neutral border)
+                prep_image_baseline = self.apply_neutral_border_ocr_mode(prep_image)
+                cropped_baseline = F.interpolate(
+                    prep_image_baseline,
                     size=self.ocr_input_shape[:2],
                     mode='bilinear',
                     align_corners=False
                 )
+                ocr_input_baseline = cropped_baseline.permute(0, 2, 3, 1) * 255
+                baseline_acts = self._capture_activations(ocr_input_baseline)
 
-                ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
-                activations_dict = {}
+                # 2. Get activations with random patch
+                _, _, img_h, img_w = prep_image.shape
+                patch_h, patch_w = PATCH_HEIGHT, PATCH_WIDTH
 
-                # Temporarily hook all target layers
-                hooks = []
-                for layer_idx, layer_config in enumerate(self.layer_configs):
-                    def make_hook(idx):
-                        def hook(module, input, output):
-                            # Flatten the output and store
-                            if isinstance(output, torch.Tensor):
-                                activations_dict[idx] = output.squeeze(0).reshape(-1).detach().cpu()
-                        return hook
+                # Only apply if patch fits in image
+                if img_h >= patch_h and img_w >= patch_w:
+                    # Sample random patch
+                    random_patch = torch.rand(1, 3, patch_h, patch_w, device=self.device)
 
-                    # Find and hook the layer
-                    layer_module = self._find_layer_by_name(layer_config.name)
-                    if layer_module is not None:
-                        hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+                    # Apply at random location
+                    y_offset = np.random.randint(0, img_h - patch_h + 1)
+                    x_offset = np.random.randint(0, img_w - patch_w + 1)
 
-                # Forward pass
-                self.ocr(ocr_input)
+                    prep_image_patched = prep_image.clone()
+                    prep_image_patched[:, :, y_offset:y_offset+patch_h, x_offset:x_offset+patch_w] = random_patch
 
-                # Remove hooks
-                for hook in hooks:
-                    hook.remove()
+                    cropped_patched = F.interpolate(
+                        prep_image_patched,
+                        size=self.ocr_input_shape[:2],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    ocr_input_patched = cropped_patched.permute(0, 2, 3, 1) * 255
+                    patched_acts = self._capture_activations(ocr_input_patched)
 
-                # Store activations
-                for layer_idx, activation in activations_dict.items():
-                    if layer_idx not in all_layer_activations:
-                        all_layer_activations[layer_idx] = []
-                    all_layer_activations[layer_idx].append(activation)
+                    # 3. Compute deltas
+                    for layer_idx in baseline_acts.keys():
+                        delta = patched_acts[layer_idx] - baseline_acts[layer_idx]
+                        if layer_idx not in all_layer_deltas:
+                            all_layer_deltas[layer_idx] = []
+                        all_layer_deltas[layer_idx].append(delta)
 
-        # Compute std_dev for each layer
+        # Compute mean and std_dev of deltas for each layer
         self.layer_activation_stddev = {}
-        for layer_idx in sorted(all_layer_activations.keys()):
-            activations_list = all_layer_activations[layer_idx]
-            # Stack all activations: [num_samples, num_elements]
-            stacked = torch.stack(activations_list, dim=0)
-            # Compute std_dev along sample axis
-            std_dev = stacked.std(dim=0)  # [num_elements]
-            # Avoid division by zero
-            std_dev = torch.clamp(std_dev, min=1e-6)
-            self.layer_activation_stddev[layer_idx] = std_dev.to(self.device)
+        for layer_idx in sorted(all_layer_deltas.keys()):
+            deltas_list = all_layer_deltas[layer_idx]
+            # Stack all deltas: [num_samples, num_elements]
+            stacked = torch.stack(deltas_list, dim=0)
+            # Compute mean and std_dev along sample axis
+            mean_delta = stacked.mean(dim=0)
+            std_delta = stacked.std(dim=0)
+            # Use std_delta for normalization; clamp to avoid division issues
+            std_delta = torch.clamp(std_delta, min=1e-6)
+            self.layer_activation_stddev[layer_idx] = std_delta.to(self.device)
 
         print(f"✓ Profiled {len(self.layer_activation_stddev)} layers")
         for layer_idx, std_dev in self.layer_activation_stddev.items():
-            print(f"  Layer {layer_idx}: {std_dev.shape} activations, mean_std={std_dev.mean():.6f}")
+            print(f"  Layer {layer_idx}: {std_dev.shape} activations, mean_delta_std={std_dev.mean():.6f}")
+
+    def _capture_activations(self, ocr_input: torch.Tensor) -> Dict[int, torch.Tensor]:
+        """Helper to capture activations at all layers for a given input."""
+        activations_dict = {}
+        hooks = []
+
+        # Register hooks for all layers
+        for layer_idx, layer_config in enumerate(self.layer_configs):
+            def make_hook(idx):
+                def hook(module, input, output):
+                    if isinstance(output, torch.Tensor):
+                        activations_dict[idx] = output.squeeze(0).reshape(-1).detach().cpu()
+                return hook
+
+            layer_module = self._find_layer_by_name(layer_config.name)
+            if layer_module is not None:
+                hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+
+        # Forward pass
+        self.ocr(ocr_input)
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        return activations_dict
 
     def _find_layer_by_name(self, layer_name: str):
         """Find a module in the OCR model by its name."""
