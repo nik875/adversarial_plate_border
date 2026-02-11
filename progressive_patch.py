@@ -2020,7 +2020,7 @@ class ProgressivePatchTrainer:
                     batch_diversity_loss = 0.0
                     batch_tv_loss = 0.0
                     batch_spectrum_loss = 0.0
-                    batch_cascade_penalty = 0.0
+                    batch_cascade_sum = 0.0
                     batch_raw_diversity_score = 0.0
                     batch_raw_quality_score = 0.0
                     batch_count = 0
@@ -2200,11 +2200,10 @@ class ProgressivePatchTrainer:
                         batch_diversity_loss += total_loss.item()
                         batch_tv_loss += tv_loss_weighted.item()
                         batch_spectrum_loss += spectrum_loss_weighted.item()
-                        batch_cascade_penalty = cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
-
                         # Accumulate raw diversity and quality scores
                         batch_raw_diversity_score += diversity_score.item() if isinstance(diversity_score, torch.Tensor) else diversity_score
-                        batch_raw_quality_score += quality_score.item() if isinstance(quality_score, torch.Tensor) else quality_score
+                        batch_raw_quality_score += log_quality_score.item() if isinstance(log_quality_score, torch.Tensor) else log_quality_score
+                        batch_cascade_sum += cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
 
                         batch_count += 1
 
@@ -2228,7 +2227,7 @@ class ProgressivePatchTrainer:
                         total_diversity_loss += batch_diversity_loss / batch_count
                         total_tv_loss += batch_tv_loss / batch_count
                         total_spectrum_loss += batch_spectrum_loss / batch_count
-                        total_cascade_penalty += batch_cascade_penalty / batch_count if batch_count > 0 else 0
+                        total_cascade_penalty += batch_cascade_sum / batch_count
                         total_raw_diversity_score += batch_raw_diversity_score / batch_count
                         total_raw_quality_score += batch_raw_quality_score / batch_count
 
@@ -2242,8 +2241,7 @@ class ProgressivePatchTrainer:
                 avg_spectrum_loss = total_spectrum_loss / num_updates if num_updates > 0 else 0
                 avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
-                avg_raw_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
-                avg_log_quality = np.log(avg_raw_quality + 1e-8) if avg_raw_quality > 0 else np.log(1e-8)
+                avg_log_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
                 pbar.set_postfix({
                     'DivScore': f"{avg_raw_diversity:.4f}",
                     'LogQual': f"{avg_log_quality:.4f}",
