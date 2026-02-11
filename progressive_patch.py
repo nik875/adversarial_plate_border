@@ -1285,25 +1285,25 @@ class ProgressivePatchTrainer:
 
     def compute_spectrum_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute pixel-space diversity loss based on eigenvalue spectrum decay rate.
+        Compute pixel-space diversity loss based on effective rank.
 
-        Measures diversity by computing the decay rate of the eigenvalue spectrum
-        of the flattened patch matrix. A slower decay (higher effective rank) indicates
-        greater diversity among patches.
+        Measures diversity by computing the effective rank of the flattened patch matrix.
+        Effective rank = (sum(sigma_i))^2 / sum(sigma_i^2), ranging from 1 (rank 1) to
+        min(batch_size, H*W). Higher effective rank indicates greater diversity.
 
         Process:
         1. Apply border mask to focus on visible region
         2. Convert to grayscale
         3. Flatten and stack into matrix [batch_size, H*W]
-        4. Compute SVD to get eigenvalues
-        5. Calculate decay rate (log ratio of consecutive eigenvalues)
-        6. Return negative decay rate (we want to minimize it = maximize diversity)
+        4. Compute SVD to get singular values
+        5. Calculate effective rank
+        6. Return negative effective rank (minimize to maximize diversity)
 
         Args:
             patches: [batch_size, 3, H, W] patch tensor in [0, 1]
 
         Returns:
-            torch.Tensor: Scalar loss (negative decay rate)
+            torch.Tensor: Scalar loss (negative effective rank)
         """
         batch_size = patches.shape[0]
         if batch_size < 2:
@@ -1327,7 +1327,7 @@ class ProgressivePatchTrainer:
         # Center the data (subtract mean for each dimension)
         patches_centered = patches_flat - patches_flat.mean(dim=0, keepdim=True)
 
-        # Compute SVD to get singular values (related to eigenvalues)
+        # Compute SVD to get singular values
         # U: [batch_size, batch_size], S: [min(batch_size, H*W)], Vh: [H*W, H*W]
         try:
             U, S, Vh = torch.svd(patches_centered)
@@ -1335,25 +1335,24 @@ class ProgressivePatchTrainer:
             # Fallback if SVD fails
             return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
-        # Take singular values (which are proportional to eigenvalues of the covariance matrix)
-        # S is already sorted in descending order
-        S = S / (batch_size - 1) ** 0.5 if batch_size > 1 else S  # Normalize by sqrt(n-1)
+        # Singular values are already sorted in descending order
+        # Normalize by sqrt(n-1) for proper variance scaling
+        S = S / (batch_size - 1) ** 0.5 if batch_size > 1 else S
 
-        # Avoid log(0) by adding small epsilon
+        # Avoid division by zero
         epsilon = 1e-8
         S = torch.clamp(S, min=epsilon)
 
-        # Calculate decay rate: average log ratio of consecutive eigenvalues
-        # Smaller decay rate = slower decay = higher effective rank = more diversity
-        if len(S) > 1:
-            log_ratios = torch.log(S[:-1] / S[1:])  # log(lambda_i / lambda_{i+1})
-            decay_rate = log_ratios.mean()
-        else:
-            decay_rate = torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
+        # Calculate effective rank: (sum(sigma_i))^2 / sum(sigma_i^2)
+        # Ranges from 1 (rank 1, all variance in one direction) to min(batch_size, H*W) (full rank)
+        sum_sigma = S.sum()
+        sum_sigma_sq = (S ** 2).sum()
 
-        # Return decay rate: minimizing this slows the eigenvalue decay
-        # (we want slower decay, which means smaller decay_rate)
-        return decay_rate
+        effective_rank = (sum_sigma ** 2) / sum_sigma_sq
+
+        # Return negative effective rank: minimizing this maximizes effective rank
+        # (we want higher effective rank = more diversity)
+        return -effective_rank
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
