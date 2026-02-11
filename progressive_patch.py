@@ -1326,8 +1326,12 @@ class ProgressivePatchTrainer:
                     patch_i = patches[i:i+1]  # [1, 3, H, W]
                     patch_j = patches[j:j+1]  # [1, 3, H, W]
 
+                    # Apply border mask to focus on visible region only
+                    patch_i_masked = patch_i * border_mask
+                    patch_j_masked = patch_j * border_mask
+
                     # Compute DISTS distance (higher = more different, which is good)
-                    dists_dist = self.dists_model(patch_i, patch_j)  # [1, 1, 1, 1]
+                    dists_dist = self.dists_model(patch_i_masked, patch_j_masked)  # [1, 1, 1, 1]
                     dists_val = dists_dist.item()
 
                     # Use negative DISTS as diversity loss (want to maximize perceptual distance)
