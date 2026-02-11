@@ -1601,6 +1601,8 @@ class ProgressivePatchTrainer:
         1. Neutral border (baseline)
         2. Uniform random pixel patch applied as border (matching training spatial layout)
 
+        Profiles only the final layer (FinalOutput) to match training focus.
+
         Uses torch.rand pixel patches (not generator output) to ensure maximum diversity
         and proper activation scale calibration. Generator-initialized patches would all
         be nearly identical, yielding near-zero std and blown-up normalized quality scores.
@@ -1608,10 +1610,11 @@ class ProgressivePatchTrainer:
         Args:
             num_samples: Number of images to sample for profiling (default: 1024)
         """
-        print(f"\nProfiling patch-induced activation deltas on {num_samples} random images...")
+        print(f"\nProfiling patch-induced activation deltas on {num_samples} random images (final layer only)...")
 
         num_samples = min(num_samples, len(self.train_loader))
-        all_layer_deltas = {}  # layer_idx -> list of delta vectors
+        target_layer_idx = len(self.layer_configs) - 1  # Final layer only
+        layer_deltas = []  # List of delta vectors for target layer
 
         # Sample random images from training set
         self.ocr.eval()
@@ -1635,7 +1638,7 @@ class ProgressivePatchTrainer:
                     align_corners=False
                 )
                 ocr_input_baseline = cropped_baseline.permute(0, 2, 3, 1) * 255
-                baseline_acts = self._capture_activations(ocr_input_baseline)
+                baseline_acts = self._capture_activations_target_layer(ocr_input_baseline, target_layer_idx)
 
                 # 2. Generate uniform random pixel patch and apply as border
                 # Use torch.rand (not generator) to ensure maximum patch diversity
@@ -1651,31 +1654,24 @@ class ProgressivePatchTrainer:
                     align_corners=False
                 )
                 ocr_input_patched = cropped_patched.permute(0, 2, 3, 1) * 255
-                patched_acts = self._capture_activations(ocr_input_patched)
+                patched_acts = self._capture_activations_target_layer(ocr_input_patched, target_layer_idx)
 
-                # 3. Compute deltas
-                for layer_idx in baseline_acts.keys():
-                    delta = patched_acts[layer_idx] - baseline_acts[layer_idx]
-                    if layer_idx not in all_layer_deltas:
-                        all_layer_deltas[layer_idx] = []
-                    all_layer_deltas[layer_idx].append(delta)
+                # 3. Compute delta for target layer
+                delta = patched_acts - baseline_acts
+                layer_deltas.append(delta)
 
-        # Compute mean and std_dev of deltas for each layer
+        # Compute mean and std_dev of deltas for the target layer
         self.layer_activation_stddev = {}
-        for layer_idx in sorted(all_layer_deltas.keys()):
-            deltas_list = all_layer_deltas[layer_idx]
-            # Stack all deltas: [num_samples, num_elements]
-            stacked = torch.stack(deltas_list, dim=0)
-            # Compute mean and std_dev along sample axis
-            mean_delta = stacked.mean(dim=0)
-            std_delta = stacked.std(dim=0)
-            # Use std_delta for normalization; clamp to avoid division issues
-            std_delta = torch.clamp(std_delta, min=1e-6)
-            self.layer_activation_stddev[layer_idx] = std_delta.to(self.device)
+        deltas_stacked = torch.stack(layer_deltas, dim=0)
+        mean_delta = deltas_stacked.mean(dim=0)
+        std_delta = deltas_stacked.std(dim=0)
+        # Use std_delta for normalization; clamp to avoid division issues
+        std_delta = torch.clamp(std_delta, min=1e-6)
+        self.layer_activation_stddev[target_layer_idx] = std_delta.to(self.device)
 
-        print(f"✓ Profiled {len(self.layer_activation_stddev)} layers")
-        for layer_idx, std_dev in self.layer_activation_stddev.items():
-            print(f"  Layer {layer_idx}: {std_dev.shape} activations, mean_delta_std={std_dev.mean():.6f}")
+        layer_config = self.layer_configs[target_layer_idx]
+        print(f"✓ Profiled final layer ({target_layer_idx}): {layer_config.description}")
+        print(f"  Layer {target_layer_idx}: {std_delta.shape} activations, mean_delta_std={std_delta.mean():.6f}")
 
     def _capture_activations(self, ocr_input: torch.Tensor) -> Dict[int, torch.Tensor]:
         """Helper to capture activations at all layers for a given input."""
@@ -1702,6 +1698,32 @@ class ProgressivePatchTrainer:
             hook.remove()
 
         return activations_dict
+
+    def _capture_activations_target_layer(self, ocr_input: torch.Tensor, target_layer_idx: int) -> torch.Tensor:
+        """Helper to capture activations for only the target layer."""
+        activations_dict = {}
+        hooks = []
+
+        # Register hook only for target layer
+        def make_hook(idx):
+            def hook(module, input, output):
+                if isinstance(output, torch.Tensor):
+                    activations_dict[idx] = output.squeeze(0).reshape(-1).detach().cpu()
+            return hook
+
+        layer_config = self.layer_configs[target_layer_idx]
+        layer_module = self._find_layer_by_name(layer_config.name)
+        if layer_module is not None:
+            hooks.append(layer_module.register_forward_hook(make_hook(target_layer_idx)))
+
+        # Forward pass
+        self.ocr(ocr_input)
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        return activations_dict.get(target_layer_idx, torch.zeros(1, device=self.device))
 
     def _find_layer_by_name(self, layer_name: str):
         """Find a module in the OCR model by its name."""
