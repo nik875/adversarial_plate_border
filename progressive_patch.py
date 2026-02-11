@@ -520,8 +520,11 @@ class BottleneckDenseRefiner(nn.Module):
             )
 
         # Generate seed-conditioned character features for each scale
-        # Each scale MLP outputs feature map [B, char_embed_dim*H/scale*W/scale]
-        # Flatten spatial dims, pass through decoder, reshape back
+        # MLP: z[B, 16] → [B, num_patches * 32]
+        # Reshape: [B, num_patches, 32]
+        # Flatten: [B*num_patches, 32]
+        # Decoder: → [B*num_patches, 1, 56, 56]
+        # Downscale and reshape: [B, 1, H, W]
         char_features_list = []
         for scale in self.scales:
             mlp = self.scale_mlps[str(scale)]
@@ -529,18 +532,19 @@ class BottleneckDenseRefiner(nn.Module):
             num_patches_w = self.patch_width // scale
             num_patches = num_patches_h * num_patches_w
 
-            # MLP output: [B, char_embed_dim * num_patches]
-            scale_features_flat = mlp(z)
+            # MLP output: [B, num_patches * 32]
+            mlp_output = mlp(z)
 
-            # Reshape to [B, char_embed_dim, num_patches_h, num_patches_w] then flatten spatial
-            scale_features = scale_features_flat.view(batch_size, self.char_embed_dim, num_patches_h, num_patches_w)
-            # Flatten spatial dims: [B*num_patches, char_embed_dim]
-            scale_features_batch = scale_features.permute(0, 2, 3, 1).contiguous().view(batch_size * num_patches, self.char_embed_dim)
+            # Reshape to [B, num_patches, 32]
+            char_embeddings = mlp_output.view(batch_size, num_patches, self.char_embed_dim)
 
-            # Pass through Omniglot decoder: [B*num_patches, char_embed_dim] → [B*num_patches, 1, 56, 56]
+            # Flatten to [B*num_patches, 32]
+            char_embeddings_flat = char_embeddings.view(batch_size * num_patches, self.char_embed_dim)
+
+            # Pass through Omniglot decoder: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
             with torch.no_grad():
-                self.omniglot_decoder = self.omniglot_decoder.to(scale_features_batch.device)
-                characters = self.omniglot_decoder(scale_features_batch)
+                self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
+                characters = self.omniglot_decoder(char_embeddings_flat)
 
             # Downscale characters to scale size: [B*num_patches, 1, scale, scale]
             characters_resized = F.interpolate(
@@ -550,7 +554,7 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
-            # Reshape back to [B, 1, H/scale, W/scale]
+            # Reshape back to [B, 1, H, W]
             characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
             characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
             char_scale = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
