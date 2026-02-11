@@ -322,58 +322,6 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
     ]
 
 
-class SimplePatchGenerator(nn.Module):
-    """Simple MLP patch generator (memory-efficient alternative to FoundationPatchGenerator)"""
-    def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512,
-                 hidden_dims: List[int] = None, num_layers: int = 11):
-        super().__init__()
-
-        self.latent_dim = latent_dim
-        self.patch_height = patch_height
-        self.patch_width = patch_width
-        self.patch_dim = 3 * patch_height * patch_width
-
-        # Default hidden dimensions if not specified
-        if hidden_dims is None:
-            hidden_dims = [256, 512, 1024]
-
-        layers = []
-        prev_dim = latent_dim
-
-        # Build hidden layers
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.SiLU(inplace=True))
-            prev_dim = hidden_dim
-
-        # Output layer
-        layers.append(nn.Linear(prev_dim, self.patch_dim))
-        layers.append(nn.Sigmoid())  # Output in [0, 1]
-
-        self.network = nn.Sequential(*layers)
-
-        # Initialize weights
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-        print(f"Simple generator initialized: {latent_dim} → {' → '.join(map(str, hidden_dims))} → {self.patch_dim}")
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [batch_size, latent_dim]
-        Returns:
-            patches: [batch_size, 3, patch_height, patch_width]
-        """
-        patches_flat = self.network(z)  # [batch_size, patch_dim]
-        patches = patches_flat.view(-1, 3, self.patch_height, self.patch_width)
-        return patches
-
-
 class BottleneckDenseRefiner(nn.Module):
     """
     Bottleneck dense refiner for patch refinement with minimal parameters.
@@ -452,9 +400,9 @@ class BottleneckDenseRefiner(nn.Module):
         )
 
         # Spatial propagation layers (same padding to preserve size)
-        # Process concatenated patches/refined to propagate information spatially
+        # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
         self.spatial_layers = nn.Sequential(
-            nn.Conv2d(6, 32, kernel_size=3, padding=1),
+            nn.Conv2d(10, 32, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.SiLU(inplace=True),
@@ -462,9 +410,47 @@ class BottleneckDenseRefiner(nn.Module):
             nn.SiLU(inplace=True),
         )
 
+        # Load Omniglot decoder for character generation
+        print("Loading Omniglot decoder for character conditioning...")
+        omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
+        if omniglot_decoder_path.exists():
+            self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path))
+            self.omniglot_decoder.eval()
+            for param in self.omniglot_decoder.parameters():
+                param.requires_grad = False
+            print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path}")
+        else:
+            raise FileNotFoundError(f"Omniglot decoder not found at {omniglot_decoder_path}. "
+                                  f"Please ensure omniglot_ae_export/decoder_traced.pt exists.")
+
         # Multi-scale regional decomposition
         # Different scales capture different contextual information
         self.scales = [8, 16, 32, 64]  # Patch sizes
+
+        # Create scale-specific MLPs for character generation
+        # Each patch position has its own MLP that converts z to character embeddings
+        self.scale_mlps = nn.ModuleDict()
+        self.num_patches_per_scale = {}
+
+        for scale in self.scales:
+            num_patches_h = patch_height // scale
+            num_patches_w = patch_width // scale
+            num_patches = num_patches_h * num_patches_w
+            self.num_patches_per_scale[scale] = (num_patches_h, num_patches_w, num_patches)
+
+            # Create MLP for each patch position: z[16] → 32 dims
+            mlp_list = nn.ModuleList()
+            for _ in range(num_patches):
+                mlp = nn.Sequential(
+                    nn.Linear(latent_dim, 32),
+                    nn.SiLU(inplace=True),
+                    nn.Linear(32, 32),
+                    nn.SiLU(inplace=True),
+                    nn.Linear(32, 32),
+                )
+                mlp_list.append(mlp)
+            self.scale_mlps[str(scale)] = mlp_list
+
         self.scale_convs = nn.ModuleDict()
         for scale in self.scales:
             # Each scale gets its own 1x1 conv to compress 32 → 3 channels
@@ -539,9 +525,17 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
+        # Generate character features for each scale
+        # Each scale has its own set of per-patch MLPs that generate characters
+        char_features_list = []
+        for scale in self.scales:
+            char_features = self._generate_character_features(z, scale, batch_size, z.device)  # [B, 1, H, W]
+            char_features_list.append(char_features)
+
         # Multi-scale regional decomposition
-        # Concatenate original and refined patches
-        combined = torch.cat([patches, refined], dim=1)  # [B, 6, H, W]
+        # Concatenate original patch, refined patch, and character features from all scales
+        # [B, 3] + [B, 3] + [B, 1] + [B, 1] + [B, 1] + [B, 1] = [B, 10]
+        combined = torch.cat([patches, refined] + char_features_list, dim=1)  # [B, 10, H, W]
 
         # Spatial propagation: propagate information without changing size
         spatial_features = self.spatial_layers(combined)  # [B, 32, H, W]
@@ -572,6 +566,66 @@ class BottleneckDenseRefiner(nn.Module):
         refined_patches = self.post_expansion_smooth(refined_patches)  # [B, 3, H, W]
 
         return refined_patches
+
+    def _generate_character_features(self, z: torch.Tensor, scale: int, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Generate character features for a specific scale using per-patch MLPs.
+
+        Args:
+            z: [batch_size, latent_dim] latent seed
+            scale: Patch size (8, 16, 32, or 64)
+            batch_size: Batch size
+            device: Device to create tensors on
+
+        Returns:
+            char_features: [batch_size, 1, patch_height, patch_width] character features at scale
+        """
+        num_patches_h, num_patches_w, num_patches = self.num_patches_per_scale[scale]
+        mlp_list = self.scale_mlps[str(scale)]
+
+        # Generate character embeddings for each patch
+        # Process all patches in batch: [B, num_patches, 32]
+        char_embeddings = []
+        for patch_idx in range(num_patches):
+            mlp = mlp_list[patch_idx]
+            # Apply patch-specific MLP to z: [B, 16] → [B, 32]
+            char_embed = mlp(z)  # [B, 32]
+            char_embeddings.append(char_embed)
+
+        # Stack embeddings: [num_patches, B, 32] → transpose → [B, num_patches, 32]
+        char_embeddings = torch.stack(char_embeddings, dim=0)  # [num_patches, B, 32]
+        char_embeddings = char_embeddings.permute(1, 0, 2)  # [B, num_patches, 32]
+
+        # Decode all character embeddings through Omniglot decoder in batch
+        # Reshape to process as batch: [B*num_patches, 32]
+        char_embeddings_flat = char_embeddings.view(batch_size * num_patches, 32)
+
+        with torch.no_grad():
+            # Generate characters: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
+            characters = self.omniglot_decoder(char_embeddings_flat)
+
+        # Downscale characters to patch size
+        characters_resized = F.interpolate(
+            characters,
+            size=(scale, scale),
+            mode='bilinear',
+            align_corners=True
+        )  # [B*num_patches, 1, scale, scale]
+
+        # Fold patches back into full image
+        # Reshape: [B*num_patches, 1, scale, scale] → [B, num_patches, 1, scale, scale]
+        characters_resized = characters_resized.view(batch_size, num_patches, 1, scale, scale)
+
+        # Reshape to: [B, 1, num_patches_h, scale, num_patches_w, scale]
+        characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
+
+        # Permute to: [B, 1, num_patches_h, num_patches_w, scale, scale]
+        characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
+
+        # Fold into full image: [B, 1, H, W]
+        char_features = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
+
+        return char_features
 
     def _process_scale(self, spatial_features: torch.Tensor, scale: int, batch_size: int) -> torch.Tensor:
         """
@@ -739,13 +793,9 @@ class FoundationPatchGenerator(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-        # Optional: bottleneck dense refiner for final refinement
-        self.use_bottleneck_refiner = use_bottleneck_refiner
-        if use_bottleneck_refiner:
-            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim)
-            print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning, bottleneck_dim={bottleneck_dim})")
-        else:
-            self.bottleneck_refiner = None
+        # Bottleneck dense refiner for final refinement
+        self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim)
+        print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning, bottleneck_dim={bottleneck_dim})")
 
         print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
         print(f"Patch projector: 65 → 32 → 3 channels (1x1 convolutions, ~2.2K parameters)")
@@ -805,9 +855,8 @@ class FoundationPatchGenerator(nn.Module):
         # Project to patch using 1x1 convolutions
         patches = self.patch_projector(projector_input)  # [B, 3, H, W]
 
-        # Apply bottleneck dense refiner if enabled (with seed conditioning)
-        if self.use_bottleneck_refiner and self.bottleneck_refiner is not None:
-            patches = self.bottleneck_refiner(patches, z)
+        # Apply bottleneck dense refiner (with seed conditioning)
+        patches = self.bottleneck_refiner(patches, z)
 
         return patches
 
@@ -830,7 +879,6 @@ class ProgressivePatchTrainer:
                  tv_weight: float = 2.5,
                  spectrum_weight: float = 1.0,
                  layer_configs: Optional[List[LayerConfig]] = None,
-                 use_simple_generator: bool = False,
                  ocr_dataset_split: str = 'train',
                  ocr_max_samples: Optional[int] = None,
                  ocr_images_per_batch: int = 1,
@@ -838,7 +886,6 @@ class ProgressivePatchTrainer:
                  use_vae_lora: bool = True,
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
-                 use_bottleneck_refiner: bool = False,
                  bottleneck_dim: int = 256,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
@@ -849,11 +896,9 @@ class ProgressivePatchTrainer:
         self.spectrum_weight = spectrum_weight
         self.save_examples_every = save_examples_every
         self.ocr_images_per_batch = ocr_images_per_batch
-        self.use_simple_generator = use_simple_generator
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.use_bottleneck_refiner = use_bottleneck_refiner
         self.bottleneck_dim = bottleneck_dim
 
         # Require ocr_patches_per_image
@@ -957,32 +1002,21 @@ class ProgressivePatchTrainer:
 
         print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val")
 
-        # Initialize generator (simple or foundation model)
+        # Initialize generator (foundation model with trainable VAE)
         # num_layers is fixed at 11 for the OCR model
         num_layers = len(self.layer_configs)
 
-        if use_simple_generator:
-            # Simple MLP generator (memory-efficient)
-            self.generator = SimplePatchGenerator(
-                latent_dim=basis_dim,
-                patch_height=self.patch_height,
-                patch_width=self.patch_width,
-                num_layers=num_layers
-            ).to(self.device)
-        else:
-            # Foundation model generator with trainable VAE
-            # Create generator with trainable adapter + trainable SD VAE decoder
-            self.generator = FoundationPatchGenerator(
-                latent_dim=basis_dim,
-                patch_height=self.patch_height,
-                patch_width=self.patch_width,
-                num_layers=num_layers,
-                use_vae_lora=use_vae_lora,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                use_bottleneck_refiner=use_bottleneck_refiner,
-                bottleneck_dim=bottleneck_dim
-            ).to(self.device)
+        self.generator = FoundationPatchGenerator(
+            latent_dim=basis_dim,
+            patch_height=self.patch_height,
+            patch_width=self.patch_width,
+            num_layers=num_layers,
+            use_vae_lora=use_vae_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            use_bottleneck_refiner=True,
+            bottleneck_dim=bottleneck_dim
+        ).to(self.device)
 
         # Activation capture for diversity metric
         self.ocr_activations = None  # Current activations from forward hook
@@ -2285,7 +2319,7 @@ class ProgressivePatchTrainer:
             return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * step / total_steps)) / 2) / initial_lr
 
         # Create lambda functions for each parameter group
-        # Group 0: VAE (or all params if simple generator)
+        # Group 0: VAE
         # Groups 1+: Custom layers
         lambda_funcs = []
         for group in optimizer.param_groups:
@@ -2341,42 +2375,38 @@ class ProgressivePatchTrainer:
             vae_learning_rate = learning_rate
 
         # Collect trainable parameters
-        if self.use_simple_generator:
-            optimizer = optim.AdamW(self.generator.parameters(), lr=learning_rate, weight_decay=1e-4)
+        trainable_params = []
+
+        # VAE parameters (LoRA only if enabled)
+        if hasattr(self.generator, 'use_vae_lora') and self.generator.use_vae_lora:
+            vae_lora_params = [p for p in self.generator.vae.parameters() if p.requires_grad]
+            trainable_params.append({'params': vae_lora_params, 'lr': vae_learning_rate, 'name': 'vae_lora'})
+            print(f"Optimizer: VAE LoRA parameters: {sum(p.numel() for p in vae_lora_params):,} (lr={vae_learning_rate})")
         else:
-            trainable_params = []
+            vae_params = list(self.generator.vae.parameters())
+            trainable_params.append({'params': vae_params, 'lr': vae_learning_rate, 'name': 'vae_full'})
+            print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,} (lr={vae_learning_rate})")
 
-            # VAE parameters (LoRA only if enabled)
-            if hasattr(self.generator, 'use_vae_lora') and self.generator.use_vae_lora:
-                vae_lora_params = [p for p in self.generator.vae.parameters() if p.requires_grad]
-                trainable_params.append({'params': vae_lora_params, 'lr': vae_learning_rate, 'name': 'vae_lora'})
-                print(f"Optimizer: VAE LoRA parameters: {sum(p.numel() for p in vae_lora_params):,} (lr={vae_learning_rate})")
-            else:
-                vae_params = list(self.generator.vae.parameters())
-                trainable_params.append({'params': vae_params, 'lr': vae_learning_rate, 'name': 'vae_full'})
-                print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,} (lr={vae_learning_rate})")
+        # Other components (always trainable) - use custom learning rate
+        for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector']:
+            module = getattr(self.generator, name)
+            params = list(module.parameters())
+            trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
+            print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
 
-            # Other components (always trainable) - use custom learning rate
-            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector']:
-                module = getattr(self.generator, name)
-                params = list(module.parameters())
-                trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
-                print(f"Optimizer: {name} parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
+        # Bottleneck refiner - use custom learning rate
+        module = self.generator.bottleneck_refiner
+        params = list(module.parameters())
+        trainable_params.append({'params': params, 'lr': learning_rate, 'name': 'bottleneck_refiner'})
+        print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
 
-            # Bottleneck refiner (optional, only if enabled) - use custom learning rate
-            if self.use_bottleneck_refiner and hasattr(self.generator, 'bottleneck_refiner') and self.generator.bottleneck_refiner is not None:
-                module = self.generator.bottleneck_refiner
-                params = list(module.parameters())
-                trainable_params.append({'params': params, 'lr': learning_rate, 'name': 'bottleneck_refiner'})
-                print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
+        # Print total trainable parameters
+        total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
+        print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
+        print(f"Optimizer: VAE learning rate: {vae_learning_rate}, Custom layers learning rate: {learning_rate}")
+        print(f"Optimizer: Both decay to lr_min={lr_min} via cosine annealing")
 
-            # Print total trainable parameters
-            total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
-            print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
-            print(f"Optimizer: VAE learning rate: {vae_learning_rate}, Custom layers learning rate: {learning_rate}")
-            print(f"Optimizer: Both decay to lr_min={lr_min} via cosine annealing")
-
-            optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
+        optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
 
         # Calculate total training steps for step-based scheduling
         num_images = len(self.train_loader)
@@ -2417,14 +2447,10 @@ class ProgressivePatchTrainer:
         print(f"   Patch size: {self.patch_height}×{self.patch_width}")
         print(f"   Latent dimensions: {self.basis_dim}")
 
-        # Print generator architecture based on type
-        if self.use_simple_generator:
-            print(f"   Generator: SimplePatchGenerator (MLP-based, memory-efficient)")
-            print(f"     Architecture: z[{self.basis_dim}] → 256 → 512 → 1024 → {3 * self.patch_height * self.patch_width} → patch[3×{self.patch_height}×{self.patch_width}]")
-        else:
-            vae_latent_dim = self.generator.vae_latent_dim
-            print(f"   Generator: FoundationPatchGenerator (VAE-based, high quality)")
-            print(f"     Architecture: z[{self.basis_dim}] → adapter → VAE → CNN refiner → patch[3×{self.patch_height}×{self.patch_width}]")
+        # Print generator architecture
+        vae_latent_dim = self.generator.vae_latent_dim
+        print(f"   Generator: FoundationPatchGenerator (VAE-based, high quality)")
+        print(f"     Architecture: z[{self.basis_dim}] → adapter → VAE → CNN refiner → patch[3×{self.patch_height}×{self.patch_width}]")
 
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   Quality weight: {self.quality_weight}")
@@ -2552,20 +2578,9 @@ def main():
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
-    parser.add_argument('--simple-generator', action='store_true',
-                        help='Use simple MLP generator instead of foundation model (VAE-based). '
-                        'Simple generator: z → MLP[256→512→1024] → patch. '
-                        'Foundation model: z → adapter → VAE decoder → CNN refiner → patch projector (1×1 convs) → patch. '
-                        'Simple generator uses ~10x less memory but may produce lower quality patches.')
-    parser.add_argument('--use-bottleneck-refiner', action='store_true',
-                        help='Add bottleneck dense refiner for final patch refinement (only with FoundationPatchGenerator). '
-                        'Architecture: Spatial compress (stride 4,2) → Dense bottleneck → Spatial expand. '
-                        'Parameters: ~50-100K (vs 300M+ for full dense). '
-                        'Benefits: Dense processing of patch features with minimal parameters through spatial reduction.')
     parser.add_argument('--bottleneck-dim', type=int, default=256,
                         help='Hidden dimension of middle dense layer in bottleneck refiner (default: 256). '
-                        'Controls expressivity: 256 (baseline) → 512 (more capacity, +35%% params) → 1024 (more capacity, +100%% params). '
-                        'Only used if --use-bottleneck-refiner is enabled.')
+                        'Controls expressivity: 256 (baseline) → 512 (more capacity, +35%% params) → 1024 (more capacity, +100%% params).')
     parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
@@ -2628,7 +2643,6 @@ def main():
         'performance_weight': args.performance_weight,
         'tv_weight': args.tv_weight,
         'spectrum_weight': args.spectrum_weight,
-        'use_simple_generator': args.simple_generator,
         'ocr_dataset_split': args.ocr_dataset_split,
         'ocr_max_samples': args.ocr_max_samples,
         'ocr_images_per_batch': args.ocr_images_per_batch,
@@ -2636,7 +2650,7 @@ def main():
         'use_vae_lora': args.use_vae_lora,
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
-        'use_bottleneck_refiner': args.use_bottleneck_refiner,
+        'use_bottleneck_refiner': True,
         'bottleneck_dim': args.bottleneck_dim,
         'save_examples_every': args.save_examples_every
     }
@@ -2752,14 +2766,6 @@ Memory-efficient training with eval_depth (reduces diversity computation):
     python progressive_patch.py --batch-size 64 --eval-depth 512
     # Evaluates up to 512 pairs instead of 64^2=4096 (8x memory reduction)
 
-Memory-efficient training with simple generator (reduces model size):
-    python progressive_patch.py --simple-generator
-    # Uses SimplePatchGenerator (MLP) instead of FoundationPatchGenerator (VAE-based)
-    # ~10x less memory usage, faster training, but potentially lower quality patches
-
-    # Combine with eval_depth for maximum memory efficiency:
-    python progressive_patch.py --simple-generator --batch-size 64 --eval-depth 512
-
 Queue specific layers for progressive training:
     python progressive_patch.py --target-layer "0,5,10"
     # Train progressively through only layers 0 (Conv1), 5 (PatchExtractor), and 10 (FinalOutput)
@@ -2818,20 +2824,13 @@ Convergence criteria:
 
 Then automatically advances to next layer in progression.
 
-Generator architectures:
-- SimplePatchGenerator (--simple-generator flag):
-  * Simple MLP: z[basis_dim] → 256 → 512 → 1024 → patch
-  * Memory: ~10x less than FoundationPatchGenerator
-  * Speed: Faster forward/backward passes
-  * Quality: Lower quality patches, less realistic textures
-  * Use case: Quick prototyping, limited GPU memory, faster iterations
-
-- FoundationPatchGenerator (default):
-  * Complex architecture: Adapter → VAE decoder → CNN refiner → patch projector (1×1 convs)
-  * Memory: High (requires SD VAE decoder with many parameters)
-  * Speed: Slower due to VAE and multiple refinement stages
-  * Quality: Higher quality, more realistic patches
-  * Use case: Final runs, high-quality patch generation
+Generator architecture:
+- FoundationPatchGenerator:
+  * Complex architecture: Adapter → VAE decoder → CNN refiner → Bottleneck dense refiner → patch projector
+  * Uses Stable Diffusion VAE decoder (trainable with LoRA support)
+  * CNN refiner provides feature refinement
+  * Bottleneck refiner applies dense processing via spatial compression/expansion
+  * Quality: High-quality, realistic patches with multi-scale processing
 
 Diversity computation and memory:
 - eval_depth controls the total number of (patch, image) evaluations for diversity:
@@ -2841,7 +2840,6 @@ Diversity computation and memory:
   * Randomly samples off-diagonal pairs from budget (eval_depth - batch_size)
 - Benefits: Reduces memory without sacrificing diversity quality, enables larger batch sizes
 - Example: batch_size=32, eval_depth=256 reduces evals from 1024 to 256 (75% reduction)
-- Combine with --simple-generator for maximum memory efficiency
 
 Checkpoint structure:
 - training_complete_final_model/: FINAL model after all training (generator + 20 sample patches)
