@@ -97,12 +97,15 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
                  fontsize=10, fontweight='normal')
 
-    # Original images
-    axes[0, 0].imshow(img1)
+    # Original images with center mask applied
+    img1_masked = img1.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+    img2_masked = img2.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+
+    axes[0, 0].imshow(img1_masked.astype(np.uint8))
     axes[0, 0].set_title('Image 1')
     axes[0, 0].axis('off')
 
-    axes[0, 1].imshow(img2)
+    axes[0, 1].imshow(img2_masked.astype(np.uint8))
     axes[0, 1].set_title('Image 2')
     axes[0, 1].axis('off')
 
@@ -198,12 +201,15 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
                  fontsize=10, fontweight='normal')
 
-    # Original images
-    axes[0, 0].imshow(img1)
+    # Original images with center mask applied
+    img1_masked = img1.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+    img2_masked = img2.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+
+    axes[0, 0].imshow(img1_masked.astype(np.uint8))
     axes[0, 0].set_title('Image 1')
     axes[0, 0].axis('off')
 
-    axes[0, 1].imshow(img2)
+    axes[0, 1].imshow(img2_masked.astype(np.uint8))
     axes[0, 1].set_title('Image 2')
     axes[0, 1].axis('off')
 
