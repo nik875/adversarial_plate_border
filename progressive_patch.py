@@ -438,15 +438,13 @@ class BottleneckDenseRefiner(nn.Module):
             num_patches = num_patches_h * num_patches_w
             self.num_patches_per_scale[scale] = (num_patches_h, num_patches_w, num_patches)
 
-            # Create MLP for each patch position: z[16] → 32 dims
+            # Create MLP for each patch position: z[16] → 16 → 32 dims
             mlp_list = nn.ModuleList()
             for _ in range(num_patches):
                 mlp = nn.Sequential(
-                    nn.Linear(latent_dim, 32),
+                    nn.Linear(latent_dim, 16),
                     nn.SiLU(inplace=True),
-                    nn.Linear(32, 32),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(32, 32),
+                    nn.Linear(16, 32),
                 )
                 mlp_list.append(mlp)
             self.scale_mlps[str(scale)] = mlp_list
