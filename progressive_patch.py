@@ -1690,13 +1690,13 @@ class ProgressivePatchTrainer:
 
     def profile_layer_activations(self, num_samples: int = 1024):
         """
-        Profile activation deltas from random patches vs neutral baseline.
+        Profile activation deltas from VAE-generated patches vs neutral baseline.
 
         For each image, computes activations with:
         1. Neutral border (baseline)
-        2. Random patch applied at random location
+        2. Uniformly random VAE-generated patch applied as border (matching training)
 
-        Then computes mean and std_dev of the delta between random patch and baseline.
+        Then computes mean and std_dev of the delta between patched and baseline.
         This captures the typical magnitude of activation changes from patches,
         used to appropriately scale quality scores during training.
 
@@ -1732,37 +1732,29 @@ class ProgressivePatchTrainer:
                 ocr_input_baseline = cropped_baseline.permute(0, 2, 3, 1) * 255
                 baseline_acts = self._capture_activations(ocr_input_baseline)
 
-                # 2. Get activations with random patch
-                _, _, img_h, img_w = prep_image.shape
-                patch_h, patch_w = PATCH_HEIGHT, PATCH_WIDTH
+                # 2. Generate uniformly random patch from VAE and apply as border (matching training)
+                # Sample from uniform distribution in latent space
+                z = self.sample_coefficients(1)
+                random_patch = self.generate_patches(z)[0]  # [3, H, W]
 
-                # Only apply if patch fits in image
-                if img_h >= patch_h and img_w >= patch_w:
-                    # Sample random patch
-                    random_patch = torch.rand(1, 3, patch_h, patch_w, device=self.device)
+                # Apply patch as border using the same method as training
+                prep_image_patched, _ = self.apply_patch_ocr_mode(prep_image, random_patch)
 
-                    # Apply at random location
-                    y_offset = np.random.randint(0, img_h - patch_h + 1)
-                    x_offset = np.random.randint(0, img_w - patch_w + 1)
+                cropped_patched = F.interpolate(
+                    prep_image_patched,
+                    size=self.ocr_input_shape[:2],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                ocr_input_patched = cropped_patched.permute(0, 2, 3, 1) * 255
+                patched_acts = self._capture_activations(ocr_input_patched)
 
-                    prep_image_patched = prep_image.clone()
-                    prep_image_patched[:, :, y_offset:y_offset+patch_h, x_offset:x_offset+patch_w] = random_patch
-
-                    cropped_patched = F.interpolate(
-                        prep_image_patched,
-                        size=self.ocr_input_shape[:2],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    ocr_input_patched = cropped_patched.permute(0, 2, 3, 1) * 255
-                    patched_acts = self._capture_activations(ocr_input_patched)
-
-                    # 3. Compute deltas
-                    for layer_idx in baseline_acts.keys():
-                        delta = patched_acts[layer_idx] - baseline_acts[layer_idx]
-                        if layer_idx not in all_layer_deltas:
-                            all_layer_deltas[layer_idx] = []
-                        all_layer_deltas[layer_idx].append(delta)
+                # 3. Compute deltas
+                for layer_idx in baseline_acts.keys():
+                    delta = patched_acts[layer_idx] - baseline_acts[layer_idx]
+                    if layer_idx not in all_layer_deltas:
+                        all_layer_deltas[layer_idx] = []
+                    all_layer_deltas[layer_idx].append(delta)
 
         # Compute mean and std_dev of deltas for each layer
         self.layer_activation_stddev = {}
@@ -2138,10 +2130,11 @@ class ProgressivePatchTrainer:
 
                                     # Normalize by std_dev
                                     normalized_delta = delta_flat / (std_dev + 1e-8)
-                                    normalized_delta_norm = torch.norm(normalized_delta)
+                                    # Use RMS (dimension-independent) instead of L2 norm
+                                    normalized_delta_rms = (normalized_delta ** 2).mean().sqrt()
 
-                                    # Quality score: normalized activation delta
-                                    quality_scores.append(normalized_delta_norm)
+                                    # Quality score: normalized activation delta (dimension-independent)
+                                    quality_scores.append(normalized_delta_rms)
                         else:
                             # If no stddev profiling, use ones
                             quality_scores = [torch.tensor(1.0, device=self.device) for _ in accumulated_patches]
@@ -2173,8 +2166,9 @@ class ProgressivePatchTrainer:
                                                 delta_prior = prior_act - baseline_prior
                                                 delta_flat_prior = delta_prior.flatten()
                                                 normalized_delta_prior = delta_flat_prior / (std_dev_prior + 1e-8)
-                                                normalized_delta_norm_prior = torch.norm(normalized_delta_prior)
-                                                prior_quality_scores.append(normalized_delta_norm_prior)
+                                                # Use RMS (dimension-independent) instead of L2 norm
+                                                normalized_delta_rms_prior = (normalized_delta_prior ** 2).mean().sqrt()
+                                                prior_quality_scores.append(normalized_delta_rms_prior)
 
                                         if prior_quality_scores:
                                             quality_prior_avg = torch.stack(prior_quality_scores).mean()
