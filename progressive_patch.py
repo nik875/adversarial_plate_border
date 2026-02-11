@@ -1351,9 +1351,9 @@ class ProgressivePatchTrainer:
         else:
             decay_rate = torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
-        # Return negative decay rate: minimizing this maximizes diversity
+        # Return decay rate: minimizing this slows the eigenvalue decay
         # (we want slower decay, which means smaller decay_rate)
-        return -decay_rate
+        return decay_rate
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
