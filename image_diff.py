@@ -15,7 +15,7 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.ndimage import gaussian_filter
-from kornia.metrics import structural_similarity as kornia_ssim
+from kornia.metrics import ssim
 
 
 def load_image(path):
@@ -59,24 +59,29 @@ def compute_ssim_kornia(img1, img2, window_size=11):
     Returns:
         ssim_map: Per-pixel SSIM dissimilarity (1 - SSIM)
     """
-    # Convert to grayscale and normalize to [0, 1]
-    if len(img1.shape) == 3:
-        img1_gray = cv2.cvtColor(img1.astype(np.uint8), cv2.COLOR_RGB2GRAY) / 255.0
-        img2_gray = cv2.cvtColor(img2.astype(np.uint8), cv2.COLOR_RGB2GRAY) / 255.0
-    else:
-        img1_gray = img1.astype(np.float32) / 255.0
-        img2_gray = img2.astype(np.float32) / 255.0
+    # Normalize to [0, 1]
+    img1_norm = img1.astype(np.float32) / 255.0 if img1.max() > 1 else img1.astype(np.float32)
+    img2_norm = img2.astype(np.float32) / 255.0 if img2.max() > 1 else img2.astype(np.float32)
 
-    # Convert to torch tensors and add batch/channel dimensions (1, 1, H, W)
+    # Convert to torch tensors with shape (1, C, H, W)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tensor1 = torch.from_numpy(img1_gray[np.newaxis, np.newaxis, :, :]).float().to(device)
-    tensor2 = torch.from_numpy(img2_gray[np.newaxis, np.newaxis, :, :]).float().to(device)
 
-    # Compute SSIM map using Kornia
-    ssim_map = kornia_ssim(tensor1, tensor2, window_size=window_size)
+    if len(img1_norm.shape) == 3:
+        # RGB image: (H, W, C) -> (C, H, W) -> (1, C, H, W)
+        tensor1 = torch.from_numpy(np.transpose(img1_norm, (2, 0, 1))[np.newaxis, :, :, :]).float().to(device)
+        tensor2 = torch.from_numpy(np.transpose(img2_norm, (2, 0, 1))[np.newaxis, :, :, :]).float().to(device)
+    else:
+        # Grayscale: (H, W) -> (1, H, W) -> (1, 1, H, W)
+        tensor1 = torch.from_numpy(img1_norm[np.newaxis, np.newaxis, :, :]).float().to(device)
+        tensor2 = torch.from_numpy(img2_norm[np.newaxis, np.newaxis, :, :]).float().to(device)
 
-    # Convert back to numpy and return dissimilarity (1 - SSIM)
-    ssim_map = ssim_map.squeeze().cpu().numpy()
+    # Compute SSIM map using Kornia (returns [B, C, H, W])
+    ssim_map = ssim(tensor1, tensor2, window_size=window_size)
+
+    # Average across channels and convert to numpy
+    ssim_map = ssim_map.mean(dim=1).squeeze().cpu().numpy()
+
+    # Return dissimilarity (1 - SSIM)
     return 1 - ssim_map
 
 
