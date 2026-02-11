@@ -1954,12 +1954,12 @@ class ProgressivePatchTrainer:
 
         For each image, samples a random target layer and trains patches to:
         1. Maximize diversity at that layer (diversity score)
-        2. Achieve high quality score at that layer (quality = tanh(delta/std_dev/2))
+        2. Achieve high quality score at that layer (quality = normalized activation delta)
         3. Minimize impact on prior layers (cascade penalty with exponential decay)
 
         Loss = -(diversity * quality - cascade_penalty) where:
         - diversity: log determinant of gram matrix of activation deltas
-        - quality: tanh-bounded quality score at target layer
+        - quality: normalized activation delta (no saturation)
         - cascade_penalty: exponentially decaying penalty on prior layers
         """
         total_diversity_loss = 0.0
@@ -2109,9 +2109,8 @@ class ProgressivePatchTrainer:
                                     normalized_delta = delta_flat / (std_dev + 1e-8)
                                     normalized_delta_norm = torch.norm(normalized_delta)
 
-                                    # Quality score: tanh(norm / 2)
-                                    quality = torch.tanh(normalized_delta_norm / 2.0)
-                                    quality_scores.append(quality)
+                                    # Quality score: normalized activation delta
+                                    quality_scores.append(normalized_delta_norm)
                         else:
                             # If no stddev profiling, use ones
                             quality_scores = [torch.tensor(1.0, device=self.device) for _ in accumulated_patches]
@@ -2144,8 +2143,7 @@ class ProgressivePatchTrainer:
                                                 delta_flat_prior = delta_prior.flatten()
                                                 normalized_delta_prior = delta_flat_prior / (std_dev_prior + 1e-8)
                                                 normalized_delta_norm_prior = torch.norm(normalized_delta_prior)
-                                                quality_prior = torch.tanh(normalized_delta_norm_prior / 2.0)
-                                                prior_quality_scores.append(quality_prior)
+                                                prior_quality_scores.append(normalized_delta_norm_prior)
 
                                         if prior_quality_scores:
                                             quality_prior_avg = torch.stack(prior_quality_scores).mean()
