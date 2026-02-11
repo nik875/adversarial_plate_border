@@ -22,6 +22,7 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
+from kornia.metrics import ssim
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -1211,26 +1212,26 @@ class ProgressivePatchTrainer:
 
     def compute_spectrum_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute pixel-space diversity loss based on variance entropy.
+        Compute SSIM-based structural similarity penalty to encourage patch diversity.
 
-        Measures diversity by computing Shannon entropy of the explained variance
-        distribution. High entropy = variance spread across many components (good).
-        Low entropy = variance concentrated in few components (bad).
+        SSIM (Structural Similarity Index) measures similarity based on luminance,
+        contrast, and structure. We penalize high SSIM between patch pairs to force
+        genuinely different structures across patches in the batch.
+
+        High SSIM penalty = patches have similar structures
+        Low SSIM penalty = patches have different structures (good)
 
         Process:
         1. Apply border mask to focus on visible region
-        2. Convert to grayscale
-        3. Flatten and stack into matrix [batch_size, H*W]
-        4. Compute SVD to get singular values
-        5. Calculate explained variance ratio for each component
-        6. Compute Shannon entropy of the distribution
-        7. Return negative entropy (minimize to maximize diversity)
+        2. Compute pairwise SSIM between all patch pairs
+        3. Average SSIM across visible regions
+        4. Return mean pairwise SSIM as the penalty
 
         Args:
             patches: [batch_size, 3, H, W] patch tensor in [0, 1]
 
         Returns:
-            torch.Tensor: Scalar loss (negative Shannon entropy)
+            torch.Tensor: Scalar loss (mean pairwise SSIM penalty)
         """
         batch_size = patches.shape[0]
         if batch_size < 2:
@@ -1239,49 +1240,42 @@ class ProgressivePatchTrainer:
         _, _, H, W = patches.shape
         border_mask = self.create_border_mask(H, W, border_scale=1.4).to(patches.device)  # [1, 1, H, W]
 
-        # Apply border mask to patches
-        patches_masked = patches * border_mask  # [batch_size, 3, H, W]
+        # Compute pairwise SSIM between all patches
+        ssim_sum = 0.0
+        pair_count = 0
 
-        # Convert to grayscale: [batch_size, 3, H, W] -> [batch_size, H, W]
-        # Using standard RGB to grayscale conversion: 0.299*R + 0.587*G + 0.114*B
-        patches_gray = (0.299 * patches_masked[:, 0] +
-                        0.587 * patches_masked[:, 1] +
-                        0.114 * patches_masked[:, 2])  # [batch_size, H, W]
+        for i in range(batch_size):
+            for j in range(i + 1, batch_size):
+                # SSIM expects [B, C, H, W], so add batch dim to each patch
+                patch_i = patches[i:i+1]  # [1, 3, H, W]
+                patch_j = patches[j:j+1]  # [1, 3, H, W]
 
-        # Flatten each patch: [batch_size, H*W]
-        patches_flat = patches_gray.reshape(batch_size, -1)  # [batch_size, H*W]
+                # Compute SSIM using kornia (returns per-pixel map [B, 3, H, W])
+                # window_size=11 is standard for SSIM
+                ssim_map = ssim(patch_i, patch_j, window_size=11)  # [1, 3, H, W]
 
-        # Center the data (subtract mean for each dimension)
-        patches_centered = patches_flat - patches_flat.mean(dim=0, keepdim=True)
+                # Average across channels: [1, 3, H, W] -> [1, 1, H, W]
+                ssim_map_avg = ssim_map.mean(dim=1, keepdim=True)
 
-        # Compute SVD to get singular values
-        # U: [batch_size, batch_size], S: [min(batch_size, H*W)], Vh: [H*W, H*W]
-        try:
-            U, S, Vh = torch.svd(patches_centered)
-        except:
-            # Fallback if SVD fails
+                # Apply border mask: only consider visible regions
+                masked_ssim = ssim_map_avg * border_mask  # [1, 1, H, W]
+
+                # Compute mean only over visible border region
+                num_visible_pixels = border_mask.sum()
+                if num_visible_pixels > 0:
+                    ssim_val = masked_ssim.sum() / num_visible_pixels
+                else:
+                    ssim_val = 0.0
+
+                ssim_sum += ssim_val
+                pair_count += 1
+
+        # Return mean SSIM across all pairs
+        # Minimizing this penalty maximizes structural diversity
+        if pair_count > 0:
+            return ssim_sum / pair_count
+        else:
             return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
-
-        # Singular values are already sorted in descending order
-        # Normalize by sqrt(n-1) for proper variance scaling
-        S = S / (batch_size - 1) ** 0.5 if batch_size > 1 else S
-
-        # Avoid division by zero and log(0)
-        epsilon = 1e-8
-        S = torch.clamp(S, min=epsilon)
-
-        # Calculate explained variance ratio for each principal component
-        variance = S ** 2  # Variance from singular values
-        explained_variance = variance / variance.sum()  # Normalize to [0, 1], sums to 1
-
-        # Compute Shannon entropy: -sum(p_i * log(p_i))
-        # High entropy = uniform distribution (variance spread across components)
-        # Low entropy = concentrated distribution (variance in few components)
-        entropy = -(explained_variance * torch.log(explained_variance + epsilon)).sum()
-
-        # Return negative entropy: minimizing this maximizes entropy
-        # (we want variance spread across components, not concentrated)
-        return -entropy
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
