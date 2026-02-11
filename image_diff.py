@@ -11,10 +11,11 @@ from glob import glob
 
 import cv2
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.ndimage import gaussian_filter
-from skimage.metrics import structural_similarity as ssim
+from kornia.metrics import structural_similarity as kornia_ssim
 
 
 def load_image(path):
@@ -48,41 +49,35 @@ def create_center_mask(height, width):
     return mask
 
 
-def compute_local_ssim(img1, img2, window_size=11):
-    """Compute local SSIM at each pixel using a sliding window.
+def compute_ssim_kornia(img1, img2, window_size=11):
+    """Compute SSIM dissimilarity using Kornia GPU-accelerated implementation.
 
     Args:
-        img1, img2: Images as numpy arrays
+        img1, img2: Images as numpy arrays (H x W x C)
         window_size: Size of the SSIM computation window
 
     Returns:
-        ssim_map: Per-pixel SSIM values (1 - SSIM so higher = more different)
+        ssim_map: Per-pixel SSIM dissimilarity (1 - SSIM)
     """
-    # Convert to grayscale
+    # Convert to grayscale and normalize to [0, 1]
     if len(img1.shape) == 3:
-        img1 = cv2.cvtColor(img1.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
-        img2 = cv2.cvtColor(img2.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+        img1_gray = cv2.cvtColor(img1.astype(np.uint8), cv2.COLOR_RGB2GRAY) / 255.0
+        img2_gray = cv2.cvtColor(img2.astype(np.uint8), cv2.COLOR_RGB2GRAY) / 255.0
+    else:
+        img1_gray = img1.astype(np.float32) / 255.0
+        img2_gray = img2.astype(np.float32) / 255.0
 
-    h, w = img1.shape
-    pad = window_size // 2
-    ssim_map = np.zeros((h, w), dtype=np.float32)
+    # Convert to torch tensors and add batch/channel dimensions (1, 1, H, W)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tensor1 = torch.from_numpy(img1_gray[np.newaxis, np.newaxis, :, :]).float().to(device)
+    tensor2 = torch.from_numpy(img2_gray[np.newaxis, np.newaxis, :, :]).float().to(device)
 
-    for i in range(pad, h - pad):
-        for j in range(pad, w - pad):
-            window1 = img1[i - pad:i + pad + 1, j - pad:j + pad + 1]
-            window2 = img2[i - pad:i + pad + 1, j - pad:j + pad + 1]
-            ssim_val = ssim(window1, window2, data_range=255)
-            ssim_map[i, j] = 1 - ssim_val  # Convert to dissimilarity
+    # Compute SSIM map using Kornia
+    ssim_map = kornia_ssim(tensor1, tensor2, window_size=window_size)
 
-    # Fill edges with nearest valid value
-    for i in range(pad):
-        ssim_map[i, :] = ssim_map[pad, :]
-        ssim_map[h - 1 - i, :] = ssim_map[h - 1 - pad, :]
-    for j in range(pad):
-        ssim_map[:, j] = ssim_map[:, pad]
-        ssim_map[:, w - 1 - j] = ssim_map[:, w - 1 - pad]
-
-    return ssim_map
+    # Convert back to numpy and return dissimilarity (1 - SSIM)
+    ssim_map = ssim_map.squeeze().cpu().numpy()
+    return 1 - ssim_map
 
 
 def compute_average_diff_zones(images_list, gaussian_sigma=2, mask=None):
@@ -99,13 +94,13 @@ def compute_average_diff_zones(images_list, gaussian_sigma=2, mask=None):
     if not images_list or len(images_list) < 2:
         return None, None
 
-    h, w = images_list[0].shape[:2]
     ssim_maps = []
 
     # Compute SSIM for all pairs
+    print(f"  Computing SSIM for {len(images_list) * (len(images_list) - 1) // 2} image pairs...")
     for i in range(len(images_list)):
         for j in range(i + 1, len(images_list)):
-            ssim_map = compute_local_ssim(images_list[i], images_list[j])
+            ssim_map = compute_ssim_kornia(images_list[i], images_list[j])
             ssim_maps.append(ssim_map)
 
     zone_heatmap = np.mean(ssim_maps, axis=0)
