@@ -22,7 +22,7 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
-import dists
+from DISTS_pytorch import DISTS
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -1308,7 +1308,7 @@ class ProgressivePatchTrainer:
 
         # Initialize DISTS model if not already done
         if not hasattr(self, 'dists_model'):
-            self.dists_model = dists.DISTS().to(patches.device)
+            self.dists_model = DISTS().to(patches.device)
             self.dists_model.eval()
 
         # Create border mask (same for all patches)
