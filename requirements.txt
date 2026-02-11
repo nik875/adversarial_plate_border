@@ -9,6 +9,7 @@ scipy
 scikit-learn
 cma
 kornia
+lpips
 shapely
 fast-alpr
 open_image_models[onnx]

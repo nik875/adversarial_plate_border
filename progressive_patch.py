@@ -22,7 +22,7 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
-from kornia.metrics import ssim
+import lpips
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -850,7 +850,7 @@ class ProgressivePatchTrainer:
                  diversity_exponent: float = 1.0,
                  quality_exponent: float = 1.0,
                  tv_weight: float = 2.5,
-                 ssim_weight: float = 1.0,
+                 lpips_weight: float = 1.0,
                  cascade_weight: float = 0.25,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  use_simple_generator: bool = False,
@@ -869,7 +869,7 @@ class ProgressivePatchTrainer:
         self.diversity_exponent = diversity_exponent
         self.quality_exponent = quality_exponent
         self.tv_weight = tv_weight
-        self.ssim_weight = ssim_weight
+        self.lpips_weight = lpips_weight
         self.cascade_weight = cascade_weight
         self.save_examples_every = save_examples_every
         self.ocr_images_per_batch = ocr_images_per_batch
@@ -1284,14 +1284,14 @@ class ProgressivePatchTrainer:
 
         return mask
 
-    def compute_ssim_loss(self, patches: torch.Tensor) -> torch.Tensor:
+    def compute_lpips_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute SSIM-based structural similarity penalty to prevent patches from
-        having the same structure with different intensity mappings.
+        Compute LPIPS-based perceptual distance penalty to prevent patches from
+        having similar perceptual content.
 
-        SSIM (Structural Similarity Index) measures similarity based on luminance,
-        contrast, and structure. High SSIM = similar structures even if brightness/
-        contrast differs. We penalize high SSIM to force genuinely different structures.
+        LPIPS (Learned Perceptual Image Patch Similarity) uses a VGG network to
+        compute perceptual similarity. High LPIPS = perceptually different.
+        We use negative LPIPS (perceptual distance) to penalize similar patches.
 
         Only compares the visible border region (excludes center plate region that
         gets obscured when patch is applied).
@@ -1300,45 +1300,48 @@ class ProgressivePatchTrainer:
             patches: [batch_size, 3, H, W] patch tensor
 
         Returns:
-            torch.Tensor: Scalar SSIM penalty (mean pairwise SSIM, higher = more similar)
+            torch.Tensor: Scalar LPIPS penalty (mean negative pairwise LPIPS distance)
         """
         batch_size = patches.shape[0]
         if batch_size < 2:
             return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
+        # Initialize LPIPS model if not already done
+        if not hasattr(self, 'lpips_model'):
+            self.lpips_model = lpips.LPIPS(net='vgg').to(patches.device)
+            self.lpips_model.eval()
+
         # Create border mask (same for all patches)
         _, _, H, W = patches.shape
         border_mask = self.create_border_mask(H, W, border_scale=1.4).to(patches.device)  # [1, 1, H, W]
 
-        # Compute pairwise SSIM between all patches
-        ssim_sum = 0.0
+        # Compute pairwise LPIPS between all patches
+        lpips_sum = 0.0
         pair_count = 0
 
-        for i in range(batch_size):
-            for j in range(i + 1, batch_size):
-                # SSIM expects [B, C, H, W], so add batch dim to each patch
-                patch_i = patches[i:i+1]  # [1, 3, H, W]
-                patch_j = patches[j:j+1]  # [1, 3, H, W]
+        with torch.no_grad():
+            for i in range(batch_size):
+                for j in range(i + 1, batch_size):
+                    # LPIPS expects [B, 3, H, W] in range [-1, 1]
+                    patch_i = patches[i:i+1]  # [1, 3, H, W]
+                    patch_j = patches[j:j+1]  # [1, 3, H, W]
 
-                # Compute SSIM (returns per-pixel map)
-                ssim_map = ssim(patch_i, patch_j, window_size=11)  # [1, 3, H, W]
+                    # Normalize to [-1, 1] range if needed (assuming input is [0, 1])
+                    patch_i_norm = patch_i * 2 - 1
+                    patch_j_norm = patch_j * 2 - 1
 
-                # Apply border mask: only consider visible regions
-                # Average across channels first, then apply spatial mask
-                ssim_map_avg = ssim_map.mean(dim=1, keepdim=True)  # [1, 1, H, W]
-                masked_ssim = ssim_map_avg * border_mask  # [1, 1, H, W]
+                    # Compute LPIPS distance (higher = more different, which is good)
+                    lpips_dist = self.lpips_model(patch_i_norm, patch_j_norm)  # [1, 1, 1, 1]
+                    lpips_val = lpips_dist.item()
 
-                # Compute mean only over visible border region
-                num_visible_pixels = border_mask.sum()
-                ssim_val = masked_ssim.sum() / num_visible_pixels if num_visible_pixels > 0 else 0.0
+                    # Use negative LPIPS as diversity loss (want to maximize perceptual distance)
+                    lpips_sum += lpips_val
+                    pair_count += 1
 
-                ssim_sum += ssim_val
-                pair_count += 1
+        # Average LPIPS across all pairs (negative = diversity penalty)
+        avg_lpips = lpips_sum / pair_count if pair_count > 0 else 0.0
 
-        # Average SSIM across all pairs
-        avg_ssim = ssim_sum / pair_count if pair_count > 0 else 0.0
-
-        return avg_ssim
+        return avg_lpips
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
@@ -1892,7 +1895,7 @@ class ProgressivePatchTrainer:
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
-        total_ssim_loss = 0.0
+        total_lpips_loss = 0.0
         total_cascade_penalty = 0.0
         total_raw_diversity_score = 0.0
         total_raw_quality_score = 0.0
@@ -1925,7 +1928,7 @@ class ProgressivePatchTrainer:
                     # Accumulate losses for this batch
                     batch_diversity_loss = 0.0
                     batch_tv_loss = 0.0
-                    batch_ssim_loss = 0.0
+                    batch_lpips_loss = 0.0
                     batch_cascade_penalty = 0.0
                     batch_raw_diversity_score = 0.0
                     batch_raw_quality_score = 0.0
@@ -2091,12 +2094,12 @@ class ProgressivePatchTrainer:
                         tv_loss = self.total_variation_loss(patches_stacked)
                         tv_loss_weighted = self.tv_weight * tv_loss
 
-                        # Compute SSIM loss
-                        ssim_loss = self.compute_ssim_loss(patches_stacked)
-                        ssim_loss_weighted = self.ssim_weight * ssim_loss
+                        # Compute LPIPS loss
+                        lpips_loss = self.compute_lpips_loss(patches_stacked)
+                        lpips_loss_weighted = self.lpips_weight * lpips_loss
 
                         # Final combined loss
-                        final_loss = total_loss + tv_loss_weighted + ssim_loss_weighted
+                        final_loss = total_loss + tv_loss_weighted + lpips_loss_weighted
 
                         # Backward (accumulate gradients)
                         final_loss.backward()
@@ -2104,7 +2107,7 @@ class ProgressivePatchTrainer:
                         # Accumulate losses for batch
                         batch_diversity_loss += total_loss.item()
                         batch_tv_loss += tv_loss_weighted.item()
-                        batch_ssim_loss += ssim_loss_weighted.item()
+                        batch_lpips_loss += lpips_loss_weighted.item()
                         batch_cascade_penalty = cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
 
                         # Accumulate raw diversity and quality scores
@@ -2132,7 +2135,7 @@ class ProgressivePatchTrainer:
                         # Track average losses for batch
                         total_diversity_loss += batch_diversity_loss / batch_count
                         total_tv_loss += batch_tv_loss / batch_count
-                        total_ssim_loss += batch_ssim_loss / batch_count
+                        total_lpips_loss += batch_lpips_loss / batch_count
                         total_cascade_penalty += batch_cascade_penalty
                         total_raw_diversity_score += batch_raw_diversity_score / batch_count
                         total_raw_quality_score += batch_raw_quality_score / batch_count
@@ -2143,7 +2146,7 @@ class ProgressivePatchTrainer:
                 # Update progress bar
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
-                avg_ssim_loss = total_ssim_loss / num_updates if num_updates > 0 else 0
+                avg_lpips_loss = total_lpips_loss / num_updates if num_updates > 0 else 0
                 avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
                 avg_raw_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
@@ -2152,7 +2155,7 @@ class ProgressivePatchTrainer:
                     'QualScore': f"{avg_raw_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
-                    'SSIMLoss': f"{avg_ssim_loss:.4f}",
+                    'LPIPSLoss': f"{avg_lpips_loss:.4f}",
                     'Cascade': f"{avg_cascade_penalty:.4f}",
                 })
                 pbar.update(1)
@@ -2176,8 +2179,8 @@ class ProgressivePatchTrainer:
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
         avg_tv_loss = total_tv_loss / max(num_updates, 1)
-        avg_ssim_loss = total_ssim_loss / max(num_updates, 1)
-        return avg_diversity_loss, avg_tv_loss, avg_ssim_loss
+        avg_lpips_loss = total_lpips_loss / max(num_updates, 1)
+        return avg_diversity_loss, avg_tv_loss, avg_lpips_loss
 
     def validate(self) -> float:
         """Validation pass using diversity score"""
@@ -2437,7 +2440,7 @@ class ProgressivePatchTrainer:
             'epoch': [],
             'diversity_loss': [],
             'tv_loss': [],
-            'ssim_loss': [],
+            'lpips_loss': [],
             'learning_rate': []
         }
 
@@ -2463,7 +2466,7 @@ class ProgressivePatchTrainer:
 
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   TV weight: {self.tv_weight}")
-        print(f"   SSIM weight: {self.ssim_weight}")
+        print(f"   LPIPS weight: {self.lpips_weight}")
         print(f"   Cascade weight: {self.cascade_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
@@ -2476,20 +2479,20 @@ class ProgressivePatchTrainer:
             current_lr = optimizer.param_groups[0]['lr']
 
             # Training (scheduler.step() is called per batch inside train_epoch)
-            train_diversity_loss, train_tv_loss, train_ssim_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
+            train_diversity_loss, train_tv_loss, train_lpips_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
 
             # Record history
             history['epoch'].append(epoch)
             history['diversity_loss'].append(train_diversity_loss)
             history['tv_loss'].append(train_tv_loss)
-            history['ssim_loss'].append(train_ssim_loss)
+            history['lpips_loss'].append(train_lpips_loss)
             history['learning_rate'].append(current_lr)
 
             # Print epoch summary
             epoch_summary = (f"Epoch {epoch:3d}/{max_epochs} | "
                             f"DivLoss: {train_diversity_loss:.4f} | "
                             f"TVLoss: {train_tv_loss:.4f} | "
-                            f"SSIMLoss: {train_ssim_loss:.4f} | "
+                            f"LPIPSLoss: {train_lpips_loss:.4f} | "
                             f"LR: {current_lr:.2e}")
             print(epoch_summary)
 
@@ -2570,8 +2573,8 @@ def main():
                         'Values < 1.0 compress quality scores (e.g., 0.5 takes sqrt).')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
-    parser.add_argument('--ssim-weight', type=float, default=1.0,
-                        help='Weight for SSIM penalty to prevent structural similarity (default: 1.0)')
+    parser.add_argument('--lpips-weight', type=float, default=1.0,
+                        help='Weight for LPIPS penalty to prevent perceptual similarity (default: 1.0)')
     parser.add_argument('--cascade-weight', type=float, default=0.25,
                         help='Weight for cascade penalty on prior layers (default: 0.25). '
                         'Penalizes patch impact on layers before target layer to prevent learning shallow attacks.')
@@ -2669,7 +2672,7 @@ def main():
         'diversity_exponent': args.diversity_exponent,
         'quality_exponent': args.quality_exponent,
         'tv_weight': args.tv_weight,
-        'ssim_weight': args.ssim_weight,
+        'lpips_weight': args.lpips_weight,
         'cascade_weight': args.cascade_weight,
         'use_simple_generator': args.simple_generator,
         'ocr_dataset_split': args.ocr_dataset_split,
@@ -2718,9 +2721,9 @@ def main():
         ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        # TV and SSIM regularization losses
+        # TV and LPIPS regularization losses
         ax2.plot(history['epoch'], history['tv_loss'], 'g-', label='TV Loss', alpha=0.7)
-        ax2.plot(history['epoch'], history['ssim_loss'], 'orange', label='SSIM Loss', alpha=0.7)
+        ax2.plot(history['epoch'], history['lpips_loss'], 'orange', label='LPIPS Loss', alpha=0.7)
         for i, record in enumerate(trainer.layer_history):
             if i > 0:
                 transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
