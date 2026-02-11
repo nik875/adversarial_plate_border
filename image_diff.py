@@ -94,7 +94,7 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
-                 fontsize=14, fontweight='bold')
+                 fontsize=10, fontweight='normal')
 
     # Original images
     axes[0, 0].imshow(img1)
@@ -194,7 +194,7 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Image Comparison: {Path(path1).name} vs {Path(path2).name}\nMSE: {mse:.2f}',
-                 fontsize=14, fontweight='bold')
+                 fontsize=10, fontweight='normal')
 
     # Original images
     axes[0, 0].imshow(img1)
@@ -248,7 +248,7 @@ def display_diff_of_diffs(within_layer_zone, across_layer_zone, outfile=None):
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle('Diff of Diffs: Within-Layer vs Across-Layer Average Difference Zones',
-                 fontsize=14, fontweight='bold')
+                 fontsize=10, fontweight='normal')
 
     # Within-layer average zones
     im1 = axes[0].imshow(within_layer_zone, cmap='hot')
