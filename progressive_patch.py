@@ -2245,19 +2245,26 @@ class ProgressivePatchTrainer:
                 except StopIteration:
                     break
 
-                # Update progress bar
+                # Update progress bar (averaged over batches)
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
                 avg_spectrum_loss = total_spectrum_loss / num_updates if num_updates > 0 else 0
                 avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
                 avg_raw_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
+
+                # Per-patch losses (divide by patches per batch)
+                patches_per_batch = images_per_batch * patches_per_image
+                per_patch_div_loss = avg_diversity_loss / patches_per_batch if patches_per_batch > 0 else 0
+                per_patch_tv_loss = avg_tv_loss / patches_per_batch if patches_per_batch > 0 else 0
+                per_patch_spec_loss = avg_spectrum_loss / patches_per_batch if patches_per_batch > 0 else 0
+
                 pbar.set_postfix({
                     'DivScore': f"{avg_raw_diversity:.4f}",
                     'QualScore': f"{avg_raw_quality:.4f}",
-                    'DivLoss': f"{avg_diversity_loss:.4f}",
-                    'TVLoss': f"{avg_tv_loss:.4f}",
-                    'SpecLoss': f"{avg_spectrum_loss:.4f}",
+                    'DivLoss/patch': f"{per_patch_div_loss:.4f}",
+                    'TVLoss/patch': f"{per_patch_tv_loss:.4f}",
+                    'SpecLoss/patch': f"{per_patch_spec_loss:.4f}",
                     'Cascade': f"{avg_cascade_penalty:.4f}",
                 })
                 pbar.update(1)
