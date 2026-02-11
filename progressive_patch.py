@@ -414,7 +414,7 @@ class BottleneckDenseRefiner(nn.Module):
         print("Loading Omniglot decoder for character conditioning...")
         omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
         if omniglot_decoder_path.exists():
-            self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path))
+            self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
             self.omniglot_decoder.eval()
             for param in self.omniglot_decoder.parameters():
                 param.requires_grad = False
