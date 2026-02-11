@@ -14,6 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from scipy.ndimage import gaussian_filter
+from skimage.metrics import structural_similarity as ssim
 
 
 def load_image(path):
@@ -47,37 +48,67 @@ def create_center_mask(height, width):
     return mask
 
 
-def compute_average_diff_across_images(images_list):
-    """Compute average difference map across multiple image pairs."""
-    if not images_list or len(images_list) < 2:
-        return None
+def compute_local_ssim(img1, img2, window_size=11):
+    """Compute local SSIM at each pixel using a sliding window.
 
-    # Ensure all images have same shape
-    target_shape = images_list[0].shape
-    resized = []
-    for img in images_list:
-        if img.shape != target_shape:
-            h, w = target_shape[:2]
-            img = cv2.resize(img, (w, h))
-        resized.append(img.astype(np.float32))
+    Args:
+        img1, img2: Images as numpy arrays
+        window_size: Size of the SSIM computation window
 
-    # Compute pairwise differences and average
-    all_diffs = []
-    for i in range(len(resized)):
-        for j in range(i + 1, len(resized)):
-            diff = cv2.absdiff(resized[i], resized[j])
-            all_diffs.append(diff)
+    Returns:
+        ssim_map: Per-pixel SSIM values (1 - SSIM so higher = more different)
+    """
+    # Convert to grayscale
+    if len(img1.shape) == 3:
+        img1 = cv2.cvtColor(img1.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+        img2 = cv2.cvtColor(img2.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    return np.mean(all_diffs, axis=0) if all_diffs else None
+    h, w = img1.shape
+    pad = window_size // 2
+    ssim_map = np.zeros((h, w), dtype=np.float32)
+
+    for i in range(pad, h - pad):
+        for j in range(pad, w - pad):
+            window1 = img1[i - pad:i + pad + 1, j - pad:j + pad + 1]
+            window2 = img2[i - pad:i + pad + 1, j - pad:j + pad + 1]
+            ssim_val = ssim(window1, window2, data_range=255)
+            ssim_map[i, j] = 1 - ssim_val  # Convert to dissimilarity
+
+    # Fill edges with nearest valid value
+    for i in range(pad):
+        ssim_map[i, :] = ssim_map[pad, :]
+        ssim_map[h - 1 - i, :] = ssim_map[h - 1 - pad, :]
+    for j in range(pad):
+        ssim_map[:, j] = ssim_map[:, pad]
+        ssim_map[:, w - 1 - j] = ssim_map[:, w - 1 - pad]
+
+    return ssim_map
 
 
-def compute_average_diff_zones(diff_map, gaussian_sigma=2, mask=None):
-    """Compute per-pixel difference heatmap with log scaling.
+def compute_average_diff_zones(images_list, gaussian_sigma=2, mask=None):
+    """Compute average SSIM dissimilarity heatmap across images with log scaling.
+
+    Args:
+        images_list: List of images
+        gaussian_sigma: Sigma for Gaussian smoothing
+        mask: Optional mask to apply
 
     Returns:
         tuple: (log_scaled_heatmap, original_heatmap)
     """
-    zone_heatmap = np.mean(diff_map, axis=2)
+    if not images_list or len(images_list) < 2:
+        return None, None
+
+    h, w = images_list[0].shape[:2]
+    ssim_maps = []
+
+    # Compute SSIM for all pairs
+    for i in range(len(images_list)):
+        for j in range(i + 1, len(images_list)):
+            ssim_map = compute_local_ssim(images_list[i], images_list[j])
+            ssim_maps.append(ssim_map)
+
+    zone_heatmap = np.mean(ssim_maps, axis=0)
     if mask is not None:
         zone_heatmap = zone_heatmap * mask
     zone_heatmap = gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
@@ -185,16 +216,15 @@ def main():
             sys.exit(1)
 
         print(f"Loaded {len(images)} images")
-        print("Computing average within-layer differences...")
+        print("Computing average SSIM-based differences...")
 
-        avg_diff = compute_average_diff_across_images(images)
-        if avg_diff is None:
+        h, w = images[0].shape[:2]
+        center_mask = create_center_mask(h, w)
+        zone_data = compute_average_diff_zones(images, mask=center_mask)
+
+        if zone_data[0] is None:
             print("Error: Could not compute differences", file=sys.stderr)
             sys.exit(1)
-
-        h, w = avg_diff.shape[:2]
-        center_mask = create_center_mask(h, w)
-        zone_data = compute_average_diff_zones(avg_diff, mask=center_mask)
 
         display_average_diff(images, zone_data, args.directory, args.outfile)
 
