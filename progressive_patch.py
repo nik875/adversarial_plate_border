@@ -1716,8 +1716,12 @@ class ProgressivePatchTrainer:
 
                 # Run through model and capture activations for all layers
                 prep_image = batch_dict['prep_image'].unsqueeze(0).to(self.device)
+
+                # Apply neutral border to match baseline structure during training
+                prep_image_with_border = self.apply_neutral_border_ocr_mode(prep_image)
+
                 cropped_plate = F.interpolate(
-                    prep_image,
+                    prep_image_with_border,
                     size=self.ocr_input_shape[:2],
                     mode='bilinear',
                     align_corners=False
