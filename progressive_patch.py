@@ -414,16 +414,30 @@ class BottleneckDenseRefiner(nn.Module):
         # Different scales capture different contextual information
         self.scales = [8, 16, 32, 64]  # Patch sizes
 
+        # Load Omniglot decoder for character generation
+        print("Loading Omniglot decoder for character conditioning...")
+        omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
+        if omniglot_decoder_path.exists():
+            self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
+            self.omniglot_decoder.eval()
+            for param in self.omniglot_decoder.parameters():
+                param.requires_grad = False
+            print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path}")
+        else:
+            raise FileNotFoundError(f"Omniglot decoder not found at {omniglot_decoder_path}. "
+                                  f"Please ensure omniglot_ae_export/decoder_traced.pt exists.")
+
         # Create scale-specific dense MLPs for seed-conditioned feature generation
-        # Each MLP takes z and outputs a spatial feature map at that scale
+        # Each MLP takes z and outputs a spatial feature map (channel dim encodes seed)
         self.scale_mlps = nn.ModuleDict()
+        self.char_embed_dim = 32  # Channel dimension that encodes seed info
 
         for scale in self.scales:
             num_patches_h = patch_height // scale
             num_patches_w = patch_width // scale
-            output_size = num_patches_h * num_patches_w  # Single channel output
+            output_size = self.char_embed_dim * num_patches_h * num_patches_w
 
-            # Dense MLP: z[16] → hidden → output_size (to be reshaped to spatial dims)
+            # Dense MLP: z[16] → hidden → char_embed_dim * num_patches
             mlp = nn.Sequential(
                 nn.Linear(latent_dim, 64),
                 nn.SiLU(inplace=True),
@@ -505,27 +519,43 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
-        # Generate seed-conditioned features for each scale
-        # Each scale MLP takes z and outputs spatial features
+        # Generate seed-conditioned character features for each scale
+        # Each scale MLP outputs feature map [B, char_embed_dim*H/scale*W/scale]
+        # Flatten spatial dims, pass through decoder, reshape back
         char_features_list = []
         for scale in self.scales:
             mlp = self.scale_mlps[str(scale)]
-            # MLP output: [B, num_patches_h * num_patches_w]
-            scale_features_flat = mlp(z)
-
-            # Reshape to spatial: [B, 1, H/scale, W/scale]
             num_patches_h = self.patch_height // scale
             num_patches_w = self.patch_width // scale
-            scale_features = scale_features_flat.view(batch_size, 1, num_patches_h, num_patches_w)
+            num_patches = num_patches_h * num_patches_w
 
-            # Upsample to full resolution: [B, 1, H, W]
-            scale_features_upsampled = F.interpolate(
-                scale_features,
-                size=(self.patch_height, self.patch_width),
+            # MLP output: [B, char_embed_dim * num_patches]
+            scale_features_flat = mlp(z)
+
+            # Reshape to [B, char_embed_dim, num_patches_h, num_patches_w] then flatten spatial
+            scale_features = scale_features_flat.view(batch_size, self.char_embed_dim, num_patches_h, num_patches_w)
+            # Flatten spatial dims: [B*num_patches, char_embed_dim]
+            scale_features_batch = scale_features.permute(0, 2, 3, 1).contiguous().view(batch_size * num_patches, self.char_embed_dim)
+
+            # Pass through Omniglot decoder: [B*num_patches, char_embed_dim] → [B*num_patches, 1, 56, 56]
+            with torch.no_grad():
+                self.omniglot_decoder = self.omniglot_decoder.to(scale_features_batch.device)
+                characters = self.omniglot_decoder(scale_features_batch)
+
+            # Downscale characters to scale size: [B*num_patches, 1, scale, scale]
+            characters_resized = F.interpolate(
+                characters,
+                size=(scale, scale),
                 mode='bilinear',
                 align_corners=True
             )
-            char_features_list.append(scale_features_upsampled)
+
+            # Reshape back to [B, 1, H/scale, W/scale]
+            characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
+            characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
+            char_scale = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
+
+            char_features_list.append(char_scale)
 
         # Multi-scale regional decomposition
         # Concatenate original patch, refined patch, and character features from all scales
