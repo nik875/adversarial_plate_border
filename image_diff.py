@@ -72,11 +72,14 @@ def compute_average_diff_across_images(images_list):
 
 
 def compute_average_diff_zones(diff_map, gaussian_sigma=2, mask=None):
-    """Compute per-pixel difference heatmap."""
+    """Compute per-pixel difference heatmap with log scaling."""
     zone_heatmap = np.mean(diff_map, axis=2)
     if mask is not None:
         zone_heatmap = zone_heatmap * mask
-    return gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
+    zone_heatmap = gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
+    # Log scale to prevent extreme values from dominating
+    zone_heatmap = np.log1p(zone_heatmap)
+    return zone_heatmap
 
 
 def display_average_diff(images, zone_heatmap, directory, outfile=None):
