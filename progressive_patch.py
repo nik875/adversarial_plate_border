@@ -2176,12 +2176,13 @@ class ProgressivePatchTrainer:
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
                         # Additive diversity-quality loss: both terms independently incentivized
-                        # combined = diversity_weight * diversity_score + quality_weight * quality_score
+                        # combined = diversity_weight * diversity_score + quality_weight * log(quality_score)
                         # Loss = -(performance_weight * combined) + cascade_penalty
                         # diversity_score is negative (log-det: min at -inf, max at 0)
                         # quality_score is positive (normalized activation delta RMS)
-                        # To minimize loss: maximize diversity_score (toward 0) AND maximize quality_score
-                        combined_diversity_quality_loss = self.diversity_weight * diversity_score + self.quality_weight * quality_score
+                        # To minimize loss: maximize diversity_score (toward 0) AND maximize log(quality_score)
+                        log_quality_score = torch.log(quality_score + 1e-8)  # Add epsilon to avoid log(0)
+                        combined_diversity_quality_loss = self.diversity_weight * diversity_score + self.quality_weight * log_quality_score
                         total_loss = -(self.performance_weight * combined_diversity_quality_loss) + cascade_penalty
 
                         # Stack patches for batch operations
