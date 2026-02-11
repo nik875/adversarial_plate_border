@@ -601,6 +601,8 @@ class BottleneckDenseRefiner(nn.Module):
         char_embeddings_flat = char_embeddings.view(batch_size * num_patches, 32)
 
         with torch.no_grad():
+            # Move decoder to match input device (loaded on CPU, move to GPU if needed)
+            self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
             # Generate characters: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
             characters = self.omniglot_decoder(char_embeddings_flat)
 
