@@ -517,7 +517,15 @@ class BottleneckDenseRefiner(nn.Module):
             num_patches_h = self.patch_height // scale
             num_patches_w = self.patch_width // scale
             scale_features = scale_features_flat.view(batch_size, 1, num_patches_h, num_patches_w)
-            char_features_list.append(scale_features)
+
+            # Upsample to full resolution: [B, 1, H, W]
+            scale_features_upsampled = F.interpolate(
+                scale_features,
+                size=(self.patch_height, self.patch_width),
+                mode='bilinear',
+                align_corners=True
+            )
+            char_features_list.append(scale_features_upsampled)
 
         # Multi-scale regional decomposition
         # Concatenate original patch, refined patch, and character features from all scales
