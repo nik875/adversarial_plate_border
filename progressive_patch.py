@@ -388,12 +388,13 @@ class BottleneckDenseRefiner(nn.Module):
     Seed conditioning: Latent seed z is projected and concatenated at bottleneck
     to provide learned guidance to the refinement process.
     """
-    def __init__(self, patch_height: int = 256, patch_width: int = 512, latent_dim: int = 16):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512, latent_dim: int = 16, bottleneck_dim: int = 256):
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
         self.latent_dim = latent_dim
+        self.bottleneck_dim = bottleneck_dim
 
         # Compress spatial dimensions with strided convolutions
         self.compress = nn.Sequential(
@@ -424,9 +425,9 @@ class BottleneckDenseRefiner(nn.Module):
         self.dense = nn.Sequential(
             nn.Linear(bottleneck_with_seed_dim, 512),
             nn.SiLU(inplace=True),
-            nn.Linear(512, 256),
+            nn.Linear(512, self.bottleneck_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(256, 4096),
+            nn.Linear(self.bottleneck_dim, 4096),
             nn.SiLU(inplace=True),
         )
 
@@ -615,7 +616,7 @@ class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11,
                  use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16,
-                 use_bottleneck_refiner: bool = False):
+                 use_bottleneck_refiner: bool = False, bottleneck_dim: int = 256):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -741,8 +742,8 @@ class FoundationPatchGenerator(nn.Module):
         # Optional: bottleneck dense refiner for final refinement
         self.use_bottleneck_refiner = use_bottleneck_refiner
         if use_bottleneck_refiner:
-            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim)
-            print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning)")
+            self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim)
+            print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning, bottleneck_dim={bottleneck_dim})")
         else:
             self.bottleneck_refiner = None
 
@@ -838,6 +839,7 @@ class ProgressivePatchTrainer:
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
                  use_bottleneck_refiner: bool = False,
+                 bottleneck_dim: int = 256,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
@@ -852,6 +854,7 @@ class ProgressivePatchTrainer:
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.use_bottleneck_refiner = use_bottleneck_refiner
+        self.bottleneck_dim = bottleneck_dim
 
         # Require ocr_patches_per_image
         if ocr_patches_per_image is None:
@@ -977,7 +980,8 @@ class ProgressivePatchTrainer:
                 use_vae_lora=use_vae_lora,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
-                use_bottleneck_refiner=use_bottleneck_refiner
+                use_bottleneck_refiner=use_bottleneck_refiner,
+                bottleneck_dim=bottleneck_dim
             ).to(self.device)
 
         # Activation capture for diversity metric
@@ -2558,6 +2562,10 @@ def main():
                         'Architecture: Spatial compress (stride 4,2) → Dense bottleneck → Spatial expand. '
                         'Parameters: ~50-100K (vs 300M+ for full dense). '
                         'Benefits: Dense processing of patch features with minimal parameters through spatial reduction.')
+    parser.add_argument('--bottleneck-dim', type=int, default=256,
+                        help='Hidden dimension of middle dense layer in bottleneck refiner (default: 256). '
+                        'Controls expressivity: 256 (baseline) → 512 (more capacity, +35%% params) → 1024 (more capacity, +100%% params). '
+                        'Only used if --use-bottleneck-refiner is enabled.')
     parser.add_argument('--ocr-dataset', type=str, required=True,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
@@ -2629,6 +2637,7 @@ def main():
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
         'use_bottleneck_refiner': args.use_bottleneck_refiner,
+        'bottleneck_dim': args.bottleneck_dim,
         'save_examples_every': args.save_examples_every
     }
 
