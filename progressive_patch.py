@@ -1285,25 +1285,26 @@ class ProgressivePatchTrainer:
 
     def compute_spectrum_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute pixel-space diversity loss based on effective rank.
+        Compute pixel-space diversity loss based on variance entropy.
 
-        Measures diversity by computing the effective rank of the flattened patch matrix.
-        Effective rank = (sum(sigma_i))^2 / sum(sigma_i^2), ranging from 1 (rank 1) to
-        min(batch_size, H*W). Higher effective rank indicates greater diversity.
+        Measures diversity by computing Shannon entropy of the explained variance
+        distribution. High entropy = variance spread across many components (good).
+        Low entropy = variance concentrated in few components (bad).
 
         Process:
         1. Apply border mask to focus on visible region
         2. Convert to grayscale
         3. Flatten and stack into matrix [batch_size, H*W]
         4. Compute SVD to get singular values
-        5. Calculate effective rank
-        6. Return negative effective rank (minimize to maximize diversity)
+        5. Calculate explained variance ratio for each component
+        6. Compute Shannon entropy of the distribution
+        7. Return negative entropy (minimize to maximize diversity)
 
         Args:
             patches: [batch_size, 3, H, W] patch tensor in [0, 1]
 
         Returns:
-            torch.Tensor: Scalar loss (negative effective rank)
+            torch.Tensor: Scalar loss (negative Shannon entropy)
         """
         batch_size = patches.shape[0]
         if batch_size < 2:
@@ -1339,20 +1340,22 @@ class ProgressivePatchTrainer:
         # Normalize by sqrt(n-1) for proper variance scaling
         S = S / (batch_size - 1) ** 0.5 if batch_size > 1 else S
 
-        # Avoid division by zero
+        # Avoid division by zero and log(0)
         epsilon = 1e-8
         S = torch.clamp(S, min=epsilon)
 
-        # Calculate effective rank: (sum(sigma_i))^2 / sum(sigma_i^2)
-        # Ranges from 1 (rank 1, all variance in one direction) to min(batch_size, H*W) (full rank)
-        sum_sigma = S.sum()
-        sum_sigma_sq = (S ** 2).sum()
+        # Calculate explained variance ratio for each principal component
+        variance = S ** 2  # Variance from singular values
+        explained_variance = variance / variance.sum()  # Normalize to [0, 1], sums to 1
 
-        effective_rank = (sum_sigma ** 2) / sum_sigma_sq
+        # Compute Shannon entropy: -sum(p_i * log(p_i))
+        # High entropy = uniform distribution (variance spread across components)
+        # Low entropy = concentrated distribution (variance in few components)
+        entropy = -(explained_variance * torch.log(explained_variance + epsilon)).sum()
 
-        # Return negative effective rank: minimizing this maximizes effective rank
-        # (we want higher effective rank = more diversity)
-        return -effective_rank
+        # Return negative entropy: minimizing this maximizes entropy
+        # (we want variance spread across components, not concentrated)
+        return -entropy
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
