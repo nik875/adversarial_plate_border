@@ -2179,7 +2179,10 @@ class ProgressivePatchTrainer:
                         # Apply exponential emphasis to diversity and quality components if specified
                         diversity_score_emphasized = diversity_score ** self.diversity_exponent
                         quality_score_emphasized = quality_score ** self.quality_exponent
-                        combined_diversity_quality_loss = diversity_score_emphasized * quality_score_emphasized
+                        # Negate quality to align signs: diversity_score is negative (log-det), quality is positive
+                        # Product of two negatives = positive, then negate once more = negative loss to minimize
+                        # Minimizing negative loss = maximizing (more negative diversity_score = better diversity, higher quality)
+                        combined_diversity_quality_loss = diversity_score_emphasized * (-quality_score_emphasized)
                         total_loss = -(self.diversity_weight * combined_diversity_quality_loss - cascade_penalty)
 
                         # Stack patches for batch operations
