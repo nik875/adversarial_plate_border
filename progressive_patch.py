@@ -2243,9 +2243,10 @@ class ProgressivePatchTrainer:
                 avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
                 avg_raw_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
+                avg_log_quality = np.log(avg_raw_quality + 1e-8) if avg_raw_quality > 0 else np.log(1e-8)
                 pbar.set_postfix({
                     'DivScore': f"{avg_raw_diversity:.4f}",
-                    'QualScore': f"{avg_raw_quality:.4f}",
+                    'LogQual': f"{avg_log_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
                     'SpecLoss': f"{avg_spectrum_loss:.4f}",
