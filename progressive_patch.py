@@ -2152,8 +2152,8 @@ class ProgressivePatchTrainer:
                     'QualScore': f"{avg_raw_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
+                    'SSIMLoss': f"{avg_ssim_loss:.4f}",
                     'Cascade': f"{avg_cascade_penalty:.4f}",
-                    'Updates': num_updates
                 })
                 pbar.update(1)
 
