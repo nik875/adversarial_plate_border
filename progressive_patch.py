@@ -2171,7 +2171,8 @@ class ProgressivePatchTrainer:
 
                                         if prior_quality_scores:
                                             quality_prior_avg = torch.stack(prior_quality_scores).mean()
-                                            cascade_penalty = cascade_penalty + weight * quality_prior_avg
+                                            log_quality_prior = torch.log(quality_prior_avg + 1e-8)
+                                            cascade_penalty = cascade_penalty + weight * log_quality_prior
 
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
