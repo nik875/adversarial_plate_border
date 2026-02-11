@@ -804,7 +804,6 @@ class ProgressivePatchTrainer:
                  performance_weight: float = 1.0,
                  tv_weight: float = 2.5,
                  spectrum_weight: float = 1.0,
-                 cascade_weight: float = 0.25,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  use_simple_generator: bool = False,
                  ocr_dataset_split: str = 'train',
@@ -822,7 +821,6 @@ class ProgressivePatchTrainer:
         self.performance_weight = performance_weight
         self.tv_weight = tv_weight
         self.spectrum_weight = spectrum_weight
-        self.cascade_weight = cascade_weight
         self.save_examples_every = save_examples_every
         self.ocr_images_per_batch = ocr_images_per_batch
         self.use_simple_generator = use_simple_generator
@@ -1899,22 +1897,17 @@ class ProgressivePatchTrainer:
             return activations_dict
 
     def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LambdaLR, epoch: int) -> Tuple[float, float, float]:
-        """Train for one epoch with random layer sampling and cascade penalty.
+        """Train for one epoch targeting the final layer.
 
-        For each image, samples a random target layer and trains patches to:
-        1. Maximize diversity at that layer (diversity score)
-        2. Achieve high quality score at that layer (quality = normalized activation delta)
-        3. Minimize impact on prior layers (cascade penalty with exponential decay)
+        For each image, trains patches to:
+        1. Maximize diversity at the final layer (diversity score)
+        2. Achieve high quality score at the final layer (quality = normalized activation delta)
 
-        Loss = -(diversity * quality - cascade_penalty) where:
-        - diversity: log determinant of gram matrix of activation deltas
-        - quality: normalized activation delta (no saturation)
-        - cascade_penalty: exponentially decaying penalty on prior layers
+        Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
         total_spectrum_loss = 0.0
-        total_cascade_penalty = 0.0
         total_raw_diversity_score = 0.0
         total_raw_quality_score = 0.0
         num_updates = 0
@@ -1947,7 +1940,6 @@ class ProgressivePatchTrainer:
                     batch_diversity_loss = 0.0
                     batch_tv_loss = 0.0
                     batch_spectrum_loss = 0.0
-                    batch_cascade_sum = 0.0
                     batch_raw_diversity_score = 0.0
                     batch_raw_quality_score = 0.0
                     batch_count = 0
@@ -1976,9 +1968,7 @@ class ProgressivePatchTrainer:
                             accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
                                                        for k, v in single_batch.items()})
 
-                        # Compute baseline activations up to target layer (with neutral border)
-                        # Needed for cascade penalty computation on prior layers
-                        baseline_activations = {}  # layer_idx -> activation
+                        # Compute baseline activations for target layer (with neutral border)
                         prep_image = single_batch['prep_image'].to(self.device).unsqueeze(0)
 
                         # Apply neutral border to match patch structure for fair comparison
@@ -1990,43 +1980,40 @@ class ProgressivePatchTrainer:
                             mode='bilinear',
                             align_corners=False
                         )
-                        baseline_hooks = []
                         baseline_activations_dict = {}
 
-                        for layer_idx in layer_indices_to_capture:
-                            def make_hook(idx):
-                                def hook(module, input, output):
-                                    if isinstance(output, torch.Tensor):
-                                        baseline_activations_dict[idx] = output.squeeze(0).detach().clone()
-                                return hook
-                            layer_config = self.layer_configs[layer_idx]
-                            layer_module = self._find_layer_by_name(layer_config.name)
-                            if layer_module is not None:
-                                baseline_hooks.append(layer_module.register_forward_hook(make_hook(layer_idx)))
+                        # Register hook for target layer only
+                        def make_hook(idx):
+                            def hook(module, input, output):
+                                if isinstance(output, torch.Tensor):
+                                    baseline_activations_dict[idx] = output.squeeze(0).detach().clone()
+                            return hook
+
+                        layer_config = self.layer_configs[sampled_layer_idx]
+                        layer_module = self._find_layer_by_name(layer_config.name)
+                        baseline_hook = None
+                        if layer_module is not None:
+                            baseline_hook = layer_module.register_forward_hook(make_hook(sampled_layer_idx))
 
                         # Forward pass without patch
                         ocr_input = cropped_plate.permute(0, 2, 3, 1) * 255
                         self.ocr(ocr_input)
-                        baseline_activations = baseline_activations_dict.copy()
+                        baseline_activation = baseline_activations_dict.get(sampled_layer_idx)
 
-                        # Remove baseline hooks
-                        for hook in baseline_hooks:
-                            hook.remove()
+                        # Remove baseline hook
+                        if baseline_hook is not None:
+                            baseline_hook.remove()
 
-                        # Get activations for all patches at all relevant layers (0 to target for cascade)
-                        patch_activations_per_layer = {idx: [] for idx in layer_indices_to_capture}
+                        # Get activations for all patches at target layer only
+                        target_layer_activations = []
                         for patch in accumulated_patches:
                             activations_dict = self._get_multi_layer_activations(
                                 single_batch, patch, layer_indices_to_capture, use_grad=True
                             )
-                            for layer_idx in layer_indices_to_capture:
-                                patch_activations_per_layer[layer_idx].append(activations_dict.get(layer_idx))
-
-                        # Compute diversity at target layer
-                        target_layer_activations = patch_activations_per_layer[sampled_layer_idx]
+                            target_layer_activations.append(activations_dict.get(sampled_layer_idx))
 
                         # Create baseline list for target layer (one per accumulated patch)
-                        baseline_for_diversity = [baseline_activations[sampled_layer_idx]] * len(accumulated_patches)
+                        baseline_for_diversity = [baseline_activation] * len(accumulated_patches) if baseline_activation is not None else None
 
                         # Compute diversity score
                         diversity_score = self.compute_activation_diversity(
@@ -2039,13 +2026,12 @@ class ProgressivePatchTrainer:
 
                         # Compute quality score at target layer
                         quality_scores = []
-                        if sampled_layer_idx in self.layer_activation_stddev:
+                        if sampled_layer_idx in self.layer_activation_stddev and baseline_activation is not None:
                             std_dev = self.layer_activation_stddev[sampled_layer_idx]
-                            baseline_target = baseline_activations[sampled_layer_idx]
                             for patch_act in target_layer_activations:
                                 if patch_act is not None:
                                     # Compute delta
-                                    delta = patch_act - baseline_target
+                                    delta = patch_act - baseline_activation
                                     delta_flat = delta.flatten()
 
                                     # Normalize by std_dev
@@ -2061,45 +2047,9 @@ class ProgressivePatchTrainer:
 
                         quality_score = torch.stack(quality_scores).mean() if quality_scores else torch.tensor(1.0, device=self.device)
 
-                        # Compute cascade penalty on prior layers
-                        cascade_penalty = 0.0
-                        if sampled_layer_idx > 0:
-                            # Cosine decay: stays high for most layers, drops sharply near target
-                            # weight[i] = cos(π * i / (2 * (num_prior_layers)))
-                            # Layer 0: cos(0) = 1.0 (100%)
-                            # Last layer: cos(π/2) ≈ 0.0 (0%)
-                            num_prior_layers = sampled_layer_idx
-
-                            for prior_layer_idx in range(sampled_layer_idx):
-                                weight = np.cos(np.pi * prior_layer_idx / (2.0 * num_prior_layers))
-
-                                # Compute quality score for prior layer
-                                if prior_layer_idx in self.layer_activation_stddev:
-                                    std_dev_prior = self.layer_activation_stddev[prior_layer_idx]
-                                    baseline_prior = baseline_activations.get(prior_layer_idx)
-                                    prior_acts = patch_activations_per_layer.get(prior_layer_idx, [])
-
-                                    if baseline_prior is not None and prior_acts:
-                                        prior_quality_scores = []
-                                        for prior_act in prior_acts:
-                                            if prior_act is not None:
-                                                delta_prior = prior_act - baseline_prior
-                                                delta_flat_prior = delta_prior.flatten()
-                                                normalized_delta_prior = delta_flat_prior / (std_dev_prior + 1e-8)
-                                                # Use RMS (dimension-independent) instead of L2 norm
-                                                normalized_delta_rms_prior = (normalized_delta_prior ** 2).mean().sqrt()
-                                                prior_quality_scores.append(normalized_delta_rms_prior)
-
-                                        if prior_quality_scores:
-                                            quality_prior_avg = torch.stack(prior_quality_scores).mean()
-                                            log_quality_prior = torch.log(quality_prior_avg + 1e-8)
-                                            cascade_penalty = cascade_penalty + weight * log_quality_prior
-
-                        cascade_penalty = self.cascade_weight * cascade_penalty
-
                         log_quality_score = torch.log(quality_score + 1e-8)
                         combined = self.diversity_weight * diversity_score + self.quality_weight * log_quality_score
-                        total_loss = -(self.performance_weight * combined) + cascade_penalty
+                        total_loss = -(self.performance_weight * combined)
 
                         # Stack patches for batch operations
                         patches_stacked = torch.stack(accumulated_patches, dim=0)
@@ -2125,7 +2075,6 @@ class ProgressivePatchTrainer:
                         # Accumulate raw diversity and quality scores
                         batch_raw_diversity_score += diversity_score.item() if isinstance(diversity_score, torch.Tensor) else diversity_score
                         batch_raw_quality_score += log_quality_score.item() if isinstance(log_quality_score, torch.Tensor) else log_quality_score
-                        batch_cascade_sum += cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
 
                         batch_count += 1
 
@@ -2149,7 +2098,6 @@ class ProgressivePatchTrainer:
                         total_diversity_loss += batch_diversity_loss / batch_count
                         total_tv_loss += batch_tv_loss / batch_count
                         total_spectrum_loss += batch_spectrum_loss / batch_count
-                        total_cascade_penalty += batch_cascade_sum / batch_count
                         total_raw_diversity_score += batch_raw_diversity_score / batch_count
                         total_raw_quality_score += batch_raw_quality_score / batch_count
 
@@ -2161,7 +2109,6 @@ class ProgressivePatchTrainer:
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
                 avg_spectrum_loss = total_spectrum_loss / num_updates if num_updates > 0 else 0
-                avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
                 avg_log_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
                 pbar.set_postfix({
@@ -2170,7 +2117,6 @@ class ProgressivePatchTrainer:
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
                     'SpecLoss': f"{avg_spectrum_loss:.4f}",
-                    'Cascade': f"{avg_cascade_penalty:.4f}",
                 })
                 pbar.update(1)
 
@@ -2331,18 +2277,17 @@ class ProgressivePatchTrainer:
 
     def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50):
         """
-        Random layer sampling training with cascade penalty.
+        Train patches targeting the final OCR layer.
 
         Trains patches by:
-        1. Profiling layer activations for normalization
-        2. Looping over epochs (not layers)
-        3. For each epoch, randomly sampling target layers per image
-        4. Training with cascade penalty to prevent early-layer attacks
+        1. Profiling final layer activations for normalization
+        2. Training for specified number of epochs
+        3. Targeting the final layer (FinalOutput) exclusively
 
         Saves:
         - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
         - checkpoints/{run_id}/best_progressive_patch/: Best model across all training
-        - checkpoints/{run_id}/layer{i}_samples_epoch_*/: Sample patches for each layer (10 per layer)
+        - checkpoints/{run_id}/checkpoint_epoch_*/: Periodic checkpoints every 10 epochs
         """
         from datetime import datetime
 
@@ -2465,7 +2410,6 @@ class ProgressivePatchTrainer:
         print(f"   Performance weight: {self.performance_weight}")
         print(f"   TV weight: {self.tv_weight}")
         print(f"   DISTS weight: {self.spectrum_weight}")
-        print(f"   Cascade weight: {self.cascade_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
         print(f"   Max epochs: {max_epochs}")
@@ -2557,20 +2501,17 @@ def main():
                         help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
                         help='Weight for diversity term in combined loss (default: 1.0). '
-                        'Multiplies diversity_score. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score)) + cascade')
+                        'Multiplies diversity_score. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
     parser.add_argument('--quality-weight', type=float, default=1.0,
                         help='Weight for quality term in combined loss (default: 1.0). '
-                        'Multiplies quality_score. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score)) + cascade')
+                        'Multiplies quality_score. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
     parser.add_argument('--performance-weight', type=float, default=1.0,
                         help='Overall weight for diversity-quality combined loss (default: 1.0). '
-                        'Multiplies the entire combined term. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score)) + cascade')
+                        'Multiplies the entire combined term. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--spectrum-weight', type=float, default=1.0,
                         help='Weight for spectrum diversity loss to maximize effective rank (default: 1.0)')
-    parser.add_argument('--cascade-weight', type=float, default=0.25,
-                        help='Weight for cascade penalty on prior layers (default: 0.25). '
-                        'Penalizes patch impact on layers before target layer to prevent learning shallow attacks.')
     parser.add_argument('--save-examples-every', type=int, default=None,
                         help='Save example patches every N batches during training (default: disabled). '
                         'Saves 5 sample patches to checkpoints/{run_id}/example_samples/. '
@@ -2661,7 +2602,6 @@ def main():
         'performance_weight': args.performance_weight,
         'tv_weight': args.tv_weight,
         'spectrum_weight': args.spectrum_weight,
-        'cascade_weight': args.cascade_weight,
         'use_simple_generator': args.simple_generator,
         'ocr_dataset_split': args.ocr_dataset_split,
         'ocr_max_samples': args.ocr_max_samples,
