@@ -1927,6 +1927,8 @@ class ProgressivePatchTrainer:
                     batch_tv_loss = 0.0
                     batch_ssim_loss = 0.0
                     batch_cascade_penalty = 0.0
+                    batch_raw_diversity_score = 0.0
+                    batch_raw_quality_score = 0.0
                     batch_count = 0
 
                     # Process images_per_batch images
@@ -2106,8 +2108,8 @@ class ProgressivePatchTrainer:
                         batch_cascade_penalty = cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
 
                         # Accumulate raw diversity and quality scores
-                        total_raw_diversity_score += diversity_score.item() if isinstance(diversity_score, torch.Tensor) else diversity_score
-                        total_raw_quality_score += quality_score.item() if isinstance(quality_score, torch.Tensor) else quality_score
+                        batch_raw_diversity_score += diversity_score.item() if isinstance(diversity_score, torch.Tensor) else diversity_score
+                        batch_raw_quality_score += quality_score.item() if isinstance(quality_score, torch.Tensor) else quality_score
 
                         batch_count += 1
 
@@ -2132,6 +2134,8 @@ class ProgressivePatchTrainer:
                         total_tv_loss += batch_tv_loss / batch_count
                         total_ssim_loss += batch_ssim_loss / batch_count
                         total_cascade_penalty += batch_cascade_penalty
+                        total_raw_diversity_score += batch_raw_diversity_score / batch_count
+                        total_raw_quality_score += batch_raw_quality_score / batch_count
 
                 except StopIteration:
                     break
