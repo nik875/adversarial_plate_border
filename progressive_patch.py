@@ -22,7 +22,6 @@ import numpy as np
 from tqdm import tqdm
 import kornia
 import kornia.geometry as K
-from DISTS_pytorch import DISTS
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
 from matplotlib import patches
@@ -850,7 +849,7 @@ class ProgressivePatchTrainer:
                  diversity_exponent: float = 1.0,
                  quality_exponent: float = 1.0,
                  tv_weight: float = 2.5,
-                 dists_weight: float = 1.0,
+                 spectrum_weight: float = 1.0,
                  cascade_weight: float = 0.25,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  use_simple_generator: bool = False,
@@ -869,7 +868,7 @@ class ProgressivePatchTrainer:
         self.diversity_exponent = diversity_exponent
         self.quality_exponent = quality_exponent
         self.tv_weight = tv_weight
-        self.dists_weight = dists_weight
+        self.spectrum_weight = spectrum_weight
         self.cascade_weight = cascade_weight
         self.save_examples_every = save_examples_every
         self.ocr_images_per_batch = ocr_images_per_batch
@@ -1284,65 +1283,77 @@ class ProgressivePatchTrainer:
 
         return mask
 
-    def compute_dists_loss(self, patches: torch.Tensor) -> torch.Tensor:
+    def compute_spectrum_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
-        Compute DISTS-based perceptual distance penalty to prevent patches from
-        having similar perceptual content.
+        Compute pixel-space diversity loss based on eigenvalue spectrum decay rate.
 
-        DISTS (Deep Image Structure and Texture Similarity) computes perceptual
-        similarity. High DISTS = perceptually different.
-        We use negative DISTS (perceptual distance) to penalize similar patches.
+        Measures diversity by computing the decay rate of the eigenvalue spectrum
+        of the flattened patch matrix. A slower decay (higher effective rank) indicates
+        greater diversity among patches.
 
-        Only compares the visible border region (excludes center plate region that
-        gets obscured when patch is applied).
+        Process:
+        1. Apply border mask to focus on visible region
+        2. Convert to grayscale
+        3. Flatten and stack into matrix [batch_size, H*W]
+        4. Compute SVD to get eigenvalues
+        5. Calculate decay rate (log ratio of consecutive eigenvalues)
+        6. Return negative decay rate (we want to minimize it = maximize diversity)
 
         Args:
-            patches: [batch_size, 3, H, W] patch tensor
+            patches: [batch_size, 3, H, W] patch tensor in [0, 1]
 
         Returns:
-            torch.Tensor: Scalar DISTS penalty (mean negative pairwise DISTS distance)
+            torch.Tensor: Scalar loss (negative decay rate)
         """
         batch_size = patches.shape[0]
         if batch_size < 2:
             return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
-        # Initialize DISTS model if not already done
-        if not hasattr(self, 'dists_model'):
-            self.dists_model = DISTS().to(patches.device)
-            self.dists_model.eval()
-
-        # Create border mask (same for all patches)
         _, _, H, W = patches.shape
         border_mask = self.create_border_mask(H, W, border_scale=1.4).to(patches.device)  # [1, 1, H, W]
 
-        # Compute pairwise DISTS between all patches
-        dists_sum = 0.0
-        pair_count = 0
+        # Apply border mask to patches
+        patches_masked = patches * border_mask  # [batch_size, 3, H, W]
 
-        with torch.no_grad():
-            for i in range(batch_size):
-                for j in range(i + 1, batch_size):
-                    # DISTS expects [B, 3, H, W] in range [0, 1]
-                    patch_i = patches[i:i+1]  # [1, 3, H, W]
-                    patch_j = patches[j:j+1]  # [1, 3, H, W]
+        # Convert to grayscale: [batch_size, 3, H, W] -> [batch_size, H, W]
+        # Using standard RGB to grayscale conversion: 0.299*R + 0.587*G + 0.114*B
+        patches_gray = (0.299 * patches_masked[:, 0] +
+                        0.587 * patches_masked[:, 1] +
+                        0.114 * patches_masked[:, 2])  # [batch_size, H, W]
 
-                    # Apply border mask to focus on visible region only
-                    patch_i_masked = patch_i * border_mask
-                    patch_j_masked = patch_j * border_mask
+        # Flatten each patch: [batch_size, H*W]
+        patches_flat = patches_gray.reshape(batch_size, -1)  # [batch_size, H*W]
 
-                    # Compute DISTS distance (higher = more different, which is good)
-                    dists_dist = self.dists_model(patch_i_masked, patch_j_masked)  # [1, 1, 1, 1]
-                    dists_val = dists_dist.item()
+        # Center the data (subtract mean for each dimension)
+        patches_centered = patches_flat - patches_flat.mean(dim=0, keepdim=True)
 
-                    # Use negative DISTS as diversity loss (want to maximize perceptual distance)
-                    dists_sum += dists_val
-                    pair_count += 1
+        # Compute SVD to get singular values (related to eigenvalues)
+        # U: [batch_size, batch_size], S: [min(batch_size, H*W)], Vh: [H*W, H*W]
+        try:
+            U, S, Vh = torch.svd(patches_centered)
+        except:
+            # Fallback if SVD fails
+            return torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
 
-        # Average DISTS across all pairs
-        # Negate so higher DISTS (more perceptually different) reduces the loss
-        avg_dists = dists_sum / pair_count if pair_count > 0 else 0.0
+        # Take singular values (which are proportional to eigenvalues of the covariance matrix)
+        # S is already sorted in descending order
+        S = S / (batch_size - 1) ** 0.5 if batch_size > 1 else S  # Normalize by sqrt(n-1)
 
-        return torch.tensor(-avg_dists, device=patches.device, dtype=patches.dtype)
+        # Avoid log(0) by adding small epsilon
+        epsilon = 1e-8
+        S = torch.clamp(S, min=epsilon)
+
+        # Calculate decay rate: average log ratio of consecutive eigenvalues
+        # Smaller decay rate = slower decay = higher effective rank = more diversity
+        if len(S) > 1:
+            log_ratios = torch.log(S[:-1] / S[1:])  # log(lambda_i / lambda_{i+1})
+            decay_rate = log_ratios.mean()
+        else:
+            decay_rate = torch.tensor(0.0, device=patches.device, dtype=patches.dtype)
+
+        # Return negative decay rate: minimizing this maximizes diversity
+        # (we want slower decay, which means smaller decay_rate)
+        return -decay_rate
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
@@ -1947,7 +1958,7 @@ class ProgressivePatchTrainer:
         """
         total_diversity_loss = 0.0
         total_tv_loss = 0.0
-        total_dists_loss = 0.0
+        total_spectrum_loss = 0.0
         total_cascade_penalty = 0.0
         total_raw_diversity_score = 0.0
         total_raw_quality_score = 0.0
@@ -1980,7 +1991,7 @@ class ProgressivePatchTrainer:
                     # Accumulate losses for this batch
                     batch_diversity_loss = 0.0
                     batch_tv_loss = 0.0
-                    batch_dists_loss = 0.0
+                    batch_spectrum_loss = 0.0
                     batch_cascade_penalty = 0.0
                     batch_raw_diversity_score = 0.0
                     batch_raw_quality_score = 0.0
@@ -2150,12 +2161,12 @@ class ProgressivePatchTrainer:
                         tv_loss = self.total_variation_loss(patches_stacked)
                         tv_loss_weighted = self.tv_weight * tv_loss
 
-                        # Compute DISTS loss
-                        dists_loss = self.compute_dists_loss(patches_stacked)
-                        lpips_loss_weighted = self.dists_weight * dists_loss
+                        # Compute spectrum diversity loss
+                        spectrum_loss = self.compute_spectrum_loss(patches_stacked)
+                        spectrum_loss_weighted = self.spectrum_weight * spectrum_loss
 
                         # Final combined loss
-                        final_loss = total_loss + tv_loss_weighted + lpips_loss_weighted
+                        final_loss = total_loss + tv_loss_weighted + spectrum_loss_weighted
 
                         # Backward (accumulate gradients)
                         final_loss.backward()
@@ -2163,7 +2174,7 @@ class ProgressivePatchTrainer:
                         # Accumulate losses for batch
                         batch_diversity_loss += total_loss.item()
                         batch_tv_loss += tv_loss_weighted.item()
-                        batch_dists_loss += lpips_loss_weighted.item()
+                        batch_spectrum_loss += spectrum_loss_weighted.item()
                         batch_cascade_penalty = cascade_penalty.item() if isinstance(cascade_penalty, torch.Tensor) else cascade_penalty
 
                         # Accumulate raw diversity and quality scores
@@ -2191,7 +2202,7 @@ class ProgressivePatchTrainer:
                         # Track average losses for batch
                         total_diversity_loss += batch_diversity_loss / batch_count
                         total_tv_loss += batch_tv_loss / batch_count
-                        total_dists_loss += batch_dists_loss / batch_count
+                        total_spectrum_loss += batch_spectrum_loss / batch_count
                         total_cascade_penalty += batch_cascade_penalty
                         total_raw_diversity_score += batch_raw_diversity_score / batch_count
                         total_raw_quality_score += batch_raw_quality_score / batch_count
@@ -2202,7 +2213,7 @@ class ProgressivePatchTrainer:
                 # Update progress bar
                 avg_diversity_loss = total_diversity_loss / num_updates if num_updates > 0 else 0
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
-                avg_dists_loss = total_dists_loss / num_updates if num_updates > 0 else 0
+                avg_spectrum_loss = total_spectrum_loss / num_updates if num_updates > 0 else 0
                 avg_cascade_penalty = total_cascade_penalty / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
                 avg_raw_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
@@ -2211,7 +2222,7 @@ class ProgressivePatchTrainer:
                     'QualScore': f"{avg_raw_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
-                    'DISTSLoss': f"{avg_dists_loss:.4f}",
+                    'SpecLoss': f"{avg_spectrum_loss:.4f}",
                     'Cascade': f"{avg_cascade_penalty:.4f}",
                 })
                 pbar.update(1)
@@ -2235,8 +2246,8 @@ class ProgressivePatchTrainer:
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
         avg_tv_loss = total_tv_loss / max(num_updates, 1)
-        avg_dists_loss = total_dists_loss / max(num_updates, 1)
-        return avg_diversity_loss, avg_tv_loss, avg_dists_loss
+        avg_spectrum_loss = total_spectrum_loss / max(num_updates, 1)
+        return avg_diversity_loss, avg_tv_loss, avg_spectrum_loss
 
     def validate(self) -> float:
         """Validation pass using diversity score"""
@@ -2496,7 +2507,7 @@ class ProgressivePatchTrainer:
             'epoch': [],
             'diversity_loss': [],
             'tv_loss': [],
-            'dists_loss': [],
+            'spectrum_loss': [],
             'learning_rate': []
         }
 
@@ -2522,7 +2533,7 @@ class ProgressivePatchTrainer:
 
         print(f"   Diversity weight: {self.diversity_weight}")
         print(f"   TV weight: {self.tv_weight}")
-        print(f"   DISTS weight: {self.dists_weight}")
+        print(f"   DISTS weight: {self.spectrum_weight}")
         print(f"   Cascade weight: {self.cascade_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
@@ -2535,20 +2546,20 @@ class ProgressivePatchTrainer:
             current_lr = optimizer.param_groups[0]['lr']
 
             # Training (scheduler.step() is called per batch inside train_epoch)
-            train_diversity_loss, train_tv_loss, train_dists_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
+            train_diversity_loss, train_tv_loss, train_spectrum_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
 
             # Record history
             history['epoch'].append(epoch)
             history['diversity_loss'].append(train_diversity_loss)
             history['tv_loss'].append(train_tv_loss)
-            history['dists_loss'].append(train_dists_loss)
+            history['spectrum_loss'].append(train_spectrum_loss)
             history['learning_rate'].append(current_lr)
 
             # Print epoch summary
             epoch_summary = (f"Epoch {epoch:3d}/{max_epochs} | "
                             f"DivLoss: {train_diversity_loss:.4f} | "
                             f"TVLoss: {train_tv_loss:.4f} | "
-                            f"DISTSLoss: {train_dists_loss:.4f} | "
+                            f"SpecLoss: {train_spectrum_loss:.4f} | "
                             f"LR: {current_lr:.2e}")
             print(epoch_summary)
 
@@ -2629,8 +2640,8 @@ def main():
                         'Values < 1.0 compress quality scores (e.g., 0.5 takes sqrt).')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
-    parser.add_argument('--dists-weight', type=float, default=1.0,
-                        help='Weight for DISTS penalty to prevent perceptual similarity (default: 1.0)')
+    parser.add_argument('--spectrum-weight', type=float, default=1.0,
+                        help='Weight for spectrum diversity loss to maximize effective rank (default: 1.0)')
     parser.add_argument('--cascade-weight', type=float, default=0.25,
                         help='Weight for cascade penalty on prior layers (default: 0.25). '
                         'Penalizes patch impact on layers before target layer to prevent learning shallow attacks.')
@@ -2728,7 +2739,7 @@ def main():
         'diversity_exponent': args.diversity_exponent,
         'quality_exponent': args.quality_exponent,
         'tv_weight': args.tv_weight,
-        'dists_weight': args.dists_weight,
+        'spectrum_weight': args.spectrum_weight,
         'cascade_weight': args.cascade_weight,
         'use_simple_generator': args.simple_generator,
         'ocr_dataset_split': args.ocr_dataset_split,
@@ -2777,9 +2788,9 @@ def main():
         ax1.grid(True, alpha=0.3)
         ax1.legend()
 
-        # TV and DISTS regularization losses
+        # TV and spectrum regularization losses
         ax2.plot(history['epoch'], history['tv_loss'], 'g-', label='TV Loss', alpha=0.7)
-        ax2.plot(history['epoch'], history['dists_loss'], 'orange', label='DISTS Loss', alpha=0.7)
+        ax2.plot(history['epoch'], history['spectrum_loss'], 'orange', label='Spectrum Loss', alpha=0.7)
         for i, record in enumerate(trainer.layer_history):
             if i > 0:
                 transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
