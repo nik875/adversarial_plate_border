@@ -1457,6 +1457,50 @@ class ProgressivePatchTrainer:
 
         return result_image, center_mask
 
+    def apply_neutral_border_ocr_mode(self, image: torch.Tensor, center_ratio: float = 0.6,
+                                       border_color: float = 0.5) -> torch.Tensor:
+        """
+        Apply a neutral gray/black border in OCR mode for fair baseline comparison.
+
+        This matches the spatial structure of apply_patch_ocr_mode but uses a neutral color
+        instead of adversarial content. Used for baseline computation so the only difference
+        between baseline and patched images is the adversarial patch content, not the presence
+        of a border region.
+
+        Args:
+            image: [B, 3, H, W] - cropped license plate images
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
+            border_color: Value for neutral border (default: 0.5 = gray)
+
+        Returns:
+            result_image: [B, 3, H, W] - image with neutral border applied
+        """
+        batch_size = image.shape[0]
+        image_height, image_width = image.shape[2], image.shape[3]
+
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
+
+        # Calculate padding to center the mask
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
+
+        # Create mask: 1 in center region, 0 elsewhere
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                                 dtype=torch.float32, device=self.device)
+        center_mask[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = 1.0
+        center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
+
+        # Create neutral border (gray by default)
+        neutral_border = torch.full_like(image, border_color)
+
+        # Blend: keep original image in center, use neutral border on borders
+        result_image = image * center_mask + neutral_border * (1 - center_mask)
+        result_image = torch.clamp(result_image, 0, 1)
+
+        return result_image
+
     def _get_activations_for_patch_image(self, batch: dict, patch: torch.Tensor,
                                           use_grad: bool = False, skip_detection: bool = False) -> torch.Tensor:
         """
@@ -1581,6 +1625,9 @@ class ProgressivePatchTrainer:
         """
         Get baseline activation for an image (compute on-the-fly if needed).
 
+        Applies a neutral gray border to match the spatial structure of adversarial patches,
+        ensuring fair comparison between baseline and patched activations.
+
         In OCR mode: computes on-the-fly and caches (memory efficient).
         In standard mode: uses pre-computed baselines.
 
@@ -1599,8 +1646,12 @@ class ProgressivePatchTrainer:
         with torch.no_grad():
             # OCR mode: use prep_image directly (already cropped)
             prep_image = batch['prep_image'].unsqueeze(0).to(self.device)
+
+            # Apply neutral border to match patch structure
+            prep_image_with_border = self.apply_neutral_border_ocr_mode(prep_image)
+
             cropped_plate = F.interpolate(
-                prep_image,
+                prep_image_with_border,
                 size=self.ocr_input_shape[:2],
                 mode='bilinear',
                 align_corners=False
@@ -1966,11 +2017,15 @@ class ProgressivePatchTrainer:
                             accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
                                                        for k, v in single_batch.items()})
 
-                        # Compute baseline activations for all layers (without patch)
+                        # Compute baseline activations for all layers (with neutral border)
                         baseline_activations = {}  # layer_idx -> activation
                         prep_image = single_batch['prep_image'].to(self.device).unsqueeze(0)
+
+                        # Apply neutral border to match patch structure for fair comparison
+                        prep_image_with_border = self.apply_neutral_border_ocr_mode(prep_image)
+
                         cropped_plate = F.interpolate(
-                            prep_image,
+                            prep_image_with_border,
                             size=self.ocr_input_shape[:2],
                             mode='bilinear',
                             align_corners=False
