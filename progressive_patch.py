@@ -1976,7 +1976,8 @@ class ProgressivePatchTrainer:
                             accumulated_batches.append({k: v.detach().clone() if torch.is_tensor(v) else v
                                                        for k, v in single_batch.items()})
 
-                        # Compute baseline activations for all layers (with neutral border)
+                        # Compute baseline activations up to target layer (with neutral border)
+                        # Needed for cascade penalty computation on prior layers
                         baseline_activations = {}  # layer_idx -> activation
                         prep_image = single_batch['prep_image'].to(self.device).unsqueeze(0)
 
@@ -2012,7 +2013,7 @@ class ProgressivePatchTrainer:
                         for hook in baseline_hooks:
                             hook.remove()
 
-                        # Get activations for all patches at all layers
+                        # Get activations for all patches at all relevant layers (0 to target for cascade)
                         patch_activations_per_layer = {idx: [] for idx in layer_indices_to_capture}
                         for patch in accumulated_patches:
                             activations_dict = self._get_multi_layer_activations(
