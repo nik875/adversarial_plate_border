@@ -2133,7 +2133,7 @@ class ProgressivePatchTrainer:
                     'LogQual': f"{avg_log_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
-                    'SpecLoss': f"{avg_spectrum_loss:.4f}",
+                    'SSIMLoss': f"{avg_spectrum_loss:.4f}",
                 })
                 pbar.update(1)
 
@@ -2426,7 +2426,7 @@ class ProgressivePatchTrainer:
         print(f"   Quality weight: {self.quality_weight}")
         print(f"   Performance weight: {self.performance_weight}")
         print(f"   TV weight: {self.tv_weight}")
-        print(f"   DISTS weight: {self.spectrum_weight}")
+        print(f"   SSIM weight: {self.spectrum_weight}")
         print(f"   Device: {self.device}")
         print(f"   LR: {learning_rate} (cosine annealing to {lr_min})")
         print(f"   Max epochs: {max_epochs}")
@@ -2451,7 +2451,7 @@ class ProgressivePatchTrainer:
             epoch_summary = (f"Epoch {epoch:3d}/{max_epochs} | "
                             f"DivLoss: {train_diversity_loss:.4f} | "
                             f"TVLoss: {train_tv_loss:.4f} | "
-                            f"SpecLoss: {train_spectrum_loss:.4f} | "
+                            f"SSIMLoss: {train_spectrum_loss:.4f} | "
                             f"LR: {current_lr:.2e}")
             print(epoch_summary)
 
@@ -2527,8 +2527,9 @@ def main():
                         'Multiplies the entire combined term. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
-    parser.add_argument('--spectrum-weight', type=float, default=1.0,
-                        help='Weight for spectrum diversity loss to maximize effective rank (default: 1.0)')
+    parser.add_argument('--ssim-weight', type=float, default=1.0, dest='spectrum_weight',
+                        help='Weight for SSIM structural diversity loss to discourage patch similarity (default: 1.0). '
+                        'Penalizes high SSIM between patches - higher value = force more different structures.')
     parser.add_argument('--save-examples-every', type=int, default=None,
                         help='Save example patches every N batches during training (default: disabled). '
                         'Saves 5 sample patches to checkpoints/{run_id}/example_samples/. '
