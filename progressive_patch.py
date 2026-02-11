@@ -1341,7 +1341,7 @@ class ProgressivePatchTrainer:
         # Average LPIPS across all pairs (negative = diversity penalty)
         avg_lpips = lpips_sum / pair_count if pair_count > 0 else 0.0
 
-        return avg_lpips
+        return torch.tensor(avg_lpips, device=patches.device, dtype=patches.dtype)
 
     def total_variation_loss(self, patches: torch.Tensor) -> torch.Tensor:
         """
