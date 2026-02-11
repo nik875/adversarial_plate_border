@@ -331,15 +331,6 @@ class SimplePatchGenerator(nn.Module):
         self.patch_height = patch_height
         self.patch_width = patch_width
         self.patch_dim = 3 * patch_height * patch_width
-        self.num_layers = num_layers
-
-        # Layer embedding layer: embeds target layer information into the seed
-        self.layer_embedding = nn.Sequential(
-            nn.Linear(latent_dim + num_layers, 256),
-            nn.SiLU(inplace=True),
-            nn.Linear(256, latent_dim),
-            nn.Sigmoid()  # Constrain output to [0, 1]
-        )
 
         # Default hidden dimensions if not specified
         if hidden_dims is None:
@@ -369,32 +360,6 @@ class SimplePatchGenerator(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         print(f"Simple generator initialized: {latent_dim} → {' → '.join(map(str, hidden_dims))} → {self.patch_dim}")
-
-    def embed_layer_info(self, z: torch.Tensor, layer_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Embed target layer information into the seed.
-
-        Args:
-            z: Latent codes [batch_size, basis_dim]
-            layer_indices: Target layer indices [batch_size], each in [0, num_layers-1]
-
-        Returns:
-            z_embedded: Modified latent codes [batch_size, basis_dim] with layer info embedded
-        """
-        batch_size = z.shape[0]
-        device = z.device
-
-        # Create one-hot encoding of layer indices
-        one_hot_layers = torch.zeros(batch_size, self.num_layers, device=device)
-        one_hot_layers.scatter_(1, layer_indices.unsqueeze(1), 1.0)
-
-        # Concatenate seed with one-hot layer encoding
-        z_with_layer = torch.cat([z, one_hot_layers], dim=1)
-
-        # Pass through layer embedding to get modified seed
-        z_embedded = self.layer_embedding(z_with_layer)
-
-        return z_embedded
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -632,17 +597,6 @@ class FoundationPatchGenerator(nn.Module):
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
-        self.num_layers = num_layers
-
-        # Layer embedding layer: embeds target layer information into the seed
-        # Takes concatenation of (seed + one_hot_layer_encoding) and outputs modified seed
-        # Uses sigmoid to constrain output to [0, 1] for better search space conditioning
-        self.layer_embedding = nn.Sequential(
-            nn.Linear(latent_dim + num_layers, 256),
-            nn.SiLU(inplace=True),
-            nn.Linear(256, latent_dim),
-            nn.Sigmoid()  # Constrain output to [0, 1]
-        )
 
         # SD VAE expects latents of shape [B, 4, H/8, W/8]
         # For 256×512 output, latent is [B, 4, 32, 64]
@@ -689,7 +643,7 @@ class FoundationPatchGenerator(nn.Module):
         print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
 
         # Trainable adapter: z → VAE latent space
-        # Simple linear projection since layer_embedding already encodes layer information
+        # Simple linear projection to transform latent codes to VAE latent space
         self.adapter = nn.Linear(latent_dim, self.vae_latent_dim)
 
         # Initialize adapter weights
@@ -861,7 +815,6 @@ class ProgressivePatchTrainer:
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
                  use_bottleneck_refiner: bool = False,
-                 target_layer: Optional[str] = None,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
@@ -888,30 +841,8 @@ class ProgressivePatchTrainer:
         self.use_all_for_train = False
 
         # Progressive layer configuration
-        # Get layer configs for random layer sampling
-        # (No longer using progressive layer-by-layer training)
+        # Always target the last layer (FinalOutput)
         self.layer_configs = layer_configs or get_ocr_layer_progression()
-        self.num_layers = len(self.layer_configs)
-
-        # Parse target layers if specified
-        self.target_layer_indices = None
-        if target_layer is not None:
-            try:
-                layer_indices = [int(x.strip()) for x in target_layer.split(',')]
-                # Validate indices
-                invalid_indices = [idx for idx in layer_indices if idx < 0 or idx >= self.num_layers]
-                if invalid_indices:
-                    raise ValueError(
-                        f"Invalid layer indices: {invalid_indices}. Valid range: 0-{self.num_layers-1}"
-                    )
-                self.target_layer_indices = layer_indices
-                layer_names = [self.layer_configs[idx].description for idx in layer_indices]
-                print(f"Target layers specified: {layer_indices} ({', '.join(layer_names)})")
-            except ValueError as e:
-                raise ValueError(f"Error parsing --target-layer: {str(e)}")
-
-        self.current_layer_epoch = 0
-        self.layer_history = []  # Track training history for each layer
 
         # Image preprocessing
         self.transform = T.Compose([T.ToTensor()])
@@ -1203,32 +1134,6 @@ class ProgressivePatchTrainer:
     def sample_coefficients(self, batch_size: int) -> torch.Tensor:
         """Sample z ~ Uniform(0, 1) for generating patches"""
         return torch.rand(batch_size, self.basis_dim, device=self.device)
-
-    def embed_layer_info(self, z: torch.Tensor, layer_indices: torch.Tensor) -> torch.Tensor:
-        """
-        Embed target layer information into the seed.
-
-        Args:
-            z: Latent codes [batch_size, basis_dim]
-            layer_indices: Target layer indices [batch_size], each in [0, num_layers-1]
-
-        Returns:
-            z_embedded: Modified latent codes [batch_size, basis_dim] with layer info embedded
-        """
-        batch_size = z.shape[0]
-        device = z.device
-
-        # Create one-hot encoding of layer indices
-        one_hot_layers = torch.zeros(batch_size, self.num_layers, device=device)
-        one_hot_layers.scatter_(1, layer_indices.unsqueeze(1), 1.0)
-
-        # Concatenate seed with one-hot layer encoding
-        z_with_layer = torch.cat([z, one_hot_layers], dim=1)  # [batch_size, basis_dim + num_layers]
-
-        # Pass through layer embedding to get modified seed
-        z_embedded = self.generator.layer_embedding(z_with_layer)  # [batch_size, basis_dim]
-
-        return z_embedded
 
     def generate_patches(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -1971,7 +1876,7 @@ class ProgressivePatchTrainer:
 
             return activations_dict
 
-    def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LambdaLR, epoch: int, target_layer_idx: Optional[int] = None) -> Tuple[float, float, float]:
+    def train_epoch(self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LambdaLR, epoch: int) -> Tuple[float, float, float]:
         """Train for one epoch with random layer sampling and cascade penalty.
 
         For each image, samples a random target layer and trains patches to:
@@ -2034,15 +1939,8 @@ class ProgressivePatchTrainer:
                         batch = next(dataloader_iter)
                         single_batch = {k: v[0] for k, v in batch.items()}
 
-                        # Sample random target layer for this image
-                        if target_layer_idx is None:
-                            # Use specified target layers if available, otherwise sample from all
-                            if self.target_layer_indices is not None:
-                                sampled_layer_idx = np.random.choice(self.target_layer_indices)
-                            else:
-                                sampled_layer_idx = np.random.randint(0, len(self.layer_configs))
-                        else:
-                            sampled_layer_idx = target_layer_idx
+                        # Always target the last layer (FinalOutput)
+                        sampled_layer_idx = len(self.layer_configs) - 1
 
                         # Generate patches_per_image patches for this image
                         accumulated_patches = []
@@ -2257,17 +2155,10 @@ class ProgressivePatchTrainer:
                 batch_count_global += 1
                 if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
                     save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
-                    # Generate 10 samples for each layer (respect target_layer if specified)
-                    layers_to_sample = self.target_layer_indices if self.target_layer_indices is not None else range(len(self.layer_configs))
-                    saved_count = 0
-                    for layer_idx in layers_to_sample:
-                        layer_name = self.layer_configs[layer_idx].description.replace(" ", "_").replace("(", "").replace(")", "")
-                        layer_save_dir = os.path.join(save_subdir, f"layer{layer_idx}_{layer_name}")
-                        if self.save_basis_safe(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx):
-                            saved_count += 1
-                    total_layers = len(layers_to_sample)
-                    if saved_count > 0:
-                        print(f"   ✓ Saved periodic samples: {saved_count}/{total_layers} layers")
+                    # Generate 10 samples for the last layer only
+                    last_layer_idx = len(self.layer_configs) - 1
+                    if self.save_basis_safe(epoch, save_subdir, num_samples=10, save_generator=False, layer_idx=last_layer_idx):
+                        print(f"   ✓ Saved periodic samples for final layer")
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
@@ -2370,21 +2261,10 @@ class ProgressivePatchTrainer:
 
             # Sample and save example patches
             z_samples = self.sample_coefficients(num_samples)
-
-            # If layer_idx specified, embed layer information into seeds
-            if layer_idx is not None:
-                layer_indices = torch.full((num_samples,), layer_idx, dtype=torch.long, device=self.device)
-                z_samples = self.embed_layer_info(z_samples, layer_indices)
-
             sample_patches = self.generate_patches(z_samples)
 
-            # Create filename based on whether layer is specified
-            if layer_idx is not None:
-                layer_name = self.layer_configs[layer_idx].description.replace(" ", "_") if layer_idx < len(self.layer_configs) else f"layer_{layer_idx}"
-                # Very clear filename: [TARGET_LAYER_X] [LayerName] sample_[NUM].png
-                filename_template = f"[TARGET_LAYER_{layer_idx}]_{layer_name}__sample_{{i}}.png"
-            else:
-                filename_template = f"sample_{{i}}_epoch_{epoch:04d}.png"
+            # Simple filename for patches
+            filename_template = f"patch_epoch_{epoch:04d}_sample_{{i}}.png"
 
             for i, patch in enumerate(sample_patches):
                 patch_pil = T.ToPILImage()(patch.cpu())
@@ -2488,7 +2368,7 @@ class ProgressivePatchTrainer:
                 print(f"Optimizer: VAE full parameters: {sum(p.numel() for p in vae_params):,} (lr={vae_learning_rate})")
 
             # Other components (always trainable) - use custom learning rate
-            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector', 'layer_embedding']:
+            for name in ['adapter', 'skip_projection', 'cnn_refiner', 'patch_projector']:
                 module = getattr(self.generator, name)
                 params = list(module.parameters())
                 trainable_params.append({'params': params, 'lr': learning_rate, 'name': name})
@@ -2574,7 +2454,7 @@ class ProgressivePatchTrainer:
             current_lr = optimizer.param_groups[0]['lr']
 
             # Training (scheduler.step() is called per batch inside train_epoch)
-            train_diversity_loss, train_tv_loss, train_spectrum_loss = self.train_epoch(optimizer, scheduler, epoch, target_layer_idx=None)
+            train_diversity_loss, train_tv_loss, train_spectrum_loss = self.train_epoch(optimizer, scheduler, epoch)
 
             # Record history
             history['epoch'].append(epoch)
@@ -2601,16 +2481,12 @@ class ProgressivePatchTrainer:
                 else:
                     print(f"   ✓ New best training loss: {best_train_loss:.4f} (save failed, continuing)")
 
-            # Save samples per layer periodically (every 10 epochs)
+            # Save samples periodically (every 10 epochs)
             if epoch % 10 == 0:
-                saved_count = 0
-                for layer_idx in range(len(self.layer_configs)):
-                    layer_name = self.layer_configs[layer_idx].description.replace(" ", "_")
-                    layer_save_dir = os.path.join(self.checkpoint_base, f"layer{layer_idx}_{layer_name}_epoch_{epoch:04d}")
-                    if self.save_basis_safe(epoch, layer_save_dir, num_samples=10, save_generator=False, layer_idx=layer_idx):
-                        saved_count += 1
-                if saved_count > 0:
-                    print(f"   ✓ Saved per-layer checkpoint: {saved_count}/{len(self.layer_configs)} layers")
+                last_layer_idx = len(self.layer_configs) - 1
+                checkpoint_dir = os.path.join(self.checkpoint_base, f"checkpoint_epoch_{epoch:04d}")
+                if self.save_basis_safe(epoch, checkpoint_dir, num_samples=10, save_generator=False, layer_idx=last_layer_idx):
+                    print(f"   ✓ Saved checkpoint for epoch {epoch}")
 
         print("\n" + "="*80)
         print("TRAINING COMPLETED!")
@@ -2729,11 +2605,6 @@ def main():
                         help='LoRA rank (default: 8)')
     parser.add_argument('--lora-alpha', type=int, default=16,
                         help='LoRA alpha (default: 16)')
-    parser.add_argument('--target-layer', type=str, default=None,
-                        help='Comma-separated list of target layer indices to train on (default: all layers). '
-                        'Example: --target-layer "0,5,10" trains only on layers 0, 5, and 10. '
-                        'Layer indices: 0=Conv1, 1=Conv2, 2=Conv3, 3=Conv4, 4=Conv5, '
-                        '5=PatchExtractor, 6-9=TransformerBlocks, 10=FinalOutput')
     args = parser.parse_args()
 
     # Validate dataset argument
@@ -2777,7 +2648,6 @@ def main():
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
         'use_bottleneck_refiner': args.use_bottleneck_refiner,
-        'target_layer': args.target_layer,
         'save_examples_every': args.save_examples_every
     }
 
