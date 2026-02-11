@@ -72,19 +72,29 @@ def compute_average_diff_across_images(images_list):
 
 
 def compute_average_diff_zones(diff_map, gaussian_sigma=2, mask=None):
-    """Compute per-pixel difference heatmap with log scaling."""
+    """Compute per-pixel difference heatmap with log scaling.
+
+    Returns:
+        tuple: (log_scaled_heatmap, original_heatmap)
+    """
     zone_heatmap = np.mean(diff_map, axis=2)
     if mask is not None:
         zone_heatmap = zone_heatmap * mask
     zone_heatmap = gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
+    original_heatmap = zone_heatmap.copy()
     # Log scale to prevent extreme values from dominating
     zone_heatmap = np.log1p(zone_heatmap)
-    return zone_heatmap
+    return zone_heatmap, original_heatmap
 
 
-def display_average_diff(images, zone_heatmap, directory, outfile=None):
-    """Display average difference zones with sample images and greyscale overlay."""
-    h, w = zone_heatmap.shape
+def display_average_diff(images, zone_data, directory, outfile=None):
+    """Display average difference zones with sample images and greyscale overlay.
+
+    Args:
+        zone_data: tuple of (log_scaled_heatmap, original_heatmap)
+    """
+    zone_heatmap_log, zone_heatmap_orig = zone_data
+    h, w = zone_heatmap_log.shape
     center_mask = create_center_mask(h, w)
 
     # Select two random samples
@@ -107,19 +117,35 @@ def display_average_diff(images, zone_heatmap, directory, outfile=None):
     axes[0, 1].set_title('Sample 2')
     axes[0, 1].axis('off')
 
-    # Bottom left: Heatmap
-    im = axes[1, 0].imshow(zone_heatmap, cmap='hot')
+    # Bottom left: Heatmap (log-scaled display, original scale colorbar)
+    im = axes[1, 0].imshow(zone_heatmap_log, cmap='hot')
     axes[1, 0].set_title('Average Difference Zones')
     axes[1, 0].axis('off')
     cbar = plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
-    cbar.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
+
+    # Create custom colorbar with original values
+    cbar_min, cbar_max = zone_heatmap_orig.min(), zone_heatmap_orig.max()
+    log_min, log_max = zone_heatmap_log.min(), zone_heatmap_log.max()
+    log_range = log_max - log_min if log_max > log_min else 1
+
+    # Map colorbar positions to original values
+    def format_cbar(x, pos):
+        # x is in range [log_min, log_max], map back to original range
+        if log_range > 0:
+            ratio = (x - log_min) / log_range
+            orig_val = cbar_min + ratio * (cbar_max - cbar_min)
+        else:
+            orig_val = cbar_min
+        return f'{orig_val:.1f}'
+
+    cbar.ax.yaxis.set_major_formatter(ticker.FuncFormatter(format_cbar))
 
     # Bottom right: Greyscale with red highlighting for all diffs
     grey = cv2.cvtColor(sample1, cv2.COLOR_RGB2GRAY)
     grey_rgb = np.stack([grey, grey, grey], axis=2).astype(np.float32)
     grey_rgb = grey_rgb * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
 
-    zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
+    zone_norm = np.clip(zone_heatmap_orig / (np.max(zone_heatmap_orig) + 1e-8), 0, 1)
     grey_rgb[:, :, 0] = np.maximum(grey_rgb[:, :, 0], zone_norm * 255)
 
     axes[1, 1].imshow(grey_rgb.astype(np.uint8))
@@ -168,9 +194,9 @@ def main():
 
         h, w = avg_diff.shape[:2]
         center_mask = create_center_mask(h, w)
-        zone_heatmap = compute_average_diff_zones(avg_diff, mask=center_mask)
+        zone_data = compute_average_diff_zones(avg_diff, mask=center_mask)
 
-        display_average_diff(images, zone_heatmap, args.directory, args.outfile)
+        display_average_diff(images, zone_data, args.directory, args.outfile)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
