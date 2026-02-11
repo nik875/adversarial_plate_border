@@ -79,35 +79,49 @@ def compute_average_diff_zones(diff_map, gaussian_sigma=2, mask=None):
     return gaussian_filter(zone_heatmap, sigma=gaussian_sigma)
 
 
-def display_average_diff(sample_img, zone_heatmap, directory, outfile=None):
-    """Display average difference zones with greyscale overlay."""
+def display_average_diff(images, zone_heatmap, directory, outfile=None):
+    """Display average difference zones with sample images and greyscale overlay."""
     h, w = zone_heatmap.shape
     center_mask = create_center_mask(h, w)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Select two random samples
+    idx1, idx2 = np.random.choice(len(images), 2, replace=False)
+    sample1, sample2 = images[idx1], images[idx2]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f'Average Difference Zones: {Path(directory).name}',
                  fontsize=10, fontweight='normal')
 
-    # Heatmap
-    im = axes[0].imshow(zone_heatmap, cmap='hot')
-    axes[0].set_title('Average Difference Zones')
-    axes[0].axis('off')
-    cbar = plt.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+    # Top row: two random samples with mask applied
+    sample1_masked = sample1.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+    sample2_masked = sample2.astype(np.float32) * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
+
+    axes[0, 0].imshow(sample1_masked.astype(np.uint8))
+    axes[0, 0].set_title('Sample 1')
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(sample2_masked.astype(np.uint8))
+    axes[0, 1].set_title('Sample 2')
+    axes[0, 1].axis('off')
+
+    # Bottom left: Heatmap
+    im = axes[1, 0].imshow(zone_heatmap, cmap='hot')
+    axes[1, 0].set_title('Average Difference Zones')
+    axes[1, 0].axis('off')
+    cbar = plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
     cbar.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
-    # Greyscale with red highlighting
-    grey = cv2.cvtColor(sample_img, cv2.COLOR_RGB2GRAY)
+    # Bottom right: Greyscale with red highlighting for all diffs
+    grey = cv2.cvtColor(sample1, cv2.COLOR_RGB2GRAY)
     grey_rgb = np.stack([grey, grey, grey], axis=2).astype(np.float32)
     grey_rgb = grey_rgb * (center_mask[:, :, np.newaxis] * 0.5 + 0.5)
 
-    threshold = np.percentile(zone_heatmap, 75)
     zone_norm = np.clip(zone_heatmap / (np.max(zone_heatmap) + 1e-8), 0, 1)
-    high_diff_mask = zone_heatmap > threshold
-    grey_rgb[high_diff_mask, 0] = zone_norm[high_diff_mask] * 255
+    grey_rgb[:, :, 0] = np.maximum(grey_rgb[:, :, 0], zone_norm * 255)
 
-    axes[1].imshow(grey_rgb.astype(np.uint8))
-    axes[1].set_title('Highlighted (Top 25%)')
-    axes[1].axis('off')
+    axes[1, 1].imshow(grey_rgb.astype(np.uint8))
+    axes[1, 1].set_title('Highlighted (All Diffs)')
+    axes[1, 1].axis('off')
 
     plt.tight_layout()
     if outfile:
@@ -153,7 +167,7 @@ def main():
         center_mask = create_center_mask(h, w)
         zone_heatmap = compute_average_diff_zones(avg_diff, mask=center_mask)
 
-        display_average_diff(images[0], zone_heatmap, args.directory, args.outfile)
+        display_average_diff(images, zone_heatmap, args.directory, args.outfile)
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
