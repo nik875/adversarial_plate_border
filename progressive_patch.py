@@ -846,8 +846,7 @@ class ProgressivePatchTrainer:
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
                  diversity_weight: float = 1.0,
-                 diversity_exponent: float = 1.0,
-                 quality_exponent: float = 1.0,
+                 performance_weight: float = 1.0,
                  tv_weight: float = 2.5,
                  spectrum_weight: float = 1.0,
                  cascade_weight: float = 0.25,
@@ -865,8 +864,7 @@ class ProgressivePatchTrainer:
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
-        self.diversity_exponent = diversity_exponent
-        self.quality_exponent = quality_exponent
+        self.performance_weight = performance_weight
         self.tv_weight = tv_weight
         self.spectrum_weight = spectrum_weight
         self.cascade_weight = cascade_weight
@@ -2175,15 +2173,13 @@ class ProgressivePatchTrainer:
 
                         cascade_penalty = self.cascade_weight * cascade_penalty
 
-                        # Combined diversity-quality loss (scaled by diversity_weight)
-                        # Apply exponential emphasis to diversity and quality components if specified
-                        diversity_score_emphasized = diversity_score ** self.diversity_exponent
-                        quality_score_emphasized = quality_score ** self.quality_exponent
-                        # Negate quality to align signs: diversity_score is negative (log-det), quality is positive
-                        # Product of two negatives = positive, then negate once more = negative loss to minimize
-                        # Minimizing negative loss = maximizing (more negative diversity_score = better diversity, higher quality)
-                        combined_diversity_quality_loss = diversity_score_emphasized * (-quality_score_emphasized)
-                        total_loss = -(self.diversity_weight * combined_diversity_quality_loss - cascade_penalty)
+                        # Additive diversity-quality loss: both terms independently incentivized
+                        # Loss = -(diversity_weight * diversity_score + performance_weight * quality_score) + cascade_penalty
+                        # diversity_score is negative (log-det: min at -inf, max at 0)
+                        # quality_score is positive (normalized activation delta RMS)
+                        # To minimize loss: maximize diversity_score (toward 0) AND maximize quality_score
+                        combined_diversity_quality_loss = self.diversity_weight * diversity_score + self.performance_weight * quality_score
+                        total_loss = -combined_diversity_quality_loss + cascade_penalty
 
                         # Stack patches for batch operations
                         patches_stacked = torch.stack(accumulated_patches, dim=0)
@@ -2564,6 +2560,7 @@ class ProgressivePatchTrainer:
             print(f"     Architecture: z[{self.basis_dim}] → adapter → VAE → CNN refiner → patch[3×{self.patch_height}×{self.patch_width}]")
 
         print(f"   Diversity weight: {self.diversity_weight}")
+        print(f"   Performance weight: {self.performance_weight}")
         print(f"   TV weight: {self.tv_weight}")
         print(f"   DISTS weight: {self.spectrum_weight}")
         print(f"   Cascade weight: {self.cascade_weight}")
@@ -2661,15 +2658,11 @@ def main():
     parser.add_argument('--basis-dim', type=int, default=16,
                         help='Dimensionality of latent basis (default: 16)')
     parser.add_argument('--diversity-weight', type=float, default=1.0,
-                        help='Weight for diversity loss (default: 1.0)')
-    parser.add_argument('--diversity-exponent', type=float, default=1.0,
-                        help='Exponential emphasis on diversity component (default: 1.0 = no emphasis). '
-                        'Values > 1.0 emphasize high diversity more (e.g., 2.0 squares diversity). '
-                        'Values < 1.0 compress diversity scores (e.g., 0.5 takes sqrt).')
-    parser.add_argument('--quality-exponent', type=float, default=1.0,
-                        help='Exponential emphasis on quality component (default: 1.0 = no emphasis). '
-                        'Values > 1.0 emphasize high quality more (e.g., 2.0 squares quality). '
-                        'Values < 1.0 compress quality scores (e.g., 0.5 takes sqrt).')
+                        help='Weight for diversity loss term in additive loss (default: 1.0). '
+                        'Higher = prioritize diverse patches. Loss = -(diversity_weight * diversity_score + quality_weight * quality_score)')
+    parser.add_argument('--performance-weight', type=float, default=1.0,
+                        help='Weight for quality/performance loss term in additive loss (default: 1.0). '
+                        'Higher = prioritize patches with strong activation impact. Loss = -(diversity_weight * diversity_score + quality_weight * quality_score)')
     parser.add_argument('--tv-weight', type=float, default=2.5,
                         help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
     parser.add_argument('--spectrum-weight', type=float, default=1.0,
@@ -2768,8 +2761,7 @@ def main():
         'grad_accumulate': 16,  # Default gradient accumulation steps
         'basis_dim': args.basis_dim,
         'diversity_weight': args.diversity_weight,
-        'diversity_exponent': args.diversity_exponent,
-        'quality_exponent': args.quality_exponent,
+        'performance_weight': args.performance_weight,
         'tv_weight': args.tv_weight,
         'spectrum_weight': args.spectrum_weight,
         'cascade_weight': args.cascade_weight,
