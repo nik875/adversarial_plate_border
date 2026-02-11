@@ -1720,18 +1720,18 @@ class ProgressivePatchTrainer:
                 prep_image = batch_dict['prep_image'].unsqueeze(0).to(self.device)
 
                 # Sample a uniformly random patch of the same size as learned patches
-                patch_size_h, patch_size_w = self.patch_size_h, self.patch_size_w
+                patch_h, patch_w = PATCH_HEIGHT, PATCH_WIDTH
                 _, _, img_h, img_w = prep_image.shape
 
                 # Random patch in [0, 1]
-                random_patch = torch.rand(1, 3, patch_size_h, patch_size_w, device=self.device)
+                random_patch = torch.rand(1, 3, patch_h, patch_w, device=self.device)
 
                 # Apply patch at random location
-                y_offset = np.random.randint(0, max(1, img_h - patch_size_h + 1))
-                x_offset = np.random.randint(0, max(1, img_w - patch_size_w + 1))
+                y_offset = np.random.randint(0, max(1, img_h - patch_h + 1))
+                x_offset = np.random.randint(0, max(1, img_w - patch_w + 1))
 
                 prep_image_with_patch = prep_image.clone()
-                prep_image_with_patch[:, :, y_offset:y_offset+patch_size_h, x_offset:x_offset+patch_size_w] = random_patch
+                prep_image_with_patch[:, :, y_offset:y_offset+patch_h, x_offset:x_offset+patch_w] = random_patch
 
                 cropped_plate = F.interpolate(
                     prep_image_with_patch,
