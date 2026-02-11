@@ -437,9 +437,11 @@ class BottleneckDenseRefiner(nn.Module):
             num_patches_w = patch_width // scale
             output_size = self.char_embed_dim * num_patches_h * num_patches_w
 
-            # Dense MLP: z[16] → hidden → char_embed_dim * num_patches
+            # Dense MLP: z[16] → 64 → 64 → char_embed_dim * num_patches
             mlp = nn.Sequential(
                 nn.Linear(latent_dim, 64),
+                nn.SiLU(inplace=True),
+                nn.Linear(64, 64),
                 nn.SiLU(inplace=True),
                 nn.Linear(64, output_size),
             )
