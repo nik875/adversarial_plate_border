@@ -12,6 +12,7 @@ from glob import glob
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 from scipy.ndimage import gaussian_filter
 
 
@@ -109,7 +110,8 @@ def display_comparison(img1, img2, diff, mse, path1, path2, outfile=None):
     im = axes[1, 0].imshow(zone_heatmap, cmap='hot')
     axes[1, 0].set_title('Average Difference Zones')
     axes[1, 0].axis('off')
-    plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
     # Greyscale with red highlighting for top 25% threshold
     grey = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
@@ -209,7 +211,8 @@ def display_comparison_with_zones(img1, img2, diff, mse, path1, path2, outfile=N
     im = axes[1, 0].imshow(zone_heatmap, cmap='hot')
     axes[1, 0].set_title('Average Difference Zones')
     axes[1, 0].axis('off')
-    plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar = plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
     # Greyscale with red highlighting for top 25% threshold
     grey = cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY)
@@ -254,19 +257,22 @@ def display_diff_of_diffs(within_layer_zone, across_layer_zone, outfile=None):
     im1 = axes[0].imshow(within_layer_zone, cmap='hot')
     axes[0].set_title('Within-Layer Average Zones')
     axes[0].axis('off')
-    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+    cbar1 = plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+    cbar1.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
     # Across-layer average zones
     im2 = axes[1].imshow(across_layer_zone, cmap='hot')
     axes[1].set_title('Across-Layer Average Zones')
     axes[1].axis('off')
-    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar2 = plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar2.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
     # Difference (using diverging colormap for clarity)
     im3 = axes[2].imshow(diff_of_diffs, cmap='RdBu_r')
     axes[2].set_title('Difference (Red=More Across-Layer Diff)')
     axes[2].axis('off')
-    plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+    cbar3 = plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+    cbar3.ax.yaxis.set_major_formatter(ticker.StrMethodFormatter('{x:.1f}'))
 
     plt.tight_layout()
     if outfile:
