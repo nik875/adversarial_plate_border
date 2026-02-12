@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torchvision import transforms as T
+from tqdm import tqdm
 
 
 def load_patch_from_png(patch_path):
