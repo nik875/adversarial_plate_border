@@ -103,18 +103,30 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     images = []
     dimensions = []  # Track (width, height) for each image
     failed_samples = []
+    rejected_samples = []
+
+    # Minimum size requirements
+    min_width = 213
+    min_height = 106
 
     # Randomly select validation indices to load
     selected_indices = random.sample(val_indices, min(num_samples, len(val_indices)))
 
     print(f"\nLoading {len(selected_indices)} validation samples from combined dataset...")
+    print(f"Filtering: minimum size {min_width}×{min_height} (W×H)")
     for combined_idx in selected_indices:
         try:
             item = combined_dataset[combined_idx]
             img_tensor = item['prep_image']
-            images.append(img_tensor)
             # Track dimensions: tensor is [3, H, W], so width=W, height=H
             height, width = img_tensor.shape[1], img_tensor.shape[2]
+
+            # Reject if too small
+            if width < min_width or height < min_height:
+                rejected_samples.append((combined_idx, width, height))
+                continue
+
+            images.append(img_tensor)
             dimensions.append((width, height))
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
@@ -122,6 +134,12 @@ def load_validation_samples_from_csv(csv_path, num_samples):
             failed_samples.append((combined_idx, error_msg))
 
     print(f"Loaded {len(images)} validation samples")
+    if rejected_samples:
+        print(f"Rejected {len(rejected_samples)} samples (too small):")
+        for idx, w, h in rejected_samples[:5]:  # Show first 5
+            print(f"  Index {idx}: {w}×{h}", file=sys.stderr)
+        if len(rejected_samples) > 5:
+            print(f"  ... and {len(rejected_samples) - 5} more", file=sys.stderr)
     if failed_samples:
         print(f"Failed to load {len(failed_samples)} samples:", file=sys.stderr)
         for idx, error in failed_samples:
