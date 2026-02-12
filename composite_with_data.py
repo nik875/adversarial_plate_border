@@ -163,6 +163,48 @@ def apply_patch_ocr_mode(image, patch, center_ratio=0.6):
     return result_image
 
 
+def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5):
+    """Apply neutral grey border to image (center region preserved).
+
+    Args:
+        image: [3, H, W] or [1, 3, H, W] tensor in [0, 1]
+        center_ratio: Fraction of image to preserve in center (default: 0.6)
+        border_color: Value for neutral border (default: 0.5 = gray)
+
+    Returns:
+        result: [B, 3, H, W] image with grey border
+    """
+    # Handle single image
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+
+    batch_size = image.shape[0]
+    image_height, image_width = image.shape[2], image.shape[3]
+
+    # Create center mask (1 in center, 0 on borders)
+    center_h = int(image_height * center_ratio)
+    center_w = int(image_width * center_ratio)
+
+    # Calculate padding to center the mask
+    pad_h = (image_height - center_h) // 2
+    pad_w = (image_width - center_w) // 2
+
+    # Create mask: 1 in center region, 0 elsewhere
+    center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                             dtype=torch.float32)
+    center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
+    center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
+
+    # Create neutral border
+    neutral_border = torch.full_like(image, border_color)
+
+    # Blend: keep original image in center, use neutral border on borders
+    result_image = image * center_mask + neutral_border * (1 - center_mask)
+    result_image = torch.clamp(result_image, 0, 1)
+
+    return result_image
+
+
 def find_latest_patches(run_dir):
     """Find the latest epoch/batch patches in the run directory.
 
@@ -254,7 +296,7 @@ def main():
             sys.exit(1)
 
         # Composite patches with samples
-        print(f"\nCreating {len(val_images)} composite images...")
+        print(f"\nCreating {len(val_images)} composite images with controls...")
         for img_idx, val_image in enumerate(val_images):
             # Select random patch for this image
             patch = random.choice(patches)
@@ -270,6 +312,18 @@ def main():
             output_path = output_dir / f"composite_{img_idx:02d}.jpg"
             cv2.imwrite(str(output_path), composite_bgr)
             print(f"  Saved {output_path.name}")
+
+            # Apply grey control border
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=0.6, border_color=0.5)
+            control = control.squeeze(0)  # Remove batch dim
+
+            # Convert to numpy and save
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+
+            control_path = output_dir / f"control_{img_idx:02d}.jpg"
+            cv2.imwrite(str(control_path), control_bgr)
+            print(f"  Saved {control_path.name}")
 
         print(f"\nComposite images saved to {output_dir}")
 
