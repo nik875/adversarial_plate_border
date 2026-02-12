@@ -2278,7 +2278,7 @@ class ProgressivePatchTrainer:
                 patch_pil = T.ToPILImage()(patch.cpu())
                 patch_pil.save(f"{save_dir}/{filename_template.format(i=i)}")
 
-    def _create_cosine_scheduler(self, optimizer, vae_lr, custom_lr, lr_min, max_epochs, total_steps):
+    def _create_cosine_scheduler(self, optimizer, vae_lr, custom_lr, lr_min, max_epochs, total_steps, start_epoch=1):
         """
         Create a cosine annealing scheduler that handles different initial learning rates
         for VAE and custom layers, both decaying to the same minimum learning rate.
@@ -2292,15 +2292,25 @@ class ProgressivePatchTrainer:
             lr_min: Minimum learning rate (same for all groups)
             max_epochs: Maximum number of epochs for scheduling
             total_steps: Total number of training steps (batches) across all epochs
+            start_epoch: Epoch to start from (default: 1). Used to calculate step offset for resumption.
 
         Returns:
             Scheduler that applies cosine annealing to each group independently, updated per step
         """
         import math
 
+        # Calculate starting step offset for resumption
+        num_images = len(self.train_loader)
+        batches_per_epoch = num_images // self.ocr_images_per_batch
+        if num_images % self.ocr_images_per_batch != 0:
+            batches_per_epoch += 1
+
+        step_offset = (start_epoch - 1) * batches_per_epoch
+
         def cosine_decay(initial_lr, step):
-            """Cosine annealing from initial_lr to lr_min, based on step count"""
-            return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * step / total_steps)) / 2) / initial_lr
+            """Cosine annealing from initial_lr to lr_min, based on step count with offset for resumption"""
+            adjusted_step = step + step_offset
+            return (lr_min + (initial_lr - lr_min) * (1 + math.cos(math.pi * adjusted_step / total_steps)) / 2) / initial_lr
 
         # Create lambda functions for each parameter group
         # Group 0: VAE
@@ -2314,7 +2324,7 @@ class ProgressivePatchTrainer:
 
         return optim.lr_scheduler.LambdaLR(optimizer, lambda_funcs)
 
-    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50):
+    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50, resume_from: Optional[str] = None, start_epoch: int = 1):
         """
         Train patches targeting the final OCR layer.
 
@@ -2323,12 +2333,27 @@ class ProgressivePatchTrainer:
         2. Training for specified number of epochs
         3. Targeting the final layer (FinalOutput) exclusively
 
+        Args:
+            learning_rate: Learning rate for custom layers (default: 0.01)
+            vae_learning_rate: Learning rate for VAE (default: None, uses learning_rate)
+            lr_min: Minimum learning rate for cosine annealing (default: 1e-5)
+            max_epochs: Number of epochs to train (default: 50)
+            resume_from: Path to checkpoint file to resume from (optional)
+            start_epoch: Epoch to start/resume from (default: 1). If resume_from is provided without explicit
+                        start_epoch, the epoch is inferred from the checkpoint.
+
         Saves:
         - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
         - checkpoints/{run_id}/best_progressive_patch/: Best model across all training
-        - checkpoints/{run_id}/checkpoint_epoch_*/: Periodic checkpoints every 10 epochs
+        - checkpoints/{run_id}/checkpoint_epoch_*/: Periodic checkpoints every epoch
         """
         from datetime import datetime
+
+        # Validate start_epoch
+        if start_epoch < 1:
+            raise ValueError(f"start_epoch must be >= 1, got {start_epoch}")
+        if start_epoch > max_epochs:
+            raise ValueError(f"start_epoch ({start_epoch}) cannot be greater than max_epochs ({max_epochs})")
 
         # Create unique run ID based on timestamp
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2337,14 +2362,48 @@ class ProgressivePatchTrainer:
         print(f"\nRun ID: {self.run_id}")
         print(f"Checkpoint directory: {self.checkpoint_base}\n")
 
-        # Save train/val split CSV to checkpoint directory
-        self._save_train_val_split(
-            self.full_dataset,
-            self.train_loader.dataset,
-            self.val_loader.dataset,
-            [],
-            save_dir=self.checkpoint_base
-        )
+        # Handle train/val split: reload from original run if resuming, otherwise save current split
+        if resume_from is not None:
+            # Extract original run_id from checkpoint path
+            # Path format: checkpoints/ORIGINAL_RUN_ID/checkpoint_epoch_*/generator_epoch_*.pt
+            path_parts = Path(resume_from).parts
+            try:
+                checkpoints_idx = path_parts.index('checkpoints')
+                original_run_id = path_parts[checkpoints_idx + 1]
+                original_checkpoint_dir = os.path.join("checkpoints", original_run_id)
+
+                # Try to load train/val split from original run
+                split_csv_path = os.path.join(original_checkpoint_dir, 'train_val_split.csv')
+                if os.path.exists(split_csv_path):
+                    print(f"Loading train/val split from original run: {split_csv_path}")
+                    # Load the split and reconstruct dataloaders to ensure consistency
+                    import pandas as pd
+                    split_df = pd.read_csv(split_csv_path)
+
+                    # Reconstruct dataloaders with same indices as original training
+                    train_indices = split_df[split_df['split'] == 'train'].index.tolist()
+                    val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
+
+                    from torch.utils.data import Subset
+                    self.train_loader.dataset = Subset(self.full_dataset, train_indices)
+                    self.val_loader.dataset = Subset(self.full_dataset, val_indices)
+
+                    print(f"   Reloaded: {len(train_indices)} training, {len(val_indices)} validation images\n")
+                else:
+                    print(f"⚠️  Warning: Could not find train/val split CSV at {split_csv_path}")
+                    print(f"   Using current dataset split (may differ from original training)\n")
+            except (ValueError, IndexError) as e:
+                print(f"⚠️  Warning: Could not extract original run_id from checkpoint path: {resume_from}")
+                print(f"   Using current dataset split (may differ from original training)\n")
+        else:
+            # Save train/val split CSV to checkpoint directory (only for new training runs)
+            self._save_train_val_split(
+                self.full_dataset,
+                self.train_loader.dataset,
+                self.val_loader.dataset,
+                [],
+                save_dir=self.checkpoint_base
+            )
 
         # Profile layer activations upfront for normalization
         print("\n" + "="*80)
@@ -2392,6 +2451,46 @@ class ProgressivePatchTrainer:
 
         optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
 
+        # Handle checkpoint resumption
+        if resume_from is not None:
+            print(f"\n{'='*80}")
+            print(f"RESUMING FROM CHECKPOINT: {resume_from}")
+            print(f"{'='*80}")
+
+            # Check if file exists
+            if not os.path.exists(resume_from):
+                raise FileNotFoundError(f"Checkpoint file not found: {resume_from}")
+
+            # Load checkpoint
+            checkpoint = torch.load(resume_from, map_location=self.device)
+
+            # Validate compatibility
+            if checkpoint.get('basis_dim') != self.basis_dim:
+                raise ValueError(f"Checkpoint basis_dim {checkpoint.get('basis_dim')} != current {self.basis_dim}")
+            if checkpoint.get('patch_size') != (self.patch_height, self.patch_width):
+                raise ValueError(f"Checkpoint patch_size {checkpoint.get('patch_size')} != current patch size ({self.patch_height}, {self.patch_width})")
+            if checkpoint.get('use_vae_lora') != getattr(self.generator, 'use_vae_lora', False):
+                raise ValueError(f"Checkpoint LoRA setting {checkpoint.get('use_vae_lora')} != current {getattr(self.generator, 'use_vae_lora', False)}")
+            if checkpoint.get('lora_rank') != getattr(self.generator, 'lora_rank', None):
+                raise ValueError(f"Checkpoint lora_rank {checkpoint.get('lora_rank')} != current {getattr(self.generator, 'lora_rank', None)}")
+            if checkpoint.get('lora_alpha') != getattr(self.generator, 'lora_alpha', None):
+                raise ValueError(f"Checkpoint lora_alpha {checkpoint.get('lora_alpha')} != current {getattr(self.generator, 'lora_alpha', None)}")
+
+            # Load generator weights
+            self.generator.load_state_dict(checkpoint['generator_state_dict'])
+
+            # Infer start_epoch from checkpoint if user didn't explicitly specify it
+            checkpoint_epoch = checkpoint.get('epoch', 0)
+            if start_epoch == 1:  # Default value, user didn't override
+                start_epoch = checkpoint_epoch + 1
+                print(f"   Inferred start epoch: {start_epoch} (checkpoint was epoch {checkpoint_epoch})")
+            else:
+                print(f"   Using user-specified start epoch: {start_epoch} (checkpoint was epoch {checkpoint_epoch})")
+
+            print(f"   Loaded weights from epoch {checkpoint_epoch}")
+            print(f"   Will resume training at epoch {start_epoch}")
+            print(f"{'='*80}\n")
+
         # Calculate total training steps for step-based scheduling
         num_images = len(self.train_loader)
         batches_per_epoch = num_images // self.ocr_images_per_batch
@@ -2408,7 +2507,8 @@ class ProgressivePatchTrainer:
             learning_rate,
             lr_min,
             max_epochs,
-            total_steps
+            total_steps,
+            start_epoch=start_epoch
         )
 
         # Training history
@@ -2448,7 +2548,7 @@ class ProgressivePatchTrainer:
         print("="*80 + "\n")
 
         # Main training loop over epochs
-        for epoch in range(1, max_epochs + 1):
+        for epoch in range(start_epoch, max_epochs + 1):
             current_lr = optimizer.param_groups[0]['lr']
 
             # Training (scheduler.step() is called per batch inside train_epoch)
@@ -2558,6 +2658,13 @@ def main():
     parser.add_argument('--epochs', type=int, default=50,
                         help='Number of epochs to train for (default: 50). '
                         'Learning rate decays over this many epochs via cosine annealing.')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Path to checkpoint file to resume from (e.g., checkpoints/20260212_150000/checkpoint_epoch_0003/generator_epoch_0003.pt). '
+                        'When specified, loads generator weights from this checkpoint.')
+    parser.add_argument('--start-epoch', type=int, default=1,
+                        help='Epoch to start/resume training from (default: 1). '
+                        'If --resume-from is provided without --start-epoch, the epoch is inferred from the checkpoint. '
+                        'Useful for adjusting learning rate curve when resuming.')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2645,7 +2752,9 @@ def main():
             learning_rate=args.learning_rate,
             vae_learning_rate=args.vae_learning_rate,
             lr_min=args.lr_min,
-            max_epochs=args.epochs
+            max_epochs=args.epochs,
+            resume_from=args.resume_from,
+            start_epoch=args.start_epoch
         )
 
         # Save training history as CSV
