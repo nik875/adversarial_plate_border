@@ -195,9 +195,9 @@ def main():
     )
     parser.add_argument(
         "--generator-type",
-        choices=["simple", "foundation"],
-        default="simple",
-        help="Generator architecture type (default: simple, auto-detected from checkpoint if mismatch detected)"
+        choices=["foundation"],
+        default="foundation",
+        help="Generator architecture type (only FoundationPatchGenerator supported)"
     )
     parser.add_argument(
         "--csv",

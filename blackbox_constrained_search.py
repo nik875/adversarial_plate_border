@@ -22,7 +22,6 @@ import kornia
 import kornia.geometry as K
 
 from progressive_patch import FoundationPatchGenerator
-from conditional_patch import SimplePatchGenerator
 from refine_generator import RefinementNetwork
 
 
@@ -61,7 +60,7 @@ class BlackBoxPatchOptimizer:
     def __init__(self,
                  generator_checkpoint: str,
                  refinement_checkpoint: Optional[str] = None,
-                 generator_type: str = 'simple',
+                 generator_type: str = 'foundation',
                  device: str = None,
                  test_images_dir: Optional[str] = None,
                  csv_path: Optional[str] = None,
@@ -76,7 +75,7 @@ class BlackBoxPatchOptimizer:
         Args:
             generator_checkpoint: Path to generator .pt file
             refinement_checkpoint: Path to refinement .pt file (optional)
-            generator_type: 'simple' or 'foundation'
+            generator_type: 'foundation' (FoundationPatchGenerator)
             device: 'cuda', 'mps', or 'cpu'
             test_images_dir: Directory containing test images with license plates (alternative to csv_path)
             csv_path: CSV file with image paths and corners (alternative to test_images_dir)
@@ -135,47 +134,26 @@ class BlackBoxPatchOptimizer:
             print(f"Loaded {len(self.test_images)} test images from CSV")
 
     def _load_generator(self, checkpoint_path: str, generator_type: str):
-        """Load frozen generator from checkpoint"""
+        """Load frozen FoundationPatchGenerator from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         state_dict = checkpoint['generator_state_dict']
 
-        # Auto-detect generator type from checkpoint if not explicitly specified
-        if generator_type == 'simple' and 'vae.encoder.conv_in.weight' in state_dict:
-            print("Warning: Detected Foundation generator in checkpoint, auto-switching to 'foundation' type")
-            generator_type = 'foundation'
-        elif generator_type == 'foundation' and 'vae.encoder.conv_in.weight' not in state_dict:
-            print("Warning: Expected Foundation generator but checkpoint appears to be Simple, auto-switching to 'simple' type")
-            generator_type = 'simple'
-
-        # Extract latent_dim
+        # Extract latent_dim from checkpoint
         if 'basis_dim' in checkpoint:
             latent_dim = checkpoint['basis_dim']
         else:
-            # Infer from state dict
-            if generator_type == 'simple':
-                first_layer_key = 'network.0.weight'
-                latent_dim = state_dict[first_layer_key].shape[1]
-            else:  # foundation
-                first_layer_key = 'adapter.0.weight'
-                latent_dim = state_dict[first_layer_key].shape[1]
+            # Infer from state dict (adapter layer for FoundationPatchGenerator)
+            first_layer_key = 'adapter.weight'
+            latent_dim = state_dict[first_layer_key].shape[1]
 
-        print(f"Detected generator type: {generator_type}, latent_dim={latent_dim}")
+        print(f"Loading FoundationPatchGenerator, latent_dim={latent_dim}")
 
-        # Initialize generator
-        if generator_type == 'simple':
-            generator = SimplePatchGenerator(
-                latent_dim=latent_dim,
-                patch_height=256,
-                patch_width=512
-            )
-        elif generator_type == 'foundation':
-            generator = FoundationPatchGenerator(
-                latent_dim=latent_dim,
-                patch_height=256,
-                patch_width=512
-            )
-        else:
-            raise ValueError(f"Unknown generator type: {generator_type}")
+        # Initialize generator (only FoundationPatchGenerator supported)
+        generator = FoundationPatchGenerator(
+            latent_dim=latent_dim,
+            patch_height=256,
+            patch_width=512
+        )
 
         generator.load_state_dict(state_dict)
         generator.to(self.device)
@@ -757,8 +735,8 @@ def main():
                        help='Path to refinement checkpoint (.pt file, optional)')
     parser.add_argument('--disable-refiner', action='store_true',
                        help='Disable refinement network even if checkpoint provided')
-    parser.add_argument('--generator-type', choices=['simple', 'foundation'],
-                       default='simple', help='Generator architecture type')
+    parser.add_argument('--generator-type', choices=['foundation'],
+                       default='foundation', help='Generator architecture type (only FoundationPatchGenerator supported)')
     parser.add_argument('--test-images-dir', default=None,
                        help='Directory with test images and corner annotations (alternative to --csv)')
     parser.add_argument('--csv', default=None,
