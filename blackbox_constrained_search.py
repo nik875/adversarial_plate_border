@@ -64,6 +64,7 @@ class BlackBoxPatchOptimizer:
                  device: str = None,
                  test_images_dir: Optional[str] = None,
                  csv_path: Optional[str] = None,
+                 split_csv_path: Optional[str] = None,
                  target_plate: Optional[str] = None,
                  disruption_mode: bool = True,
                  test_image_subset: Optional[int] = None,
@@ -79,6 +80,7 @@ class BlackBoxPatchOptimizer:
             device: 'cuda', 'mps', or 'cpu'
             test_images_dir: Directory containing test images with license plates (alternative to csv_path)
             csv_path: CSV file with image paths and corners (alternative to test_images_dir)
+            split_csv_path: Path to train_val_split CSV to filter validation set (optional)
             target_plate: Target plate text for impersonation (None for disruption)
             disruption_mode: If True, optimize for detection failure. If False, impersonation.
             use_homography: If True, apply patch via homography transform. If False, use simple rectangular insertion.
@@ -106,6 +108,15 @@ class BlackBoxPatchOptimizer:
         self.disruption_mode = disruption_mode
         self.test_image_subset = test_image_subset
 
+        # Load validation indices from split CSV if provided
+        self.val_indices = None
+        if split_csv_path:
+            import pandas as pd
+            print(f"Loading validation split from: {split_csv_path}")
+            split_df = pd.read_csv(split_csv_path)
+            self.val_indices = split_df[split_df['split'] == 'val'].index.tolist()
+            print(f"  Found {len(self.val_indices)} validation indices")
+
         # Load generator
         print(f"Loading generator from: {generator_checkpoint}")
         self.generator, self.latent_dim = self._load_generator(
@@ -130,7 +141,7 @@ class BlackBoxPatchOptimizer:
             self._load_test_images(test_images_dir)
             print(f"Loaded {len(self.test_images)} test images")
         elif csv_path:
-            self._load_test_images_from_csv(csv_path)
+            self._load_test_images_from_csv(csv_path, val_indices=self.val_indices)
             print(f"Loaded {len(self.test_images)} test images from CSV")
 
     def _load_generator(self, checkpoint_path: str, generator_type: str):
@@ -220,17 +231,26 @@ class BlackBoxPatchOptimizer:
             self.test_images.append(image_np)
             self.test_corners.append(corners)
 
-    def _load_test_images_from_csv(self, csv_path: str):
+    def _load_test_images_from_csv(self, csv_path: str, val_indices: Optional[List[int]] = None):
         """
         Load test images and corners from CSV file (preproc_labels.csv format).
 
         Expected CSV columns (from AdversarialPatchDataset):
         - 'preprocessed_filename': Path to preprocessed image
         - 'new_p1_x', 'new_p1_y', 'new_p2_x', 'new_p2_y', etc: Corner coordinates
+
+        Args:
+            csv_path: Path to CSV file
+            val_indices: Optional list of indices to filter to (from train_val_split CSV)
         """
         import pandas as pd
 
         df = pd.read_csv(csv_path)
+
+        # Filter to validation indices if provided
+        if val_indices is not None:
+            df = df.iloc[val_indices]
+            print(f"Filtered to {len(df)} validation images")
 
         for idx, row in df.iterrows():
             img_path = row['preprocessed_filename']
