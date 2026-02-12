@@ -941,11 +941,16 @@ class ProgressivePatchTrainer:
         # Split into train (80%) and val (20%)
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
-        train_dataset, val_dataset = random_split(
+
+        # Use FlexibleSubset to allow updating indices if resuming with different split
+        from dataset import FlexibleSubset
+        temp_train, temp_val = random_split(
             full_dataset,
             [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
+        train_dataset = FlexibleSubset(full_dataset, temp_train.indices)
+        val_dataset = FlexibleSubset(full_dataset, temp_val.indices)
 
         # Save train/val split mapping to CSV (immediately)
         self._save_train_val_split(
@@ -2476,19 +2481,15 @@ class ProgressivePatchTrainer:
                 if split_csv_path and os.path.exists(split_csv_path):
                     import pandas as pd
                     split_df = pd.read_csv(split_csv_path)
-                    train_count = len(split_df[split_df['split'] == 'train'])
-                    val_count = len(split_df[split_df['split'] == 'validation'])
+                    train_indices = split_df[split_df['split'] == 'train'].index.tolist()
+                    val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
 
-                    if is_continue_run:
-                        # For --continue-run: DataLoaders already have correct split (created with seed 42 in __init__)
-                        print(f"Train/val split confirmed: {split_csv_path}")
-                        print(f"   {train_count} training, {val_count} validation images")
-                        print(f"   (DataLoaders use seed 42, split already correct)\n")
-                    else:
-                        # For --resume-from: Cannot modify DataLoaders after creation (PyTorch limitation)
-                        print(f"Found original split: {split_csv_path}")
-                        print(f"   {train_count} training, {val_count} validation images")
-                        print(f"   Note: Using current dataset split (DataLoaders already initialized)\n")
+                    # Update DataLoaders with original split indices using FlexibleSubset
+                    self.train_loader.dataset.update_indices(train_indices)
+                    self.val_loader.dataset.update_indices(val_indices)
+
+                    print(f"Loaded train/val split: {split_csv_path}")
+                    print(f"   {len(train_indices)} training, {len(val_indices)} validation images\n")
                 else:
                     print(f"⚠️  Warning: Could not find train/val split CSV in {original_checkpoint_dir}")
                     print(f"   Using current dataset split (may differ from original training)\n")

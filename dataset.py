@@ -15,6 +15,28 @@ import getpass
 pillow_heif.register_heif_opener()
 
 
+class FlexibleSubset(Dataset):
+    """
+    A flexible subset of a dataset that allows changing indices after creation.
+    Useful for updating train/val splits when resuming training from a checkpoint
+    with a different split than the current seed would generate.
+    """
+
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = torch.tensor(indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx].item()]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def update_indices(self, new_indices):
+        """Update the subset indices (useful for changing splits after initialization)"""
+        self.indices = torch.tensor(new_indices)
+
+
 def transform_path_for_user(filepath):
     """Transform file paths based on current user"""
     current_user = getpass.getuser()
