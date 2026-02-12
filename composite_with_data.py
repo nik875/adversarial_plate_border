@@ -320,13 +320,15 @@ def main():
             heights = [h for w, h in dimensions]
             avg_width = np.mean(widths)
             avg_height = np.mean(heights)
+            std_width = np.std(widths)
+            std_height = np.std(heights)
             min_width = np.min(widths)
             max_width = np.max(widths)
             min_height = np.min(heights)
             max_height = np.max(heights)
 
             print(f"\nImage Dimension Statistics:")
-            print(f"  Average size: {avg_width:.1f} × {avg_height:.1f} (W × H)")
+            print(f"  Average size: {avg_width:.1f} ± {std_width:.1f} × {avg_height:.1f} ± {std_height:.1f} (W × H)")
             print(f"  Width range: {min_width} - {max_width}")
             print(f"  Height range: {min_height} - {max_height}")
 
