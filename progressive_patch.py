@@ -2324,7 +2324,7 @@ class ProgressivePatchTrainer:
 
         return optim.lr_scheduler.LambdaLR(optimizer, lambda_funcs)
 
-    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50, resume_from: Optional[str] = None, start_epoch: int = 1, checkpoint_every: int = 1):
+    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50, resume_from: Optional[str] = None, start_epoch: int = 1, checkpoint_every: int = 1, continue_run: Optional[str] = None):
         """
         Train patches targeting the final OCR layer.
 
@@ -2342,6 +2342,8 @@ class ProgressivePatchTrainer:
             start_epoch: Epoch to start/resume from (default: 1). If resume_from is provided without explicit
                         start_epoch, the epoch is inferred from the checkpoint.
             checkpoint_every: Save full checkpoint every N epochs (default: 1). Set to 5+ to reduce disk usage.
+            continue_run: Path to previous run directory to continue from (e.g., checkpoints/20260101_120000).
+                         Automatically finds latest checkpoint, reuses same directory. Incompatible with resume_from.
 
         Saves:
         - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
@@ -2357,13 +2359,56 @@ class ProgressivePatchTrainer:
             raise ValueError(f"start_epoch ({start_epoch}) cannot be greater than max_epochs ({max_epochs})")
         if checkpoint_every < 1:
             raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
+        if continue_run is not None and resume_from is not None:
+            raise ValueError(f"--continue-run and --resume-from are incompatible, use only one")
+        if continue_run is not None and start_epoch != 1:
+            raise ValueError(f"--continue-run auto-detects start_epoch, cannot use --start-epoch")
 
-        # Create unique run ID based on timestamp
-        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.checkpoint_base = os.path.join("checkpoints", self.run_id)
-        os.makedirs(self.checkpoint_base, exist_ok=True)
-        print(f"\nRun ID: {self.run_id}")
-        print(f"Checkpoint directory: {self.checkpoint_base}\n")
+        # Handle --continue-run: find latest checkpoint and continue in same directory
+        if continue_run is not None:
+            if not os.path.isdir(continue_run):
+                raise ValueError(f"Continue run directory not found: {continue_run}")
+
+            # Find latest checkpoint in this directory
+            checkpoint_dirs = sorted([
+                d for d in os.listdir(continue_run)
+                if d.startswith('checkpoint_epoch_') and os.path.isdir(os.path.join(continue_run, d))
+            ])
+
+            if not checkpoint_dirs:
+                raise ValueError(f"No checkpoints found in {continue_run}")
+
+            latest_checkpoint_dir = checkpoint_dirs[-1]
+            latest_checkpoint_path = os.path.join(
+                continue_run, latest_checkpoint_dir,
+                [f for f in os.listdir(os.path.join(continue_run, latest_checkpoint_dir))
+                 if f.startswith('generator_epoch_') and f.endswith('.pt')][0]
+            )
+
+            print(f"\n{'='*80}")
+            print(f"CONTINUING RUN: {continue_run}")
+            print(f"Latest checkpoint: {latest_checkpoint_path}")
+            print(f"{'='*80}\n")
+
+            # Extract run_id from continue_run path
+            self.run_id = os.path.basename(continue_run)
+            self.checkpoint_base = continue_run
+            resume_from = latest_checkpoint_path
+
+            # Load checkpoint to determine start epoch
+            checkpoint = torch.load(resume_from, map_location=self.device)
+            checkpoint_epoch = checkpoint.get('epoch', 0)
+            start_epoch = checkpoint_epoch + 1  # Redo all batches of next epoch
+
+            print(f"Loaded checkpoint from epoch {checkpoint_epoch}")
+            print(f"Will resume at epoch {start_epoch} (redoing all batches of epoch {checkpoint_epoch + 1})\n")
+        else:
+            # Create unique run ID based on timestamp
+            self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.checkpoint_base = os.path.join("checkpoints", self.run_id)
+            os.makedirs(self.checkpoint_base, exist_ok=True)
+            print(f"\nRun ID: {self.run_id}")
+            print(f"Checkpoint directory: {self.checkpoint_base}\n")
 
         # Handle train/val split: reload from original run if resuming, otherwise save current split
         if resume_from is not None:
@@ -2671,6 +2716,11 @@ def main():
                         help='Epoch to start/resume training from (default: 1). '
                         'If --resume-from is provided without --start-epoch, the epoch is inferred from the checkpoint. '
                         'Useful for adjusting learning rate curve when resuming.')
+    parser.add_argument('--continue-run', type=str, default=None,
+                        help='Continue training from the last checkpoint in a previous run (e.g., checkpoints/20260101_120000). '
+                        'Automatically finds latest checkpoint, loads it, and continues in same directory. '
+                        'Redoes all batches of the next epoch (important when checkpoint_every > 1). '
+                        'Incompatible with --resume-from and --start-epoch.')
     parser.add_argument('--checkpoint-every', type=int, default=1,
                         help='Save full generator checkpoint every N epochs (default: 1). '
                         'Set to 5 to save every 5 epochs, reducing disk usage. '
@@ -2721,6 +2771,12 @@ def main():
                 f"Unknown dataset '{dataset_name}'. Available: {available_datasets}"
             )
 
+    # Validate checkpoint arguments
+    if args.continue_run is not None and args.resume_from is not None:
+        raise ValueError(f"--continue-run and --resume-from are incompatible, use only one")
+    if args.continue_run is not None and args.start_epoch != 1:
+        raise ValueError(f"--continue-run auto-detects start_epoch, cannot use --start-epoch")
+
     print(f"\n{'='*80}")
     print(f"OCR MODE (cropped license plates)")
     print(f"{'='*80}")
@@ -2765,7 +2821,8 @@ def main():
             max_epochs=args.epochs,
             resume_from=args.resume_from,
             start_epoch=args.start_epoch,
-            checkpoint_every=args.checkpoint_every
+            checkpoint_every=args.checkpoint_every,
+            continue_run=args.continue_run
         )
 
         # Save training history as CSV
