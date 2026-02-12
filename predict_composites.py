@@ -89,7 +89,7 @@ def main():
     total_samples = len(composite_images)
 
     print(f"Found {total_samples} image pairs")
-    print(f"Number of patches: {args.num_patches}")
+    print(f"Number of patches: {num_patches}")
     print(f"Samples per patch: {num_samples}")
 
     # Initialize ALPR in OCR-only mode
