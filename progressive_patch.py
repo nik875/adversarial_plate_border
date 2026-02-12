@@ -2447,16 +2447,26 @@ class ProgressivePatchTrainer:
 
         # Handle train/val split: reload from original run if resuming, otherwise save current split
         if resume_from is not None:
-            # Extract original run_id from checkpoint path
-            # Path format: checkpoints/ORIGINAL_RUN_ID/checkpoint_epoch_*/generator_epoch_*.pt
-            path_parts = Path(resume_from).parts
-            try:
-                checkpoints_idx = path_parts.index('checkpoints')
-                original_run_id = path_parts[checkpoints_idx + 1]
-                original_checkpoint_dir = os.path.join("checkpoints", original_run_id)
+            # When using --continue-run, checkpoint_base is already set
+            # Otherwise, extract original run_id from checkpoint path
+            original_checkpoint_dir = None
 
-                # Try to load train/val split from original run
-                # Look for any train_val_split*.csv file (may have timestamp in filename)
+            # First try: use checkpoint_base if it was set (e.g., from --continue-run)
+            if hasattr(self, 'checkpoint_base') and self.checkpoint_base:
+                original_checkpoint_dir = self.checkpoint_base
+
+            # Second try: extract from checkpoint path
+            if original_checkpoint_dir is None:
+                try:
+                    path_parts = Path(resume_from).parts
+                    checkpoints_idx = path_parts.index('checkpoints')
+                    original_run_id = path_parts[checkpoints_idx + 1]
+                    original_checkpoint_dir = os.path.join("checkpoints", original_run_id)
+                except (ValueError, IndexError):
+                    pass
+
+            # Try to load train/val split from original run
+            if original_checkpoint_dir:
                 split_csv_path = None
                 for f in os.listdir(original_checkpoint_dir):
                     if f.startswith('train_val_split') and f.endswith('.csv'):
@@ -2464,25 +2474,29 @@ class ProgressivePatchTrainer:
                         break
 
                 if split_csv_path and os.path.exists(split_csv_path):
-                    print(f"Loading train/val split from original run: {split_csv_path}")
-                    # Load the split and reconstruct dataloaders to ensure consistency
-                    import pandas as pd
-                    split_df = pd.read_csv(split_csv_path)
+                    try:
+                        print(f"Loading train/val split from original run: {split_csv_path}")
+                        # Load the split and reconstruct dataloaders to ensure consistency
+                        import pandas as pd
+                        split_df = pd.read_csv(split_csv_path)
 
-                    # Reconstruct dataloaders with same indices as original training
-                    train_indices = split_df[split_df['split'] == 'train'].index.tolist()
-                    val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
+                        # Reconstruct dataloaders with same indices as original training
+                        train_indices = split_df[split_df['split'] == 'train'].index.tolist()
+                        val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
 
-                    from torch.utils.data import Subset
-                    self.train_loader.dataset = Subset(self.full_dataset, train_indices)
-                    self.val_loader.dataset = Subset(self.full_dataset, val_indices)
+                        from torch.utils.data import Subset
+                        self.train_loader.dataset = Subset(self.full_dataset, train_indices)
+                        self.val_loader.dataset = Subset(self.full_dataset, val_indices)
 
-                    print(f"   Reloaded: {len(train_indices)} training, {len(val_indices)} validation images\n")
+                        print(f"   Reloaded: {len(train_indices)} training, {len(val_indices)} validation images\n")
+                    except Exception as e:
+                        print(f"⚠️  Warning: Could not load train/val split CSV: {e}")
+                        print(f"   Using current dataset split (may differ from original training)\n")
                 else:
                     print(f"⚠️  Warning: Could not find train/val split CSV in {original_checkpoint_dir}")
                     print(f"   Using current dataset split (may differ from original training)\n")
-            except (ValueError, IndexError) as e:
-                print(f"⚠️  Warning: Could not extract original run_id from checkpoint path: {resume_from}")
+            else:
+                print(f"⚠️  Warning: Could not determine checkpoint directory")
                 print(f"   Using current dataset split (may differ from original training)\n")
         else:
             # Save train/val split CSV to checkpoint directory (only for new training runs)
