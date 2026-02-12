@@ -2128,6 +2128,23 @@ class ProgressivePatchTrainer:
                         total_raw_quality_score += batch_raw_quality_score / batch_count
 
                 except StopIteration:
+                    # Apply accumulated gradients from incomplete final batch before breaking
+                    if batch_count > 0:
+                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        num_updates += 1
+
+                        # Track losses
+                        total_diversity_loss += batch_diversity_loss / batch_count
+                        total_tv_loss += batch_tv_loss / batch_count
+                        total_spectrum_loss += batch_spectrum_loss / batch_count
+                        total_raw_diversity_score += batch_raw_diversity_score / batch_count
+                        total_raw_quality_score += batch_raw_quality_score / batch_count
+
+                        # Update progress bar for final batch
+                        pbar.update(1)
                     break
 
                 # Update progress bar: show average loss per patch (divided by num_patches_processed)
