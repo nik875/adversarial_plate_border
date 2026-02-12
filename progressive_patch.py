@@ -2456,8 +2456,14 @@ class ProgressivePatchTrainer:
                 original_checkpoint_dir = os.path.join("checkpoints", original_run_id)
 
                 # Try to load train/val split from original run
-                split_csv_path = os.path.join(original_checkpoint_dir, 'train_val_split.csv')
-                if os.path.exists(split_csv_path):
+                # Look for any train_val_split*.csv file (may have timestamp in filename)
+                split_csv_path = None
+                for f in os.listdir(original_checkpoint_dir):
+                    if f.startswith('train_val_split') and f.endswith('.csv'):
+                        split_csv_path = os.path.join(original_checkpoint_dir, f)
+                        break
+
+                if split_csv_path and os.path.exists(split_csv_path):
                     print(f"Loading train/val split from original run: {split_csv_path}")
                     # Load the split and reconstruct dataloaders to ensure consistency
                     import pandas as pd
@@ -2473,7 +2479,7 @@ class ProgressivePatchTrainer:
 
                     print(f"   Reloaded: {len(train_indices)} training, {len(val_indices)} validation images\n")
                 else:
-                    print(f"⚠️  Warning: Could not find train/val split CSV at {split_csv_path}")
+                    print(f"⚠️  Warning: Could not find train/val split CSV in {original_checkpoint_dir}")
                     print(f"   Using current dataset split (may differ from original training)\n")
             except (ValueError, IndexError) as e:
                 print(f"⚠️  Warning: Could not extract original run_id from checkpoint path: {resume_from}")
