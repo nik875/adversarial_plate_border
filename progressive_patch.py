@@ -2369,25 +2369,60 @@ class ProgressivePatchTrainer:
             if not os.path.isdir(continue_run):
                 raise ValueError(f"Continue run directory not found: {continue_run}")
 
-            # Find latest checkpoint in this directory
+            # Try to find latest checkpoint: prefer checkpoint_epoch_*, then best_progressive_patch, then training_complete_final_model
             checkpoint_dirs = sorted([
                 d for d in os.listdir(continue_run)
                 if d.startswith('checkpoint_epoch_') and os.path.isdir(os.path.join(continue_run, d))
             ])
 
-            if not checkpoint_dirs:
-                raise ValueError(f"No checkpoints found in {continue_run}")
+            latest_checkpoint_path = None
+            checkpoint_source = None
 
-            latest_checkpoint_dir = checkpoint_dirs[-1]
-            latest_checkpoint_path = os.path.join(
-                continue_run, latest_checkpoint_dir,
-                [f for f in os.listdir(os.path.join(continue_run, latest_checkpoint_dir))
-                 if f.startswith('generator_epoch_') and f.endswith('.pt')][0]
-            )
+            if checkpoint_dirs:
+                # Use latest periodic checkpoint
+                latest_checkpoint_dir = checkpoint_dirs[-1]
+                checkpoint_dir = os.path.join(continue_run, latest_checkpoint_dir)
+                checkpoint_files = [f for f in os.listdir(checkpoint_dir)
+                                   if f.startswith('generator_epoch_') and f.endswith('.pt')]
+                if checkpoint_files:
+                    latest_checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files[0])
+                    checkpoint_source = f"periodic checkpoint ({latest_checkpoint_dir})"
+
+            if latest_checkpoint_path is None:
+                # Fall back to best model
+                best_dir = os.path.join(continue_run, 'best_progressive_patch')
+                if os.path.isdir(best_dir):
+                    checkpoint_files = [f for f in os.listdir(best_dir)
+                                       if f.startswith('generator_epoch_') and f.endswith('.pt')]
+                    if checkpoint_files:
+                        # Get the latest one (highest epoch number)
+                        checkpoint_files.sort()
+                        latest_checkpoint_path = os.path.join(best_dir, checkpoint_files[-1])
+                        checkpoint_source = "best model (best_progressive_patch)"
+
+            if latest_checkpoint_path is None:
+                # Fall back to final model
+                final_dir = os.path.join(continue_run, 'training_complete_final_model')
+                if os.path.isdir(final_dir):
+                    checkpoint_files = [f for f in os.listdir(final_dir)
+                                       if f.startswith('generator_epoch_') and f.endswith('.pt')]
+                    if checkpoint_files:
+                        checkpoint_files.sort()
+                        latest_checkpoint_path = os.path.join(final_dir, checkpoint_files[-1])
+                        checkpoint_source = "final model (training_complete_final_model)"
+
+            if latest_checkpoint_path is None:
+                available_dirs = ', '.join(os.listdir(continue_run))
+                raise ValueError(
+                    f"No checkpoints found in {continue_run}\n"
+                    f"Available directories: {available_dirs}\n"
+                    f"Expected: checkpoint_epoch_*, best_progressive_patch/, or training_complete_final_model/"
+                )
 
             print(f"\n{'='*80}")
             print(f"CONTINUING RUN: {continue_run}")
-            print(f"Latest checkpoint: {latest_checkpoint_path}")
+            print(f"Latest checkpoint: {checkpoint_source}")
+            print(f"Path: {latest_checkpoint_path}")
             print(f"{'='*80}\n")
 
             # Extract run_id from continue_run path
