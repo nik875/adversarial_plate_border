@@ -62,8 +62,6 @@ class BlackBoxPatchOptimizer:
                  refinement_checkpoint: Optional[str] = None,
                  generator_type: str = 'foundation',
                  device: str = None,
-                 test_images_dir: Optional[str] = None,
-                 csv_path: Optional[str] = None,
                  split_csv_path: Optional[str] = None,
                  target_plate: Optional[str] = None,
                  disruption_mode: bool = True,
@@ -78,9 +76,7 @@ class BlackBoxPatchOptimizer:
             refinement_checkpoint: Path to refinement .pt file (optional)
             generator_type: 'foundation' (FoundationPatchGenerator)
             device: 'cuda', 'mps', or 'cpu'
-            test_images_dir: Directory containing test images with license plates (alternative to csv_path)
-            csv_path: CSV file with image paths and corners (alternative to test_images_dir)
-            split_csv_path: Path to train_val_split CSV to filter validation set (optional)
+            split_csv_path: Path to train_val_split CSV from training checkpoint directory
             target_plate: Target plate text for impersonation (None for disruption)
             disruption_mode: If True, optimize for detection failure. If False, impersonation.
             use_homography: If True, apply patch via homography transform. If False, use simple rectangular insertion.
@@ -108,14 +104,15 @@ class BlackBoxPatchOptimizer:
         self.disruption_mode = disruption_mode
         self.test_image_subset = test_image_subset
 
-        # Load validation indices from split CSV if provided
-        self.val_indices = None
-        if split_csv_path:
-            import pandas as pd
-            print(f"Loading validation split from: {split_csv_path}")
-            split_df = pd.read_csv(split_csv_path)
-            self.val_indices = split_df[split_df['split'] == 'val'].index.tolist()
-            print(f"  Found {len(self.val_indices)} validation indices")
+        # Load validation indices from split CSV
+        if not split_csv_path:
+            raise ValueError("split_csv_path is required (from checkpoint directory)")
+
+        import pandas as pd
+        print(f"Loading validation split from: {split_csv_path}")
+        split_df = pd.read_csv(split_csv_path)
+        val_indices = split_df[split_df['split'] == 'val'].index.tolist()
+        print(f"  Found {len(val_indices)} validation indices")
 
         # Load generator
         print(f"Loading generator from: {generator_checkpoint}")
@@ -134,15 +131,11 @@ class BlackBoxPatchOptimizer:
             self.refiner.eval()
             print("Refinement network loaded")
 
-        # Load test images
+        # Load test images from the same OCR datasets used during training
         self.test_images = []
         self.test_corners = []
-        if test_images_dir:
-            self._load_test_images(test_images_dir)
-            print(f"Loaded {len(self.test_images)} test images")
-        elif csv_path:
-            self._load_test_images_from_csv(csv_path, val_indices=self.val_indices)
-            print(f"Loaded {len(self.test_images)} test images from CSV")
+        self._load_from_ocr_dataset(split_df, val_indices)
+        print(f"Loaded {len(self.test_images)} test images from OCR dataset")
 
     def _load_generator(self, checkpoint_path: str, generator_type: str):
         """Load frozen FoundationPatchGenerator from checkpoint"""
@@ -195,6 +188,68 @@ class BlackBoxPatchOptimizer:
         refiner.to(self.device)
 
         return refiner
+
+    def _load_from_ocr_dataset(self, split_df: 'pd.DataFrame', val_indices: List[int]):
+        """
+        Load test images from OCR datasets (same as progressive_patch.py uses).
+
+        Reconstructs the dataset that was used during training and filters to validation indices.
+
+        Args:
+            split_df: DataFrame from train_val_split CSV
+            val_indices: List of validation indices
+        """
+        # Import load_datasets (same as progressive_patch.py)
+        try:
+            import importlib.util
+            from pathlib import Path
+            load_datasets_path = Path(__file__).parent / "foundationmodel" / "dataset" / "load_datasets.py"
+            spec = importlib.util.spec_from_file_location("load_datasets", load_datasets_path)
+            load_datasets = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(load_datasets)
+            iter_dataset = load_datasets.iter_dataset
+            DATASETS = load_datasets.DATASETS
+        except Exception as e:
+            raise ImportError(f"Could not import load_datasets: {e}")
+
+        # Get unique datasets and load them in order
+        dataset_names = split_df['dataset'].unique()
+        print(f"Loading OCR datasets: {list(dataset_names)}")
+
+        # Build a mapping from global index to (dataset_idx, local_idx, img, text)
+        global_idx = 0
+        dataset_samples = {}  # global_idx -> (img, text)
+
+        for dataset_name in dataset_names:
+            print(f"\nLoading {dataset_name}...")
+            local_idx = 0
+            for img, text, meta in iter_dataset(dataset_name, 'test', max_samples=None):
+                if global_idx in val_indices:
+                    # Convert PIL image to numpy array if needed
+                    if hasattr(img, 'convert'):  # PIL Image
+                        img_np = np.array(img.convert('RGB'))
+                    else:
+                        img_np = np.array(img)
+                    dataset_samples[global_idx] = (img_np, text)
+                global_idx += 1
+
+            print(f"  Loaded {local_idx} samples (selected {len([i for i in dataset_samples if i < global_idx])} for validation)")
+
+        # Extract images and texts in index order
+        for idx in sorted(val_indices):
+            if idx in dataset_samples:
+                img_np, text = dataset_samples[idx]
+                self.test_images.append(img_np)
+                # For OCR-mode datasets, create dummy corners (center of image)
+                h, w = img_np.shape[:2]
+                center_x, center_y = w / 2, h / 2
+                corners = np.array([
+                    [center_x - w/4, center_y - h/4],
+                    [center_x + w/4, center_y - h/4],
+                    [center_x + w/4, center_y + h/4],
+                    [center_x - w/4, center_y + h/4]
+                ], dtype=np.float32)
+                self.test_corners.append(corners)
 
     def _load_test_images(self, test_images_dir: str):
         """

@@ -200,11 +200,6 @@ def main():
         help="Generator architecture type (only FoundationPatchGenerator supported)"
     )
     parser.add_argument(
-        "--csv",
-        default=None,
-        help="CSV file with image paths and corners (default: preproc_labels.csv, or loaded from checkpoint dir)"
-    )
-    parser.add_argument(
         "--device",
         default=None,
         choices=["cuda", "mps", "cpu"],
@@ -303,15 +298,11 @@ def main():
 
     # Find train_val_split_TIMESTAMP.csv
     split_csv_files = list(checkpoint_dir.glob("train_val_split_*.csv"))
-    split_csv_path = None
-    if split_csv_files:
-        split_csv_path = str(split_csv_files[0])
-        print(f"Found train/val split: {split_csv_path}")
-    else:
-        print(f"Warning: No train_val_split CSV found in {checkpoint_dir}")
-
-    # Use provided CSV or default
-    csv_path = args.csv if args.csv else "preproc_labels.csv"
+    if not split_csv_files:
+        print(f"Error: No train_val_split CSV found in {checkpoint_dir}")
+        return
+    split_csv_path = str(split_csv_files[0])
+    print(f"Found train/val split: {split_csv_path}")
 
     print("=" * 70)
     print("BLACK-BOX ADVERSARIAL PATCH OPTIMIZATION (CMA-ES)")
@@ -320,9 +311,7 @@ def main():
     print(f"Generator checkpoint: {generator_checkpoint}")
     if args.refinement_checkpoint:
         print(f"Refinement checkpoint: {args.refinement_checkpoint}")
-    print(f"CSV file: {csv_path}")
-    if split_csv_path:
-        print(f"Validation split: {split_csv_path}")
+    print(f"Validation split: {split_csv_path}")
     print(f"Evaluation mode: {'OCR (cropped plates)' if args.ocr_mode else 'Standard (full images)'}")
     if args.ocr_mode:
         print(f"  Border scale: {args.border_scale}")
@@ -344,7 +333,6 @@ def main():
         refinement_checkpoint=refinement_checkpoint,
         generator_type=args.generator_type,
         device=args.device,
-        csv_path=csv_path,
         split_csv_path=split_csv_path,
         target_plate=args.target_plate,
         disruption_mode=(args.target_plate is None),
