@@ -2324,7 +2324,7 @@ class ProgressivePatchTrainer:
 
         return optim.lr_scheduler.LambdaLR(optimizer, lambda_funcs)
 
-    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50, resume_from: Optional[str] = None, start_epoch: int = 1):
+    def train(self, learning_rate: float = 0.01, vae_learning_rate: Optional[float] = None, lr_min: float = 1e-5, max_epochs: int = 50, resume_from: Optional[str] = None, start_epoch: int = 1, checkpoint_every: int = 1):
         """
         Train patches targeting the final OCR layer.
 
@@ -2341,6 +2341,7 @@ class ProgressivePatchTrainer:
             resume_from: Path to checkpoint file to resume from (optional)
             start_epoch: Epoch to start/resume from (default: 1). If resume_from is provided without explicit
                         start_epoch, the epoch is inferred from the checkpoint.
+            checkpoint_every: Save full checkpoint every N epochs (default: 1). Set to 5+ to reduce disk usage.
 
         Saves:
         - checkpoints/{run_id}/training_complete_final_model/: Final model after all training (20 samples)
@@ -2349,11 +2350,13 @@ class ProgressivePatchTrainer:
         """
         from datetime import datetime
 
-        # Validate start_epoch
+        # Validate parameters
         if start_epoch < 1:
             raise ValueError(f"start_epoch must be >= 1, got {start_epoch}")
         if start_epoch > max_epochs:
             raise ValueError(f"start_epoch ({start_epoch}) cannot be greater than max_epochs ({max_epochs})")
+        if checkpoint_every < 1:
+            raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
 
         # Create unique run ID based on timestamp
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2579,11 +2582,14 @@ class ProgressivePatchTrainer:
                 else:
                     print(f"   ✓ New best training loss: {best_train_loss:.4f} (save failed, continuing)")
 
-            # Save full generator checkpoint every epoch (enables recovery if interrupted)
-            last_layer_idx = len(self.layer_configs) - 1
-            checkpoint_dir = os.path.join(self.checkpoint_base, f"checkpoint_epoch_{epoch:04d}")
-            if self.save_basis_safe(epoch, checkpoint_dir, num_samples=10, save_generator=True, layer_idx=last_layer_idx):
-                print(f"   ✓ Saved full checkpoint for epoch {epoch}")
+            # Save full generator checkpoint periodically (enables recovery if interrupted)
+            if epoch % checkpoint_every == 0:
+                last_layer_idx = len(self.layer_configs) - 1
+                checkpoint_dir = os.path.join(self.checkpoint_base, f"checkpoint_epoch_{epoch:04d}")
+                if self.save_basis_safe(epoch, checkpoint_dir, num_samples=10, save_generator=True, layer_idx=last_layer_idx):
+                    print(f"   ✓ Saved checkpoint at epoch {epoch} (every {checkpoint_every} epochs)")
+                else:
+                    print(f"   ⚠️  Failed to save checkpoint at epoch {epoch}")
 
         print("\n" + "="*80)
         print("TRAINING COMPLETED!")
@@ -2665,6 +2671,10 @@ def main():
                         help='Epoch to start/resume training from (default: 1). '
                         'If --resume-from is provided without --start-epoch, the epoch is inferred from the checkpoint. '
                         'Useful for adjusting learning rate curve when resuming.')
+    parser.add_argument('--checkpoint-every', type=int, default=1,
+                        help='Save full generator checkpoint every N epochs (default: 1). '
+                        'Set to 5 to save every 5 epochs, reducing disk usage. '
+                        'Final checkpoint and best model are always saved.')
     parser.add_argument('--no-use-all-for-train', action='store_true',
                         help='Disable using all data for training (use 80%% train / 20%% validation split). '
                         'Default: uses 100%% of data for training.')
@@ -2754,7 +2764,8 @@ def main():
             lr_min=args.lr_min,
             max_epochs=args.epochs,
             resume_from=args.resume_from,
-            start_epoch=args.start_epoch
+            start_epoch=args.start_epoch,
+            checkpoint_every=args.checkpoint_every
         )
 
         # Save training history as CSV
