@@ -2482,7 +2482,7 @@ class ProgressivePatchTrainer:
                     import pandas as pd
                     split_df = pd.read_csv(split_csv_path)
                     train_indices = split_df[split_df['split'] == 'train'].index.tolist()
-                    val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
+                    val_indices = split_df[split_df['split'] == 'val'].index.tolist()
 
                     # Update DataLoaders with original split indices using FlexibleSubset
                     self.train_loader.dataset.update_indices(train_indices)
