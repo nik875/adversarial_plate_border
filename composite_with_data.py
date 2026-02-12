@@ -297,35 +297,41 @@ def main():
 
         # Composite patches with samples
         print(f"\nCreating {len(val_images)} composite images with controls...")
+        saved_count = 0
         for img_idx, val_image in enumerate(val_images):
-            # Select random patch for this image
-            patch = random.choice(patches)
+            try:
+                # Select random patch for this image
+                patch = random.choice(patches)
 
-            # Apply patch
-            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=0.6)
-            composite = composite.squeeze(0)  # Remove batch dim
+                # Apply patch
+                composite = apply_patch_ocr_mode(val_image, patch, center_ratio=0.6)
+                composite = composite.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy and save
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+                # Convert to numpy and save
+                composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
 
-            output_path = output_dir / f"composite_{img_idx:02d}.jpg"
-            cv2.imwrite(str(output_path), composite_bgr)
-            print(f"  Saved {output_path.name}")
+                output_path = output_dir / f"composite_{img_idx:02d}.jpg"
+                cv2.imwrite(str(output_path), composite_bgr)
 
-            # Apply grey control border
-            control = apply_neutral_border_ocr_mode(val_image, center_ratio=0.6, border_color=0.5)
-            control = control.squeeze(0)  # Remove batch dim
+                # Apply grey control border
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=0.6, border_color=0.5)
+                control = control.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy and save
-            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+                # Convert to numpy and save
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
 
-            control_path = output_dir / f"control_{img_idx:02d}.jpg"
-            cv2.imwrite(str(control_path), control_bgr)
-            print(f"  Saved {control_path.name}")
+                control_path = output_dir / f"control_{img_idx:02d}.jpg"
+                cv2.imwrite(str(control_path), control_bgr)
 
-        print(f"\nComposite images saved to {output_dir}")
+                print(f"  Saved composite_{img_idx:02d}.jpg and control_{img_idx:02d}.jpg")
+                saved_count += 1
+            except Exception as e:
+                print(f"  Error processing image {img_idx}: {e}", file=sys.stderr)
+
+        print(f"\nSuccessfully created {saved_count} composite and {saved_count} control image pairs")
+        print(f"Saved to {output_dir}")
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
