@@ -35,43 +35,77 @@ def load_patch_from_png(patch_path):
     return tensor
 
 
-def load_validation_samples_from_csv(csv_path, data_dir, num_samples=10):
-    """Load random validation samples from CSV.
+def load_validation_samples_from_csv(csv_path, num_samples=10):
+    """Load random validation samples from CSV using public dataset loaders.
 
     Args:
         csv_path: Path to train_val_split CSV
-        data_dir: Directory containing image files
         num_samples: Number of samples to load
 
     Returns:
         List of loaded images as tensors [3, H, W] in [0, 1]
     """
+    # Import dataset loader
+    import sys
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    try:
+        from load_datasets import iter_dataset
+    except ImportError:
+        raise ImportError("Could not import load_datasets.py - make sure it's in the same directory")
+
     # Read CSV to find validation samples
-    val_paths = []
+    val_samples = []
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row['split'].lower() == 'val':
-                img_path = Path(data_dir) / f"{row['index']}.jpg"
-                if img_path.exists():
-                    val_paths.append(img_path)
+                val_samples.append({
+                    'dataset': row['dataset'],
+                    'index': int(row['index']),
+                    'text': row['text']
+                })
 
-    if not val_paths:
+    if not val_samples:
         raise ValueError(f"No validation samples found in {csv_path}")
 
-    # Randomly select samples
-    selected_paths = random.sample(val_paths, min(num_samples, len(val_paths)))
+    print(f"Found {len(val_samples)} validation samples in CSV")
 
-    # Load images
+    # Randomly select samples
+    selected_samples = random.sample(val_samples, min(num_samples, len(val_samples)))
+
+    # Load images using iter_dataset
     images = []
-    for img_path in selected_paths:
-        img = cv2.imread(str(img_path))
-        if img is not None:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    loaded_datasets = {}  # Cache dataset iterators
+
+    for sample_info in selected_samples:
+        dataset_name = sample_info['dataset']
+        sample_idx = sample_info['index']
+
+        # Load dataset if not already cached
+        if dataset_name not in loaded_datasets:
+            print(f"  Loading {dataset_name}...")
+            all_samples = []
+            for img, text, meta in iter_dataset(dataset_name, 'train'):
+                all_samples.append((img, text, meta))
+            loaded_datasets[dataset_name] = all_samples
+
+        # Get the sample
+        dataset_samples = loaded_datasets[dataset_name]
+        if sample_idx < len(dataset_samples):
+            img, text, meta = dataset_samples[sample_idx]
+
+            # Convert PIL image to tensor
+            if isinstance(img, np.ndarray):
+                img_array = img
+            else:
+                img_array = np.array(img)
+
+            img_rgb = img_array.astype(np.float32) / 255.0
             tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
             images.append(tensor)
 
-    print(f"Loaded {len(images)} validation samples from {len(selected_paths)} paths")
+    print(f"Loaded {len(images)} validation samples")
     return images
 
 
@@ -205,18 +239,10 @@ def main():
 
         print(f"Using data split: {data_split_csv}")
 
-        # Find data directory (assuming images are in same directory as CSV or parent)
-        data_dir = data_split_csv.parent
-        if not any(data_dir.glob("*.jpg")):
-            # Try parent directory
-            data_dir = data_dir.parent
-            if not any(data_dir.glob("*.jpg")):
-                print(f"Warning: Could not find JPG files in {data_dir}", file=sys.stderr)
-
         # Load validation samples
         print(f"Loading validation samples...")
         val_images = load_validation_samples_from_csv(
-            data_split_csv, data_dir, args.num_samples
+            data_split_csv, args.num_samples
         )
 
         if not val_images:
