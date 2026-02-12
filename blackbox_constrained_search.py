@@ -21,7 +21,8 @@ from tqdm import tqdm
 import kornia
 import kornia.geometry as K
 
-from progressive_patch import SimplePatchGenerator, FoundationPatchGenerator
+from progressive_patch import FoundationPatchGenerator
+from conditional_patch import SimplePatchGenerator
 from refine_generator import RefinementNetwork
 
 
