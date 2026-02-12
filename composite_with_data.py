@@ -37,7 +37,7 @@ def load_patch_from_png(patch_path):
 
 
 def load_validation_samples_from_csv(csv_path, num_samples):
-    """Load random validation samples from CSV using public dataset loaders.
+    """Load validation samples using combined dataset (matching training setup).
 
     Args:
         csv_path: Path to train_val_split CSV
@@ -46,107 +46,81 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     Returns:
         List of loaded images as tensors [3, H, W] in [0, 1]
     """
-    # Import load_datasets from foundationmodel/dataset/
+    # Import OCRDataset and ConcatDataset
     script_dir = Path(__file__).parent
-    load_datasets_path = script_dir / "foundationmodel" / "dataset" / "load_datasets.py"
+    from torch.utils.data import ConcatDataset
 
-    if not load_datasets_path.exists():
-        raise FileNotFoundError(f"Could not find load_datasets.py at {load_datasets_path}")
+    # Import OCRDataset from progressive_patch
+    sys.path.insert(0, str(script_dir))
+    try:
+        from progressive_patch import OCRDataset
+    except ImportError:
+        raise ImportError("Could not import OCRDataset from progressive_patch.py")
 
-    spec = importlib.util.spec_from_file_location("load_datasets", load_datasets_path)
-    load_datasets = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(load_datasets)
-    iter_dataset = load_datasets.iter_dataset
+    # Read CSV to get dataset names and validation indices
+    val_indices = []
+    dataset_names_in_csv = set()
 
-    # Read CSV to find validation samples
-    val_samples = []
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             if row['split'].lower() == 'val':
-                val_samples.append({
-                    'dataset': row['dataset'],
-                    'index': int(row['index']),
-                    'text': row['text']
-                })
+                val_indices.append(int(row['index']))
+                dataset_names_in_csv.add(row['dataset'])
 
-    if not val_samples:
+    if not val_indices:
         raise ValueError(f"No validation samples found in {csv_path}")
 
-    print(f"Found {len(val_samples)} validation samples in CSV")
+    print(f"Found {len(val_indices)} validation samples in CSV")
+    print(f"Datasets in CSV: {', '.join(sorted(dataset_names_in_csv))}")
 
-    # Load images using iter_dataset
+    # Load and combine datasets in order
+    datasets_to_combine = []
+    for dataset_name in sorted(dataset_names_in_csv):
+        print(f"  Loading {dataset_name}...")
+        try:
+            dataset = OCRDataset(
+                dataset_name=dataset_name,
+                split='train',
+                transform=None,
+                max_samples=None
+            )
+            datasets_to_combine.append(dataset)
+            print(f"    Loaded {len(dataset)} samples from {dataset_name}")
+        except Exception as e:
+            print(f"  Error loading {dataset_name}: {e}", file=sys.stderr)
+            raise
+
+    # Combine datasets (matching how progressive_patch.py does it)
+    if len(datasets_to_combine) > 1:
+        combined_dataset = ConcatDataset(datasets_to_combine)
+        print(f"Combined {len(datasets_to_combine)} datasets: {len(combined_dataset)} total samples")
+    else:
+        combined_dataset = datasets_to_combine[0]
+
+    # Load validation samples using combined dataset indices
     images = []
-    loaded_datasets = {}  # Cache dataset iterators
     failed_samples = []
 
-    # Try to load samples until we get the requested number
-    attempts = 0
-    max_attempts = len(val_samples) * 2  # Allow more attempts
+    # Randomly select validation indices to load
+    selected_indices = random.sample(val_indices, min(num_samples, len(val_indices)))
 
-    while len(images) < num_samples and attempts < max_attempts:
-        # Randomly select one sample
-        sample_info = random.choice(val_samples)
-        dataset_name = sample_info['dataset']
-        sample_idx = sample_info['index']
-
-        # Load dataset if not already cached
-        if dataset_name not in loaded_datasets:
-            try:
-                print(f"  Loading {dataset_name}...")
-                all_samples = []
-                for img, text, meta in iter_dataset(dataset_name, 'train'):
-                    all_samples.append((img, text, meta))
-                loaded_datasets[dataset_name] = all_samples
-                print(f"    Loaded {len(all_samples)} samples from {dataset_name}")
-            except Exception as e:
-                print(f"  Warning: Failed to load dataset {dataset_name}: {e}", file=sys.stderr)
-                failed_samples.append((dataset_name, sample_idx, f"Dataset load error: {e}"))
-                attempts += 1
-                continue
-
-        # Get the sample
-        dataset_samples = loaded_datasets[dataset_name]
-        if sample_idx >= len(dataset_samples):
-            error_msg = f"Index out of bounds: {sample_idx} >= {len(dataset_samples)}"
-            print(f"  Warning: {dataset_name}[{sample_idx}]: {error_msg}", file=sys.stderr)
-            failed_samples.append((dataset_name, sample_idx, error_msg))
-            attempts += 1
-            continue
-
+    print(f"\nLoading {len(selected_indices)} validation samples from combined dataset...")
+    for combined_idx in selected_indices:
         try:
-            img, text, meta = dataset_samples[sample_idx]
-
-            # Convert PIL image to tensor
-            if isinstance(img, np.ndarray):
-                img_array = img
-            else:
-                img_array = np.array(img)
-
-            if img_array.size == 0:
-                raise ValueError("Image array is empty")
-
-            if len(img_array.shape) != 3:
-                raise ValueError(f"Expected 3D array, got shape {img_array.shape}")
-
-            img_rgb = img_array.astype(np.float32) / 255.0
-            tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
-            images.append(tensor)
-
+            item = combined_dataset[combined_idx]
+            img_tensor = item['prep_image']
+            images.append(img_tensor)
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
-            print(f"  Warning: Failed to process {dataset_name}[{sample_idx}]: {error_msg}", file=sys.stderr)
-            failed_samples.append((dataset_name, sample_idx, error_msg))
+            print(f"  Warning: Failed to load sample {combined_idx}: {error_msg}", file=sys.stderr)
+            failed_samples.append((combined_idx, error_msg))
 
-        attempts += 1
-
-    print(f"Loaded {len(images)} validation samples (attempted {attempts} times)")
+    print(f"Loaded {len(images)} validation samples")
     if failed_samples:
         print(f"Failed to load {len(failed_samples)} samples:", file=sys.stderr)
-        for dataset_name, idx, error in failed_samples[:5]:  # Show first 5 failures
-            print(f"  {dataset_name}[{idx}]: {error}", file=sys.stderr)
-        if len(failed_samples) > 5:
-            print(f"  ... and {len(failed_samples) - 5} more", file=sys.stderr)
+        for idx, error in failed_samples:
+            print(f"  Index {idx}: {error}", file=sys.stderr)
 
     return images
 
