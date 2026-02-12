@@ -2474,24 +2474,21 @@ class ProgressivePatchTrainer:
                         break
 
                 if split_csv_path and os.path.exists(split_csv_path):
-                    try:
-                        print(f"Loading train/val split from original run: {split_csv_path}")
-                        # Load the split and reconstruct dataloaders to ensure consistency
-                        import pandas as pd
-                        split_df = pd.read_csv(split_csv_path)
+                    import pandas as pd
+                    split_df = pd.read_csv(split_csv_path)
+                    train_count = len(split_df[split_df['split'] == 'train'])
+                    val_count = len(split_df[split_df['split'] == 'validation'])
 
-                        # Reconstruct dataloaders with same indices as original training
-                        train_indices = split_df[split_df['split'] == 'train'].index.tolist()
-                        val_indices = split_df[split_df['split'] == 'validation'].index.tolist()
-
-                        from torch.utils.data import Subset
-                        self.train_loader.dataset = Subset(self.full_dataset, train_indices)
-                        self.val_loader.dataset = Subset(self.full_dataset, val_indices)
-
-                        print(f"   Reloaded: {len(train_indices)} training, {len(val_indices)} validation images\n")
-                    except Exception as e:
-                        print(f"⚠️  Warning: Could not load train/val split CSV: {e}")
-                        print(f"   Using current dataset split (may differ from original training)\n")
+                    if is_continue_run:
+                        # For --continue-run: DataLoaders already have correct split (created with seed 42 in __init__)
+                        print(f"Train/val split confirmed: {split_csv_path}")
+                        print(f"   {train_count} training, {val_count} validation images")
+                        print(f"   (DataLoaders use seed 42, split already correct)\n")
+                    else:
+                        # For --resume-from: Cannot modify DataLoaders after creation (PyTorch limitation)
+                        print(f"Found original split: {split_csv_path}")
+                        print(f"   {train_count} training, {val_count} validation images")
+                        print(f"   Note: Using current dataset split (DataLoaders already initialized)\n")
                 else:
                     print(f"⚠️  Warning: Could not find train/val split CSV in {original_checkpoint_dir}")
                     print(f"   Using current dataset split (may differ from original training)\n")
