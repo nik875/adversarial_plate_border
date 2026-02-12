@@ -361,7 +361,6 @@ def main():
                 control_path = output_dir / f"control_{img_idx:02d}.jpg"
                 cv2.imwrite(str(control_path), control_bgr)
 
-                print(f"  Saved composite_{img_idx:02d}.jpg and control_{img_idx:02d}.jpg")
                 saved_count += 1
             except Exception as e:
                 print(f"  Error processing image {img_idx}: {e}", file=sys.stderr)
