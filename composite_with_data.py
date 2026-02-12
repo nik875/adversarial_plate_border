@@ -15,6 +15,7 @@ from pathlib import Path
 from glob import glob
 import csv
 import random
+import importlib.util
 
 import cv2
 import torch
@@ -45,14 +46,17 @@ def load_validation_samples_from_csv(csv_path, num_samples=10):
     Returns:
         List of loaded images as tensors [3, H, W] in [0, 1]
     """
-    # Import dataset loader
-    import sys
+    # Import load_datasets from foundationmodel/dataset/
     script_dir = Path(__file__).parent
-    sys.path.insert(0, str(script_dir))
-    try:
-        from load_datasets import iter_dataset
-    except ImportError:
-        raise ImportError("Could not import load_datasets.py - make sure it's in the same directory")
+    load_datasets_path = script_dir / "foundationmodel" / "dataset" / "load_datasets.py"
+
+    if not load_datasets_path.exists():
+        raise FileNotFoundError(f"Could not find load_datasets.py at {load_datasets_path}")
+
+    spec = importlib.util.spec_from_file_location("load_datasets", load_datasets_path)
+    load_datasets = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(load_datasets)
+    iter_dataset = load_datasets.iter_dataset
 
     # Read CSV to find validation samples
     val_samples = []
