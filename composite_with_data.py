@@ -78,10 +78,11 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     # Load images using iter_dataset
     images = []
     loaded_datasets = {}  # Cache dataset iterators
+    failed_samples = []
 
     # Try to load samples until we get the requested number
     attempts = 0
-    max_attempts = len(val_samples)
+    max_attempts = len(val_samples) * 2  # Allow more attempts
 
     while len(images) < num_samples and attempts < max_attempts:
         # Randomly select one sample
@@ -91,35 +92,62 @@ def load_validation_samples_from_csv(csv_path, num_samples):
 
         # Load dataset if not already cached
         if dataset_name not in loaded_datasets:
-            print(f"  Loading {dataset_name}...")
-            all_samples = []
-            for img, text, meta in iter_dataset(dataset_name, 'train'):
-                all_samples.append((img, text, meta))
-            loaded_datasets[dataset_name] = all_samples
+            try:
+                print(f"  Loading {dataset_name}...")
+                all_samples = []
+                for img, text, meta in iter_dataset(dataset_name, 'train'):
+                    all_samples.append((img, text, meta))
+                loaded_datasets[dataset_name] = all_samples
+                print(f"    Loaded {len(all_samples)} samples from {dataset_name}")
+            except Exception as e:
+                print(f"  Warning: Failed to load dataset {dataset_name}: {e}", file=sys.stderr)
+                failed_samples.append((dataset_name, sample_idx, f"Dataset load error: {e}"))
+                attempts += 1
+                continue
 
         # Get the sample
         dataset_samples = loaded_datasets[dataset_name]
-        if sample_idx < len(dataset_samples):
-            try:
-                img, text, meta = dataset_samples[sample_idx]
+        if sample_idx >= len(dataset_samples):
+            error_msg = f"Index out of bounds: {sample_idx} >= {len(dataset_samples)}"
+            print(f"  Warning: {dataset_name}[{sample_idx}]: {error_msg}", file=sys.stderr)
+            failed_samples.append((dataset_name, sample_idx, error_msg))
+            attempts += 1
+            continue
 
-                # Convert PIL image to tensor
-                if isinstance(img, np.ndarray):
-                    img_array = img
-                else:
-                    img_array = np.array(img)
+        try:
+            img, text, meta = dataset_samples[sample_idx]
 
-                img_rgb = img_array.astype(np.float32) / 255.0
-                tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
-                images.append(tensor)
-            except Exception as e:
-                print(f"  Warning: Failed to load {dataset_name}[{sample_idx}]: {e}")
-                attempts += 1
-                continue
+            # Convert PIL image to tensor
+            if isinstance(img, np.ndarray):
+                img_array = img
+            else:
+                img_array = np.array(img)
+
+            if img_array.size == 0:
+                raise ValueError("Image array is empty")
+
+            if len(img_array.shape) != 3:
+                raise ValueError(f"Expected 3D array, got shape {img_array.shape}")
+
+            img_rgb = img_array.astype(np.float32) / 255.0
+            tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
+            images.append(tensor)
+
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            print(f"  Warning: Failed to process {dataset_name}[{sample_idx}]: {error_msg}", file=sys.stderr)
+            failed_samples.append((dataset_name, sample_idx, error_msg))
 
         attempts += 1
 
     print(f"Loaded {len(images)} validation samples (attempted {attempts} times)")
+    if failed_samples:
+        print(f"Failed to load {len(failed_samples)} samples:", file=sys.stderr)
+        for dataset_name, idx, error in failed_samples[:5]:  # Show first 5 failures
+            print(f"  {dataset_name}[{idx}]: {error}", file=sys.stderr)
+        if len(failed_samples) > 5:
+            print(f"  ... and {len(failed_samples) - 5} more", file=sys.stderr)
+
     return images
 
 
