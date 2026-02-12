@@ -2479,12 +2479,11 @@ class ProgressivePatchTrainer:
                 else:
                     print(f"   ✓ New best training loss: {best_train_loss:.4f} (save failed, continuing)")
 
-            # Save samples periodically (every 10 epochs)
-            if epoch % 10 == 0:
-                last_layer_idx = len(self.layer_configs) - 1
-                checkpoint_dir = os.path.join(self.checkpoint_base, f"checkpoint_epoch_{epoch:04d}")
-                if self.save_basis_safe(epoch, checkpoint_dir, num_samples=10, save_generator=False, layer_idx=last_layer_idx):
-                    print(f"   ✓ Saved checkpoint for epoch {epoch}")
+            # Save full generator checkpoint every epoch (enables recovery if interrupted)
+            last_layer_idx = len(self.layer_configs) - 1
+            checkpoint_dir = os.path.join(self.checkpoint_base, f"checkpoint_epoch_{epoch:04d}")
+            if self.save_basis_safe(epoch, checkpoint_dir, num_samples=10, save_generator=True, layer_idx=last_layer_idx):
+                print(f"   ✓ Saved full checkpoint for epoch {epoch}")
 
         print("\n" + "="*80)
         print("TRAINING COMPLETED!")
