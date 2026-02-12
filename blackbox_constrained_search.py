@@ -136,26 +136,31 @@ class BlackBoxPatchOptimizer:
     def _load_generator(self, checkpoint_path: str, generator_type: str):
         """Load frozen FoundationPatchGenerator from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        state_dict = checkpoint['generator_state_dict']
 
-        # Extract latent_dim from checkpoint
-        if 'basis_dim' in checkpoint:
-            latent_dim = checkpoint['basis_dim']
-        else:
-            # Infer from state dict (adapter layer for FoundationPatchGenerator)
-            first_layer_key = 'adapter.weight'
-            latent_dim = state_dict[first_layer_key].shape[1]
+        # Extract all metadata from checkpoint (match progressive_patch.py pattern)
+        latent_dim = checkpoint['basis_dim']
+        patch_height, patch_width = checkpoint['patch_size']
+        use_vae_lora = checkpoint.get('use_vae_lora', True)
+        lora_rank = checkpoint.get('lora_rank', 8)
+        lora_alpha = checkpoint.get('lora_alpha', 16)
 
-        print(f"Loading FoundationPatchGenerator, latent_dim={latent_dim}")
+        print(f"Loading FoundationPatchGenerator from checkpoint:")
+        print(f"  latent_dim={latent_dim}")
+        print(f"  patch_size=({patch_height}, {patch_width})")
+        print(f"  use_vae_lora={use_vae_lora}, lora_rank={lora_rank}, lora_alpha={lora_alpha}")
 
-        # Initialize generator (only FoundationPatchGenerator supported)
+        # Initialize generator with exact checkpoint parameters
         generator = FoundationPatchGenerator(
             latent_dim=latent_dim,
-            patch_height=256,
-            patch_width=512
+            patch_height=patch_height,
+            patch_width=patch_width,
+            use_vae_lora=use_vae_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha
         )
 
-        generator.load_state_dict(state_dict)
+        # Load weights
+        generator.load_state_dict(checkpoint['generator_state_dict'])
         generator.to(self.device)
 
         return generator, latent_dim
