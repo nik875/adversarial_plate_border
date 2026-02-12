@@ -1959,8 +1959,7 @@ class ProgressivePatchTrainer:
 
         batch_count_global = 0
         with tqdm(total=num_batches, desc=desc, leave=False) as pbar:
-            img_idx = 0
-            while img_idx < num_images:
+            while True:
                 try:
                     # Accumulate losses for this batch
                     batch_diversity_loss = 0.0
@@ -1972,9 +1971,6 @@ class ProgressivePatchTrainer:
 
                     # Process images_per_batch images
                     for img_in_batch in range(images_per_batch):
-                        if img_idx >= num_images:
-                            break
-
                         # Get one image
                         batch = next(dataloader_iter)
                         single_batch = {k: v[0] for k, v in batch.items()}
@@ -2110,8 +2106,6 @@ class ProgressivePatchTrainer:
                         elif self.device == 'mps':
                             torch.mps.empty_cache()
 
-                        img_idx += 1
-
                     # Update weights after processing all images in batch
                     if batch_count > 0:
                         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
@@ -2128,7 +2122,7 @@ class ProgressivePatchTrainer:
                         total_raw_quality_score += batch_raw_quality_score / batch_count
 
                 except StopIteration:
-                    # Apply accumulated gradients from incomplete final batch before breaking
+                    # Dataloader exhausted - apply remaining gradients if any were accumulated
                     if batch_count > 0:
                         torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
                         optimizer.step()
@@ -2143,8 +2137,10 @@ class ProgressivePatchTrainer:
                         total_raw_diversity_score += batch_raw_diversity_score / batch_count
                         total_raw_quality_score += batch_raw_quality_score / batch_count
 
-                        # Update progress bar for final batch
+                        # Update progress bar
+                        batch_count_global += 1
                         pbar.update(1)
+                    # Exit the main loop
                     break
 
                 # Update progress bar: show average loss per patch (divided by num_patches_processed)
