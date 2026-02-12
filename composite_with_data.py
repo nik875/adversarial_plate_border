@@ -330,8 +330,10 @@ def main():
             print(f"  Height range: {min_height} - {max_height}")
 
         # Composite patches with samples (cycling through patches)
-        print(f"\nCreating {len(val_images)} composite images with controls...")
+        print(f"\nCreating composite images with controls...")
         print(f"Pairing {len(patches)} patches with {len(val_images)} validation samples (cycling)...")
+
+        pbar = tqdm(total=len(val_images), desc="Compositing")
         saved_count = 0
         for img_idx, val_image in enumerate(val_images):
             # Cycle through patches
@@ -365,7 +367,9 @@ def main():
             except Exception as e:
                 print(f"  Error processing image {img_idx}: {e}", file=sys.stderr)
 
-        print(f"\nSuccessfully created {saved_count} composite and {saved_count} control image pairs")
+            pbar.update(1)
+
+        pbar.close()
         print(f"Saved to {output_dir}")
 
     except Exception as e:
