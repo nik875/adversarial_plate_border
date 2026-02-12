@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Predict text on composite and control images using fast-alpr OCR-only mode.
+Predict text on composite and control images and analyze patch effectiveness.
+
+Groups results by patch and calculates success rate where success =
+detected text differs between control and composite versions.
 
 Usage:
-  python predict_composites.py composite_output -o results.csv
+  python predict_composites.py composite_output -n 10 -o results.csv
 """
 
 import argparse
 import sys
 from pathlib import Path
 import csv
+from collections import defaultdict
 
-import cv2
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -24,11 +27,13 @@ except ImportError:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Predict text on composite and control images using fast-alpr.'
+        description='Analyze patch effectiveness on composite images.'
     )
     parser.add_argument('composite_dir', help='Path to composite_output directory')
-    parser.add_argument('-o', '--outfile', default='predictions.csv',
-                        help='Output CSV file (default: predictions.csv)')
+    parser.add_argument('-n', '--num-patches', type=int, required=True,
+                        help='Number of patches (required for grouping results)')
+    parser.add_argument('-o', '--outfile', default='patch_analysis.csv',
+                        help='Output CSV file (default: patch_analysis.csv)')
 
     args = parser.parse_args()
 
@@ -41,13 +46,22 @@ def main():
     composite_images = sorted(composite_dir.glob("composite_*.jpg"))
     control_images = sorted(composite_dir.glob("control_*.jpg"))
 
-    if not composite_images and not control_images:
+    if not composite_images or not control_images:
         print(f"Error: No composite_*.jpg or control_*.jpg files found in {composite_dir}",
               file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(composite_images)} composite images")
-    print(f"Found {len(control_images)} control images")
+    if len(composite_images) != len(control_images):
+        print(f"Error: Number of composite ({len(composite_images)}) and control ({len(control_images)}) images don't match",
+              file=sys.stderr)
+        sys.exit(1)
+
+    num_samples = len(composite_images) // args.num_patches
+    total_samples = len(composite_images)
+
+    print(f"Found {total_samples} image pairs")
+    print(f"Number of patches: {args.num_patches}")
+    print(f"Samples per patch: {num_samples}")
 
     # Initialize ALPR in OCR-only mode
     if ALPR is None:
@@ -62,79 +76,106 @@ def main():
     )
     print("fast-alpr loaded")
 
-    # Process all images
-    results = []
+    # Process all image pairs
+    print("\nRunning OCR on all images...")
+    pbar = tqdm(total=total_samples * 2, desc="OCR Progress")
 
-    print("\nPredicting on control images...")
-    for img_path in tqdm(control_images, desc="Control"):
+    composite_predictions = {}
+    control_predictions = {}
+
+    for idx, (comp_path, ctrl_path) in enumerate(zip(composite_images, control_images)):
         try:
-            # Load image
-            image = Image.open(str(img_path)).convert('RGB')
+            # Load and predict composite
+            image = Image.open(str(comp_path)).convert('RGB')
             image_array = np.array(image)
-
-            # Predict text
             ocr_result = alpr.ocr.predict(image_array)
-            detected_text = ocr_result.text if ocr_result is not None else ""
-
-            results.append({
-                'image': img_path.name,
-                'type': 'control',
-                'predicted_text': detected_text,
-            })
+            composite_predictions[idx] = ocr_result.text if ocr_result is not None else ""
+            pbar.update(1)
         except Exception as e:
-            print(f"Error processing {img_path.name}: {e}", file=sys.stderr)
-            results.append({
-                'image': img_path.name,
-                'type': 'control',
-                'predicted_text': f'ERROR: {e}',
-            })
+            print(f"Error processing {comp_path.name}: {e}", file=sys.stderr)
+            composite_predictions[idx] = f"ERROR: {e}"
+            pbar.update(1)
 
-    print("\nPredicting on composite images...")
-    for img_path in tqdm(composite_images, desc="Composite"):
         try:
-            # Load image
-            image = Image.open(str(img_path)).convert('RGB')
+            # Load and predict control
+            image = Image.open(str(ctrl_path)).convert('RGB')
             image_array = np.array(image)
-
-            # Predict text
             ocr_result = alpr.ocr.predict(image_array)
-            detected_text = ocr_result.text if ocr_result is not None else ""
-
-            results.append({
-                'image': img_path.name,
-                'type': 'composite',
-                'predicted_text': detected_text,
-            })
+            control_predictions[idx] = ocr_result.text if ocr_result is not None else ""
+            pbar.update(1)
         except Exception as e:
-            print(f"Error processing {img_path.name}: {e}", file=sys.stderr)
-            results.append({
-                'image': img_path.name,
-                'type': 'composite',
-                'predicted_text': f'ERROR: {e}',
-            })
+            print(f"Error processing {ctrl_path.name}: {e}", file=sys.stderr)
+            control_predictions[idx] = f"ERROR: {e}"
+            pbar.update(1)
+
+    pbar.close()
+
+    # Group results by patch and calculate metrics
+    print("\nAnalyzing results by patch...")
+    patch_results = defaultdict(list)
+
+    for sample_idx in range(total_samples):
+        patch_idx = sample_idx % args.num_patches
+        composite_text = composite_predictions.get(sample_idx, "")
+        control_text = control_predictions.get(sample_idx, "")
+
+        # Success = texts differ (patch changed the prediction)
+        success = composite_text != control_text
+
+        patch_results[patch_idx].append({
+            'sample_idx': sample_idx,
+            'control_text': control_text,
+            'composite_text': composite_text,
+            'success': success,
+        })
+
+    # Calculate and display metrics per patch
+    print("\n" + "=" * 80)
+    print("PATCH EFFECTIVENESS ANALYSIS")
+    print("=" * 80)
+
+    summary_results = []
+    overall_success = 0
+    overall_total = 0
+
+    for patch_idx in range(args.num_patches):
+        results = patch_results[patch_idx]
+        successes = sum(1 for r in results if r['success'])
+        total = len(results)
+        success_rate = (successes / total * 100) if total > 0 else 0
+
+        print(f"\nPatch {patch_idx}:")
+        print(f"  Success Rate: {successes}/{total} ({success_rate:.1f}%)")
+        print(f"  Samples:")
+        for r in results:
+            status = "✓ SUCCESS" if r['success'] else "✗ FAILED"
+            print(f"    {status} | Sample {r['sample_idx']:3d} | Control: '{r['control_text']:15s}' → Composite: '{r['composite_text']:15s}'")
+
+        summary_results.append({
+            'patch_idx': patch_idx,
+            'successes': successes,
+            'total': total,
+            'success_rate': f"{success_rate:.1f}%",
+        })
+
+        overall_success += successes
+        overall_total += total
+
+    # Print overall summary
+    overall_rate = (overall_success / overall_total * 100) if overall_total > 0 else 0
+    print(f"\n{'=' * 80}")
+    print(f"OVERALL SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"Total Success Rate: {overall_success}/{overall_total} ({overall_rate:.1f}%)")
 
     # Save results to CSV
     output_path = Path(args.outfile)
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['image', 'type', 'predicted_text'])
+        writer = csv.DictWriter(f, fieldnames=['patch_idx', 'successes', 'total', 'success_rate'])
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(summary_results)
 
     print(f"\nResults saved to {output_path}")
-
-    # Print summary
-    control_results = [r for r in results if r['type'] == 'control']
-    composite_results = [r for r in results if r['type'] == 'composite']
-
-    print(f"\nSummary:")
-    print(f"  Control images: {len(control_results)}")
-    print(f"  Composite images: {len(composite_results)}")
-    print(f"\nControl predictions:")
-    for r in control_results:
-        print(f"  {r['image']:20s} -> {r['predicted_text']}")
-    print(f"\nComposite predictions:")
-    for r in composite_results:
-        print(f"  {r['image']:20s} -> {r['predicted_text']}")
 
 
 if __name__ == '__main__':
