@@ -44,7 +44,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
         num_samples: Number of samples to load
 
     Returns:
-        List of loaded images as tensors [3, H, W] in [0, 1]
+        Tuple of (list of images as tensors [3, H, W] in [0, 1], list of (width, height) tuples)
     """
     # Import OCRDataset and ConcatDataset
     script_dir = Path(__file__).parent
@@ -100,6 +100,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
 
     # Load validation samples using combined dataset indices
     images = []
+    dimensions = []  # Track (width, height) for each image
     failed_samples = []
 
     # Randomly select validation indices to load
@@ -111,6 +112,9 @@ def load_validation_samples_from_csv(csv_path, num_samples):
             item = combined_dataset[combined_idx]
             img_tensor = item['prep_image']
             images.append(img_tensor)
+            # Track dimensions: tensor is [3, H, W], so width=W, height=H
+            height, width = img_tensor.shape[1], img_tensor.shape[2]
+            dimensions.append((width, height))
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             print(f"  Warning: Failed to load sample {combined_idx}: {error_msg}", file=sys.stderr)
@@ -122,7 +126,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
         for idx, error in failed_samples:
             print(f"  Index {idx}: {error}", file=sys.stderr)
 
-    return images
+    return images, dimensions
 
 
 def apply_patch_ocr_mode(image, patch, center_ratio=0.6):
@@ -301,13 +305,29 @@ def main():
         # Load validation samples (n_samples per patch)
         num_val_samples = num_patches * args.n_samples
         print(f"Loading {num_val_samples} validation samples ({args.n_samples} per patch)...")
-        val_images = load_validation_samples_from_csv(
+        val_images, dimensions = load_validation_samples_from_csv(
             data_split_csv, num_val_samples
         )
 
         if not val_images:
             print("Error: No validation samples loaded", file=sys.stderr)
             sys.exit(1)
+
+        # Calculate and print image dimension statistics
+        if dimensions:
+            widths = [w for w, h in dimensions]
+            heights = [h for w, h in dimensions]
+            avg_width = np.mean(widths)
+            avg_height = np.mean(heights)
+            min_width = np.min(widths)
+            max_width = np.max(widths)
+            min_height = np.min(heights)
+            max_height = np.max(heights)
+
+            print(f"\nImage Dimension Statistics:")
+            print(f"  Average size: {avg_width:.1f} × {avg_height:.1f} (W × H)")
+            print(f"  Width range: {min_width} - {max_width}")
+            print(f"  Height range: {min_height} - {max_height}")
 
         # Composite patches with samples (cycling through patches)
         print(f"\nCreating {len(val_images)} composite images with controls...")
