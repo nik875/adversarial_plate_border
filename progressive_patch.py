@@ -2443,15 +2443,7 @@ class ProgressivePatchTrainer:
         trainable_params.append({'params': params, 'lr': learning_rate, 'name': 'bottleneck_refiner'})
         print(f"Optimizer: bottleneck_refiner parameters: {sum(p.numel() for p in params):,} (lr={learning_rate})")
 
-        # Print total trainable parameters
-        total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
-        print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
-        print(f"Optimizer: VAE learning rate: {vae_learning_rate}, Custom layers learning rate: {learning_rate}")
-        print(f"Optimizer: Both decay to lr_min={lr_min} via cosine annealing")
-
-        optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
-
-        # Handle checkpoint resumption
+        # Handle checkpoint resumption (before optimizer creation so it starts with correct weights)
         if resume_from is not None:
             print(f"\n{'='*80}")
             print(f"RESUMING FROM CHECKPOINT: {resume_from}")
@@ -2490,6 +2482,14 @@ class ProgressivePatchTrainer:
             print(f"   Loaded weights from epoch {checkpoint_epoch}")
             print(f"   Will resume training at epoch {start_epoch}")
             print(f"{'='*80}\n")
+
+        # Print total trainable parameters
+        total_trainable = sum(p.numel() for group in trainable_params for p in group['params'])
+        print(f"Optimizer: TOTAL trainable parameters: {total_trainable:,}")
+        print(f"Optimizer: VAE learning rate: {vae_learning_rate}, Custom layers learning rate: {learning_rate}")
+        print(f"Optimizer: Both decay to lr_min={lr_min} via cosine annealing")
+
+        optimizer = optim.AdamW(trainable_params, weight_decay=1e-4)
 
         # Calculate total training steps for step-based scheduling
         num_images = len(self.train_loader)
