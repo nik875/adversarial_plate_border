@@ -251,6 +251,8 @@ def main():
     parser.add_argument('run_dir', help='Path to run directory (e.g., checkpoints/20260211_174724)')
     parser.add_argument('-o', '--outdir', default='composite_output',
                         help='Output directory for composite images (default: composite_output)')
+    parser.add_argument('-n', '--n-samples', type=int, default=1,
+                        help='Number of validation samples per patch (default: 1). Total composites = num_patches * n_samples')
 
     args = parser.parse_args()
 
@@ -296,21 +298,26 @@ def main():
 
         print(f"Using data split: {data_split_csv}")
 
-        # Load validation samples (one per patch)
-        print(f"Loading {num_patches} validation samples (one per patch)...")
+        # Load validation samples (n_samples per patch)
+        num_val_samples = num_patches * args.n_samples
+        print(f"Loading {num_val_samples} validation samples ({args.n_samples} per patch)...")
         val_images = load_validation_samples_from_csv(
-            data_split_csv, num_patches
+            data_split_csv, num_val_samples
         )
 
         if not val_images:
             print("Error: No validation samples loaded", file=sys.stderr)
             sys.exit(1)
 
-        # Composite patches with samples (1-to-1 pairing)
+        # Composite patches with samples (cycling through patches)
         print(f"\nCreating {len(val_images)} composite images with controls...")
-        print(f"Pairing {len(patches)} patches with {len(val_images)} validation samples (1-to-1)...")
+        print(f"Pairing {len(patches)} patches with {len(val_images)} validation samples (cycling)...")
         saved_count = 0
-        for img_idx, (val_image, patch) in enumerate(zip(val_images, patches)):
+        for img_idx, val_image in enumerate(val_images):
+            # Cycle through patches
+            patch_idx = img_idx % len(patches)
+            patch = patches[patch_idx]
+
             try:
                 # Apply patch
                 composite = apply_patch_ocr_mode(val_image, patch, center_ratio=0.6)
