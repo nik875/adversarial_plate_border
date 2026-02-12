@@ -30,8 +30,8 @@ def main():
         description='Analyze patch effectiveness on composite images.'
     )
     parser.add_argument('composite_dir', help='Path to composite_output directory')
-    parser.add_argument('-n', '--num-patches', type=int, required=True,
-                        help='Number of patches (required for grouping results)')
+    parser.add_argument('-r', '--run-dir', default=None,
+                        help='Path to run directory to infer patch count (default: infer from composite_dir parent)')
     parser.add_argument('-o', '--outfile', default='patch_analysis.csv',
                         help='Output CSV file (default: patch_analysis.csv)')
 
@@ -41,6 +41,35 @@ def main():
     if not composite_dir.exists():
         print(f"Error: Directory not found: {composite_dir}", file=sys.stderr)
         sys.exit(1)
+
+    # Infer number of patches from run directory
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+    else:
+        # Try to find run directory (parent or sibling)
+        run_dir = composite_dir.parent
+        if not (run_dir / "example_samples").exists():
+            run_dir = composite_dir.parent.parent
+        if not (run_dir / "example_samples").exists():
+            print("Error: Could not find run directory with example_samples/", file=sys.stderr)
+            sys.exit(1)
+
+    # Count patches in the latest batch
+    example_samples_dir = run_dir / "example_samples"
+    batch_dirs = sorted([d for d in example_samples_dir.iterdir() if d.is_dir()])
+    if not batch_dirs:
+        print("Error: No batch directories found", file=sys.stderr)
+        sys.exit(1)
+
+    latest_batch = batch_dirs[-1]
+    patch_files = list(latest_batch.glob("patch_epoch_*_sample_*.png"))
+    num_patches = len(patch_files)
+
+    if num_patches == 0:
+        print("Error: No patch files found", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Inferred {num_patches} patches from {latest_batch.name}")
 
     # Check for image files
     composite_images = sorted(composite_dir.glob("composite_*.jpg"))
@@ -56,7 +85,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    num_samples = len(composite_images) // args.num_patches
+    num_samples = len(composite_images) // num_patches
     total_samples = len(composite_images)
 
     print(f"Found {total_samples} image pairs")
@@ -115,7 +144,7 @@ def main():
     patch_results = defaultdict(list)
 
     for sample_idx in range(total_samples):
-        patch_idx = sample_idx % args.num_patches
+        patch_idx = sample_idx % num_patches
         composite_text = composite_predictions.get(sample_idx, "")
         control_text = control_predictions.get(sample_idx, "")
 
@@ -138,7 +167,7 @@ def main():
     overall_success = 0
     overall_total = 0
 
-    for patch_idx in range(args.num_patches):
+    for patch_idx in range(num_patches):
         results = patch_results[patch_idx]
         successes = sum(1 for r in results if r['success'])
         total = len(results)
