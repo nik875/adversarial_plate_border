@@ -34,6 +34,8 @@ def main():
                         help='Path to run directory to infer patch count (default: infer from composite_dir parent)')
     parser.add_argument('-o', '--outfile', default='patch_analysis.csv',
                         help='Output CSV file (default: patch_analysis.csv)')
+    parser.add_argument('--white-box', action='store_true',
+                        help='Use smaller xs model instead of s model')
 
     args = parser.parse_args()
 
@@ -99,9 +101,11 @@ def main():
         sys.exit(1)
 
     print("\nInitializing fast-alpr (OCR-only mode)...")
+    ocr_model = "cct-xs-v1-global-model" if args.white_box else "cct-s-v1-global-model"
+    print(f"Using OCR model: {ocr_model}")
     alpr = ALPR(
         detector=None,
-        ocr_model="cct-s-v1-global-model",
+        ocr_model=ocr_model,
     )
     print("fast-alpr loaded")
 
