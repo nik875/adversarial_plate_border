@@ -75,14 +75,17 @@ def load_validation_samples_from_csv(csv_path, num_samples):
 
     print(f"Found {len(val_samples)} validation samples in CSV")
 
-    # Randomly select samples
-    selected_samples = random.sample(val_samples, min(num_samples, len(val_samples)))
-
     # Load images using iter_dataset
     images = []
     loaded_datasets = {}  # Cache dataset iterators
 
-    for sample_info in selected_samples:
+    # Try to load samples until we get the requested number
+    attempts = 0
+    max_attempts = len(val_samples)
+
+    while len(images) < num_samples and attempts < max_attempts:
+        # Randomly select one sample
+        sample_info = random.choice(val_samples)
         dataset_name = sample_info['dataset']
         sample_idx = sample_info['index']
 
@@ -97,19 +100,26 @@ def load_validation_samples_from_csv(csv_path, num_samples):
         # Get the sample
         dataset_samples = loaded_datasets[dataset_name]
         if sample_idx < len(dataset_samples):
-            img, text, meta = dataset_samples[sample_idx]
+            try:
+                img, text, meta = dataset_samples[sample_idx]
 
-            # Convert PIL image to tensor
-            if isinstance(img, np.ndarray):
-                img_array = img
-            else:
-                img_array = np.array(img)
+                # Convert PIL image to tensor
+                if isinstance(img, np.ndarray):
+                    img_array = img
+                else:
+                    img_array = np.array(img)
 
-            img_rgb = img_array.astype(np.float32) / 255.0
-            tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
-            images.append(tensor)
+                img_rgb = img_array.astype(np.float32) / 255.0
+                tensor = torch.from_numpy(np.transpose(img_rgb, (2, 0, 1)))
+                images.append(tensor)
+            except Exception as e:
+                print(f"  Warning: Failed to load {dataset_name}[{sample_idx}]: {e}")
+                attempts += 1
+                continue
 
-    print(f"Loaded {len(images)} validation samples")
+        attempts += 1
+
+    print(f"Loaded {len(images)} validation samples (attempted {attempts} times)")
     return images
 
 
