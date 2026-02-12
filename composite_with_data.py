@@ -36,7 +36,7 @@ def load_patch_from_png(patch_path):
     return tensor
 
 
-def load_validation_samples_from_csv(csv_path, num_samples=10):
+def load_validation_samples_from_csv(csv_path, num_samples):
     """Load random validation samples from CSV using public dataset loaders.
 
     Args:
@@ -239,8 +239,6 @@ def main():
     parser.add_argument('run_dir', help='Path to run directory (e.g., checkpoints/20260211_174724)')
     parser.add_argument('-o', '--outdir', default='composite_output',
                         help='Output directory for composite images (default: composite_output)')
-    parser.add_argument('-n', '--num-samples', type=int, default=10,
-                        help='Number of validation samples to composite (default: 10)')
 
     args = parser.parse_args()
 
@@ -257,6 +255,7 @@ def main():
         # Find latest patches
         print(f"Loading patches from {run_dir}...")
         patch_files = find_latest_patches(run_dir)
+        num_patches = len(patch_files)
 
         # Load patches
         patches = []
@@ -285,24 +284,22 @@ def main():
 
         print(f"Using data split: {data_split_csv}")
 
-        # Load validation samples
-        print(f"Loading validation samples...")
+        # Load validation samples (one per patch)
+        print(f"Loading {num_patches} validation samples (one per patch)...")
         val_images = load_validation_samples_from_csv(
-            data_split_csv, args.num_samples
+            data_split_csv, num_patches
         )
 
         if not val_images:
             print("Error: No validation samples loaded", file=sys.stderr)
             sys.exit(1)
 
-        # Composite patches with samples
+        # Composite patches with samples (1-to-1 pairing)
         print(f"\nCreating {len(val_images)} composite images with controls...")
+        print(f"Pairing {len(patches)} patches with {len(val_images)} validation samples (1-to-1)...")
         saved_count = 0
-        for img_idx, val_image in enumerate(val_images):
+        for img_idx, (val_image, patch) in enumerate(zip(val_images, patches)):
             try:
-                # Select random patch for this image
-                patch = random.choice(patches)
-
                 # Apply patch
                 composite = apply_patch_ocr_mode(val_image, patch, center_ratio=0.6)
                 composite = composite.squeeze(0)  # Remove batch dim
