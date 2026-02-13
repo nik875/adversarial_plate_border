@@ -1078,6 +1078,19 @@ class ProgressivePatchTrainer:
         train_indices = set(train_dataset.indices) if hasattr(train_dataset, 'indices') else set()
         val_indices = set(val_dataset.indices) if hasattr(val_dataset, 'indices') else set()
 
+        # Debug output
+        print(f"\n_save_train_val_split DEBUG:")
+        print(f"  train_dataset type: {type(train_dataset)}")
+        print(f"  val_dataset type: {type(val_dataset)}")
+        print(f"  train_indices count: {len(train_indices)}")
+        print(f"  val_indices count: {len(val_indices)}")
+        if hasattr(train_dataset, 'indices'):
+            print(f"  train_dataset.indices type: {type(train_dataset.indices)}")
+            print(f"  train_dataset.indices: {train_dataset.indices}")
+        if hasattr(val_dataset, 'indices'):
+            print(f"  val_dataset.indices type: {type(val_dataset.indices)}")
+            print(f"  val_dataset.indices: {val_dataset.indices}")
+
         # Build metadata for all samples
         split_data = []
 
