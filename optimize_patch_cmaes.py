@@ -618,6 +618,16 @@ def main():
 
         print(f"Generated {len(patches)} patches")
 
+        # Print generator output statistics
+        if len(patches) > 0:
+            first_patch = patches[0]
+            print(f"\nGenerator output statistics (before any clamping):")
+            print(f"  Min value: {first_patch.min().item():.6f}")
+            print(f"  Max value: {first_patch.max().item():.6f}")
+            print(f"  Mean value: {first_patch.mean().item():.6f}")
+            print(f"  Values < 0: {(first_patch < 0).sum().item()} pixels")
+            print(f"  Values > 1: {(first_patch > 1).sum().item()} pixels")
+
         # Create debug directory for quantization comparison
         debug_dir = output_dir / "quantization_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
