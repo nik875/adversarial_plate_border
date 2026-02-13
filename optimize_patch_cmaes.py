@@ -528,18 +528,23 @@ def main():
     parser.add_argument('--outdir', default='cmaes_output',
                         help='Output directory for results (default: cmaes_output)')
 
+    # Mode selection
+    parser.add_argument('--composite-only', action='store_true',
+                        help='Composite mode: just composite patches from run_dir with n validation samples and save, then exit (no optimization)')
+
     args = parser.parse_args()
 
-    # Check dependencies
-    if ALPR is None:
-        print("Error: fast-alpr not installed. Install with: pip install fast-alpr",
-              file=sys.stderr)
-        sys.exit(1)
+    # Check dependencies (CMA-ES only needed for optimization mode)
+    if not args.composite_only:
+        if ALPR is None:
+            print("Error: fast-alpr not installed. Install with: pip install fast-alpr",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    if cma is None:
-        print("Error: cma not installed. Install with: pip install cma",
-              file=sys.stderr)
-        sys.exit(1)
+        if cma is None:
+            print("Error: cma not installed. Install with: pip install cma",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Set random seed
     if args.seed is not None:
@@ -594,6 +599,68 @@ def main():
     # Load generator
     print(f"\nLoading generator from {run_dir}...")
     generator, latent_dim, device = load_generator(run_dir)
+
+    # Composite-only mode: just generate and save composites, then exit
+    if args.composite_only:
+        print("\n" + "="*80)
+        print("COMPOSITE-ONLY MODE")
+        print("="*80)
+
+        # Generate random latent codes for patches
+        num_patches = args.popsize if args.popsize else 10
+        print(f"\nGenerating {num_patches} random patches...")
+
+        patches = []
+        for i in range(num_patches):
+            z = np.random.randn(latent_dim) * args.sigma0
+            patch = generate_patch_from_z(generator, z, device)
+            patches.append(patch)
+
+        print(f"Generated {len(patches)} patches")
+
+        # Composite patches with validation samples
+        print(f"\nCompositing {len(patches)} patches with {len(val_images)} validation samples...")
+        print(f"Total outputs: {len(patches) * len(val_images)} composite + control pairs")
+
+        pbar = tqdm(total=len(val_images) * len(patches), desc="Compositing")
+
+        for img_idx, val_image in enumerate(val_images):
+            # Cycle through patches
+            for patch_idx, patch in enumerate(patches):
+                try:
+                    # Apply patch
+                    composite = apply_patch_ocr_mode(val_image, patch, center_ratio=args.center_ratio)
+                    composite = composite.squeeze(0)  # Remove batch dim
+
+                    # Convert to numpy and save
+                    composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+
+                    # Calculate global index for cycling behavior
+                    global_idx = img_idx * len(patches) + patch_idx
+                    output_path = output_dir / f"composite_{global_idx:04d}.jpg"
+                    cv2.imwrite(str(output_path), composite_bgr)
+
+                    # Apply grey control border
+                    control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+                    control = control.squeeze(0)  # Remove batch dim
+
+                    # Convert to numpy and save
+                    control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+
+                    control_path = output_dir / f"control_{global_idx:04d}.jpg"
+                    cv2.imwrite(str(control_path), control_bgr)
+
+                except Exception as e:
+                    print(f"  Error processing image {img_idx} patch {patch_idx}: {e}", file=sys.stderr)
+
+                pbar.update(1)
+
+        pbar.close()
+        print(f"\nSaved {len(patches) * len(val_images)} composite/control pairs to {output_dir}")
+        print("Done!")
+        return
 
     # Initialize ALPR
     print("\nInitializing fast-alpr (OCR-only mode)...")
