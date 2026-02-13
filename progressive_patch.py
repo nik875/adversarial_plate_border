@@ -397,8 +397,11 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
             nn.SiLU(inplace=True),
             nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
-            nn.Sigmoid(),  # Ensure output is in [0, 1] range
         )
+
+        # Final activation to ensure output is in [0, 1] range
+        # Kept separate so any future layers added won't bypass it
+        self.final_activation = nn.Sigmoid()
 
         # Spatial propagation layers (same padding to preserve size)
         # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
@@ -591,12 +594,14 @@ class BottleneckDenseRefiner(nn.Module):
             # spatial_scale_weights[:, scale_idx:scale_idx+1]: [B, 1, H, W]
             refined_patches = refined_patches + spatial_scale_weights[:, scale_idx:scale_idx+1] * scale_output
 
-        # Apply nonlinearity before final smoothing (Sigmoid is applied at the end of post_expansion_smooth)
+        # Apply nonlinearity before final smoothing
         refined_patches = torch.nn.functional.silu(refined_patches)
 
         # Apply post-multi-scale smoothing with progressive kernel sizes
-        # Final Sigmoid in this layer ensures output is in [0, 1]
         refined_patches = self.post_expansion_smooth(refined_patches)  # [B, 3, H, W]
+
+        # Apply final activation to ensure output is strictly in [0, 1]
+        refined_patches = self.final_activation(refined_patches)
 
         return refined_patches
 
