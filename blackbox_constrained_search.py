@@ -522,11 +522,10 @@ class BlackBoxPatchOptimizer:
         if len(self.test_images) == 0:
             raise ValueError("No test images loaded. Provide test_images_dir.")
 
-        # Subsample test images if specified
-        if self.test_image_subset is not None and self.test_image_subset < len(self.test_images):
-            indices = np.random.choice(len(self.test_images), size=self.test_image_subset, replace=False)
-            test_images = [self.test_images[i] for i in indices]
-            test_corners = [self.test_corners[i] for i in indices]
+        # Use pre-sampled indices (same for all individuals in a generation)
+        if hasattr(self, '_current_test_indices') and self._current_test_indices is not None:
+            test_images = [self.test_images[i] for i in self._current_test_indices]
+            test_corners = [self.test_corners[i] for i in self._current_test_indices]
         else:
             test_images = self.test_images
             test_corners = self.test_corners
@@ -671,6 +670,16 @@ class BlackBoxPatchOptimizer:
 
         with tqdm(total=max_iterations, desc="CMA-ES") as pbar:
             while iteration < max_iterations:
+                # Sample test images once per generation (same for all individuals)
+                if self.test_image_subset is not None and self.test_image_subset < len(self.test_images):
+                    self._current_test_indices = np.random.choice(
+                        len(self.test_images),
+                        size=self.test_image_subset,
+                        replace=False
+                    )
+                else:
+                    self._current_test_indices = None
+
                 try:
                     # Ask for new candidate solutions
                     solutions = es.ask()
