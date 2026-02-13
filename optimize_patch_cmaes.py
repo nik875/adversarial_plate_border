@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+import Levenshtein
 
 try:
     from fast_alpr import ALPR
@@ -356,7 +357,7 @@ def generate_patch_from_z(generator, z, device):
 
 
 def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
-    """Evaluate a patch by counting misreads on validation images.
+    """Evaluate a patch by computing edit distance between control and composite OCR.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
@@ -365,9 +366,11 @@ def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
         center_ratio: Center ratio for compositing
 
     Returns:
-        num_misreads: Number of images where composite OCR differs from control OCR
+        Tuple of (total_edit_distance, num_misreads, avg_edit_distance)
     """
+    total_edit_distance = 0
     misreads = 0
+    num_evaluated = 0
 
     for val_image in val_images:
         try:
@@ -390,15 +393,23 @@ def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
             composite_text = composite_result.text if composite_result is not None else ""
             control_text = control_result.text if control_result is not None else ""
 
+            # Calculate Levenshtein edit distance
+            edit_dist = Levenshtein.distance(control_text, composite_text)
+            total_edit_distance += edit_dist
+
             # Count misread if texts differ
             if composite_text != control_text:
                 misreads += 1
 
+            num_evaluated += 1
+
         except Exception as e:
-            # Treat errors as non-misreads (conservative)
+            # Treat errors as 0 edit distance (conservative)
+            num_evaluated += 1
             pass
 
-    return misreads
+    avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
+    return total_edit_distance, misreads, avg_edit_distance
 
 
 def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_dir=None, candidate_idx=0):
@@ -413,9 +424,11 @@ def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_d
         candidate_idx: Index of the candidate being evaluated
 
     Returns:
-        num_misreads: Number of images where composite OCR differs from control OCR
+        Tuple of (total_edit_distance, num_misreads, avg_edit_distance)
     """
+    total_edit_distance = 0
     misreads = 0
+    num_evaluated = 0
     debug_results = []
 
     for img_idx, val_image in enumerate(val_images):
@@ -439,10 +452,16 @@ def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_d
             composite_text = composite_result.text if composite_result is not None else ""
             control_text = control_result.text if control_result is not None else ""
 
+            # Calculate Levenshtein edit distance
+            edit_dist = Levenshtein.distance(control_text, composite_text)
+            total_edit_distance += edit_dist
+
             # Count misread if texts differ
             is_misread = (composite_text != control_text)
             if is_misread:
                 misreads += 1
+
+            num_evaluated += 1
 
             # Save debug images
             if debug_dir is not None:
@@ -461,28 +480,33 @@ def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_d
                     'img_idx': img_idx,
                     'control_text': control_text,
                     'composite_text': composite_text,
+                    'edit_distance': edit_dist,
                     'is_misread': is_misread,
                 })
 
         except Exception as e:
-            # Treat errors as non-misreads (conservative)
+            # Treat errors as 0 edit distance (conservative)
+            num_evaluated += 1
             pass
 
     # Save debug summary
+    avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
     if debug_dir is not None and debug_results:
         summary_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_summary.txt"
         with open(summary_path, 'w') as f:
             f.write(f"Candidate {candidate_idx} Debug Summary\n")
             f.write(f"{'=' * 80}\n")
+            f.write(f"Total edit distance: {total_edit_distance}\n")
+            f.write(f"Average edit distance: {avg_edit_distance:.2f}\n")
             f.write(f"Total misreads: {misreads}/{len(val_images)} ({misreads/len(val_images)*100:.1f}%)\n\n")
             f.write(f"Per-image results:\n")
             for result in debug_results:
                 status = "MISREAD" if result['is_misread'] else "MATCH"
-                f.write(f"  Image {result['img_idx']:2d}: {status:7s} | "
+                f.write(f"  Image {result['img_idx']:2d}: {status:7s} | EditDist: {result['edit_distance']:2d} | "
                        f"Control: '{result['control_text']:15s}' → "
                        f"Composite: '{result['composite_text']:15s}'\n")
 
-    return misreads
+    return total_edit_distance, misreads, avg_edit_distance
 
 
 def main():
@@ -596,14 +620,17 @@ def main():
     debug_dir = output_dir / "debug_output"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define objective function for CMA-ES (minimize negative misreads)
+    # Define objective function for CMA-ES (minimize negative edit distance)
     eval_count = [0]  # Track number of evaluations
-    best_score = [0]
+    best_edit_distance = [0]
+    best_avg_edit_distance = [0]
+    best_misread_pct = [0]
     best_z = [None]
     current_iteration = [0]  # Track current iteration
+    all_edit_distances = []  # Track all edit distances for progress bar
 
     def objective(z, candidate_idx=None):
-        """Objective function: returns negative misreads (CMA-ES minimizes)."""
+        """Objective function: returns negative edit distance (CMA-ES minimizes)."""
         eval_count[0] += 1
 
         # Generate patch from z
@@ -621,23 +648,29 @@ def main():
 
         # Evaluate on validation set with optional debug output
         if save_debug:
-            misreads = evaluate_patch_with_debug(
+            total_edit_dist, misreads, avg_edit_dist = evaluate_patch_with_debug(
                 patch, val_images, alpr,
                 center_ratio=args.center_ratio,
                 debug_dir=debug_dir,
                 candidate_idx=candidate_idx
             )
         else:
-            misreads = evaluate_patch(patch, val_images, alpr, center_ratio=args.center_ratio)
+            total_edit_dist, misreads, avg_edit_dist = evaluate_patch(
+                patch, val_images, alpr, center_ratio=args.center_ratio
+            )
+
+        # Track for progress bar
+        all_edit_distances.append(avg_edit_dist)
 
         # Track best
-        if misreads > best_score[0]:
-            best_score[0] = misreads
+        if total_edit_dist > best_edit_distance[0]:
+            best_edit_distance[0] = total_edit_dist
+            best_avg_edit_distance[0] = avg_edit_dist
+            best_misread_pct[0] = (misreads / len(val_images) * 100) if len(val_images) > 0 else 0
             best_z[0] = z.copy()
-            print(f"  New best: {misreads}/{len(val_images)} misreads (eval {eval_count[0]})")
 
-        # Return negative (CMA-ES minimizes)
-        return -misreads
+        # Return negative edit distance (CMA-ES minimizes, we want to maximize)
+        return -total_edit_dist
 
     # Initialize CMA-ES
     print(f"\nInitializing CMA-ES:")
@@ -662,22 +695,28 @@ def main():
     # Run optimization
     print(f"\nStarting CMA-ES optimization...")
     print(f"Evaluating on {len(val_images)} validation samples per iteration")
+    print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
     print("=" * 80)
 
     iteration = 0
+
+    # Create progress bar for iterations
+    pbar = tqdm(total=args.maxiter, desc="CMA-ES", unit="iter", position=0)
+
     while not es.stop():
         solutions = es.ask()
         fitness_values = []
 
-        print(f"\nIteration {iteration + 1}/{args.maxiter}")
-        print(f"  Evaluating {len(solutions)} candidates...")
-
         # Save debug output for first iteration only
         if iteration == 0:
-            print(f"  [First iteration: saving debug output to {debug_dir}]")
+            tqdm.write(f"[First iteration: saving debug output to {debug_dir}]")
 
         current_iteration[0] = iteration  # Update iteration counter for objective function
 
+        # Clear edit distances for this iteration
+        all_edit_distances.clear()
+
+        # Evaluate all candidates with a nested progress bar
         for i, z in enumerate(solutions):
             # Pass candidate index only for first iteration
             fitness = objective(z, candidate_idx=i if iteration == 0 else None)
@@ -685,21 +724,29 @@ def main():
 
         es.tell(solutions, fitness_values)
 
-        # Print iteration summary
-        avg_fitness = np.mean(fitness_values)
-        min_fitness = np.min(fitness_values)
-        print(f"  Avg misreads: {-avg_fitness:.1f}/{len(val_images)}")
-        print(f"  Best this iter: {-min_fitness:.0f}/{len(val_images)}")
-        print(f"  Best overall: {best_score[0]}/{len(val_images)}")
+        # Calculate iteration statistics
+        avg_edit_dist = np.mean(all_edit_distances) if all_edit_distances else 0
+
+        # Update progress bar with current metrics
+        pbar.set_postfix({
+            'best_edit': f'{best_avg_edit_distance[0]:.2f}',
+            'avg_edit': f'{avg_edit_dist:.2f}',
+            'misread%': f'{best_misread_pct[0]:.1f}%'
+        })
+        pbar.update(1)
 
         iteration += 1
+
+    pbar.close()
 
     # Print final results
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
     print(f"Total evaluations: {eval_count[0]}")
-    print(f"Best score: {best_score[0]}/{len(val_images)} misreads ({best_score[0]/len(val_images)*100:.1f}%)")
+    print(f"Best total edit distance: {best_edit_distance[0]}")
+    print(f"Best average edit distance: {best_avg_edit_distance[0]:.2f}")
+    print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
 
     # Save best patch
     if best_z[0] is not None:
@@ -733,10 +780,13 @@ def main():
             f.write(f"Evaluation:\n")
             f.write(f"  Validation samples: {len(val_images)}\n")
             f.write(f"  Center ratio: {args.center_ratio}\n")
-            f.write(f"  OCR model: {ocr_model}\n\n")
+            f.write(f"  OCR model: {ocr_model}\n")
+            f.write(f"  Objective: Maximize Levenshtein edit distance\n\n")
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
-            f.write(f"  Best score: {best_score[0]}/{len(val_images)} misreads ({best_score[0]/len(val_images)*100:.1f}%)\n")
+            f.write(f"  Best total edit distance: {best_edit_distance[0]}\n")
+            f.write(f"  Best average edit distance: {best_avg_edit_distance[0]:.2f}\n")
+            f.write(f"  Best misread percentage: {best_misread_pct[0]:.1f}%\n")
             f.write(f"  Best z shape: {best_z[0].shape}\n")
 
         print(f"Saved metadata to: {metadata_path}")
