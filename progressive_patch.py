@@ -397,6 +397,7 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
             nn.SiLU(inplace=True),
             nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
+            nn.Sigmoid(),  # Ensure output is in [0, 1] range
         )
 
         # Spatial propagation layers (same padding to preserve size)
