@@ -52,12 +52,11 @@ def export_model(checkpoint_path, output_path):
     generator.load_state_dict(checkpoint['generator_state_dict'])
     generator.eval()
 
-    # Method 1: Save complete model (recommended for complex models)
-    # This saves both architecture and weights
-    print(f"\nSaving complete model to: {output_path}")
+    # Save state dict only (safer for models with JIT components)
+    # To load later, you'll need to recreate the architecture, but this is more robust
+    print(f"\nSaving model state dict and config to: {output_path}")
     torch.save({
-        'model': generator,  # Complete model object
-        'state_dict': checkpoint['generator_state_dict'],  # Backup state dict
+        'state_dict': checkpoint['generator_state_dict'],
         'config': {
             'latent_dim': latent_dim,
             'patch_height': patch_height,
@@ -68,12 +67,17 @@ def export_model(checkpoint_path, output_path):
         },
         'epoch': checkpoint.get('epoch', 'unknown'),
         'source_checkpoint': str(checkpoint_path),
+        'architecture_version': 'v1',  # Track architecture version
     }, output_path)
 
     print("✓ Model exported successfully!")
-    print("\nTo load this model later:")
+    print("\nTo load this model later (even with modified progressive_patch.py):")
+    print("  # Keep a copy of the OLD progressive_patch.py as progressive_patch_v1.py")
+    print("  from progressive_patch_v1 import FoundationPatchGenerator")
     print("  exported = torch.load('exported_model.pt')")
-    print("  generator = exported['model']")
+    print("  config = exported['config']")
+    print("  generator = FoundationPatchGenerator(**config)")
+    print("  generator.load_state_dict(exported['state_dict'])")
     print("  generator.eval()")
 
     # Test generation
