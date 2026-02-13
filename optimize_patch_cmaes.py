@@ -758,6 +758,24 @@ def main():
             pixel_bgr = cv2.cvtColor(pixel_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_downscaled_with_white_pixel.png"), pixel_bgr)
 
+            # Debug 6: Composite 1x1 white rectangle at top-left using EXACT compositing logic
+            # Create white 1x1 "image"
+            white_pixel = torch.ones((3, img_h, img_w), dtype=torch.float32)
+
+            # Create mask for single pixel at [0, 0]
+            pixel_mask = torch.zeros(1, img_h, img_w, dtype=torch.float32)
+            pixel_mask[:, 0, 0] = 1.0
+            pixel_mask = pixel_mask.expand(3, -1, -1)  # [3, H, W]
+
+            # Composite: white pixel at [0,0], patch everywhere else
+            composite_1x1 = patch_downscaled_float * (1 - pixel_mask) + white_pixel * pixel_mask
+            composite_1x1 = torch.clamp(composite_1x1, 0, 1)
+
+            # Save
+            comp_1x1_np = (composite_1x1.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            comp_1x1_bgr = cv2.cvtColor(comp_1x1_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_composited_1x1_white.png"), comp_1x1_bgr)
+
             print(f"  Saved to {debug_dir}/")
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
@@ -766,6 +784,7 @@ def main():
             print(f"    - patch_composited_original_res.png (patch on border, grey in center, NO downscale)")
             print(f"    - patch_64x128_with_grey_square.png (patch @ 64x128 with 32x32 grey square at offset)")
             print(f"    - patch_downscaled_with_white_pixel.png (downscaled patch + 1 white pixel at [0,0])")
+            print(f"    - patch_composited_1x1_white.png (composited 1x1 white rect at [0,0] using mask logic)")
 
         # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
         print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
