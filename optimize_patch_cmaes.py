@@ -379,32 +379,20 @@ def create_ocr_model(ocr_model_type, white_box=False):
         return alpr.ocr  # Return the OCR component
 
     elif ocr_model_type == 'opencv-crnn':
-        # CRNN ONNX model using ONNX Runtime
-        print("Initializing CRNN OCR model (ONNX Runtime)...")
+        # CRNN ONNX model converted to PyTorch
+        print("Initializing CRNN OCR model (PyTorch from ONNX)...")
         try:
-            import onnxruntime as ort
+            import onnx
+            from onnx2pytorch import ConvertModel
 
-            # Try simplified model first (for CPU compatibility), fall back to original
-            crnn_model_simplified = Path("text_recognition_CRNN_EN_2023feb_simplified.onnx")
-            crnn_model_original = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
-
-            if crnn_model_simplified.exists():
-                crnn_model_path = crnn_model_simplified
-            elif crnn_model_original.exists():
-                crnn_model_path = crnn_model_original
-                print(f"⚠ Using original model (not simplified). If you get CPU compatibility errors,")
-                print(f"  simplify it with: python -m onnxsim {crnn_model_original} {crnn_model_simplified}")
-            else:
-                raise FileNotFoundError(
-                    f"CRNN model not found. Expected one of:\n"
-                    f"  - {crnn_model_simplified} (simplified, recommended for CPU)\n"
-                    f"  - {crnn_model_original} (original)\n"
-                    f"\nTo create the simplified version, run:\n"
-                    f"  pip install onnx-simplifier\n"
-                    f"  python -m onnxsim {crnn_model_original} {crnn_model_simplified}"
-                )
-
+            crnn_model_path = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
             crnn_dict_path = Path("alphabet_en.txt")
+
+            if not crnn_model_path.exists():
+                raise FileNotFoundError(
+                    f"CRNN model not found: {crnn_model_path}\n"
+                    f"Please ensure the model is saved in the current directory."
+                )
 
             if not crnn_dict_path.exists():
                 raise FileNotFoundError(
@@ -412,19 +400,22 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     f"Please ensure the alphabet file is in the current directory."
                 )
 
-            print(f"Loading CRNN network from {crnn_model_path}...")
-            # Load ONNX model with ONNX Runtime (CPU only)
-            session = ort.InferenceSession(str(crnn_model_path), providers=['CPUExecutionProvider'])
+            print(f"Loading and converting ONNX model to PyTorch...")
+            # Load ONNX model
+            onnx_model = onnx.load(str(crnn_model_path))
+
+            # Convert to PyTorch
+            print(f"  Converting model architecture...")
+            pytorch_model = ConvertModel(onnx_model)
+            pytorch_model.eval()
+
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
             class CRNNWrapper:
-                def __init__(self, session, alphabet):
-                    self.session = session
+                def __init__(self, model, alphabet):
+                    self.model = model
                     self.alphabet = alphabet
-                    # Get input and output names
-                    self.input_name = session.get_inputs()[0].name
-                    self.output_name = session.get_outputs()[0].name
 
                 def predict(self, image):
                     """Predict text from image using CRNN."""
@@ -439,20 +430,23 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     normalized = resized.astype(np.float32) / 255.0
 
                     # Add batch and channel dimensions: [1, 1, 32, 128]
-                    input_blob = np.expand_dims(np.expand_dims(normalized, 0), 0)
+                    input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0)
 
                     # Run inference
-                    output = self.session.run([self.output_name], {self.input_name: input_blob})
-                    output = output[0]  # Get first output
+                    with torch.no_grad():
+                        output = self.model(input_tensor)
+
+                    # Handle output - could be tensor or tuple
+                    if isinstance(output, tuple):
+                        output = output[0]
 
                     # Decode output to text
-                    # Output shape: [batch, seq_len, num_classes]
                     output = output.squeeze(0)  # Remove batch dimension
                     if len(output.shape) > 1:
                         # [seq_len, num_classes]
-                        indices = np.argmax(output, axis=1)
+                        indices = torch.argmax(output, dim=1).cpu().numpy()
                     else:
-                        indices = np.array([np.argmax(output)])
+                        indices = np.array([torch.argmax(output).cpu().numpy()])
 
                     # Decode to text
                     text = ''
@@ -469,15 +463,17 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
                     return Result(text)
 
-            crnn = CRNNWrapper(session, alphabet)
+            crnn = CRNNWrapper(pytorch_model, alphabet)
             return crnn
 
-        except ImportError:
-            print("Error: onnxruntime not installed. Install with: pip install onnxruntime",
-                  file=sys.stderr)
+        except ImportError as e:
+            print(f"Error: Required package not installed: {e}", file=sys.stderr)
+            print("Install with: pip install onnx onnx2pytorch", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
             print(f"Error: Could not initialize CRNN: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             sys.exit(1)
 
     else:
@@ -684,9 +680,10 @@ def main():
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
             try:
-                import onnxruntime
+                import onnx
+                import onnx2pytorch
             except ImportError:
-                print("Error: onnxruntime not installed. Install with: pip install onnxruntime",
+                print("Error: Required packages not installed. Install with: pip install onnx onnx2pytorch",
                       file=sys.stderr)
                 sys.exit(1)
 
