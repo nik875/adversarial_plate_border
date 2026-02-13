@@ -269,7 +269,10 @@ def main():
 
     args = parser.parse_args()
 
-    # Find latest generator checkpoint in checkpoint directory
+    # Find generator checkpoint with priority:
+    # 1. training_complete_final_model/
+    # 2. best_progressive_patch/
+    # 3. Root directory (generator_epoch_*.pt)
     import os
     from pathlib import Path
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -278,15 +281,44 @@ def main():
         print(f"Error: Checkpoint directory not found: {checkpoint_dir}")
         return
 
-    # Find latest generator_epoch_XXXX.pt
-    generator_checkpoints = sorted(checkpoint_dir.glob("generator_epoch_*.pt"))
-    if not generator_checkpoints:
-        print(f"Error: No generator checkpoints found in {checkpoint_dir}")
-        return
-    generator_checkpoint = str(generator_checkpoints[-1])
-    print(f"Found latest generator checkpoint: {generator_checkpoint}")
+    generator_checkpoint = None
+    checkpoint_source = None
 
-    # Find train_val_split_TIMESTAMP.csv
+    # Priority 1: training_complete_final_model/
+    final_dir = checkpoint_dir / "training_complete_final_model"
+    if final_dir.exists():
+        final_checkpoints = sorted(final_dir.glob("generator_epoch_*.pt"))
+        if final_checkpoints:
+            generator_checkpoint = str(final_checkpoints[-1])
+            checkpoint_source = "training_complete_final_model/"
+            print(f"Found final model checkpoint: {generator_checkpoint}")
+
+    # Priority 2: best_progressive_patch/
+    if not generator_checkpoint:
+        best_dir = checkpoint_dir / "best_progressive_patch"
+        if best_dir.exists():
+            best_checkpoints = sorted(best_dir.glob("generator_epoch_*.pt"))
+            if best_checkpoints:
+                generator_checkpoint = str(best_checkpoints[-1])
+                checkpoint_source = "best_progressive_patch/"
+                print(f"Found best model checkpoint: {generator_checkpoint}")
+
+    # Priority 3: Root directory
+    if not generator_checkpoint:
+        root_checkpoints = sorted(checkpoint_dir.glob("generator_epoch_*.pt"))
+        if root_checkpoints:
+            generator_checkpoint = str(root_checkpoints[-1])
+            checkpoint_source = "root directory"
+            print(f"Found root checkpoint: {generator_checkpoint}")
+
+    if not generator_checkpoint:
+        print(f"Error: No generator checkpoint found in:")
+        print(f"  - {final_dir}")
+        print(f"  - {best_dir}")
+        print(f"  - {checkpoint_dir}")
+        return
+
+    # Find train_val_split_TIMESTAMP.csv (in root checkpoint dir)
     split_csv_files = list(checkpoint_dir.glob("train_val_split_*.csv"))
     if not split_csv_files:
         print(f"Error: No train_val_split CSV found in {checkpoint_dir}")
@@ -298,7 +330,7 @@ def main():
     print("BLACK-BOX ADVERSARIAL PATCH OPTIMIZATION (CMA-ES)")
     print("=" * 70)
     print(f"Checkpoint directory: {args.checkpoint_dir}")
-    print(f"Generator checkpoint: {generator_checkpoint}")
+    print(f"Generator checkpoint: {generator_checkpoint} (from {checkpoint_source})")
     print(f"Validation split: {split_csv_path}")
     print(f"Evaluation mode: {'OCR (cropped plates)' if args.ocr_mode else 'Standard (full images)'}")
     if args.ocr_mode:
