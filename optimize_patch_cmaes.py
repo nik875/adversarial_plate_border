@@ -221,13 +221,13 @@ def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5):
 
 
 def load_generator(run_dir):
-    """Load the VAE generator/decoder from the run directory.
+    """Load the FoundationPatchGenerator from the run directory.
 
     Args:
         run_dir: Path to run directory
 
     Returns:
-        Tuple of (decoder model, latent_dim, device)
+        Tuple of (generator model, latent_dim, device)
     """
     import sys
     from pathlib import Path
@@ -235,43 +235,62 @@ def load_generator(run_dir):
     # Import from progressive_patch.py
     sys.path.insert(0, str(Path(__file__).parent))
     try:
-        from progressive_patch import load_vae
+        from progressive_patch import FoundationPatchGenerator
     except ImportError:
-        raise ImportError("Could not import load_vae from progressive_patch.py")
+        raise ImportError("Could not import FoundationPatchGenerator from progressive_patch.py")
 
     # Find the latest checkpoint
     checkpoint_dir = Path(run_dir)
-    checkpoint_files = sorted(checkpoint_dir.glob("*.pt"))
+    checkpoint_files = sorted(checkpoint_dir.glob("generator_epoch_*.pt"))
 
     if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoint files found in {run_dir}")
+        raise FileNotFoundError(f"No generator checkpoint files found in {run_dir}")
 
     latest_checkpoint = checkpoint_files[-1]
     print(f"Loading checkpoint: {latest_checkpoint}")
 
-    # Load the model
-    vae = load_vae()
+    # Load checkpoint
     checkpoint = torch.load(latest_checkpoint, map_location='cpu')
-    vae.load_state_dict(checkpoint['model_state_dict'])
+
+    # Extract model parameters from checkpoint
+    latent_dim = checkpoint['basis_dim']
+    patch_height, patch_width = checkpoint['patch_size']
+    use_vae_lora = checkpoint.get('use_vae_lora', True)
+    lora_rank = checkpoint.get('lora_rank', 8)
+    lora_alpha = checkpoint.get('lora_alpha', 16)
+
+    print(f"  Latent dim: {latent_dim}")
+    print(f"  Patch size: {patch_height}x{patch_width}")
+    print(f"  VAE LoRA: {use_vae_lora} (rank={lora_rank}, alpha={lora_alpha})")
+
+    # Create generator with same architecture
+    generator = FoundationPatchGenerator(
+        latent_dim=latent_dim,
+        patch_height=patch_height,
+        patch_width=patch_width,
+        use_vae_lora=use_vae_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+    )
+
+    # Load state dict
+    generator.load_state_dict(checkpoint['generator_state_dict'])
 
     # Use GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    vae = vae.to(device)
-    vae.eval()
+    generator = generator.to(device)
+    generator.eval()
 
-    # Get latent dimension from model
-    latent_dim = vae.latent_dim
+    print(f"Loaded generator on device={device}")
 
-    print(f"Loaded VAE with latent_dim={latent_dim} on device={device}")
-
-    return vae.decoder, latent_dim, device
+    return generator, latent_dim, device
 
 
-def generate_patch_from_z(decoder, z, device):
-    """Generate a patch from latent code z using the decoder.
+def generate_patch_from_z(generator, z, device):
+    """Generate a patch from latent code z using the generator.
 
     Args:
-        decoder: VAE decoder model
+        generator: FoundationPatchGenerator model
         z: Latent code as numpy array [latent_dim]
         device: torch device
 
@@ -280,8 +299,8 @@ def generate_patch_from_z(decoder, z, device):
     """
     with torch.no_grad():
         z_tensor = torch.from_numpy(z).float().unsqueeze(0).to(device)  # [1, latent_dim]
-        patch = decoder(z_tensor)  # [1, 3, H, W]
-        patch = torch.sigmoid(patch)  # Ensure [0, 1] range
+        patch = generator(z_tensor)  # [1, 3, H, W]
+        # Generator output is already in [0, 1] range (uses tanh scaled to [0, 1])
         patch = patch.squeeze(0).cpu()  # [3, H, W]
 
     return patch
@@ -427,8 +446,8 @@ def main():
     print(f"Loaded {len(val_images)} validation samples")
 
     # Load generator
-    print(f"\nLoading VAE decoder from {run_dir}...")
-    decoder, latent_dim, device = load_generator(run_dir)
+    print(f"\nLoading generator from {run_dir}...")
+    generator, latent_dim, device = load_generator(run_dir)
 
     # Initialize ALPR
     print("\nInitializing fast-alpr (OCR-only mode)...")
@@ -450,7 +469,7 @@ def main():
         eval_count[0] += 1
 
         # Generate patch from z
-        patch = generate_patch_from_z(decoder, z, device)
+        patch = generate_patch_from_z(generator, z, device)
 
         # Evaluate on validation set
         misreads = evaluate_patch(patch, val_images, alpr, center_ratio=args.center_ratio)
@@ -521,7 +540,7 @@ def main():
 
     # Save best patch
     if best_z[0] is not None:
-        best_patch = generate_patch_from_z(decoder, best_z[0], device)
+        best_patch = generate_patch_from_z(generator, best_z[0], device)
 
         # Save as PNG
         patch_np = (best_patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
