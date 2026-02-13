@@ -221,11 +221,12 @@ def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5):
     return result_image
 
 
-def load_generator(run_dir):
+def load_generator(run_dir, device=None):
     """Load the FoundationPatchGenerator from the run directory.
 
     Args:
         run_dir: Path to run directory
+        device: torch device (if None, auto-detect)
 
     Returns:
         Tuple of (generator model, latent_dim, device)
@@ -326,8 +327,9 @@ def load_generator(run_dir):
     # Load state dict
     generator.load_state_dict(checkpoint['generator_state_dict'])
 
-    # Use GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Use provided device or auto-detect
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     generator = generator.to(device)
     generator.eval()
 
@@ -356,13 +358,111 @@ def generate_patch_from_z(generator, z, device):
     return patch
 
 
-def evaluate_patch(patch, val_images, alpr, control_texts, center_ratio=0.6):
+def create_ocr_model(ocr_model_type, white_box=False):
+    """Create OCR model based on type selection.
+
+    Args:
+        ocr_model_type: 'fast-alpr' or 'opencv-crnn'
+        white_box: If True and using fast-alpr, use smaller xs model
+
+    Returns:
+        OCR model object with a predict(image) method
+    """
+    if ocr_model_type == 'fast-alpr':
+        from fast_alpr import ALPR
+        ocr_model_name = "cct-xs-v1-global-model" if white_box else "cct-s-v1-global-model"
+        print(f"Initializing fast-alpr with model: {ocr_model_name}")
+        alpr = ALPR(
+            detector=None,
+            ocr_model=ocr_model_name,
+        )
+        return alpr.ocr  # Return the OCR component
+
+    elif ocr_model_type == 'opencv-crnn':
+        # OpenCV CRNN model
+        print("Initializing OpenCV CRNN OCR model...")
+        try:
+            # Try to use opencv-python's built-in CRNN
+            import cv2
+            # Load pre-trained CRNN model
+            model_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/text_recognition_crnn.pb"
+            dict_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/alphabet_en.txt"
+
+            # For simplicity, we'll use a simple wrapper that expects a trained CRNN model
+            # This assumes you have downloaded the model files
+            crnn_model_path = "text_recognition_crnn.pb"
+            crnn_dict_path = "alphabet_en.txt"
+
+            if not (Path(crnn_model_path).exists() and Path(crnn_dict_path).exists()):
+                raise ImportError(
+                    f"OpenCV CRNN model files not found. Download from:\n"
+                    f"  Model: https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/text_recognition_crnn.pb\n"
+                    f"  Dict: https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/alphabet_en.txt\n"
+                    f"Save them as '{crnn_model_path}' and '{crnn_dict_path}' in current directory."
+                )
+
+            # Create CRNN model wrapper
+            net = cv2.dnn.readNetFromTensorflow(crnn_model_path)
+            with open(crnn_dict_path, 'r') as f:
+                alphabet = f.read().strip()
+
+            class CRNNWrapper:
+                def __init__(self, net, alphabet):
+                    self.net = net
+                    self.alphabet = alphabet
+
+                def predict(self, image):
+                    """Predict text from image using CRNN."""
+                    # Preprocess image
+                    h, w = image.shape[:2]
+                    # CRNN expects 32x128 input
+                    blob = cv2.dnn.blobFromImage(image, 1.0 / 127.5, (128, 32),
+                                                 (127.5, 127.5, 127.5),
+                                                 swapRB=True, crop=False)
+                    self.net.setInput(blob)
+                    output = self.net.forward()
+
+                    # Decode output to text
+                    # Output shape: [1, num_chars, height, width]
+                    output = output.squeeze()
+                    if len(output.shape) > 2:
+                        output = output.transpose(1, 0)  # [num_steps, num_classes]
+
+                    # Get character indices
+                    indices = np.argmax(output, axis=1)
+
+                    # Decode to text
+                    text = ''
+                    prev_idx = -1
+                    for idx in indices:
+                        if idx > 0 and idx != prev_idx:  # Skip blank (0)
+                            text += self.alphabet[idx - 1]
+                        prev_idx = idx
+
+                    class Result:
+                        def __init__(self, text):
+                            self.text = text
+
+                    return Result(text)
+
+            crnn = CRNNWrapper(net, alphabet)
+            return crnn
+
+        except ImportError as e:
+            print(f"Error: Could not initialize OpenCV CRNN: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
+
+
+def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     """Evaluate a patch by computing edit distance between control and composite OCR.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
-        alpr: fast-alpr instance for OCR
+        ocr: OCR model instance with predict(image) method
         control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
 
@@ -383,7 +483,7 @@ def evaluate_patch(patch, val_images, alpr, control_texts, center_ratio=0.6):
             composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
             # Run OCR on composite only (control already precomputed)
-            composite_result = alpr.ocr.predict(composite_np)
+            composite_result = ocr.predict(composite_np)
             composite_text = composite_result.text if composite_result is not None else ""
 
             # Calculate Levenshtein edit distance
@@ -405,13 +505,13 @@ def evaluate_patch(patch, val_images, alpr, control_texts, center_ratio=0.6):
     return total_edit_distance, misreads, avg_edit_distance
 
 
-def evaluate_patch_with_debug(patch, val_images, alpr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
     """Evaluate a patch and save debug images for all validation samples.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
-        alpr: fast-alpr instance for OCR
+        ocr: OCR model instance with predict(image) method
         control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
         debug_dir: Directory to save debug images
@@ -435,7 +535,7 @@ def evaluate_patch_with_debug(patch, val_images, alpr, control_texts, center_rat
             composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
             # Run OCR on composite only (control already precomputed)
-            composite_result = alpr.ocr.predict(composite_np)
+            composite_result = ocr.predict(composite_np)
             composite_text = composite_result.text if composite_result is not None else ""
 
             # Calculate Levenshtein edit distance
@@ -521,8 +621,14 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn'], default='fast-alpr',
+                        help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
-                        help='Use smaller xs model instead of s model')
+                        help='Use smaller xs model instead of s model (only for fast-alpr)')
+
+    # Device
+    parser.add_argument('--device', default=None,
+                        help='Device to use (default: auto-detect cuda/cpu). Examples: cpu, cuda, cuda:0, cuda:1')
 
     # Output
     parser.add_argument('--outdir', default='cmaes_output',
@@ -534,12 +640,27 @@ def main():
 
     args = parser.parse_args()
 
+    # Parse device
+    if args.device is not None:
+        device = torch.device(args.device)
+    else:
+        device = None  # Will auto-detect in load_generator
+
     # Check dependencies (CMA-ES only needed for optimization mode)
     if not args.composite_only:
-        if ALPR is None:
-            print("Error: fast-alpr not installed. Install with: pip install fast-alpr",
-                  file=sys.stderr)
-            sys.exit(1)
+        # Check for OCR model dependencies
+        if args.ocr_model == 'fast-alpr':
+            if ALPR is None:
+                print("Error: fast-alpr not installed. Install with: pip install fast-alpr",
+                      file=sys.stderr)
+                sys.exit(1)
+        elif args.ocr_model == 'opencv-crnn':
+            try:
+                import cv2
+            except ImportError:
+                print("Error: opencv-python not installed. Install with: pip install opencv-python",
+                      file=sys.stderr)
+                sys.exit(1)
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
@@ -598,7 +719,7 @@ def main():
 
     # Load generator
     print(f"\nLoading generator from {run_dir}...")
-    generator, latent_dim, device = load_generator(run_dir)
+    generator, latent_dim, device = load_generator(run_dir, device=device)
 
     # Composite-only mode: just generate and save composites, then exit
     if args.composite_only:
@@ -863,15 +984,10 @@ def main():
         print("Done!")
         return
 
-    # Initialize ALPR
-    print("\nInitializing fast-alpr (OCR-only mode)...")
-    ocr_model = "cct-xs-v1-global-model" if args.white_box else "cct-s-v1-global-model"
-    print(f"Using OCR model: {ocr_model}")
-    alpr = ALPR(
-        detector=None,
-        ocr_model=ocr_model,
-    )
-    print("fast-alpr loaded")
+    # Initialize OCR model
+    print(f"\nInitializing OCR model: {args.ocr_model}")
+    ocr = create_ocr_model(args.ocr_model, white_box=args.white_box)
+    print("OCR model loaded")
 
     # Precompute control OCR outputs once (with grey border)
     print("\nPrecomputing control OCR outputs...")
@@ -886,7 +1002,7 @@ def main():
             control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
             # Run OCR
-            control_result = alpr.ocr.predict(control_np)
+            control_result = ocr.predict(control_np)
             control_text = control_result.text if control_result is not None else ""
             control_texts.append(control_text)
 
@@ -929,14 +1045,14 @@ def main():
         # Evaluate on validation set with optional debug output
         if save_debug:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch_with_debug(
-                patch, val_images, alpr, control_texts,
+                patch, val_images, ocr, control_texts,
                 center_ratio=args.center_ratio,
                 debug_dir=debug_dir,
                 candidate_idx=candidate_idx
             )
         else:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch(
-                patch, val_images, alpr, control_texts,
+                patch, val_images, ocr, control_texts,
                 center_ratio=args.center_ratio
             )
 
@@ -1064,7 +1180,8 @@ def main():
             f.write(f"Evaluation:\n")
             f.write(f"  Validation samples: {len(val_images)}\n")
             f.write(f"  Center ratio: {args.center_ratio}\n")
-            f.write(f"  OCR model: {ocr_model}\n")
+            f.write(f"  OCR model type: {args.ocr_model}\n")
+            f.write(f"  Device: {device}\n")
             f.write(f"  Objective: Maximize Levenshtein edit distance\n\n")
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
