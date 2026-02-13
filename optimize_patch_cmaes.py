@@ -49,7 +49,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     script_dir = Path(__file__).parent
     from torch.utils.data import ConcatDataset
 
-    # Import OCRDataset from progressive_patch_v1 (original version)
+    # Import OCRDataset from progressive_patch_v1
     sys.path.insert(0, str(script_dir))
     try:
         from progressive_patch_v1 import OCRDataset
@@ -379,42 +379,29 @@ def create_ocr_model(ocr_model_type, white_box=False):
         return alpr.ocr  # Return the OCR component
 
     elif ocr_model_type == 'opencv-crnn':
-        # OpenCV CRNN model
-        print("Initializing OpenCV CRNN OCR model...")
+        # OpenCV CRNN ONNX model
+        print("Initializing OpenCV CRNN OCR model (ONNX)...")
         try:
             import cv2
-            import urllib.request
 
-            # Model URLs from OpenCV model zoo
-            model_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/text_recognition_crnn.pb"
-            dict_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/alphabet_en.txt"
-
-            crnn_model_path = Path("text_recognition_crnn.pb")
+            crnn_model_path = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
             crnn_dict_path = Path("alphabet_en.txt")
 
-            # Download model if not present
             if not crnn_model_path.exists():
-                print(f"Downloading CRNN model from OpenCV model zoo...")
-                try:
-                    urllib.request.urlretrieve(model_url, str(crnn_model_path))
-                    print(f"  Model saved to {crnn_model_path}")
-                except Exception as e:
-                    print(f"  Failed to download: {e}", file=sys.stderr)
-                    raise
+                raise FileNotFoundError(
+                    f"CRNN model not found: {crnn_model_path}\n"
+                    f"Please ensure the model is saved in the current directory."
+                )
 
-            # Download dictionary if not present
             if not crnn_dict_path.exists():
-                print(f"Downloading CRNN alphabet dictionary...")
-                try:
-                    urllib.request.urlretrieve(dict_url, str(crnn_dict_path))
-                    print(f"  Dictionary saved to {crnn_dict_path}")
-                except Exception as e:
-                    print(f"  Failed to download: {e}", file=sys.stderr)
-                    raise
+                raise FileNotFoundError(
+                    f"Alphabet dictionary not found: {crnn_dict_path}\n"
+                    f"Please ensure the alphabet file is in the current directory."
+                )
 
-            print("Loading CRNN network...")
-            # Create CRNN model wrapper
-            net = cv2.dnn.readNetFromTensorflow(str(crnn_model_path))
+            print(f"Loading CRNN network from {crnn_model_path}...")
+            # Load ONNX model
+            net = cv2.dnn.readNetFromONNX(str(crnn_model_path))
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
@@ -437,7 +424,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     output = self.net.forward()
 
                     # Decode output to text
-                    # Output shape: [1, num_chars, height, width]
+                    # Output shape: [1, num_steps, num_classes] or similar
                     output = output.squeeze()
                     if len(output.shape) > 2:
                         output = output.transpose(1, 0)  # [num_steps, num_classes]
