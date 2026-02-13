@@ -49,12 +49,12 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     script_dir = Path(__file__).parent
     from torch.utils.data import ConcatDataset
 
-    # Import OCRDataset from progressive_patch (newer version with dataset support)
+    # Import OCRDataset from progressive_patch_v1 (original version)
     sys.path.insert(0, str(script_dir))
     try:
-        from progressive_patch import OCRDataset
+        from progressive_patch_v1 import OCRDataset
     except ImportError:
-        raise ImportError("Could not import OCRDataset from progressive_patch.py")
+        raise ImportError("Could not import OCRDataset from progressive_patch_v1.py")
 
     # Read CSV to get dataset names and validation indices
     val_indices = []
