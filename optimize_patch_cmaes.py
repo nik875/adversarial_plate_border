@@ -1129,7 +1129,8 @@ def main():
     # Create progress bar for iterations
     pbar = tqdm(total=args.maxiter, desc="CMA-ES", unit="iter", position=0)
 
-    while not es.stop():
+    # Run for exactly maxiter iterations (disable all early stopping criteria)
+    while iteration < args.maxiter:
         solutions = es.ask()
         fitness_values = []
 
@@ -1175,15 +1176,7 @@ def main():
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
-
-    # Print stopping criteria
-    stop_info = es.stop()
-    if stop_info:
-        print("\nStopping criteria triggered:")
-        for key, value in stop_info.items():
-            print(f"  {key}: {value}")
-    else:
-        print("\nReached maxiter without early stopping")
+    print(f"Completed {iteration} iterations (maxiter={args.maxiter})")
     print(f"Total evaluations: {eval_count[0]}")
     print(f"Best total edit distance: {best_edit_distance[0]}")
     print(f"Best average edit distance: {best_avg_edit_distance[0]:.2f}")
