@@ -747,6 +747,17 @@ def main():
             comp_small_bgr = cv2.cvtColor(comp_small_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_64x128_with_grey_square.png"), comp_small_bgr)
 
+            # Debug 5: Composite a single white pixel at top-left corner on downscaled patch
+            patch_with_pixel = patch_downscaled_float.clone()  # Clone to avoid modifying original
+
+            # Set top-left pixel to white (1.0 in all channels)
+            patch_with_pixel[:, 0, 0] = 1.0
+
+            # Save
+            pixel_np = (patch_with_pixel.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            pixel_bgr = cv2.cvtColor(pixel_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_downscaled_with_white_pixel.png"), pixel_bgr)
+
             print(f"  Saved to {debug_dir}/")
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
@@ -754,6 +765,7 @@ def main():
             print(f"    - patch_composited_grey_rect.png (patch on border, grey in center, downscaled)")
             print(f"    - patch_composited_original_res.png (patch on border, grey in center, NO downscale)")
             print(f"    - patch_64x128_with_grey_square.png (patch @ 64x128 with 32x32 grey square at offset)")
+            print(f"    - patch_downscaled_with_white_pixel.png (downscaled patch + 1 white pixel at [0,0])")
 
         # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
         print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
