@@ -2887,9 +2887,8 @@ def main():
         # Plot training results
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
-        # Diversity loss (training vs validation)
+        # Diversity loss (training)
         ax1.plot(history['epoch'], history['diversity_loss'], 'b-', label='Train Diversity Loss', alpha=0.7)
-        ax1.plot(history['epoch'], history['val_diversity'], 'r-', label='Val Diversity', alpha=0.7)
         # Add vertical lines for layer transitions
         for i, record in enumerate(trainer.layer_history):
             if i > 0:  # Skip first layer (starts at epoch 0)
