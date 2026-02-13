@@ -23,7 +23,12 @@ from load_exported_model import load_exported_generator
 
 def load_generator_from_checkpoint(checkpoint_path):
     """Load generator from checkpoint directory."""
-    from progressive_patch import FoundationPatchGenerator
+    try:
+        from progressive_patch_v1 import FoundationPatchGenerator
+        print("Using progressive_patch_v1.py (old architecture)")
+    except ImportError:
+        from progressive_patch import FoundationPatchGenerator
+        print("WARNING: progressive_patch_v1.py not found, using current progressive_patch.py")
 
     checkpoint_dir = Path(checkpoint_path)
 
