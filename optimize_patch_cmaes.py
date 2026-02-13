@@ -618,30 +618,86 @@ def main():
 
         print(f"Generated {len(patches)} patches")
 
-        # Composite patches with validation samples
-        print(f"\nCompositing {len(patches)} patches with {len(val_images)} validation samples...")
-        print(f"Total outputs: {len(patches) * len(val_images)} composite + control pairs")
+        # Create debug directory for quantization comparison
+        debug_dir = output_dir / "quantization_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-        pbar = tqdm(total=len(val_images) * len(patches), desc="Compositing")
+        # Debug: save downscaling comparison for first patch only
+        print(f"\nSaving quantization debug outputs for first patch...")
+        if len(patches) > 0 and len(val_images) > 0:
+            first_patch = patches[0]
+            first_val_image = val_images[0]
 
-        for img_idx, val_image in enumerate(val_images):
-            # Cycle through patches
-            for patch_idx, patch in enumerate(patches):
-                try:
-                    # Apply patch
-                    composite = apply_patch_ocr_mode(val_image, patch, center_ratio=args.center_ratio)
-                    composite = composite.squeeze(0)  # Remove batch dim
+            # Get image dimensions
+            img_h, img_w = first_val_image.shape[1], first_val_image.shape[2]
 
-                    # Convert to numpy and save
-                    composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+            # Method 1: Direct downscale from float32 generator output
+            patch_downscaled_float = F.interpolate(
+                first_patch.unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # [3, H, W] float32
 
-                    # Calculate global index for cycling behavior
-                    global_idx = img_idx * len(patches) + patch_idx
-                    output_path = output_dir / f"composite_{global_idx:04d}.jpg"
-                    cv2.imwrite(str(output_path), composite_bgr)
+            # Save float-downscaled version
+            float_np = (patch_downscaled_float.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            float_bgr = cv2.cvtColor(float_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_downscaled_float32.png"), float_bgr)
 
-                    # Apply grey control border
+            # Method 2: Quantize to uint8 first, THEN downscale
+            # Convert patch to uint8 PNG format
+            patch_np = (first_patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
+
+            # Save original patch
+            cv2.imwrite(str(debug_dir / "patch_original.png"), patch_bgr)
+
+            # Convert back to tensor (simulating PNG save/load)
+            patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            patch_quantized = torch.from_numpy(np.transpose(patch_rgb, (2, 0, 1)))  # [3, H, W]
+
+            # Now downscale the quantized version
+            patch_downscaled_quantized = F.interpolate(
+                patch_quantized.unsqueeze(0),
+                size=(img_h, img_w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # [3, H, W]
+
+            # Save quantized-downscaled version
+            quant_np = (patch_downscaled_quantized.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            quant_bgr = cv2.cvtColor(quant_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_downscaled_quantized.png"), quant_bgr)
+
+            print(f"  Saved to {debug_dir}/")
+            print(f"    - patch_original.png (original generator output)")
+            print(f"    - patch_downscaled_float32.png (float → downscale)")
+            print(f"    - patch_downscaled_quantized.png (float → uint8 → float → downscale)")
+
+        # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
+        print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
+        print(f"Total outputs: {len(patches)} composite + control pairs")
+
+        pbar = tqdm(total=len(patches), desc="Compositing")
+
+        for patch_idx, patch in enumerate(patches):
+            # Use only first validation image
+            val_image = val_images[0]
+
+            try:
+                # Apply patch
+                composite = apply_patch_ocr_mode(val_image, patch, center_ratio=args.center_ratio)
+                composite = composite.squeeze(0)  # Remove batch dim
+
+                # Convert to numpy and save
+                composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+
+                output_path = output_dir / f"composite_{patch_idx:04d}.jpg"
+                cv2.imwrite(str(output_path), composite_bgr)
+
+                # Apply grey control border (only save once)
+                if patch_idx == 0:
                     control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
                     control = control.squeeze(0)  # Remove batch dim
 
@@ -649,16 +705,16 @@ def main():
                     control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                     control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
 
-                    control_path = output_dir / f"control_{global_idx:04d}.jpg"
+                    control_path = output_dir / f"control_0000.jpg"
                     cv2.imwrite(str(control_path), control_bgr)
 
-                except Exception as e:
-                    print(f"  Error processing image {img_idx} patch {patch_idx}: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"  Error processing patch {patch_idx}: {e}", file=sys.stderr)
 
-                pbar.update(1)
+            pbar.update(1)
 
         pbar.close()
-        print(f"\nSaved {len(patches) * len(val_images)} composite/control pairs to {output_dir}")
+        print(f"\nSaved {len(patches)} composite images + 1 control to {output_dir}")
         print("Done!")
         return
 
