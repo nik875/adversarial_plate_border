@@ -669,18 +669,9 @@ def main():
             quant_bgr = cv2.cvtColor(quant_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_downscaled_quantized.png"), quant_bgr)
 
-            # Debug: Composite a grey rectangle onto the downscaled patch
-            # Create a grey rectangle (64x128 in center)
-            grey_rect_h, grey_rect_w = 64, 128
-            grey_rect = torch.full((3, grey_rect_h, grey_rect_w), 0.5, dtype=torch.float32)  # Mid-grey
-
-            # Upscale grey rectangle to image size
-            grey_rect_scaled = F.interpolate(
-                grey_rect.unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
+            # Debug: Composite the patch around a grey rectangle (like apply_patch_ocr_mode does)
+            # Create a grey rectangle base image
+            grey_base = torch.full((3, img_h, img_w), 0.5, dtype=torch.float32)  # Mid-grey
 
             # Create mask for center region (60% like in apply_patch_ocr_mode)
             center_ratio = 0.6
@@ -693,8 +684,8 @@ def main():
             center_mask[:, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
             center_mask = center_mask.expand(3, -1, -1)  # [3, H, W]
 
-            # Composite: keep original in center, grey rectangle on borders
-            composite_grey = patch_downscaled_float * center_mask + grey_rect_scaled * (1 - center_mask)
+            # Composite: grey rectangle in center, patch on borders
+            composite_grey = grey_base * center_mask + patch_downscaled_float * (1 - center_mask)
             composite_grey = torch.clamp(composite_grey, 0, 1)
 
             # Save composited version
@@ -706,7 +697,7 @@ def main():
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
             print(f"    - patch_downscaled_quantized.png (float → uint8 → float → downscale)")
-            print(f"    - patch_composited_grey_rect.png (composited with grey 64x128 rectangle on border)")
+            print(f"    - patch_composited_grey_rect.png (patch on border, grey in center)")
 
         # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
         print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
