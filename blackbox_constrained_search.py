@@ -790,6 +790,7 @@ class BlackBoxPatchOptimizer:
                 postfix = {
                     'best_fitness': f'{best_fitness_ever:.4f}',
                     'current_best': f'{fitness_values[best_idx]:.4f}',
+                    'avg_fitness': f'{np.mean(fitness_values):.4f}',
                     'sigma': f'{es.sigma:.4f}'
                 }
                 if self.enable_plate_blur:
