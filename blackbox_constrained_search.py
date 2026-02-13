@@ -126,7 +126,7 @@ class BlackBoxPatchOptimizer:
         for i in range(5):
             z_test = np.random.uniform(0, 1, size=self.latent_dim)
             patch_test = self.generate_patch(z_test)
-            patch_np = (patch_test.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            patch_np = self.tensor_to_numpy_rgb(patch_test)
             Image.fromarray(patch_np).save(str(debug_dir / f"diag_patch_z{i}.png"))
         print(f"Saved 5 diagnostic patches to {debug_dir}/diag_patch_z*.png")
 
@@ -213,13 +213,12 @@ class BlackBoxPatchOptimizer:
 
         # Load validation samples using combined dataset indices
         # (same approach as composite_with_data.py)
+        # Store as [3, H, W] tensors in [0, 1] — matching composite_with_data.py exactly
         for idx in sorted(val_indices):
             try:
                 item = combined_dataset[idx]
                 img_tensor = item['prep_image']  # [3, H, W] tensor in [0, 1]
-                # Convert to numpy [H, W, 3] uint8 (for oracle consumption)
-                img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                self.test_images.append(img_np)
+                self.test_images.append(img_tensor)
             except Exception as e:
                 print(f"  Warning: Failed to load sample {idx}: {e}")
 
@@ -309,53 +308,56 @@ class BlackBoxPatchOptimizer:
             self.test_images.append(image_np)
             self.test_corners.append(corners)
 
-    def apply_patch_ocr_mode(self, image: np.ndarray, patch: torch.Tensor,
-                             center_ratio: float = 0.6) -> np.ndarray:
+    def apply_patch_ocr_mode(self, image: torch.Tensor, patch: torch.Tensor,
+                             center_ratio: float = 0.6) -> torch.Tensor:
         """
-        Apply patch to cropped plate image (same method as composite_with_data.py).
-
-        Keeps center region (plate text) and replaces outer border with patch.
+        Apply patch to cropped plate image.
+        Copied directly from composite_with_data.py — operates entirely in tensor space.
 
         Args:
-            image: [H, W, 3] numpy array, uint8, range [0, 255]
-            patch: [3, H_patch, W_patch] tensor, range [0, 1]
+            image: [3, H, W] tensor in [0, 1]
+            patch: [3, patch_h, patch_w] tensor in [0, 1]
             center_ratio: Fraction of image to preserve in center (default: 0.6)
 
         Returns:
-            patched_image: [H, W, 3] numpy array, uint8, range [0, 255]
+            result: [3, H, W] tensor in [0, 1]
         """
-        H, W = image.shape[:2]
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
 
-        # Convert image to tensor [1, 3, H, W] in [0, 1] on same device as patch
-        image_tensor = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1).unsqueeze(0) / 255.0
+        batch_size = image.shape[0]
+        image_height, image_width = image.shape[2], image.shape[3]
 
         # Resize patch to match image dimensions
         patch_resized = F.interpolate(
             patch.unsqueeze(0),
-            size=(H, W),
+            size=(image_height, image_width),
             mode='bilinear',
             align_corners=False
         )
 
-        # Create center mask (1 in center, 0 on borders) on same device
-        center_h = int(H * center_ratio)
-        center_w = int(W * center_ratio)
-        pad_h = (H - center_h) // 2
-        pad_w = (W - center_w) // 2
+        # Expand to batch size
+        patch_batch = patch_resized.repeat(batch_size, 1, 1, 1)
 
-        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32, device=self.device)
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
+
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                                  dtype=torch.float32)
         center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
         center_mask = center_mask.expand(-1, 3, -1, -1)
 
-        # Blend: keep original in center, use patch on borders
-        result = image_tensor * center_mask + patch_resized * (1 - center_mask)
-        result = torch.clamp(result, 0, 1)
+        # Blend: keep original image in center, use patch on borders
+        result_image = image * center_mask + patch_batch * (1 - center_mask)
+        result_image = torch.clamp(result_image, 0, 1)
 
-        # Convert back to numpy
-        return (result.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        return result_image.squeeze(0)  # [3, H, W]
 
-    def apply_neutral_border_ocr_mode(self, image: np.ndarray, center_ratio: float = 0.6,
-                                       border_color: float = 0.5) -> np.ndarray:
+    def apply_neutral_border_ocr_mode(self, image: torch.Tensor, center_ratio: float = 0.6,
+                                       border_color: float = 0.5) -> torch.Tensor:
         """
         Apply neutral grey border to image (matching composite_with_data.py).
 
@@ -363,37 +365,43 @@ class BlackBoxPatchOptimizer:
         instead of adversarial patch border.
 
         Args:
-            image: [H, W, 3] numpy array, uint8, range [0, 255]
+            image: [3, H, W] tensor in [0, 1]
             center_ratio: Fraction of image to preserve in center (default: 0.6)
             border_color: Value for neutral border in [0, 1] (default: 0.5 = gray)
 
         Returns:
-            bordered_image: [H, W, 3] numpy array, uint8, range [0, 255]
+            bordered_image: [3, H, W] tensor in [0, 1]
         """
-        H, W = image.shape[:2]
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
 
-        # Convert image to tensor [1, 3, H, W] in [0, 1]
-        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+        batch_size = image.shape[0]
+        image_height, image_width = image.shape[2], image.shape[3]
 
         # Create center mask (1 in center, 0 on borders)
-        center_h = int(H * center_ratio)
-        center_w = int(W * center_ratio)
-        pad_h = (H - center_h) // 2
-        pad_w = (W - center_w) // 2
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
 
-        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32)
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                                  dtype=torch.float32)
         center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
         center_mask = center_mask.expand(-1, 3, -1, -1)
 
         # Create neutral border
-        neutral_border = torch.full_like(image_tensor, border_color)
+        neutral_border = torch.full_like(image, border_color)
 
         # Blend: keep original in center, use neutral border on borders
-        result = image_tensor * center_mask + neutral_border * (1 - center_mask)
+        result = image * center_mask + neutral_border * (1 - center_mask)
         result = torch.clamp(result, 0, 1)
 
-        # Convert back to numpy
-        return (result.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        return result.squeeze(0)  # [3, H, W]
+
+    @staticmethod
+    def tensor_to_numpy_rgb(tensor: torch.Tensor) -> np.ndarray:
+        """Convert [3, H, W] tensor in [0, 1] to [H, W, 3] numpy uint8 RGB."""
+        return (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
     def generate_patch(self, z: np.ndarray) -> torch.Tensor:
         """
@@ -602,8 +610,10 @@ class BlackBoxPatchOptimizer:
         self.control_predictions = []
         for image in tqdm(self.test_images, desc="Control OCR"):
             # Apply grey border (matching composite_with_data.py's control condition)
-            control_image = self.apply_neutral_border_ocr_mode(image)
-            detected_text = oracle.query(control_image)
+            control_tensor = self.apply_neutral_border_ocr_mode(image)
+            # Convert to numpy RGB for oracle
+            control_np = self.tensor_to_numpy_rgb(control_tensor)
+            detected_text = oracle.query(control_np)
             self.control_predictions.append(detected_text or "")
         print(f"Control predictions computed for {len(self.control_predictions)} images")
 
@@ -647,15 +657,16 @@ class BlackBoxPatchOptimizer:
         debug_count = 0
 
         for idx in test_indices:
-            image = self.test_images[idx]
+            image = self.test_images[idx]  # [3, H, W] tensor in [0, 1]
             control_text = self.control_predictions[idx]
 
             # Apply patch using OCR mode (center-preserving border replacement)
-            # Same method as composite_with_data.py
-            patched_image = self.apply_patch_ocr_mode(image, patch)
+            # Exact same function as composite_with_data.py, all in tensor space
+            patched_tensor = self.apply_patch_ocr_mode(image, patch)
 
-            # Query oracle (OCR-only, no corners needed)
-            detected_text = oracle.query(patched_image) or ""
+            # Convert to numpy RGB for oracle
+            patched_np = self.tensor_to_numpy_rgb(patched_tensor)
+            detected_text = oracle.query(patched_np) or ""
 
             if debug_this_eval and debug_count < 5:
                 status = "CHANGED" if detected_text != control_text else "SAME"
@@ -666,13 +677,15 @@ class BlackBoxPatchOptimizer:
                     import cv2
                     debug_dir = Path("debug_output")
                     debug_dir.mkdir(exist_ok=True)
-                    control_image = self.apply_neutral_border_ocr_mode(image)
+                    control_tensor = self.apply_neutral_border_ocr_mode(image)
+                    raw_np = self.tensor_to_numpy_rgb(image)
+                    control_np = self.tensor_to_numpy_rgb(control_tensor)
                     cv2.imwrite(str(debug_dir / f"{debug_count:02d}_raw.jpg"),
-                                cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                                cv2.cvtColor(raw_np, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(str(debug_dir / f"{debug_count:02d}_control.jpg"),
-                                cv2.cvtColor(control_image, cv2.COLOR_RGB2BGR))
+                                cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(str(debug_dir / f"{debug_count:02d}_patched.jpg"),
-                                cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR))
+                                cv2.cvtColor(patched_np, cv2.COLOR_RGB2BGR))
 
                 debug_count += 1
 
@@ -827,24 +840,18 @@ class BlackBoxPatchOptimizer:
                             debug_dir = Path("debug_output")
                             debug_dir.mkdir(exist_ok=True)
                             patch_debug = self.generate_patch(z)
-                            patch_np = (patch_debug.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                            patch_np = self.tensor_to_numpy_rgb(patch_debug)
                             Image.fromarray(patch_np).save(str(debug_dir / f"gen0_ind{sol_idx:02d}_patch.png"))
-                            # Apply to first test image
-                            test_img = self.test_images[0]
-                            H, W = test_img.shape[:2]
-                            # Save resized patch (what actually gets composited)
-                            patch_resized = F.interpolate(
-                                patch_debug.unsqueeze(0), size=(H, W),
-                                mode='bilinear', align_corners=False
-                            ).squeeze(0)
-                            resized_np = (patch_resized.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                            Image.fromarray(resized_np).save(str(debug_dir / f"gen0_ind{sol_idx:02d}_patch_resized.png"))
-                            composited = self.apply_patch_ocr_mode(test_img, patch_debug)
+                            # Apply to first test image (tensor space, same as composite_with_data.py)
+                            test_img = self.test_images[0]  # [3, H, W] tensor
+                            composited_tensor = self.apply_patch_ocr_mode(test_img, patch_debug)
+                            composited_np = self.tensor_to_numpy_rgb(composited_tensor)
                             cv2.imwrite(str(debug_dir / f"gen0_ind{sol_idx:02d}_composited.jpg"),
-                                        cv2.cvtColor(composited, cv2.COLOR_RGB2BGR))
+                                        cv2.cvtColor(composited_np, cv2.COLOR_RGB2BGR))
                             # Also log image dimensions for first individual
                             if sol_idx == 0:
-                                print(f"  [DEBUG] Test image size: {W}x{H} (WxH), patch size: {patch_debug.shape[1]}x{patch_debug.shape[2]}")
+                                img_h, img_w = test_img.shape[1], test_img.shape[2]
+                                print(f"  [DEBUG] Test image size: {img_w}x{img_h} (WxH), patch size: {patch_debug.shape[2]}x{patch_debug.shape[1]}")
 
                         try:
                             fitness = self.evaluate_fitness(z, oracle)
