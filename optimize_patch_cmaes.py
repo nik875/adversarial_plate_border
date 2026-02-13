@@ -49,12 +49,12 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     script_dir = Path(__file__).parent
     from torch.utils.data import ConcatDataset
 
-    # Import OCRDataset from progressive_patch
+    # Import OCRDataset from progressive_patch_v1
     sys.path.insert(0, str(script_dir))
     try:
-        from progressive_patch import OCRDataset
+        from progressive_patch_v1 import OCRDataset
     except ImportError:
-        raise ImportError("Could not import OCRDataset from progressive_patch.py")
+        raise ImportError("Could not import OCRDataset from progressive_patch_v1.py")
 
     # Read CSV to get dataset names and validation indices
     val_indices = []
@@ -234,12 +234,12 @@ def load_generator(run_dir, device=None):
     import sys
     from pathlib import Path
 
-    # Import from progressive_patch.py
+    # Import from progressive_patch_v1.py (original architecture)
     sys.path.insert(0, str(Path(__file__).parent))
     try:
-        from progressive_patch import FoundationPatchGenerator
+        from progressive_patch_v1 import FoundationPatchGenerator
     except ImportError:
-        raise ImportError("Could not import FoundationPatchGenerator from progressive_patch.py")
+        raise ImportError("Could not import FoundationPatchGenerator from progressive_patch_v1.py")
 
     # Search for checkpoints in this priority order:
     # 1. training_complete_final_model (final checkpoint at end of training)
