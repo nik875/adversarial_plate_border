@@ -2896,12 +2896,7 @@ def main():
 
         # Diversity loss (training)
         ax1.plot(history['epoch'], history['diversity_loss'], 'b-', label='Train Diversity Loss', alpha=0.7)
-        # Add vertical lines for layer transitions
-        for i, record in enumerate(trainer.layer_history):
-            if i > 0:  # Skip first layer (starts at epoch 0)
-                transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
-                ax1.axvline(x=transition_epoch, color='gray', linestyle='--', alpha=0.5)
-        ax1.set_title('Diversity Over Time (Progressive Layers)')
+        ax1.set_title('Diversity Over Time')
         ax1.set_xlabel('Global Epoch')
         ax1.set_ylabel('Diversity Loss')
         ax1.grid(True, alpha=0.3)
@@ -2910,11 +2905,7 @@ def main():
         # TV and spectrum regularization losses
         ax2.plot(history['epoch'], history['tv_loss'], 'g-', label='TV Loss', alpha=0.7)
         ax2.plot(history['epoch'], history['spectrum_loss'], 'orange', label='Spectrum Loss', alpha=0.7)
-        for i, record in enumerate(trainer.layer_history):
-            if i > 0:
-                transition_epoch = sum(r['epochs_trained'] for r in trainer.layer_history[:i])
-                ax2.axvline(x=transition_epoch, color='gray', linestyle='--', alpha=0.5)
-        ax2.set_title('Regularization Losses (Progressive Layers)')
+        ax2.set_title('Regularization Losses')
         ax2.set_xlabel('Global Epoch')
         ax2.set_ylabel('Loss')
         ax2.grid(True, alpha=0.3)
