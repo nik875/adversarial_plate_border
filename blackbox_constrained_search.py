@@ -814,16 +814,36 @@ class BlackBoxPatchOptimizer:
 
                     # Evaluate fitness for each solution
                     fitness_values = []
+                    # Save debug images on the very first generation only
+                    save_gen_debug = getattr(self, '_save_gen_debug', True)
                     for sol_idx, z in enumerate(solutions):
                         # Debug: print first 5 samples for the first individual of each generation
                         if sol_idx == 0:
                             self._debug_next_eval = True
+
+                        # Save patch + one composite per individual (first generation only)
+                        if save_gen_debug:
+                            import cv2
+                            debug_dir = Path("debug_output")
+                            debug_dir.mkdir(exist_ok=True)
+                            patch_debug = self.generate_patch(z)
+                            patch_np = (patch_debug.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                            Image.fromarray(patch_np).save(str(debug_dir / f"gen0_ind{sol_idx:02d}_patch.png"))
+                            # Apply to first test image
+                            test_img = self.test_images[0]
+                            composited = self.apply_patch_ocr_mode(test_img, patch_debug)
+                            cv2.imwrite(str(debug_dir / f"gen0_ind{sol_idx:02d}_composited.jpg"),
+                                        cv2.cvtColor(composited, cv2.COLOR_RGB2BGR))
+
                         try:
                             fitness = self.evaluate_fitness(z, oracle)
                             fitness_values.append(fitness)
                         except Exception as e:
                             print(f"Warning: Fitness evaluation failed: {e}")
                             fitness_values.append(float('inf'))
+                    if save_gen_debug:
+                        self._save_gen_debug = False
+                        print(f"  [DEBUG] Saved patch + composite for {len(solutions)} individuals to debug_output/gen0_ind*")
 
                     # Tell CMA-ES the results
                     es.tell(solutions, fitness_values)
