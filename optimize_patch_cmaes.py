@@ -693,11 +693,67 @@ def main():
             comp_grey_bgr = cv2.cvtColor(comp_grey_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_composited_grey_rect.png"), comp_grey_bgr)
 
+            # Debug 3: Composite grey rectangle on ORIGINAL patch (no downscaling)
+            # Get original patch dimensions
+            patch_h, patch_w = first_patch.shape[1], first_patch.shape[2]
+
+            # Create grey base at original patch size
+            grey_base_orig = torch.full((3, patch_h, patch_w), 0.5, dtype=torch.float32)
+
+            # Create mask for center region at original size
+            center_h_orig = int(patch_h * center_ratio)
+            center_w_orig = int(patch_w * center_ratio)
+            pad_h_orig = (patch_h - center_h_orig) // 2
+            pad_w_orig = (patch_w - center_w_orig) // 2
+
+            center_mask_orig = torch.zeros(1, patch_h, patch_w, dtype=torch.float32)
+            center_mask_orig[:, pad_h_orig:pad_h_orig + center_h_orig, pad_w_orig:pad_w_orig + center_w_orig] = 1.0
+            center_mask_orig = center_mask_orig.expand(3, -1, -1)
+
+            # Composite at original resolution
+            composite_orig = grey_base_orig * center_mask_orig + first_patch * (1 - center_mask_orig)
+            composite_orig = torch.clamp(composite_orig, 0, 1)
+
+            # Save
+            comp_orig_np = (composite_orig.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            comp_orig_bgr = cv2.cvtColor(comp_orig_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_composited_original_res.png"), comp_orig_bgr)
+
+            # Debug 4: Downscale patch to 64x128, then composite small grey square off-center
+            patch_small = F.interpolate(
+                first_patch.unsqueeze(0),
+                size=(64, 128),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)  # [3, 64, 128]
+
+            # Create small grey square (32x32) at position (10, 20) - top-left offset
+            grey_square = torch.full((3, 64, 128), 0.0, dtype=torch.float32)  # Start with zeros
+            square_size = 32
+            offset_y, offset_x = 10, 20
+            grey_square[:, offset_y:offset_y+square_size, offset_x:offset_x+square_size] = 0.5
+
+            # Create mask for the square
+            square_mask = torch.zeros(1, 64, 128, dtype=torch.float32)
+            square_mask[:, offset_y:offset_y+square_size, offset_x:offset_x+square_size] = 1.0
+            square_mask = square_mask.expand(3, -1, -1)
+
+            # Composite: grey square overlaid on patch
+            composite_small = patch_small * (1 - square_mask) + grey_square * square_mask
+            composite_small = torch.clamp(composite_small, 0, 1)
+
+            # Save
+            comp_small_np = (composite_small.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            comp_small_bgr = cv2.cvtColor(comp_small_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_64x128_with_grey_square.png"), comp_small_bgr)
+
             print(f"  Saved to {debug_dir}/")
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
             print(f"    - patch_downscaled_quantized.png (float → uint8 → float → downscale)")
-            print(f"    - patch_composited_grey_rect.png (patch on border, grey in center)")
+            print(f"    - patch_composited_grey_rect.png (patch on border, grey in center, downscaled)")
+            print(f"    - patch_composited_original_res.png (patch on border, grey in center, NO downscale)")
+            print(f"    - patch_64x128_with_grey_square.png (patch @ 64x128 with 32x32 grey square at offset)")
 
         # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
         print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
