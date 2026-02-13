@@ -591,10 +591,11 @@ class BottleneckDenseRefiner(nn.Module):
             # spatial_scale_weights[:, scale_idx:scale_idx+1]: [B, 1, H, W]
             refined_patches = refined_patches + spatial_scale_weights[:, scale_idx:scale_idx+1] * scale_output
 
-        # Apply sigmoid to bound to [0, 1]
-        refined_patches = torch.sigmoid(refined_patches)
+        # Apply nonlinearity before final smoothing (Sigmoid is applied at the end of post_expansion_smooth)
+        refined_patches = torch.nn.functional.silu(refined_patches)
 
         # Apply post-multi-scale smoothing with progressive kernel sizes
+        # Final Sigmoid in this layer ensures output is in [0, 1]
         refined_patches = self.post_expansion_smooth(refined_patches)  # [B, 3, H, W]
 
         return refined_patches
