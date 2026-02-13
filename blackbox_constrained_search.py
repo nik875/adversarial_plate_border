@@ -831,9 +831,20 @@ class BlackBoxPatchOptimizer:
                             Image.fromarray(patch_np).save(str(debug_dir / f"gen0_ind{sol_idx:02d}_patch.png"))
                             # Apply to first test image
                             test_img = self.test_images[0]
+                            H, W = test_img.shape[:2]
+                            # Save resized patch (what actually gets composited)
+                            patch_resized = F.interpolate(
+                                patch_debug.unsqueeze(0), size=(H, W),
+                                mode='bilinear', align_corners=False
+                            ).squeeze(0)
+                            resized_np = (patch_resized.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                            Image.fromarray(resized_np).save(str(debug_dir / f"gen0_ind{sol_idx:02d}_patch_resized.png"))
                             composited = self.apply_patch_ocr_mode(test_img, patch_debug)
                             cv2.imwrite(str(debug_dir / f"gen0_ind{sol_idx:02d}_composited.jpg"),
                                         cv2.cvtColor(composited, cv2.COLOR_RGB2BGR))
+                            # Also log image dimensions for first individual
+                            if sol_idx == 0:
+                                print(f"  [DEBUG] Test image size: {W}x{H} (WxH), patch size: {patch_debug.shape[1]}x{patch_debug.shape[2]}")
 
                         try:
                             fitness = self.evaluate_fitness(z, oracle)
