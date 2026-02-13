@@ -97,7 +97,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     else:
         combined_dataset = datasets_to_combine[0]
 
-    # Load all validation samples upfront
+    # Load all validation samples upfront (no downsampling - we'll sample per iteration)
     images = []
     dimensions = []
     failed_samples = []
@@ -116,13 +116,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
             error_msg = f"{type(e).__name__}: {e}"
             failed_samples.append((combined_idx, error_msg))
 
-    # Randomly select down to requested number
-    if len(images) > num_samples:
-        indices_to_keep = random.sample(range(len(images)), num_samples)
-        images = [images[i] for i in sorted(indices_to_keep)]
-        dimensions = [dimensions[i] for i in sorted(indices_to_keep)]
-
-    print(f"Loaded {len(images)} validation samples")
+    print(f"Loaded {len(images)} validation samples (will sample {min(num_samples, len(images))} per iteration)")
     if failed_samples:
         print(f"Failed to load {len(failed_samples)} samples", file=sys.stderr)
 
@@ -1049,6 +1043,9 @@ def main():
     best_z = [None]
     current_iteration = [0]  # Track current iteration
     all_edit_distances = []  # Track all edit distances for progress bar
+    sampled_indices = []  # Will hold random sample indices for current iteration
+    sampled_val_images = []  # Will hold sampled validation images
+    sampled_control_texts = []  # Will hold sampled control texts
 
     def objective(z, candidate_idx=None):
         """Objective function: returns negative edit distance (CMA-ES minimizes)."""
@@ -1067,28 +1064,28 @@ def main():
             patch_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_patch.png"
             cv2.imwrite(str(patch_path), patch_bgr)
 
-        # Evaluate on validation set with optional debug output
+        # Evaluate on sampled validation set with optional debug output
         if save_debug:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch_with_debug(
-                patch, val_images, ocr, control_texts,
+                patch, sampled_val_images, ocr, sampled_control_texts,
                 center_ratio=args.center_ratio,
                 debug_dir=debug_dir,
                 candidate_idx=candidate_idx
             )
         else:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch(
-                patch, val_images, ocr, control_texts,
+                patch, sampled_val_images, ocr, sampled_control_texts,
                 center_ratio=args.center_ratio
             )
 
         # Track for progress bar
         all_edit_distances.append(avg_edit_dist)
 
-        # Track best
+        # Track best (compute percentage against full validation set for consistency)
         if total_edit_dist > best_edit_distance[0]:
             best_edit_distance[0] = total_edit_dist
             best_avg_edit_distance[0] = avg_edit_dist
-            best_misread_pct[0] = (misreads / len(val_images) * 100) if len(val_images) > 0 else 0
+            best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
             best_z[0] = z.copy()
 
         # Return negative edit distance (CMA-ES minimizes, we want to maximize)
@@ -1116,7 +1113,9 @@ def main():
 
     # Run optimization
     print(f"\nStarting CMA-ES optimization...")
-    print(f"Evaluating on {len(val_images)} validation samples per iteration")
+    num_samples_to_use = min(args.n_eval_samples, len(val_images))
+    print(f"Full validation set: {len(val_images)} samples")
+    print(f"Sampling {num_samples_to_use} samples randomly each iteration (different subset per iteration)")
     print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
     print("=" * 80)
 
@@ -1134,6 +1133,12 @@ def main():
             tqdm.write(f"[First iteration: saving debug output to {debug_dir}]")
 
         current_iteration[0] = iteration  # Update iteration counter for objective function
+
+        # Randomly sample validation subset for this iteration
+        num_samples_to_use = min(args.n_eval_samples, len(val_images))
+        sampled_indices = random.sample(range(len(val_images)), num_samples_to_use)
+        sampled_val_images = [val_images[i] for i in sampled_indices]
+        sampled_control_texts = [control_texts[i] for i in sampled_indices]
 
         # Clear edit distances for this iteration
         all_edit_distances.clear()
