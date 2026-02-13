@@ -1033,8 +1033,11 @@ def main():
     if best_z[0] is not None:
         best_patch = generate_patch_from_z(generator, best_z[0], device)
 
+        # Clamp to [0, 1] to match compositing behavior
+        best_patch_clamped = torch.clamp(best_patch, 0, 1)
+
         # Save as PNG
-        patch_np = (best_patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        patch_np = (best_patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
         patch_path = output_dir / "best_patch.png"
         cv2.imwrite(str(patch_path), patch_bgr)
