@@ -630,6 +630,9 @@ class BlackBoxPatchOptimizer:
             test_indices = range(len(self.test_images))
 
         results = []
+        # Debug: print first 5 samples for the first individual per generation
+        debug_this_eval = getattr(self, '_debug_next_eval', False)
+        debug_count = 0
 
         for idx in test_indices:
             image = self.test_images[idx]
@@ -641,6 +644,11 @@ class BlackBoxPatchOptimizer:
 
             # Query oracle (OCR-only, no corners needed)
             detected_text = oracle.query(patched_image) or ""
+
+            if debug_this_eval and debug_count < 5:
+                status = "CHANGED" if detected_text != control_text else "SAME"
+                print(f"  [DEBUG] img={idx} | control='{control_text}' | patched='{detected_text}' | {status}")
+                debug_count += 1
 
             if self.disruption_mode:
                 # Disruption: want patch to change OCR output (match predict_composites.py)
@@ -659,6 +667,9 @@ class BlackBoxPatchOptimizer:
                     edit_dist = self._levenshtein_distance(detected_text, self.target_plate)
                     max_len = max(len(detected_text), len(self.target_plate))
                     results.append(edit_dist / max_len if max_len > 0 else 1.0)
+
+        if debug_this_eval:
+            self._debug_next_eval = False
 
         # Return mean fitness across all test images
         return np.mean(results)
@@ -774,7 +785,10 @@ class BlackBoxPatchOptimizer:
 
                     # Evaluate fitness for each solution
                     fitness_values = []
-                    for z in solutions:
+                    for sol_idx, z in enumerate(solutions):
+                        # Debug: print first 5 samples for the first individual of each generation
+                        if sol_idx == 0:
+                            self._debug_next_eval = True
                         try:
                             fitness = self.evaluate_fitness(z, oracle)
                             fitness_values.append(fitness)
