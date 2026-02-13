@@ -153,19 +153,26 @@ def main():
     print(f"  Patch shape: {patch.shape}")
     print(f"  Before clamp - Min: {patch.min():.6f}, Max: {patch.max():.6f}, Mean: {patch.mean():.6f}")
 
+    # Save original (unclamped) version
+    patch_orig_np = (patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    patch_orig_bgr = cv2.cvtColor(patch_orig_np, cv2.COLOR_RGB2BGR)
+    orig_output_path = output_dir / "best_patch_orig.png"
+    cv2.imwrite(str(orig_output_path), patch_orig_bgr)
+    print(f"\n✓ Saved original (unclamped) patch to: {orig_output_path}")
+
     # Clamp to [0, 1]
     patch_clamped = torch.clamp(patch, 0, 1)
 
     print(f"  After clamp  - Min: {patch_clamped.min():.6f}, Max: {patch_clamped.max():.6f}, Mean: {patch_clamped.mean():.6f}")
 
-    # Save as PNG
+    # Save clamped version
     patch_np = (patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
 
     output_path = output_dir / "best_patch.png"
     cv2.imwrite(str(output_path), patch_bgr)
 
-    print(f"\n✓ Saved regenerated patch to: {output_path}")
+    print(f"✓ Saved clamped patch to: {output_path}")
 
 
 if __name__ == '__main__':
