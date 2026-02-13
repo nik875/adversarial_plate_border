@@ -356,13 +356,14 @@ def generate_patch_from_z(generator, z, device):
     return patch
 
 
-def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
+def evaluate_patch(patch, val_images, alpr, control_texts, center_ratio=0.6):
     """Evaluate a patch by computing edit distance between control and composite OCR.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
         alpr: fast-alpr instance for OCR
+        control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
 
     Returns:
@@ -372,26 +373,18 @@ def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
     misreads = 0
     num_evaluated = 0
 
-    for val_image in val_images:
+    for val_image, control_text in zip(val_images, control_texts):
         try:
             # Create composite (with patch)
             composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
             composite = composite.squeeze(0)  # Remove batch dim
 
-            # Create control (with grey border)
-            control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
-            control = control.squeeze(0)  # Remove batch dim
-
             # Convert to numpy for OCR
             composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Run OCR
+            # Run OCR on composite only (control already precomputed)
             composite_result = alpr.ocr.predict(composite_np)
-            control_result = alpr.ocr.predict(control_np)
-
             composite_text = composite_result.text if composite_result is not None else ""
-            control_text = control_result.text if control_result is not None else ""
 
             # Calculate Levenshtein edit distance
             edit_dist = Levenshtein.distance(control_text, composite_text)
@@ -412,13 +405,14 @@ def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
     return total_edit_distance, misreads, avg_edit_distance
 
 
-def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+def evaluate_patch_with_debug(patch, val_images, alpr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
     """Evaluate a patch and save debug images for all validation samples.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
         alpr: fast-alpr instance for OCR
+        control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
         debug_dir: Directory to save debug images
         candidate_idx: Index of the candidate being evaluated
@@ -431,26 +425,18 @@ def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_d
     num_evaluated = 0
     debug_results = []
 
-    for img_idx, val_image in enumerate(val_images):
+    for img_idx, (val_image, control_text) in enumerate(zip(val_images, control_texts)):
         try:
             # Create composite (with patch)
             composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
             composite = composite.squeeze(0)  # Remove batch dim
 
-            # Create control (with grey border)
-            control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
-            control = control.squeeze(0)  # Remove batch dim
-
             # Convert to numpy for OCR
             composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Run OCR
+            # Run OCR on composite only (control already precomputed)
             composite_result = alpr.ocr.predict(composite_np)
-            control_result = alpr.ocr.predict(control_np)
-
             composite_text = composite_result.text if composite_result is not None else ""
-            control_text = control_result.text if control_result is not None else ""
 
             # Calculate Levenshtein edit distance
             edit_dist = Levenshtein.distance(control_text, composite_text)
@@ -470,7 +456,10 @@ def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_d
                 comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
                 cv2.imwrite(str(comp_path), composite_bgr)
 
-                # Save control
+                # Save control (regenerate for debug visualization)
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
+                control = control.squeeze(0)
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
                 ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
                 cv2.imwrite(str(ctrl_path), control_bgr)
@@ -616,6 +605,29 @@ def main():
     )
     print("fast-alpr loaded")
 
+    # Precompute control OCR outputs once (with grey border)
+    print("\nPrecomputing control OCR outputs...")
+    control_texts = []
+    for val_image in tqdm(val_images, desc="Control OCR"):
+        try:
+            # Create control (with grey border)
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control = control.squeeze(0)  # Remove batch dim
+
+            # Convert to numpy for OCR
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Run OCR
+            control_result = alpr.ocr.predict(control_np)
+            control_text = control_result.text if control_result is not None else ""
+            control_texts.append(control_text)
+
+        except Exception as e:
+            # Treat errors as empty string
+            control_texts.append("")
+
+    print(f"Precomputed {len(control_texts)} control OCR outputs")
+
     # Create debug output directory
     debug_dir = output_dir / "debug_output"
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -649,14 +661,15 @@ def main():
         # Evaluate on validation set with optional debug output
         if save_debug:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch_with_debug(
-                patch, val_images, alpr,
+                patch, val_images, alpr, control_texts,
                 center_ratio=args.center_ratio,
                 debug_dir=debug_dir,
                 candidate_idx=candidate_idx
             )
         else:
             total_edit_dist, misreads, avg_edit_dist = evaluate_patch(
-                patch, val_images, alpr, center_ratio=args.center_ratio
+                patch, val_images, alpr, control_texts,
+                center_ratio=args.center_ratio
             )
 
         # Track for progress bar
