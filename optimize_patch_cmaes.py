@@ -379,10 +379,10 @@ def create_ocr_model(ocr_model_type, white_box=False):
         return alpr.ocr  # Return the OCR component
 
     elif ocr_model_type == 'opencv-crnn':
-        # OpenCV CRNN ONNX model
-        print("Initializing OpenCV CRNN OCR model (ONNX)...")
+        # CRNN ONNX model using ONNX Runtime
+        print("Initializing CRNN OCR model (ONNX Runtime)...")
         try:
-            import cv2
+            import onnxruntime as ort
 
             crnn_model_path = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
             crnn_dict_path = Path("alphabet_en.txt")
@@ -400,44 +400,54 @@ def create_ocr_model(ocr_model_type, white_box=False):
                 )
 
             print(f"Loading CRNN network from {crnn_model_path}...")
-            # Load ONNX model
-            net = cv2.dnn.readNetFromONNX(str(crnn_model_path))
+            # Load ONNX model with ONNX Runtime
+            session = ort.InferenceSession(str(crnn_model_path), providers=['CPUExecutionProvider'])
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
             class CRNNWrapper:
-                def __init__(self, net, alphabet):
-                    self.net = net
+                def __init__(self, session, alphabet):
+                    self.session = session
                     self.alphabet = alphabet
+                    # Get input and output names
+                    self.input_name = session.get_inputs()[0].name
+                    self.output_name = session.get_outputs()[0].name
 
                 def predict(self, image):
                     """Predict text from image using CRNN."""
+                    import cv2
+
                     # Convert to grayscale if needed
                     if len(image.shape) == 3:
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-                    # CRNN expects 32x128 input
-                    blob = cv2.dnn.blobFromImage(image, 1.0 / 127.5, (128, 32),
-                                                 (127.5, 127.5, 127.5),
-                                                 swapRB=False, crop=False)
-                    self.net.setInput(blob)
-                    output = self.net.forward()
+                    # CRNN expects 32x128 input, normalize to [0, 1]
+                    resized = cv2.resize(image, (128, 32))
+                    normalized = resized.astype(np.float32) / 255.0
+
+                    # Add batch and channel dimensions: [1, 1, 32, 128]
+                    input_blob = np.expand_dims(np.expand_dims(normalized, 0), 0)
+
+                    # Run inference
+                    output = self.session.run([self.output_name], {self.input_name: input_blob})
+                    output = output[0]  # Get first output
 
                     # Decode output to text
-                    # Output shape: [1, num_steps, num_classes] or similar
-                    output = output.squeeze()
-                    if len(output.shape) > 2:
-                        output = output.transpose(1, 0)  # [num_steps, num_classes]
-
-                    # Get character indices
-                    indices = np.argmax(output, axis=1)
+                    # Output shape: [batch, seq_len, num_classes]
+                    output = output.squeeze(0)  # Remove batch dimension
+                    if len(output.shape) > 1:
+                        # [seq_len, num_classes]
+                        indices = np.argmax(output, axis=1)
+                    else:
+                        indices = np.array([np.argmax(output)])
 
                     # Decode to text
                     text = ''
                     prev_idx = -1
                     for idx in indices:
                         if idx > 0 and idx != prev_idx:  # Skip blank (0)
-                            text += self.alphabet[idx - 1]
+                            if idx - 1 < len(self.alphabet):
+                                text += self.alphabet[idx - 1]
                         prev_idx = idx
 
                     class Result:
@@ -446,11 +456,15 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
                     return Result(text)
 
-            crnn = CRNNWrapper(net, alphabet)
+            crnn = CRNNWrapper(session, alphabet)
             return crnn
 
+        except ImportError:
+            print("Error: onnxruntime not installed. Install with: pip install onnxruntime",
+                  file=sys.stderr)
+            sys.exit(1)
         except Exception as e:
-            print(f"Error: Could not initialize OpenCV CRNN: {e}", file=sys.stderr)
+            print(f"Error: Could not initialize CRNN: {e}", file=sys.stderr)
             sys.exit(1)
 
     else:
@@ -657,9 +671,9 @@ def main():
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
             try:
-                import cv2
+                import onnxruntime
             except ImportError:
-                print("Error: opencv-python not installed. Install with: pip install opencv-python",
+                print("Error: onnxruntime not installed. Install with: pip install onnxruntime",
                       file=sys.stderr)
                 sys.exit(1)
 
