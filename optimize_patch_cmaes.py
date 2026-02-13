@@ -239,15 +239,64 @@ def load_generator(run_dir):
     except ImportError:
         raise ImportError("Could not import FoundationPatchGenerator from progressive_patch.py")
 
-    # Find the latest checkpoint
-    checkpoint_dir = Path(run_dir)
-    checkpoint_files = sorted(checkpoint_dir.glob("generator_epoch_*.pt"))
+    # Search for checkpoints in this priority order:
+    # 1. training_complete_final_model (final checkpoint at end of training)
+    # 2. best_progressive_patch (best model during training)
+    # 3. checkpoint_epoch_XXXX (periodic checkpoints)
+    # 4. Any other directories with generator_epoch_*.pt files
 
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No generator checkpoint files found in {run_dir}")
+    run_path = Path(run_dir)
+    latest_checkpoint = None
+    checkpoint_source = None
 
-    latest_checkpoint = checkpoint_files[-1]
+    # Priority 1: Final training checkpoint
+    final_dir = run_path / "training_complete_final_model"
+    if final_dir.exists() and final_dir.is_dir():
+        checkpoint_files = sorted(final_dir.glob("generator_epoch_*.pt"))
+        if checkpoint_files:
+            latest_checkpoint = checkpoint_files[-1]
+            checkpoint_source = "final training checkpoint"
+
+    # Priority 2: Best model checkpoint
+    if latest_checkpoint is None:
+        best_dir = run_path / "best_progressive_patch"
+        if best_dir.exists() and best_dir.is_dir():
+            checkpoint_files = sorted(best_dir.glob("generator_epoch_*.pt"))
+            if checkpoint_files:
+                latest_checkpoint = checkpoint_files[-1]
+                checkpoint_source = "best model checkpoint"
+
+    # Priority 3: Latest periodic checkpoint
+    if latest_checkpoint is None:
+        checkpoint_dirs = sorted([d for d in run_path.iterdir()
+                                 if d.is_dir() and d.name.startswith("checkpoint_epoch_")])
+        if checkpoint_dirs:
+            latest_checkpoint_dir = checkpoint_dirs[-1]
+            checkpoint_files = sorted(latest_checkpoint_dir.glob("generator_epoch_*.pt"))
+            if checkpoint_files:
+                latest_checkpoint = checkpoint_files[-1]
+                checkpoint_source = f"periodic checkpoint ({latest_checkpoint_dir.name})"
+
+    # Priority 4: Any other checkpoint directory
+    if latest_checkpoint is None:
+        # Search all subdirectories for generator checkpoints
+        all_checkpoints = sorted(run_path.glob("**/generator_epoch_*.pt"))
+        if all_checkpoints:
+            latest_checkpoint = all_checkpoints[-1]
+            checkpoint_source = f"found in {latest_checkpoint.parent.name}"
+
+    if latest_checkpoint is None:
+        raise FileNotFoundError(
+            f"No generator checkpoint files found in {run_dir}\n"
+            f"Searched for:\n"
+            f"  - training_complete_final_model/generator_epoch_*.pt\n"
+            f"  - best_progressive_patch/generator_epoch_*.pt\n"
+            f"  - checkpoint_epoch_*/generator_epoch_*.pt\n"
+            f"  - **/generator_epoch_*.pt"
+        )
+
     print(f"Loading checkpoint: {latest_checkpoint}")
+    print(f"  Source: {checkpoint_source}")
 
     # Load checkpoint
     checkpoint = torch.load(latest_checkpoint, map_location='cpu')
