@@ -109,12 +109,18 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     min_width = 213
     min_height = 106
 
-    # Randomly select validation indices to load
-    selected_indices = random.sample(val_indices, min(num_samples, len(val_indices)))
-
-    print(f"\nLoading {len(selected_indices)} validation samples from combined dataset...")
+    print(f"\nLoading validation samples from combined dataset...")
     print(f"Filtering: minimum size {min_width}×{min_height} (W×H)")
-    for combined_idx in selected_indices:
+
+    # Keep loading until we have enough valid samples
+    loaded_valid = 0
+    available_indices = list(val_indices)
+    random.shuffle(available_indices)
+
+    for combined_idx in available_indices:
+        if loaded_valid >= num_samples:
+            break
+
         try:
             item = combined_dataset[combined_idx]
             img_tensor = item['prep_image']
@@ -128,22 +134,16 @@ def load_validation_samples_from_csv(csv_path, num_samples):
 
             images.append(img_tensor)
             dimensions.append((width, height))
+            loaded_valid += 1
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             print(f"  Warning: Failed to load sample {combined_idx}: {error_msg}", file=sys.stderr)
             failed_samples.append((combined_idx, error_msg))
 
-    print(f"Loaded {len(images)} validation samples")
-    if rejected_samples:
-        print(f"Rejected {len(rejected_samples)} samples (too small):")
-        for idx, w, h in rejected_samples[:5]:  # Show first 5
-            print(f"  Index {idx}: {w}×{h}", file=sys.stderr)
-        if len(rejected_samples) > 5:
-            print(f"  ... and {len(rejected_samples) - 5} more", file=sys.stderr)
+    print(f"Loaded {len(images)} valid validation samples")
+    print(f"Rejected {len(rejected_samples)} samples (too small)")
     if failed_samples:
         print(f"Failed to load {len(failed_samples)} samples:", file=sys.stderr)
-        for idx, error in failed_samples:
-            print(f"  Index {idx}: {error}", file=sys.stderr)
 
     return images, dimensions
 
