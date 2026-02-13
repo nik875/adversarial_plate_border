@@ -385,7 +385,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
             import onnx
             from onnx2pytorch import ConvertModel
 
-            crnn_model_path = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
+            crnn_model_path = Path("CRNN_VGG_BiLSTM_CTC.onnx")
             crnn_dict_path = Path("alphabet_36.txt")
 
             if not crnn_model_path.exists():
