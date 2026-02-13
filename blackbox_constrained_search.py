@@ -122,9 +122,11 @@ class BlackBoxPatchOptimizer:
 
         # Load test images from the same OCR datasets used during training
         self.test_images = []
-        self.test_corners = []
         self._load_from_ocr_dataset(split_df, val_indices)
         print(f"Loaded {len(self.test_images)} test images from OCR dataset")
+
+        # Control predictions will be cached on first oracle query
+        self.control_predictions = None
 
     def _load_generator(self, checkpoint_path: str, generator_type: str):
         """Load frozen FoundationPatchGenerator from checkpoint"""
@@ -206,21 +208,11 @@ class BlackBoxPatchOptimizer:
             val_count = len([i for i in dataset_samples.keys() if i < global_idx and i >= (global_idx - local_idx)])
             print(f"  Loaded {local_idx} samples (selected {val_count} for validation)")
 
-        # Extract images and texts in index order
+        # Extract images in index order
         for idx in sorted(val_indices):
             if idx in dataset_samples:
                 img_np, text = dataset_samples[idx]
                 self.test_images.append(img_np)
-                # For OCR-mode datasets, create dummy corners (center of image)
-                h, w = img_np.shape[:2]
-                center_x, center_y = w / 2, h / 2
-                corners = np.array([
-                    [center_x - w/4, center_y - h/4],
-                    [center_x + w/4, center_y - h/4],
-                    [center_x + w/4, center_y + h/4],
-                    [center_x - w/4, center_y + h/4]
-                ], dtype=np.float32)
-                self.test_corners.append(corners)
 
     def _load_test_images(self, test_images_dir: str):
         """
@@ -307,6 +299,51 @@ class BlackBoxPatchOptimizer:
 
             self.test_images.append(image_np)
             self.test_corners.append(corners)
+
+    def apply_patch_ocr_mode(self, image: np.ndarray, patch: torch.Tensor,
+                             center_ratio: float = 0.6) -> np.ndarray:
+        """
+        Apply patch to cropped plate image (same method as composite_with_data.py).
+
+        Keeps center region (plate text) and replaces outer border with patch.
+
+        Args:
+            image: [H, W, 3] numpy array, uint8, range [0, 255]
+            patch: [3, H_patch, W_patch] tensor, range [0, 1]
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
+
+        Returns:
+            patched_image: [H, W, 3] numpy array, uint8, range [0, 255]
+        """
+        H, W = image.shape[:2]
+
+        # Convert image to tensor [1, 3, H, W] in [0, 1]
+        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+
+        # Resize patch to match image dimensions
+        patch_resized = F.interpolate(
+            patch.unsqueeze(0),
+            size=(H, W),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(H * center_ratio)
+        center_w = int(W * center_ratio)
+        pad_h = (H - center_h) // 2
+        pad_w = (W - center_w) // 2
+
+        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32)
+        center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
+        center_mask = center_mask.expand(-1, 3, -1, -1)
+
+        # Blend: keep original in center, use patch on borders
+        result = image_tensor * center_mask + patch_resized * (1 - center_mask)
+        result = torch.clamp(result, 0, 1)
+
+        # Convert back to numpy
+        return (result.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
     def generate_patch(self, z: np.ndarray) -> torch.Tensor:
         """
@@ -505,9 +542,26 @@ class BlackBoxPatchOptimizer:
 
         return result
 
+    def _compute_control_predictions(self, oracle: BaseBlackBoxOracle):
+        """
+        Compute and cache control predictions (OCR without patch) for all test images.
+        This establishes the baseline that patches are compared against.
+        """
+        print("Computing control predictions (no patch)...")
+        self.control_predictions = []
+        for image in tqdm(self.test_images, desc="Control OCR"):
+            detected_text = oracle.query(image)
+            self.control_predictions.append(detected_text or "")
+        print(f"Control predictions computed for {len(self.control_predictions)} images")
+
     def evaluate_fitness(self, z: np.ndarray, oracle: BaseBlackBoxOracle) -> float:
         """
         Evaluate fitness of latent code z using black-box oracle.
+
+        Disruption mode: fitness = fraction of images where OCR output is UNCHANGED
+        (lower is better - we want the patch to change predictions).
+
+        Impersonation mode: fitness based on edit distance to target plate.
 
         Args:
             z: Latent code [latent_dim] in range [0, 1]
@@ -516,55 +570,46 @@ class BlackBoxPatchOptimizer:
         Returns:
             fitness: Scalar fitness value (lower is better for CMA-ES)
         """
+        # Cache control predictions on first call
+        if self.control_predictions is None:
+            self._compute_control_predictions(oracle)
+
         # Generate patch
         patch = self.generate_patch(z)
 
         if len(self.test_images) == 0:
-            raise ValueError("No test images loaded. Provide test_images_dir.")
+            raise ValueError("No test images loaded.")
 
         # Use pre-sampled indices (same for all individuals in a generation)
         if hasattr(self, '_current_test_indices') and self._current_test_indices is not None:
-            test_images = [self.test_images[i] for i in self._current_test_indices]
-            test_corners = [self.test_corners[i] for i in self._current_test_indices]
+            test_indices = self._current_test_indices
         else:
-            test_images = self.test_images
-            test_corners = self.test_corners
+            test_indices = range(len(self.test_images))
 
         results = []
 
-        for image, corners in zip(test_images, test_corners):
-            # Crop to border region if in OCR mode
-            if self.ocr_mode:
-                image, corners = self.crop_to_border_region(image, corners)
+        for idx in test_indices:
+            image = self.test_images[idx]
+            control_text = self.control_predictions[idx]
 
-            # Apply patch
-            patched_image = self.apply_patch_to_image(image, corners, patch)
+            # Apply patch using OCR mode (center-preserving border replacement)
+            # Same method as composite_with_data.py
+            patched_image = self.apply_patch_ocr_mode(image, patch)
 
-            # Apply plate blur if enabled (helps when optimization is stuck)
-            if self.plate_blur_sigma > 0:
-                patched_image = self.apply_plate_blur(patched_image, corners, self.plate_blur_sigma)
-
-            # Query oracle
-            # In OCR mode, corners are relative to cropped region, so pass them
-            # In standard mode, pass corners for IoU-based detection selection
-            oracle_corners = corners if self.ocr_mode else corners
-            detected_text = oracle.query(patched_image, oracle_corners)
+            # Query oracle (OCR-only, no corners needed)
+            detected_text = oracle.query(patched_image) or ""
 
             if self.disruption_mode:
-                # Disruption: want no detection (None)
-                if detected_text is None:
-                    results.append(0.0)  # Perfect
+                # Disruption: want patch to change OCR output (match predict_composites.py)
+                if detected_text != control_text:
+                    results.append(0.0)  # Success: prediction changed
                 else:
-                    # Partial credit for wrong text
-                    if self.target_plate and detected_text != self.target_plate:
-                        results.append(0.5)
-                    else:
-                        results.append(1.0)  # Detected correctly
+                    results.append(1.0)  # Failure: prediction unchanged
             else:
                 # Impersonation: want target_plate detected
                 if detected_text == self.target_plate:
                     results.append(0.0)  # Perfect
-                elif detected_text is None:
+                elif detected_text is None or detected_text == "":
                     results.append(1.0)  # No detection
                 else:
                     # Compute edit distance
