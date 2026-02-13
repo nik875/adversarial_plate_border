@@ -401,6 +401,90 @@ def evaluate_patch(patch, val_images, alpr, center_ratio=0.6):
     return misreads
 
 
+def evaluate_patch_with_debug(patch, val_images, alpr, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+    """Evaluate a patch and save debug images for all validation samples.
+
+    Args:
+        patch: [3, H, W] tensor in [0, 1]
+        val_images: List of validation image tensors [3, H, W] in [0, 1]
+        alpr: fast-alpr instance for OCR
+        center_ratio: Center ratio for compositing
+        debug_dir: Directory to save debug images
+        candidate_idx: Index of the candidate being evaluated
+
+    Returns:
+        num_misreads: Number of images where composite OCR differs from control OCR
+    """
+    misreads = 0
+    debug_results = []
+
+    for img_idx, val_image in enumerate(val_images):
+        try:
+            # Create composite (with patch)
+            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+            composite = composite.squeeze(0)  # Remove batch dim
+
+            # Create control (with grey border)
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
+            control = control.squeeze(0)  # Remove batch dim
+
+            # Convert to numpy for OCR
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Run OCR
+            composite_result = alpr.ocr.predict(composite_np)
+            control_result = alpr.ocr.predict(control_np)
+
+            composite_text = composite_result.text if composite_result is not None else ""
+            control_text = control_result.text if control_result is not None else ""
+
+            # Count misread if texts differ
+            is_misread = (composite_text != control_text)
+            if is_misread:
+                misreads += 1
+
+            # Save debug images
+            if debug_dir is not None:
+                # Save composite
+                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+                comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
+                cv2.imwrite(str(comp_path), composite_bgr)
+
+                # Save control
+                control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+                ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
+                cv2.imwrite(str(ctrl_path), control_bgr)
+
+                # Track results
+                debug_results.append({
+                    'img_idx': img_idx,
+                    'control_text': control_text,
+                    'composite_text': composite_text,
+                    'is_misread': is_misread,
+                })
+
+        except Exception as e:
+            # Treat errors as non-misreads (conservative)
+            pass
+
+    # Save debug summary
+    if debug_dir is not None and debug_results:
+        summary_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_summary.txt"
+        with open(summary_path, 'w') as f:
+            f.write(f"Candidate {candidate_idx} Debug Summary\n")
+            f.write(f"{'=' * 80}\n")
+            f.write(f"Total misreads: {misreads}/{len(val_images)} ({misreads/len(val_images)*100:.1f}%)\n\n")
+            f.write(f"Per-image results:\n")
+            for result in debug_results:
+                status = "MISREAD" if result['is_misread'] else "MATCH"
+                f.write(f"  Image {result['img_idx']:2d}: {status:7s} | "
+                       f"Control: '{result['control_text']:15s}' → "
+                       f"Composite: '{result['composite_text']:15s}'\n")
+
+    return misreads
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='CMA-ES optimization of adversarial patches to maximize misreads.'
@@ -508,20 +592,43 @@ def main():
     )
     print("fast-alpr loaded")
 
+    # Create debug output directory
+    debug_dir = output_dir / "debug_output"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
     # Define objective function for CMA-ES (minimize negative misreads)
     eval_count = [0]  # Track number of evaluations
     best_score = [0]
     best_z = [None]
+    current_iteration = [0]  # Track current iteration
 
-    def objective(z):
+    def objective(z, candidate_idx=None):
         """Objective function: returns negative misreads (CMA-ES minimizes)."""
         eval_count[0] += 1
 
         # Generate patch from z
         patch = generate_patch_from_z(generator, z, device)
 
-        # Evaluate on validation set
-        misreads = evaluate_patch(patch, val_images, alpr, center_ratio=args.center_ratio)
+        # For first iteration only, save debug output
+        save_debug = (current_iteration[0] == 0 and candidate_idx is not None)
+
+        if save_debug:
+            # Save the patch itself
+            patch_np = (patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
+            patch_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_patch.png"
+            cv2.imwrite(str(patch_path), patch_bgr)
+
+        # Evaluate on validation set with optional debug output
+        if save_debug:
+            misreads = evaluate_patch_with_debug(
+                patch, val_images, alpr,
+                center_ratio=args.center_ratio,
+                debug_dir=debug_dir,
+                candidate_idx=candidate_idx
+            )
+        else:
+            misreads = evaluate_patch(patch, val_images, alpr, center_ratio=args.center_ratio)
 
         # Track best
         if misreads > best_score[0]:
@@ -565,8 +672,15 @@ def main():
         print(f"\nIteration {iteration + 1}/{args.maxiter}")
         print(f"  Evaluating {len(solutions)} candidates...")
 
+        # Save debug output for first iteration only
+        if iteration == 0:
+            print(f"  [First iteration: saving debug output to {debug_dir}]")
+
+        current_iteration[0] = iteration  # Update iteration counter for objective function
+
         for i, z in enumerate(solutions):
-            fitness = objective(z)
+            # Pass candidate index only for first iteration
+            fitness = objective(z, candidate_idx=i if iteration == 0 else None)
             fitness_values.append(fitness)
 
         es.tell(solutions, fitness_values)
