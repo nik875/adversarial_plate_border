@@ -776,6 +776,21 @@ def main():
             comp_1x1_bgr = cv2.cvtColor(comp_1x1_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_composited_1x1_white.png"), comp_1x1_bgr)
 
+            # Debug 7: Identity operation - composite patch with all-zeros using all-ones mask
+            # This should return the patch unchanged, but let's see if mask ops introduce artifacts
+            zeros_image = torch.zeros((3, img_h, img_w), dtype=torch.float32)
+            ones_mask = torch.ones((3, img_h, img_w), dtype=torch.float32)
+
+            # Composite: patch everywhere (mask=1), zeros nowhere (mask=0 would show zeros)
+            # Result should be identical to patch_downscaled_float
+            identity_composite = zeros_image * (1 - ones_mask) + patch_downscaled_float * ones_mask
+            identity_composite = torch.clamp(identity_composite, 0, 1)
+
+            # Save
+            identity_np = (identity_composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            identity_bgr = cv2.cvtColor(identity_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_identity_composite.png"), identity_bgr)
+
             print(f"  Saved to {debug_dir}/")
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
@@ -785,6 +800,7 @@ def main():
             print(f"    - patch_64x128_with_grey_square.png (patch @ 64x128 with 32x32 grey square at offset)")
             print(f"    - patch_downscaled_with_white_pixel.png (downscaled patch + 1 white pixel at [0,0])")
             print(f"    - patch_composited_1x1_white.png (composited 1x1 white rect at [0,0] using mask logic)")
+            print(f"    - patch_identity_composite.png (zeros * 0 + patch * 1 - should be identical to patch)")
 
         # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
         print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
