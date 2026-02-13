@@ -28,7 +28,7 @@ import onnx
 import onnx2torch
 from open_image_models import LicensePlateDetector
 from dataset import create_dataloaders
-from progressive_patch import SimplePatchGenerator, FoundationPatchGenerator
+from progressive_patch import FoundationPatchGenerator
 warnings.filterwarnings("ignore")
 
 
