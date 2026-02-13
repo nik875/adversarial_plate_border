@@ -1109,7 +1109,7 @@ def main():
             'verb_disp': 1,
             'verb_log': 0,
             'tolstagnation': np.inf,      # Disable stagnation (plateau) early stopping
-            'tolfun': 1e99,                # Disable function value convergence (set very high)
+            'tolfun': -np.inf,             # Disable function value convergence (set very low)
             'tolflatfitness': np.inf,     # Disable flat fitness early stopping
             'tolxstagnation': np.inf,     # Disable x-space stagnation
             'tolx': -np.inf,               # Disable x convergence
