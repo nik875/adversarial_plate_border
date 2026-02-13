@@ -588,14 +588,29 @@ class BlackBoxPatchOptimizer:
         This matches composite_with_data.py: controls have grey border applied so we
         compare grey border vs patch border (not raw image vs patch border).
         """
+        import cv2
+
+        # Save debug images
+        debug_dir = Path("debug_output")
+        debug_dir.mkdir(exist_ok=True)
+
         print("Computing control predictions (grey border, no patch)...")
         self.control_predictions = []
-        for image in tqdm(self.test_images, desc="Control OCR"):
+        for i, image in enumerate(tqdm(self.test_images, desc="Control OCR")):
             # Apply grey border (matching composite_with_data.py's control condition)
             control_image = self.apply_neutral_border_ocr_mode(image)
             detected_text = oracle.query(control_image)
             self.control_predictions.append(detected_text or "")
+
+            # Save first 10 control images and raw images for debugging
+            if i < 10:
+                raw_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(debug_dir / f"raw_{i:02d}.jpg"), raw_bgr)
+                ctrl_bgr = cv2.cvtColor(control_image, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(debug_dir / f"control_{i:02d}.jpg"), ctrl_bgr)
+
         print(f"Control predictions computed for {len(self.control_predictions)} images")
+        print(f"Debug: saved raw + control images to {debug_dir}/")
 
     def evaluate_fitness(self, z: np.ndarray, oracle: BaseBlackBoxOracle) -> float:
         """
@@ -632,6 +647,8 @@ class BlackBoxPatchOptimizer:
         results = []
         # Debug: print first 5 samples for the first individual per generation
         debug_this_eval = getattr(self, '_debug_next_eval', False)
+        # Save patched images on the very first evaluation only
+        save_debug_images = getattr(self, '_save_debug_images', True)
         debug_count = 0
 
         for idx in test_indices:
@@ -648,6 +665,14 @@ class BlackBoxPatchOptimizer:
             if debug_this_eval and debug_count < 5:
                 status = "CHANGED" if detected_text != control_text else "SAME"
                 print(f"  [DEBUG] img={idx} | control='{control_text}' | patched='{detected_text}' | {status}")
+
+                # Save patched images on first evaluation
+                if save_debug_images:
+                    import cv2
+                    debug_dir = Path("debug_output")
+                    patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(str(debug_dir / f"patched_{idx:02d}.jpg"), patched_bgr)
+
                 debug_count += 1
 
             if self.disruption_mode:
@@ -670,6 +695,9 @@ class BlackBoxPatchOptimizer:
 
         if debug_this_eval:
             self._debug_next_eval = False
+            if save_debug_images:
+                self._save_debug_images = False
+                print(f"  [DEBUG] Saved patched images to debug_output/")
 
         # Return mean fitness across all test images
         return np.mean(results)
