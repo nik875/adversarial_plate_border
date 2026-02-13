@@ -201,8 +201,10 @@ class BlackBoxPatchOptimizer:
                         img_np = np.array(img)
                     dataset_samples[global_idx] = (img_np, text)
                 global_idx += 1
+                local_idx += 1
 
-            print(f"  Loaded {local_idx} samples (selected {len([i for i in dataset_samples if i < global_idx])} for validation)")
+            val_count = len([i for i in dataset_samples.keys() if i < global_idx and i >= (global_idx - local_idx)])
+            print(f"  Loaded {local_idx} samples (selected {val_count} for validation)")
 
         # Extract images and texts in index order
         for idx in sorted(val_indices):
