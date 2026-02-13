@@ -382,27 +382,39 @@ def create_ocr_model(ocr_model_type, white_box=False):
         # OpenCV CRNN model
         print("Initializing OpenCV CRNN OCR model...")
         try:
-            # Try to use opencv-python's built-in CRNN
             import cv2
-            # Load pre-trained CRNN model
+            import urllib.request
+
+            # Model URLs from OpenCV model zoo
             model_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/text_recognition_crnn.pb"
             dict_url = "https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/alphabet_en.txt"
 
-            # For simplicity, we'll use a simple wrapper that expects a trained CRNN model
-            # This assumes you have downloaded the model files
-            crnn_model_path = "text_recognition_crnn.pb"
-            crnn_dict_path = "alphabet_en.txt"
+            crnn_model_path = Path("text_recognition_crnn.pb")
+            crnn_dict_path = Path("alphabet_en.txt")
 
-            if not (Path(crnn_model_path).exists() and Path(crnn_dict_path).exists()):
-                raise ImportError(
-                    f"OpenCV CRNN model files not found. Download from:\n"
-                    f"  Model: https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/text_recognition_crnn.pb\n"
-                    f"  Dict: https://raw.githubusercontent.com/opencv/opencv_contrib/master/samples/dnn/alphabet_en.txt\n"
-                    f"Save them as '{crnn_model_path}' and '{crnn_dict_path}' in current directory."
-                )
+            # Download model if not present
+            if not crnn_model_path.exists():
+                print(f"Downloading CRNN model from OpenCV model zoo...")
+                try:
+                    urllib.request.urlretrieve(model_url, str(crnn_model_path))
+                    print(f"  Model saved to {crnn_model_path}")
+                except Exception as e:
+                    print(f"  Failed to download: {e}", file=sys.stderr)
+                    raise
 
+            # Download dictionary if not present
+            if not crnn_dict_path.exists():
+                print(f"Downloading CRNN alphabet dictionary...")
+                try:
+                    urllib.request.urlretrieve(dict_url, str(crnn_dict_path))
+                    print(f"  Dictionary saved to {crnn_dict_path}")
+                except Exception as e:
+                    print(f"  Failed to download: {e}", file=sys.stderr)
+                    raise
+
+            print("Loading CRNN network...")
             # Create CRNN model wrapper
-            net = cv2.dnn.readNetFromTensorflow(crnn_model_path)
+            net = cv2.dnn.readNetFromTensorflow(str(crnn_model_path))
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
@@ -413,12 +425,14 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
                 def predict(self, image):
                     """Predict text from image using CRNN."""
-                    # Preprocess image
-                    h, w = image.shape[:2]
+                    # Convert to grayscale if needed
+                    if len(image.shape) == 3:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
                     # CRNN expects 32x128 input
                     blob = cv2.dnn.blobFromImage(image, 1.0 / 127.5, (128, 32),
                                                  (127.5, 127.5, 127.5),
-                                                 swapRB=True, crop=False)
+                                                 swapRB=False, crop=False)
                     self.net.setInput(blob)
                     output = self.net.forward()
 
@@ -448,7 +462,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
             crnn = CRNNWrapper(net, alphabet)
             return crnn
 
-        except ImportError as e:
+        except Exception as e:
             print(f"Error: Could not initialize OpenCV CRNN: {e}", file=sys.stderr)
             sys.exit(1)
 
