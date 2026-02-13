@@ -108,7 +108,7 @@ class BlackBoxPatchOptimizer:
         import pandas as pd
         print(f"Loading validation split from: {split_csv_path}")
         split_df = pd.read_csv(split_csv_path)
-        val_indices = split_df[split_df['split'] == 'val'].index.tolist()
+        val_indices = split_df[split_df['split'] == 'val']['index'].tolist()
         print(f"  Found {len(val_indices)} validation indices")
 
         # Load generator
@@ -194,7 +194,7 @@ class BlackBoxPatchOptimizer:
         for dataset_name in dataset_names:
             print(f"\nLoading {dataset_name}...")
             local_idx = 0
-            for img, text, meta in iter_dataset(dataset_name, 'test', max_samples=None):
+            for img, text, meta in iter_dataset(dataset_name, 'train', max_samples=None):
                 if global_idx in val_indices:
                     # Convert PIL image to numpy array if needed
                     if hasattr(img, 'convert'):  # PIL Image
@@ -344,6 +344,47 @@ class BlackBoxPatchOptimizer:
 
         # Convert back to numpy
         return (result.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+    def apply_neutral_border_ocr_mode(self, image: np.ndarray, center_ratio: float = 0.6,
+                                       border_color: float = 0.5) -> np.ndarray:
+        """
+        Apply neutral grey border to image (matching composite_with_data.py).
+
+        This is the control condition: same center preserved, but grey border
+        instead of adversarial patch border.
+
+        Args:
+            image: [H, W, 3] numpy array, uint8, range [0, 255]
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
+            border_color: Value for neutral border in [0, 1] (default: 0.5 = gray)
+
+        Returns:
+            bordered_image: [H, W, 3] numpy array, uint8, range [0, 255]
+        """
+        H, W = image.shape[:2]
+
+        # Convert image to tensor [1, 3, H, W] in [0, 1]
+        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(H * center_ratio)
+        center_w = int(W * center_ratio)
+        pad_h = (H - center_h) // 2
+        pad_w = (W - center_w) // 2
+
+        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32)
+        center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
+        center_mask = center_mask.expand(-1, 3, -1, -1)
+
+        # Create neutral border
+        neutral_border = torch.full_like(image_tensor, border_color)
+
+        # Blend: keep original in center, use neutral border on borders
+        result = image_tensor * center_mask + neutral_border * (1 - center_mask)
+        result = torch.clamp(result, 0, 1)
+
+        # Convert back to numpy
+        return (result.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
     def generate_patch(self, z: np.ndarray) -> torch.Tensor:
         """
@@ -544,13 +585,16 @@ class BlackBoxPatchOptimizer:
 
     def _compute_control_predictions(self, oracle: BaseBlackBoxOracle):
         """
-        Compute and cache control predictions (OCR without patch) for all test images.
-        This establishes the baseline that patches are compared against.
+        Compute and cache control predictions (grey border, no patch) for all test images.
+        This matches composite_with_data.py: controls have grey border applied so we
+        compare grey border vs patch border (not raw image vs patch border).
         """
-        print("Computing control predictions (no patch)...")
+        print("Computing control predictions (grey border, no patch)...")
         self.control_predictions = []
         for image in tqdm(self.test_images, desc="Control OCR"):
-            detected_text = oracle.query(image)
+            # Apply grey border (matching composite_with_data.py's control condition)
+            control_image = self.apply_neutral_border_ocr_mode(image)
+            detected_text = oracle.query(control_image)
             self.control_predictions.append(detected_text or "")
         print(f"Control predictions computed for {len(self.control_predictions)} images")
 
