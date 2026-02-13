@@ -2891,62 +2891,10 @@ def main():
         history_df.to_csv('progressive_patch_training_history.csv', index=False)
         print(f"\nTraining history saved to: progressive_patch_training_history.csv")
 
-        # Plot training results
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
-
-        # Diversity loss (training)
-        ax1.plot(history['epoch'], history['diversity_loss'], 'b-', label='Train Diversity Loss', alpha=0.7)
-        ax1.set_title('Diversity Over Time')
-        ax1.set_xlabel('Global Epoch')
-        ax1.set_ylabel('Diversity Loss')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-
-        # TV and spectrum regularization losses
-        ax2.plot(history['epoch'], history['tv_loss'], 'g-', label='TV Loss', alpha=0.7)
-        ax2.plot(history['epoch'], history['spectrum_loss'], 'orange', label='Spectrum Loss', alpha=0.7)
-        ax2.set_title('Regularization Losses')
-        ax2.set_xlabel('Global Epoch')
-        ax2.set_ylabel('Loss')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
-
-        # Learning rate
-        ax3.semilogy(history['epoch'], history['learning_rate'], 'purple', label='Learning Rate')
-        ax3.set_title('Learning Rate Schedule')
-        ax3.set_xlabel('Global Epoch')
-        ax3.set_ylabel('Learning Rate (log scale)')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
-
-        plt.tight_layout()
-        plt.savefig('progressive_patch_training_curves.png', dpi=300, bbox_inches='tight')
-
-        # Create separate figure for sample patches
-        fig2 = plt.figure(figsize=(12, 12))
-        with torch.no_grad():
-            z_samples = trainer.sample_coefficients(9)
-            sample_patches = trainer.generate_patches(z_samples)
-
-            for i in range(9):
-                ax = plt.subplot(3, 3, i + 1)
-                patch_np = sample_patches[i].detach().cpu().permute(1, 2, 0).numpy()
-                ax.imshow(patch_np)
-                ax.set_title(f'Sample {i+1}')
-                ax.axis('off')
-
-        plt.tight_layout()
-        plt.savefig('progressive_patch_sample_patches.png', dpi=300, bbox_inches='tight')
-
-        print("\nResults saved to:")
-        print("  - progressive_patch_training_curves.png")
-        print("  - progressive_patch_sample_patches.png")
-        print("  - progressive_patch_training_history.csv")
         print("\nGenerator checkpoints saved:")
         print("  - training_complete_final_model/ - FINAL trained model with 20 sample patches")
         print("  - best_progressive_patch/ - Best model during training (by loss or diversity)")
-        print("  - final_layer_checkpoint_epoch_*/ - Checkpoints every 25 epochs on final layer")
-        print("  - layer*_complete_*/ - Checkpoint after completing each layer")
+        print("  - checkpoint_epoch_*/ - Checkpoints every 25 epochs")
 
     except Exception as e:
         print(f"Training failed: {e}")
