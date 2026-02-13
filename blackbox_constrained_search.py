@@ -116,9 +116,19 @@ class BlackBoxPatchOptimizer:
         self.generator, self.latent_dim = self._load_generator(
             generator_checkpoint, generator_type
         )
-        # Use training mode - BatchNorm needs batch statistics for diverse outputs
-        self.generator.train()
+        self.generator.eval()
         print(f"Generator loaded (latent_dim={self.latent_dim})")
+
+        # Diagnostic: generate patches from a few random z values to verify diversity
+        debug_dir = Path("debug_output")
+        debug_dir.mkdir(exist_ok=True)
+        print("Generating diagnostic patches from random z values...")
+        for i in range(5):
+            z_test = np.random.uniform(0, 1, size=self.latent_dim)
+            patch_test = self.generate_patch(z_test)
+            patch_np = (patch_test.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            Image.fromarray(patch_np).save(str(debug_dir / f"diag_patch_z{i}.png"))
+        print(f"Saved 5 diagnostic patches to {debug_dir}/diag_patch_z*.png")
 
         # Load test images from the same OCR datasets used during training
         self.test_images = []
