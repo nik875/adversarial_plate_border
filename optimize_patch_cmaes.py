@@ -384,14 +384,27 @@ def create_ocr_model(ocr_model_type, white_box=False):
         try:
             import onnxruntime as ort
 
-            crnn_model_path = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
-            crnn_dict_path = Path("alphabet_en.txt")
+            # Try simplified model first (for CPU compatibility), fall back to original
+            crnn_model_simplified = Path("text_recognition_CRNN_EN_2023feb_simplified.onnx")
+            crnn_model_original = Path("text_recognition_CRNN_EN_2023feb_fp16.onnx")
 
-            if not crnn_model_path.exists():
+            if crnn_model_simplified.exists():
+                crnn_model_path = crnn_model_simplified
+            elif crnn_model_original.exists():
+                crnn_model_path = crnn_model_original
+                print(f"⚠ Using original model (not simplified). If you get CPU compatibility errors,")
+                print(f"  simplify it with: python -m onnxsim {crnn_model_original} {crnn_model_simplified}")
+            else:
                 raise FileNotFoundError(
-                    f"CRNN model not found: {crnn_model_path}\n"
-                    f"Please ensure the model is saved in the current directory."
+                    f"CRNN model not found. Expected one of:\n"
+                    f"  - {crnn_model_simplified} (simplified, recommended for CPU)\n"
+                    f"  - {crnn_model_original} (original)\n"
+                    f"\nTo create the simplified version, run:\n"
+                    f"  pip install onnx-simplifier\n"
+                    f"  python -m onnxsim {crnn_model_original} {crnn_model_simplified}"
                 )
+
+            crnn_dict_path = Path("alphabet_en.txt")
 
             if not crnn_dict_path.exists():
                 raise FileNotFoundError(
@@ -400,7 +413,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
                 )
 
             print(f"Loading CRNN network from {crnn_model_path}...")
-            # Load ONNX model with ONNX Runtime
+            # Load ONNX model with ONNX Runtime (CPU only)
             session = ort.InferenceSession(str(crnn_model_path), providers=['CPUExecutionProvider'])
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
