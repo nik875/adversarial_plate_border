@@ -317,8 +317,8 @@ class BlackBoxPatchOptimizer:
         """
         H, W = image.shape[:2]
 
-        # Convert image to tensor [1, 3, H, W] in [0, 1]
-        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+        # Convert image to tensor [1, 3, H, W] in [0, 1] on same device as patch
+        image_tensor = torch.from_numpy(image).float().to(self.device).permute(2, 0, 1).unsqueeze(0) / 255.0
 
         # Resize patch to match image dimensions
         patch_resized = F.interpolate(
@@ -328,13 +328,13 @@ class BlackBoxPatchOptimizer:
             align_corners=False
         )
 
-        # Create center mask (1 in center, 0 on borders)
+        # Create center mask (1 in center, 0 on borders) on same device
         center_h = int(H * center_ratio)
         center_w = int(W * center_ratio)
         pad_h = (H - center_h) // 2
         pad_w = (W - center_w) // 2
 
-        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32)
+        center_mask = torch.zeros(1, 1, H, W, dtype=torch.float32, device=self.device)
         center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
         center_mask = center_mask.expand(-1, 3, -1, -1)
 
@@ -343,7 +343,7 @@ class BlackBoxPatchOptimizer:
         result = torch.clamp(result, 0, 1)
 
         # Convert back to numpy
-        return (result.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        return (result.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
     def generate_patch(self, z: np.ndarray) -> torch.Tensor:
         """
