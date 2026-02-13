@@ -184,16 +184,6 @@ def main():
         help="Path to checkpoint directory (e.g., checkpoints/20260101_120000/). Will automatically load latest generator checkpoint and train/val split."
     )
     parser.add_argument(
-        "--refinement-checkpoint",
-        default=None,
-        help="Path to refinement checkpoint (.pt file, optional)"
-    )
-    parser.add_argument(
-        "--disable-refiner",
-        action="store_true",
-        help="Disable refinement network even if checkpoint provided"
-    )
-    parser.add_argument(
         "--generator-type",
         choices=["foundation"],
         default="foundation",
@@ -309,8 +299,6 @@ def main():
     print("=" * 70)
     print(f"Checkpoint directory: {args.checkpoint_dir}")
     print(f"Generator checkpoint: {generator_checkpoint}")
-    if args.refinement_checkpoint:
-        print(f"Refinement checkpoint: {args.refinement_checkpoint}")
     print(f"Validation split: {split_csv_path}")
     print(f"Evaluation mode: {'OCR (cropped plates)' if args.ocr_mode else 'Standard (full images)'}")
     if args.ocr_mode:
@@ -327,10 +315,8 @@ def main():
 
     # Initialize optimizer
     print("Initializing optimizer...")
-    refinement_checkpoint = None if args.disable_refiner else args.refinement_checkpoint
     optimizer = BlackBoxPatchOptimizer(
         generator_checkpoint=generator_checkpoint,
-        refinement_checkpoint=refinement_checkpoint,
         generator_type=args.generator_type,
         device=args.device,
         split_csv_path=split_csv_path,

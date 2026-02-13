@@ -22,7 +22,6 @@ import kornia
 import kornia.geometry as K
 
 from progressive_patch import FoundationPatchGenerator
-from refine_generator import RefinementNetwork
 
 
 class BaseBlackBoxOracle(ABC):
@@ -59,7 +58,6 @@ class BlackBoxPatchOptimizer:
 
     def __init__(self,
                  generator_checkpoint: str,
-                 refinement_checkpoint: Optional[str] = None,
                  generator_type: str = 'foundation',
                  device: str = None,
                  split_csv_path: Optional[str] = None,
@@ -73,7 +71,6 @@ class BlackBoxPatchOptimizer:
         """
         Args:
             generator_checkpoint: Path to generator .pt file
-            refinement_checkpoint: Path to refinement .pt file (optional)
             generator_type: 'foundation' (FoundationPatchGenerator)
             device: 'cuda', 'mps', or 'cpu'
             split_csv_path: Path to train_val_split CSV from training checkpoint directory
@@ -123,14 +120,6 @@ class BlackBoxPatchOptimizer:
         self.generator.train()
         print(f"Generator loaded (latent_dim={self.latent_dim})")
 
-        # Load refinement network if provided
-        self.refiner = None
-        if refinement_checkpoint:
-            print(f"Loading refinement network from: {refinement_checkpoint}")
-            self.refiner = self._load_refiner(refinement_checkpoint)
-            self.refiner.eval()
-            print("Refinement network loaded")
-
         # Load test images from the same OCR datasets used during training
         self.test_images = []
         self.test_corners = []
@@ -168,26 +157,6 @@ class BlackBoxPatchOptimizer:
         generator.to(self.device)
 
         return generator, latent_dim
-
-    def _load_refiner(self, checkpoint_path: str):
-        """Load refinement network from checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-        latent_dim = checkpoint['basis_dim']
-        use_latent_context = checkpoint.get('use_latent_context', False)
-        patch_height, patch_width = checkpoint['patch_size']
-
-        refiner = RefinementNetwork(
-            patch_height=patch_height,
-            patch_width=patch_width,
-            use_latent_context=use_latent_context,
-            latent_dim=latent_dim
-        )
-
-        refiner.load_state_dict(checkpoint['refinement_state_dict'])
-        refiner.to(self.device)
-
-        return refiner
 
     def _load_from_ocr_dataset(self, split_df: 'pd.DataFrame', val_indices: List[int]):
         """
@@ -350,18 +319,8 @@ class BlackBoxPatchOptimizer:
         z_tensor = torch.tensor(z, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
-            # Generate base patch
-            base_patch = self.generator(z_tensor).squeeze(0)
-
-            # Refine if refiner available
-            if self.refiner is not None:
-                refined_patch = self.refiner(
-                    base_patch.unsqueeze(0),
-                    z_tensor if hasattr(self.refiner, 'use_latent_context') and self.refiner.use_latent_context else None
-                ).squeeze(0)
-                return refined_patch
-            else:
-                return base_patch
+            patch = self.generator(z_tensor).squeeze(0)
+            return patch
 
     def apply_plate_blur(self, image: np.ndarray, corners: np.ndarray, blur_sigma: float) -> np.ndarray:
         """
