@@ -322,6 +322,10 @@ class BlackBoxPatchOptimizer:
         Returns:
             result: [3, H, W] tensor in [0, 1]
         """
+        # Move image to patch's device (images stored on CPU, patch on GPU)
+        device = patch.device
+        image = image.to(device)
+
         if image.dim() == 3:
             image = image.unsqueeze(0)
 
@@ -346,7 +350,7 @@ class BlackBoxPatchOptimizer:
         pad_w = (image_width - center_w) // 2
 
         center_mask = torch.zeros(batch_size, 1, image_height, image_width,
-                                  dtype=torch.float32)
+                                  dtype=torch.float32, device=device)
         center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
         center_mask = center_mask.expand(-1, 3, -1, -1)
 
@@ -354,7 +358,7 @@ class BlackBoxPatchOptimizer:
         result_image = image * center_mask + patch_batch * (1 - center_mask)
         result_image = torch.clamp(result_image, 0, 1)
 
-        return result_image.squeeze(0)  # [3, H, W]
+        return result_image.squeeze(0).cpu()  # [3, H, W] back to CPU
 
     def apply_neutral_border_ocr_mode(self, image: torch.Tensor, center_ratio: float = 0.6,
                                        border_color: float = 0.5) -> torch.Tensor:
