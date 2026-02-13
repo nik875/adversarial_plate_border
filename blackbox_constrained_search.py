@@ -667,7 +667,7 @@ class BlackBoxPatchOptimizer:
                 print(f"  [DEBUG] img={idx} | control='{control_text}' | patched='{detected_text}' | {status}")
 
                 # Save patched images on first evaluation
-                if save_debug_images:
+                if save_debug_images and idx < 10:
                     import cv2
                     debug_dir = Path("debug_output")
                     patched_bgr = cv2.cvtColor(patched_image, cv2.COLOR_RGB2BGR)
