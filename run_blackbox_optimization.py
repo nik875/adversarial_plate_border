@@ -241,9 +241,9 @@ def main():
         help="Output path for optimized latent code"
     )
     parser.add_argument(
-        "--checkpoint-dir",
+        "--optimization-checkpoint-dir",
         default=None,
-        help="Directory to save checkpoints at each best fitness (default: None)"
+        help="Directory to save optimization checkpoints at each best fitness (default: None)"
     )
     parser.add_argument(
         "--disable-homography",
@@ -341,7 +341,7 @@ def main():
         max_iterations=args.max_iterations,
         population_size=args.population_size,
         seed=args.seed,
-        checkpoint_dir=args.checkpoint_dir
+        checkpoint_dir=args.optimization_checkpoint_dir
     )
 
     # Save results
