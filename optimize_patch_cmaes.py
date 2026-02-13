@@ -1108,8 +1108,11 @@ def main():
             'maxiter': args.maxiter,
             'verb_disp': 1,
             'verb_log': 0,
-            'tolstagnation': np.inf,  # Disable stagnation (plateau) early stopping
-            'tolfun': -np.inf,        # Disable function value convergence early stopping
+            'tolstagnation': np.inf,      # Disable stagnation (plateau) early stopping
+            'tolfun': 1e99,                # Disable function value convergence (set very high)
+            'tolflatfitness': np.inf,     # Disable flat fitness early stopping
+            'tolxstagnation': np.inf,     # Disable x-space stagnation
+            'tolx': -np.inf,               # Disable x convergence
         }
     )
 
@@ -1172,6 +1175,15 @@ def main():
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
+
+    # Print stopping criteria
+    stop_info = es.stop()
+    if stop_info:
+        print("\nStopping criteria triggered:")
+        for key, value in stop_info.items():
+            print(f"  {key}: {value}")
+    else:
+        print("\nReached maxiter without early stopping")
     print(f"Total evaluations: {eval_count[0]}")
     print(f"Best total edit distance: {best_edit_distance[0]}")
     print(f"Best average edit distance: {best_avg_edit_distance[0]:.2f}")
