@@ -791,6 +791,13 @@ def main():
             identity_bgr = cv2.cvtColor(identity_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / "patch_identity_composite.png"), identity_bgr)
 
+            # Debug 8: Just clamp the downscaled patch, no compositing at all
+            patch_clamped = torch.clamp(patch_downscaled_float, 0, 1)
+
+            clamped_np = (patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            clamped_bgr = cv2.cvtColor(clamped_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(debug_dir / "patch_downscaled_clamped.png"), clamped_bgr)
+
             print(f"  Saved to {debug_dir}/")
             print(f"    - patch_original.png (original generator output)")
             print(f"    - patch_downscaled_float32.png (float → downscale)")
