@@ -1110,7 +1110,6 @@ def main():
             'verb_log': 0,
             'tolstagnation': np.inf,  # Disable stagnation (plateau) early stopping
             'tolfun': -np.inf,        # Disable function value convergence early stopping
-            'toluserfeatures': -np.inf,  # Disable user-defined feature early stopping
         }
     )
 
