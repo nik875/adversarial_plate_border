@@ -162,57 +162,56 @@ class BlackBoxPatchOptimizer:
 
     def _load_from_ocr_dataset(self, split_df: 'pd.DataFrame', val_indices: List[int]):
         """
-        Load test images from OCR datasets (same as progressive_patch.py uses).
+        Load test images from OCR datasets.
 
-        Reconstructs the dataset that was used during training and filters to validation indices.
+        Mirrors composite_with_data.py exactly: uses OCRDataset + ConcatDataset
+        with sorted dataset names and T.ToTensor() preprocessing.
 
         Args:
             split_df: DataFrame from train_val_split CSV
             val_indices: List of validation indices
         """
-        # Import load_datasets (same as progressive_patch.py)
-        try:
-            import importlib.util
-            from pathlib import Path
-            load_datasets_path = Path(__file__).parent / "foundationmodel" / "dataset" / "load_datasets.py"
-            spec = importlib.util.spec_from_file_location("load_datasets", load_datasets_path)
-            load_datasets = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(load_datasets)
-            iter_dataset = load_datasets.iter_dataset
-            DATASETS = load_datasets.DATASETS
-        except Exception as e:
-            raise ImportError(f"Could not import load_datasets: {e}")
+        import sys
+        from torch.utils.data import ConcatDataset
+        from torchvision import transforms as T
 
-        # Get unique datasets and load them in order
-        dataset_names = split_df['dataset'].unique()
-        print(f"Loading OCR datasets: {list(dataset_names)}")
+        # Import OCRDataset from progressive_patch (same as composite_with_data.py)
+        sys.path.insert(0, str(Path(__file__).parent))
+        from progressive_patch import OCRDataset
 
-        # Build a mapping from global index to (dataset_idx, local_idx, img, text)
-        global_idx = 0
-        dataset_samples = {}  # global_idx -> (img, text)
+        # Sort dataset names (matching composite_with_data.py)
+        dataset_names = sorted(split_df['dataset'].unique())
+        print(f"Loading OCR datasets: {dataset_names}")
 
+        # Load and combine datasets in order (matching composite_with_data.py)
+        datasets_to_combine = []
         for dataset_name in dataset_names:
-            print(f"\nLoading {dataset_name}...")
-            local_idx = 0
-            for img, text, meta in iter_dataset(dataset_name, 'train', max_samples=None):
-                if global_idx in val_indices:
-                    # Convert PIL image to numpy array if needed
-                    if hasattr(img, 'convert'):  # PIL Image
-                        img_np = np.array(img.convert('RGB'))
-                    else:
-                        img_np = np.array(img)
-                    dataset_samples[global_idx] = (img_np, text)
-                global_idx += 1
-                local_idx += 1
+            dataset = OCRDataset(
+                dataset_name=dataset_name,
+                split='train',
+                transform=None,
+                max_samples=None
+            )
+            datasets_to_combine.append(dataset)
+            print(f"  Loaded {len(dataset)} samples from {dataset_name}")
 
-            val_count = len([i for i in dataset_samples.keys() if i < global_idx and i >= (global_idx - local_idx)])
-            print(f"  Loaded {local_idx} samples (selected {val_count} for validation)")
+        if len(datasets_to_combine) > 1:
+            combined_dataset = ConcatDataset(datasets_to_combine)
+            print(f"Combined {len(datasets_to_combine)} datasets: {len(combined_dataset)} total samples")
+        else:
+            combined_dataset = datasets_to_combine[0]
 
-        # Extract images in index order
+        # Load validation samples using combined dataset indices
+        # (same approach as composite_with_data.py)
         for idx in sorted(val_indices):
-            if idx in dataset_samples:
-                img_np, text = dataset_samples[idx]
+            try:
+                item = combined_dataset[idx]
+                img_tensor = item['prep_image']  # [3, H, W] tensor in [0, 1]
+                # Convert to numpy [H, W, 3] uint8 (for oracle consumption)
+                img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 self.test_images.append(img_np)
+            except Exception as e:
+                print(f"  Warning: Failed to load sample {idx}: {e}")
 
     def _load_test_images(self, test_images_dir: str):
         """
