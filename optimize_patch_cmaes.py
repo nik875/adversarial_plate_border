@@ -457,6 +457,40 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
                     return Result(text)
 
+                def get_logits(self, image):
+                    """Get raw logits from model for an image.
+
+                    Args:
+                        image: Input image in BGR format (as uint8 numpy array)
+
+                    Returns:
+                        logits: [seq_len, num_classes] numpy array of raw logits
+                    """
+                    import cv2
+
+                    # Convert to grayscale if needed
+                    if len(image.shape) == 3:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+                    # CRNN expects 32x128 input, normalize to [0, 1]
+                    resized = cv2.resize(image, (128, 32))
+                    normalized = resized.astype(np.float32) / 255.0
+
+                    # Add batch and channel dimensions: [1, 1, 32, 128]
+                    input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0)
+
+                    # Run inference
+                    with torch.no_grad():
+                        output = self.model(input_tensor)
+
+                    # Handle output - could be tensor or tuple
+                    if isinstance(output, tuple):
+                        output = output[0]
+
+                    # Return raw logits as numpy array [seq_len, num_classes]
+                    output = output.squeeze(0)  # Remove batch dimension
+                    return output.cpu().numpy()
+
             crnn = CRNNWrapper(pytorch_model, alphabet)
             return crnn
 
@@ -614,6 +648,134 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
                        f"Composite: '{result['composite_text']:15s}'\n")
 
     return total_edit_distance, misreads, avg_edit_distance
+
+
+def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, center_ratio=0.6):
+    """Evaluate patch by measuring logit differences between control and composite.
+
+    Args:
+        patch: [3, H, W] tensor in [0, 1]
+        val_images: List of validation image tensors [3, H, W] in [0, 1]
+        ocr: OCR model instance with get_logits(image) method
+        control_logits_list: List of precomputed control logits (numpy arrays)
+        center_ratio: Center ratio for compositing
+
+    Returns:
+        Total logit delta (sum of absolute differences across all samples)
+    """
+    total_logit_delta = 0.0
+    num_evaluated = 0
+
+    for val_image, control_logits in zip(val_images, control_logits_list):
+        try:
+            # Create composite (with patch)
+            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+            composite = composite.squeeze(0)  # Remove batch dim
+
+            # Convert to numpy for OCR
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Get logits for composite
+            composite_logits = ocr.get_logits(composite_np)
+
+            # Compute logit delta: sum of absolute differences
+            # Handle cases where logits have different shapes (shouldn't happen, but be safe)
+            min_len = min(control_logits.shape[0], composite_logits.shape[0])
+            logit_delta = np.abs(
+                control_logits[:min_len] - composite_logits[:min_len]
+            ).sum()
+            total_logit_delta += logit_delta
+
+            num_evaluated += 1
+
+        except Exception as e:
+            # Treat errors as 0 delta (conservative)
+            num_evaluated += 1
+            pass
+
+    return total_logit_delta if num_evaluated > 0 else 0.0
+
+
+def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+    """Evaluate patch by measuring logit delta and save debug images.
+
+    Args:
+        patch: [3, H, W] tensor in [0, 1]
+        val_images: List of validation image tensors [3, H, W] in [0, 1]
+        ocr: OCR model instance with get_logits(image) method
+        control_logits_list: List of precomputed control logits (numpy arrays)
+        center_ratio: Center ratio for compositing
+        debug_dir: Directory to save debug images
+        candidate_idx: Index of the candidate being evaluated
+
+    Returns:
+        Total logit delta
+    """
+    total_logit_delta = 0.0
+    num_evaluated = 0
+    debug_results = []
+
+    for img_idx, (val_image, control_logits) in enumerate(zip(val_images, control_logits_list)):
+        try:
+            # Create composite (with patch)
+            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+            composite = composite.squeeze(0)  # Remove batch dim
+
+            # Convert to numpy for OCR
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Get logits for composite
+            composite_logits = ocr.get_logits(composite_np)
+
+            # Compute logit delta
+            min_len = min(control_logits.shape[0], composite_logits.shape[0])
+            logit_delta = np.abs(
+                control_logits[:min_len] - composite_logits[:min_len]
+            ).sum()
+            total_logit_delta += logit_delta
+
+            num_evaluated += 1
+
+            # Save debug images
+            if debug_dir is not None:
+                # Save composite
+                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+                comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
+                cv2.imwrite(str(comp_path), composite_bgr)
+
+                # Save control (regenerate for debug visualization)
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
+                control = control.squeeze(0)
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+                ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
+                cv2.imwrite(str(ctrl_path), control_bgr)
+
+                # Track results
+                debug_results.append({
+                    'img_idx': img_idx,
+                    'logit_delta': logit_delta,
+                    'control_logit_shape': control_logits.shape,
+                    'composite_logit_shape': composite_logits.shape,
+                })
+
+        except Exception as e:
+            num_evaluated += 1
+            pass
+
+    # Save debug summary
+    if debug_dir is not None and debug_results:
+        summary_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_summary.txt"
+        with open(summary_path, 'w') as f:
+            f.write(f"Candidate {candidate_idx} Debug Summary (Logit Delta Mode)\n")
+            f.write(f"{'=' * 80}\n")
+            f.write(f"Total logit delta: {total_logit_delta:.2f}\n\n")
+            f.write(f"Per-image results:\n")
+            for result in debug_results:
+                f.write(f"  Image {result['img_idx']:2d}: LogitDelta: {result['logit_delta']:10.2f} | "
+                       f"Shapes: {result['control_logit_shape']} vs {result['composite_logit_shape']}\n")
+
+    return total_logit_delta
 
 
 def main():
@@ -1009,46 +1171,76 @@ def main():
     print("OCR model loaded")
 
     # Precompute control OCR outputs once (with grey border)
-    print("\nPrecomputing control OCR outputs...")
-    control_texts = []
-    for val_image in tqdm(val_images, desc="Control OCR"):
-        try:
-            # Create control (with grey border)
-            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-            control = control.squeeze(0)  # Remove batch dim
+    # For opencv-crnn, precompute logits; for others, precompute text
+    use_logit_delta = (args.ocr_model == 'opencv-crnn')
 
-            # Convert to numpy for OCR
-            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    if use_logit_delta:
+        print("\nPrecomputing control logits (logit delta mode)...")
+        control_logits_list = []
+        for val_image in tqdm(val_images, desc="Control logits"):
+            try:
+                # Create control (with grey border)
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+                control = control.squeeze(0)  # Remove batch dim
 
-            # Run OCR
-            control_result = ocr.predict(control_np)
-            control_text = control_result.text if control_result is not None else ""
-            control_texts.append(control_text)
+                # Convert to numpy for OCR
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-        except Exception as e:
-            # Treat errors as empty string
-            control_texts.append("")
+                # Get logits
+                control_logits = ocr.get_logits(control_np)
+                control_logits_list.append(control_logits)
 
-    print(f"Precomputed {len(control_texts)} control OCR outputs")
+            except Exception as e:
+                # Treat errors as zeros with default shape
+                control_logits_list.append(np.zeros((26, 37)))  # Default CRNN output shape
+
+        print(f"Precomputed {len(control_logits_list)} control logits")
+        control_data = control_logits_list
+    else:
+        print("\nPrecomputing control OCR outputs (text mode)...")
+        control_texts = []
+        for val_image in tqdm(val_images, desc="Control OCR"):
+            try:
+                # Create control (with grey border)
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+                control = control.squeeze(0)  # Remove batch dim
+
+                # Convert to numpy for OCR
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+                # Run OCR
+                control_result = ocr.predict(control_np)
+                control_text = control_result.text if control_result is not None else ""
+                control_texts.append(control_text)
+
+            except Exception as e:
+                # Treat errors as empty string
+                control_texts.append("")
+
+        print(f"Precomputed {len(control_texts)} control OCR outputs")
+        control_data = control_texts
 
     # Create debug output directory
     debug_dir = output_dir / "debug_output"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define objective function for CMA-ES (minimize negative edit distance)
+    # Define objective function for CMA-ES
     eval_count = [0]  # Track number of evaluations
-    best_edit_distance = [0]
-    best_avg_edit_distance = [0]
-    best_misread_pct = [0]
+    best_metric = [0]  # Best edit distance or logit delta (depending on mode)
+    best_avg_metric = [0]  # Average metric
+    best_misread_pct = [0]  # Only used in text mode
     best_z = [None]
     current_iteration = [0]  # Track current iteration
-    all_edit_distances = []  # Track all edit distances for progress bar
+    all_metrics = []  # Track all metrics for progress bar
     sampled_indices = []  # Will hold random sample indices for current iteration
     sampled_val_images = []  # Will hold sampled validation images
-    sampled_control_texts = []  # Will hold sampled control texts
+    sampled_control_data = []  # Will hold sampled control texts or logits
 
     def objective(z, candidate_idx=None):
-        """Objective function: returns negative edit distance (CMA-ES minimizes)."""
+        """Objective function: returns negative metric (CMA-ES minimizes).
+
+        Metric is either edit distance (text mode) or logit delta (logit delta mode).
+        """
         eval_count[0] += 1
 
         # Generate patch from z
@@ -1065,31 +1257,50 @@ def main():
             cv2.imwrite(str(patch_path), patch_bgr)
 
         # Evaluate on sampled validation set with optional debug output
-        if save_debug:
-            total_edit_dist, misreads, avg_edit_dist = evaluate_patch_with_debug(
-                patch, sampled_val_images, ocr, sampled_control_texts,
-                center_ratio=args.center_ratio,
-                debug_dir=debug_dir,
-                candidate_idx=candidate_idx
-            )
+        if use_logit_delta:
+            # Logit delta mode (opencv-crnn only)
+            if save_debug:
+                total_metric = evaluate_patch_logit_delta_with_debug(
+                    patch, sampled_val_images, ocr, sampled_control_data,
+                    center_ratio=args.center_ratio,
+                    debug_dir=debug_dir,
+                    candidate_idx=candidate_idx
+                )
+            else:
+                total_metric = evaluate_patch_logit_delta(
+                    patch, sampled_val_images, ocr, sampled_control_data,
+                    center_ratio=args.center_ratio
+                )
+            avg_metric = total_metric / len(sampled_val_images) if len(sampled_val_images) > 0 else 0
+            misreads = 0  # Not applicable in logit delta mode
         else:
-            total_edit_dist, misreads, avg_edit_dist = evaluate_patch(
-                patch, sampled_val_images, ocr, sampled_control_texts,
-                center_ratio=args.center_ratio
-            )
+            # Text edit distance mode (default)
+            if save_debug:
+                total_metric, misreads, avg_metric = evaluate_patch_with_debug(
+                    patch, sampled_val_images, ocr, sampled_control_data,
+                    center_ratio=args.center_ratio,
+                    debug_dir=debug_dir,
+                    candidate_idx=candidate_idx
+                )
+            else:
+                total_metric, misreads, avg_metric = evaluate_patch(
+                    patch, sampled_val_images, ocr, sampled_control_data,
+                    center_ratio=args.center_ratio
+                )
 
         # Track for progress bar
-        all_edit_distances.append(avg_edit_dist)
+        all_metrics.append(avg_metric)
 
-        # Track best (compute percentage against full validation set for consistency)
-        if total_edit_dist > best_edit_distance[0]:
-            best_edit_distance[0] = total_edit_dist
-            best_avg_edit_distance[0] = avg_edit_dist
-            best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
+        # Track best
+        if total_metric > best_metric[0]:
+            best_metric[0] = total_metric
+            best_avg_metric[0] = avg_metric
+            if not use_logit_delta:
+                best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
             best_z[0] = z.copy()
 
-        # Return negative edit distance (CMA-ES minimizes, we want to maximize)
-        return -total_edit_dist
+        # Return negative metric (CMA-ES minimizes, we want to maximize)
+        return -total_metric
 
     # Initialize CMA-ES
     print(f"\nInitializing CMA-ES:")
@@ -1097,6 +1308,10 @@ def main():
     print(f"  Population size: {args.popsize}")
     print(f"  Max iterations: {args.maxiter}")
     print(f"  Initial sigma: {args.sigma0}")
+    if use_logit_delta:
+        print(f"  Mode: Logit delta optimization (opencv-crnn)")
+    else:
+        print(f"  Mode: Text edit distance optimization")
 
     x0 = np.zeros(latent_dim)  # Start from zero (neutral latent code)
 
@@ -1121,7 +1336,10 @@ def main():
     num_samples_to_use = min(args.n_eval_samples, len(val_images))
     print(f"Full validation set: {len(val_images)} samples")
     print(f"Sampling {num_samples_to_use} samples randomly each iteration (different subset per iteration)")
-    print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
+    if use_logit_delta:
+        print(f"Objective: Maximize logit delta (sum of absolute logit differences)")
+    else:
+        print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
     print("=" * 80)
 
     iteration = 0
@@ -1144,10 +1362,10 @@ def main():
         num_samples_to_use = min(args.n_eval_samples, len(val_images))
         sampled_indices = random.sample(range(len(val_images)), num_samples_to_use)
         sampled_val_images = [val_images[i] for i in sampled_indices]
-        sampled_control_texts = [control_texts[i] for i in sampled_indices]
+        sampled_control_data = [control_data[i] for i in sampled_indices]
 
-        # Clear edit distances for this iteration
-        all_edit_distances.clear()
+        # Clear metrics for this iteration
+        all_metrics.clear()
 
         # Evaluate all candidates with a nested progress bar
         for i, z in enumerate(solutions):
@@ -1158,14 +1376,20 @@ def main():
         es.tell(solutions, fitness_values)
 
         # Calculate iteration statistics
-        avg_edit_dist = np.mean(all_edit_distances) if all_edit_distances else 0
+        avg_metric = np.mean(all_metrics) if all_metrics else 0
 
         # Update progress bar with current metrics
-        pbar.set_postfix({
-            'best_edit': f'{best_avg_edit_distance[0]:.2f}',
-            'avg_edit': f'{avg_edit_dist:.2f}',
-            'misread%': f'{best_misread_pct[0]:.1f}%'
-        })
+        if use_logit_delta:
+            pbar.set_postfix({
+                'best_delta': f'{best_avg_metric[0]:.2f}',
+                'avg_delta': f'{avg_metric:.2f}',
+            })
+        else:
+            pbar.set_postfix({
+                'best_edit': f'{best_avg_metric[0]:.2f}',
+                'avg_edit': f'{avg_metric:.2f}',
+                'misread%': f'{best_misread_pct[0]:.1f}%'
+            })
         pbar.update(1)
 
         iteration += 1
@@ -1178,9 +1402,13 @@ def main():
     print("=" * 80)
     print(f"Completed {iteration} iterations (maxiter={args.maxiter})")
     print(f"Total evaluations: {eval_count[0]}")
-    print(f"Best total edit distance: {best_edit_distance[0]}")
-    print(f"Best average edit distance: {best_avg_edit_distance[0]:.2f}")
-    print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
+    if use_logit_delta:
+        print(f"Best total logit delta: {best_metric[0]:.2f}")
+        print(f"Best average logit delta: {best_avg_metric[0]:.2f}")
+    else:
+        print(f"Best total edit distance: {best_metric[0]:.2f}")
+        print(f"Best average edit distance: {best_avg_metric[0]:.2f}")
+        print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
 
     # Save best patch
     if best_z[0] is not None:
@@ -1219,12 +1447,19 @@ def main():
             f.write(f"  Center ratio: {args.center_ratio}\n")
             f.write(f"  OCR model type: {args.ocr_model}\n")
             f.write(f"  Device: {device}\n")
-            f.write(f"  Objective: Maximize Levenshtein edit distance\n\n")
+            if use_logit_delta:
+                f.write(f"  Objective: Maximize logit delta (sum of absolute logit differences)\n\n")
+            else:
+                f.write(f"  Objective: Maximize Levenshtein edit distance\n\n")
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
-            f.write(f"  Best total edit distance: {best_edit_distance[0]}\n")
-            f.write(f"  Best average edit distance: {best_avg_edit_distance[0]:.2f}\n")
-            f.write(f"  Best misread percentage: {best_misread_pct[0]:.1f}%\n")
+            if use_logit_delta:
+                f.write(f"  Best total logit delta: {best_metric[0]:.2f}\n")
+                f.write(f"  Best average logit delta: {best_avg_metric[0]:.2f}\n")
+            else:
+                f.write(f"  Best total edit distance: {best_metric[0]:.2f}\n")
+                f.write(f"  Best average edit distance: {best_avg_metric[0]:.2f}\n")
+                f.write(f"  Best misread percentage: {best_misread_pct[0]:.1f}%\n")
             f.write(f"  Best z shape: {best_z[0].shape}\n")
 
         print(f"Saved metadata to: {metadata_path}")
