@@ -525,23 +525,20 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
             def get_logits(self, image):
                 """Return raw model output as numpy array.
 
-                Must use training mode to get raw logits - eval mode applies
-                the postprocessor and returns decoded text (list), not tensors.
+                Uses return_model_output=True in eval mode to get 'out_map'
+                (raw logits) without needing labels or switching to train mode.
                 """
                 input_tensor = self._preprocess(image)
-                was_training = self.model.training
-                self.model.train()
                 with torch.no_grad():
-                    out = self.model(input_tensor)
-                if not was_training:
-                    self.model.eval()
-                # In training mode, doctr models return a dict with logits
+                    out = self.model(input_tensor, return_model_output=True)
                 if isinstance(out, dict):
-                    out = list(out.values())[0]
-                elif isinstance(out, (list, tuple)):
-                    # Unexpected in training mode, but handle gracefully
-                    out = out[0] if len(out) > 0 and isinstance(out[0], torch.Tensor) else torch.zeros(1, 1)
-                return out.squeeze(0).cpu().numpy()
+                    # 'out_map' contains raw logits before postprocessor
+                    logits = out.get("out_map") or out.get("logits") or list(out.values())[0]
+                elif isinstance(out, torch.Tensor):
+                    logits = out
+                else:
+                    raise RuntimeError(f"Unexpected ViTSTR output type: {type(out)}")
+                return logits.squeeze(0).cpu().numpy()
 
             def predict(self, image):
                 """Predict text using the model in eval mode."""
