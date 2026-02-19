@@ -413,10 +413,13 @@ def create_ocr_model(ocr_model_type, white_box=False):
                 alphabet = f.read().strip()
 
             class CRNNWrapper:
-                def __init__(self, session, alphabet, input_name):
+                def __init__(self, session, alphabet, input_name, input_shape):
                     self.session = session
                     self.alphabet = alphabet
                     self.input_name = input_name
+                    # input_shape is [batch, channels, height, width]
+                    self.input_height = input_shape[2]
+                    self.input_width = input_shape[3]
 
                 def _preprocess(self, image):
                     """Preprocess image for CRNN inference."""
@@ -426,11 +429,11 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     if len(image.shape) == 3:
                         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
-                    # CRNN expects 32x128 input, normalize to [0, 1]
-                    resized = cv2.resize(image, (128, 32))
+                    # Resize to match model's expected input (height x width from ONNX shape)
+                    resized = cv2.resize(image, (self.input_width, self.input_height))
                     normalized = resized.astype(np.float32) / 255.0
 
-                    # Add batch and channel dimensions: [1, 1, 32, 128]
+                    # Add batch and channel dimensions: [1, 1, H, W]
                     return normalized[np.newaxis, np.newaxis, :, :]
 
                 def _run(self, input_data):
@@ -474,10 +477,11 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     input_data = self._preprocess(image)
                     return self._run(input_data)
 
-            crnn = CRNNWrapper(session, alphabet, input_name)
+            input_shape = inputs[0].shape
+            crnn = CRNNWrapper(session, alphabet, input_name, input_shape)
 
             # Smoke test: run on a dummy image and print logit stats
-            dummy = np.zeros((32, 128), dtype=np.uint8)
+            dummy = np.zeros((input_shape[2], input_shape[3]), dtype=np.uint8)
             dummy_logits = crnn.get_logits(dummy)
             print(f"  Smoke test - logit shape: {dummy_logits.shape}, "
                   f"min: {dummy_logits.min():.4f}, max: {dummy_logits.max():.4f}, "
