@@ -376,8 +376,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
         # CRNN ONNX model converted to PyTorch
         print("Initializing CRNN OCR model (PyTorch from ONNX)...")
         try:
-            import onnx
-            from onnx2torch import convert
+            import onnxruntime
 
             crnn_model_path = Path("CRNN_VGG_BiLSTM_CTC.onnx")
             crnn_dict_path = Path("alphabet_36.txt")
@@ -394,21 +393,16 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     f"Please ensure the alphabet file is in the current directory."
                 )
 
-            print(f"Loading and converting ONNX model to PyTorch...")
-            # Load ONNX model
-            onnx_model = onnx.load(str(crnn_model_path))
-
-            # Convert to PyTorch
-            print(f"  Converting model architecture...")
-            pytorch_model = convert(onnx_model)
-            pytorch_model.eval()
+            print(f"Loading ONNX model with ONNX Runtime...")
+            # Create ONNX Runtime session
+            session = onnxruntime.InferenceSession(str(crnn_model_path), providers=['CPUExecutionProvider'])
 
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
             class CRNNWrapper:
-                def __init__(self, model, alphabet):
-                    self.model = model
+                def __init__(self, session, alphabet):
+                    self.session = session
                     self.alphabet = alphabet
 
                 def predict(self, image):
@@ -424,25 +418,14 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     normalized = resized.astype(np.float32) / 255.0
 
                     # Add batch and channel dimensions: [1, 1, 32, 128]
-                    input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0)
+                    input_data = normalized[np.newaxis, np.newaxis, :, :]
 
                     # Run inference
-                    with torch.no_grad():
-                        output = self.model(input_tensor)
-
-                    # Handle output - could be tensor or tuple
-                    if isinstance(output, tuple):
-                        output = output[0]
-
-                    # Decode output to text
-                    output = output.squeeze(0)  # Remove batch dimension
-                    if len(output.shape) > 1:
-                        # [seq_len, num_classes]
-                        indices = torch.argmax(output, dim=1).cpu().numpy()
-                    else:
-                        indices = np.array([torch.argmax(output).cpu().numpy()])
+                    outputs = self.session.run(None, {'input': input_data})
+                    logits = outputs[0].squeeze(0)  # [seq_len, num_classes]
 
                     # Decode to text
+                    indices = np.argmax(logits, axis=1)
                     text = ''
                     prev_idx = -1
                     for idx in indices:
@@ -477,19 +460,13 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     normalized = resized.astype(np.float32) / 255.0
 
                     # Add batch and channel dimensions: [1, 1, 32, 128]
-                    input_tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0)
+                    input_data = normalized[np.newaxis, np.newaxis, :, :]
 
                     # Run inference
-                    with torch.no_grad():
-                        output = self.model(input_tensor)
+                    outputs = self.session.run(None, {'input': input_data})
+                    logits = outputs[0].squeeze(0)  # [seq_len, num_classes]
 
-                    # Handle output - could be tensor or tuple
-                    if isinstance(output, tuple):
-                        output = output[0]
-
-                    # Return raw logits as numpy array [seq_len, num_classes]
-                    output = output.squeeze(0)  # Remove batch dimension
-                    return output.cpu().numpy()
+                    return logits
 
             crnn = CRNNWrapper(pytorch_model, alphabet)
             return crnn
@@ -833,8 +810,7 @@ def main():
                       file=sys.stderr)
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
-            import onnx
-            import onnx2torch
+            import onnxruntime
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
