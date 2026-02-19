@@ -637,32 +637,26 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     num_evaluated = 0
 
     for val_image, control_text in zip(val_images, control_texts):
-        try:
-            # Create composite (with patch)
-            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
-            composite = composite.squeeze(0)  # Remove batch dim
+        # Create composite (with patch)
+        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+        composite = composite.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy for OCR
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Convert to numpy for OCR
+        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Run OCR on composite only (control already precomputed)
-            composite_result = ocr.predict(composite_np)
-            composite_text = composite_result.text if composite_result is not None else ""
+        # Run OCR on composite only (control already precomputed)
+        composite_result = ocr.predict(composite_np)
+        composite_text = composite_result.text if composite_result is not None else ""
 
-            # Calculate Levenshtein edit distance
-            edit_dist = Levenshtein.distance(control_text, composite_text)
-            total_edit_distance += edit_dist
+        # Calculate Levenshtein edit distance
+        edit_dist = Levenshtein.distance(control_text, composite_text)
+        total_edit_distance += edit_dist
 
-            # Count misread if texts differ
-            if composite_text != control_text:
-                misreads += 1
+        # Count misread if texts differ
+        if composite_text != control_text:
+            misreads += 1
 
-            num_evaluated += 1
-
-        except Exception as e:
-            # Treat errors as 0 edit distance (conservative)
-            num_evaluated += 1
-            pass
+        num_evaluated += 1
 
     avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
     return total_edit_distance, misreads, avg_edit_distance
@@ -689,57 +683,51 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
     debug_results = []
 
     for img_idx, (val_image, control_text) in enumerate(zip(val_images, control_texts)):
-        try:
-            # Create composite (with patch)
-            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
-            composite = composite.squeeze(0)  # Remove batch dim
+        # Create composite (with patch)
+        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+        composite = composite.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy for OCR
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Convert to numpy for OCR
+        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Run OCR on composite only (control already precomputed)
-            composite_result = ocr.predict(composite_np)
-            composite_text = composite_result.text if composite_result is not None else ""
+        # Run OCR on composite only (control already precomputed)
+        composite_result = ocr.predict(composite_np)
+        composite_text = composite_result.text if composite_result is not None else ""
 
-            # Calculate Levenshtein edit distance
-            edit_dist = Levenshtein.distance(control_text, composite_text)
-            total_edit_distance += edit_dist
+        # Calculate Levenshtein edit distance
+        edit_dist = Levenshtein.distance(control_text, composite_text)
+        total_edit_distance += edit_dist
 
-            # Count misread if texts differ
-            is_misread = (composite_text != control_text)
-            if is_misread:
-                misreads += 1
+        # Count misread if texts differ
+        is_misread = (composite_text != control_text)
+        if is_misread:
+            misreads += 1
 
-            num_evaluated += 1
+        num_evaluated += 1
 
-            # Save debug images
-            if debug_dir is not None:
-                # Save composite
-                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
-                comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
-                cv2.imwrite(str(comp_path), composite_bgr)
+        # Save debug images
+        if debug_dir is not None:
+            # Save composite
+            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+            comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
+            cv2.imwrite(str(comp_path), composite_bgr)
 
-                # Save control (regenerate for debug visualization)
-                control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
-                control = control.squeeze(0)
-                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
-                ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
-                cv2.imwrite(str(ctrl_path), control_bgr)
+            # Save control (regenerate for debug visualization)
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+            ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
+            cv2.imwrite(str(ctrl_path), control_bgr)
 
-                # Track results
-                debug_results.append({
-                    'img_idx': img_idx,
-                    'control_text': control_text,
-                    'composite_text': composite_text,
-                    'edit_distance': edit_dist,
-                    'is_misread': is_misread,
-                })
-
-        except Exception as e:
-            # Treat errors as 0 edit distance (conservative)
-            num_evaluated += 1
-            pass
+            # Track results
+            debug_results.append({
+                'img_idx': img_idx,
+                'control_text': control_text,
+                'composite_text': composite_text,
+                'edit_distance': edit_dist,
+                'is_misread': is_misread,
+            })
 
     # Save debug summary
     avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
@@ -781,37 +769,32 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cont
     num_evaluated = 0
 
     for val_image, control_logits, control_text in zip(val_images, control_logits_list, control_texts):
-        try:
-            # Create composite (with patch)
-            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
-            composite = composite.squeeze(0)  # Remove batch dim
+        # Create composite (with patch)
+        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+        composite = composite.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy for OCR
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Convert to numpy for OCR
+        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Get logits for composite
-            composite_logits = ocr.get_logits(composite_np)
+        # Get logits for composite
+        composite_logits = ocr.get_logits(composite_np)
 
-            # Compute MSE between control and composite logits
-            min_len = min(control_logits.shape[0], composite_logits.shape[0])
-            logit_diff = control_logits[:min_len] - composite_logits[:min_len]
-            mse = np.mean(logit_diff ** 2)
-            total_mse += mse
+        # Compute MSE between control and composite logits
+        min_len = min(control_logits.shape[0], composite_logits.shape[0])
+        logit_diff = control_logits[:min_len] - composite_logits[:min_len]
+        mse = np.mean(logit_diff ** 2)
+        total_mse += mse
 
-            # Compute edit distance using precomputed control text
-            composite_result = ocr.predict(composite_np)
-            composite_text = composite_result.text if composite_result is not None else ""
-            edit_dist = Levenshtein.distance(control_text, composite_text)
-            total_edit_distance += edit_dist
+        # Compute edit distance using precomputed control text
+        composite_result = ocr.predict(composite_np)
+        composite_text = composite_result.text if composite_result is not None else ""
+        edit_dist = Levenshtein.distance(control_text, composite_text)
+        total_edit_distance += edit_dist
 
-            if composite_text != control_text:
-                num_misreads += 1
+        if composite_text != control_text:
+            num_misreads += 1
 
-            num_evaluated += 1
-
-        except Exception as e:
-            print(f"  [evaluate_patch_logit_delta] Error on sample: {e}", file=sys.stderr)
-            num_evaluated += 1
+        num_evaluated += 1
 
     return total_mse if num_evaluated > 0 else 0.0, total_edit_distance, num_misreads
 
@@ -839,63 +822,58 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
     debug_results = []
 
     for img_idx, (val_image, control_logits, control_text) in enumerate(zip(val_images, control_logits_list, control_texts)):
-        try:
-            # Create composite (with patch)
-            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
-            composite = composite.squeeze(0)  # Remove batch dim
+        # Create composite (with patch)
+        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+        composite = composite.squeeze(0)  # Remove batch dim
 
-            # Convert to numpy for OCR
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Convert to numpy for OCR
+        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-            # Get logits for composite
-            composite_logits = ocr.get_logits(composite_np)
+        # Get logits for composite
+        composite_logits = ocr.get_logits(composite_np)
 
-            # Compute MSE
-            min_len = min(control_logits.shape[0], composite_logits.shape[0])
-            logit_diff = control_logits[:min_len] - composite_logits[:min_len]
-            mse = np.mean(logit_diff ** 2)
-            total_mse += mse
+        # Compute MSE
+        min_len = min(control_logits.shape[0], composite_logits.shape[0])
+        logit_diff = control_logits[:min_len] - composite_logits[:min_len]
+        mse = np.mean(logit_diff ** 2)
+        total_mse += mse
 
-            # Compute edit distance using precomputed control text
-            composite_result = ocr.predict(composite_np)
-            composite_text = composite_result.text if composite_result is not None else ""
-            edit_dist = Levenshtein.distance(control_text, composite_text)
-            total_edit_distance += edit_dist
+        # Compute edit distance using precomputed control text
+        composite_result = ocr.predict(composite_np)
+        composite_text = composite_result.text if composite_result is not None else ""
+        edit_dist = Levenshtein.distance(control_text, composite_text)
+        total_edit_distance += edit_dist
 
-            if composite_text != control_text:
-                num_misreads += 1
+        if composite_text != control_text:
+            num_misreads += 1
 
-            num_evaluated += 1
+        num_evaluated += 1
 
-            # Save debug images
-            if debug_dir is not None:
-                # Save composite
-                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
-                comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
-                cv2.imwrite(str(comp_path), composite_bgr)
+        # Save debug images
+        if debug_dir is not None:
+            # Save composite
+            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+            comp_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_composite.jpg"
+            cv2.imwrite(str(comp_path), composite_bgr)
 
-                # Save control (regenerate for debug visualization)
-                control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
-                control = control.squeeze(0)
-                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
-                ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
-                cv2.imwrite(str(ctrl_path), control_bgr)
+            # Save control (regenerate for debug visualization)
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+            ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
+            cv2.imwrite(str(ctrl_path), control_bgr)
 
-                # Track results
-                debug_results.append({
-                    'img_idx': img_idx,
-                    'mse': mse,
-                    'edit_distance': edit_dist,
-                    'control_text': control_text,
-                    'composite_text': composite_text,
-                    'control_logit_shape': control_logits.shape,
-                    'composite_logit_shape': composite_logits.shape,
-                })
-
-        except Exception as e:
-            num_evaluated += 1
-            pass
+            # Track results
+            debug_results.append({
+                'img_idx': img_idx,
+                'mse': mse,
+                'edit_distance': edit_dist,
+                'control_text': control_text,
+                'composite_text': composite_text,
+                'control_logit_shape': control_logits.shape,
+                'composite_logit_shape': composite_logits.shape,
+            })
 
     # Save debug summary
     if debug_dir is not None and debug_results:
