@@ -397,34 +397,49 @@ def create_ocr_model(ocr_model_type, white_box=False):
             # Create ONNX Runtime session
             session = onnxruntime.InferenceSession(str(crnn_model_path), providers=['CPUExecutionProvider'])
 
+            # Print model input/output info for debugging
+            inputs = session.get_inputs()
+            outputs = session.get_outputs()
+            print(f"  Model inputs:")
+            for inp in inputs:
+                print(f"    {inp.name}: shape={inp.shape}, type={inp.type}")
+            print(f"  Model outputs:")
+            for out in outputs:
+                print(f"    {out.name}: shape={out.shape}, type={out.type}")
+
+            input_name = inputs[0].name
+
             with open(crnn_dict_path, 'r') as f:
                 alphabet = f.read().strip()
 
             class CRNNWrapper:
-                def __init__(self, session, alphabet):
+                def __init__(self, session, alphabet, input_name):
                     self.session = session
                     self.alphabet = alphabet
+                    self.input_name = input_name
 
-                def predict(self, image):
-                    """Predict text from image using CRNN."""
+                def _preprocess(self, image):
+                    """Preprocess image for CRNN inference."""
                     import cv2
 
                     # Convert to grayscale if needed
                     if len(image.shape) == 3:
-                        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                        image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
                     # CRNN expects 32x128 input, normalize to [0, 1]
                     resized = cv2.resize(image, (128, 32))
                     normalized = resized.astype(np.float32) / 255.0
 
                     # Add batch and channel dimensions: [1, 1, 32, 128]
-                    input_data = normalized[np.newaxis, np.newaxis, :, :]
+                    return normalized[np.newaxis, np.newaxis, :, :]
 
-                    # Run inference
-                    outputs = self.session.run(None, {'input': input_data})
-                    logits = outputs[0].squeeze(0)  # [seq_len, num_classes]
+                def _run(self, input_data):
+                    """Run inference and return raw logits."""
+                    outputs = self.session.run(None, {self.input_name: input_data})
+                    return outputs[0].squeeze(0)  # [seq_len, num_classes]
 
-                    # Decode to text
+                def _decode(self, logits):
+                    """Decode logits to text using CTC decoding."""
                     indices = np.argmax(logits, axis=1)
                     text = ''
                     prev_idx = -1
@@ -433,6 +448,13 @@ def create_ocr_model(ocr_model_type, white_box=False):
                             if idx - 1 < len(self.alphabet):
                                 text += self.alphabet[idx - 1]
                         prev_idx = idx
+                    return text
+
+                def predict(self, image):
+                    """Predict text from image using CRNN."""
+                    input_data = self._preprocess(image)
+                    logits = self._run(input_data)
+                    text = self._decode(logits)
 
                     class Result:
                         def __init__(self, text):
@@ -444,31 +466,22 @@ def create_ocr_model(ocr_model_type, white_box=False):
                     """Get raw logits from model for an image.
 
                     Args:
-                        image: Input image in BGR format (as uint8 numpy array)
+                        image: Input image in RGB format (as uint8 numpy array)
 
                     Returns:
                         logits: [seq_len, num_classes] numpy array of raw logits
                     """
-                    import cv2
+                    input_data = self._preprocess(image)
+                    return self._run(input_data)
 
-                    # Convert to grayscale if needed
-                    if len(image.shape) == 3:
-                        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            crnn = CRNNWrapper(session, alphabet, input_name)
 
-                    # CRNN expects 32x128 input, normalize to [0, 1]
-                    resized = cv2.resize(image, (128, 32))
-                    normalized = resized.astype(np.float32) / 255.0
-
-                    # Add batch and channel dimensions: [1, 1, 32, 128]
-                    input_data = normalized[np.newaxis, np.newaxis, :, :]
-
-                    # Run inference
-                    outputs = self.session.run(None, {'input': input_data})
-                    logits = outputs[0].squeeze(0)  # [seq_len, num_classes]
-
-                    return logits
-
-            crnn = CRNNWrapper(session, alphabet)
+            # Smoke test: run on a dummy image and print logit stats
+            dummy = np.zeros((32, 128), dtype=np.uint8)
+            dummy_logits = crnn.get_logits(dummy)
+            print(f"  Smoke test - logit shape: {dummy_logits.shape}, "
+                  f"min: {dummy_logits.min():.4f}, max: {dummy_logits.max():.4f}, "
+                  f"mean: {dummy_logits.mean():.4f}")
             return crnn
 
         except ImportError as e:
@@ -689,9 +702,8 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
             num_evaluated += 1
 
         except Exception as e:
-            # Treat errors conservatively
+            print(f"  [evaluate_patch_logit_delta] Error on sample: {e}", file=sys.stderr)
             num_evaluated += 1
-            pass
 
     return total_mse if num_evaluated > 0 else 0.0, total_edit_distance, num_misreads
 
