@@ -533,7 +533,12 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
                     out = self.model(input_tensor, return_model_output=True)
                 if isinstance(out, dict):
                     # 'out_map' contains raw logits before postprocessor
-                    logits = out.get("out_map") or out.get("logits") or list(out.values())[0]
+                    if "out_map" in out:
+                        logits = out["out_map"]
+                    elif "logits" in out:
+                        logits = out["logits"]
+                    else:
+                        logits = list(out.values())[0]
                 elif isinstance(out, torch.Tensor):
                     logits = out
                 else:
