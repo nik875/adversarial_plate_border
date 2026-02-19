@@ -1075,8 +1075,18 @@ class ProgressivePatchTrainer:
         from datetime import datetime
 
         # Get indices from the random_split
-        train_indices = set(train_dataset.indices) if hasattr(train_dataset, 'indices') else set()
-        val_indices = set(val_dataset.indices) if hasattr(val_dataset, 'indices') else set()
+        # Handle both torch.Tensor and list/array indices
+        if hasattr(train_dataset, 'indices'):
+            indices = train_dataset.indices
+            train_indices = set(indices.tolist() if hasattr(indices, 'tolist') else indices)
+        else:
+            train_indices = set()
+
+        if hasattr(val_dataset, 'indices'):
+            indices = val_dataset.indices
+            val_indices = set(indices.tolist() if hasattr(indices, 'tolist') else indices)
+        else:
+            val_indices = set()
 
         # Build metadata for all samples
         split_data = []
