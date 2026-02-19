@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import sys
+import shutil
 from pathlib import Path
 import csv
 import random
@@ -1013,267 +1014,72 @@ def main():
     print(f"\nLoading generator from {run_dir}...")
     generator, latent_dim, device = load_generator(run_dir, device=device)
 
-    # Composite-only mode: just generate and save composites, then exit
+    # Composite-only mode: sample 10 images, apply 10 patches (1-to-1), run OCR, save CSV
     if args.composite_only:
         print("\n" + "="*80)
         print("COMPOSITE-ONLY MODE")
         print("="*80)
 
-        # Generate random latent codes for patches
-        num_patches = args.popsize if args.popsize else 10
-        print(f"\nGenerating {num_patches} random patches...")
+        # Delete and recreate output directory
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+            print(f"Deleted existing output directory: {output_dir}")
+        output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Initialize OCR model
+        print(f"\nInitializing OCR model: {args.ocr_model}")
+        ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device)
+
+        n = 10
+        images_to_use = val_images[:n]
+        print(f"\nGenerating {n} patches...")
         patches = []
-        for i in range(num_patches):
+        for i in range(n):
             z = np.random.randn(latent_dim) * args.sigma0
             patch = generate_patch_from_z(generator, z, device)
             patches.append(patch)
 
-        print(f"Generated {len(patches)} patches")
+        print(f"Processing {n} image-patch pairs...")
+        rows = []
+        for idx, (val_image, patch) in enumerate(zip(images_to_use, patches)):
+            # Control: grey border
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control_np = (control.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            cv2.imwrite(str(output_dir / f"{idx:02d}_control.jpg"),
+                        cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR))
 
-        # Print generator output statistics
-        if len(patches) > 0:
-            first_patch = patches[0]
-            print(f"\nGenerator output statistics (before any clamping):")
-            print(f"  Min value: {first_patch.min().item():.6f}")
-            print(f"  Max value: {first_patch.max().item():.6f}")
-            print(f"  Mean value: {first_patch.mean().item():.6f}")
-            print(f"  Values < 0: {(first_patch < 0).sum().item()} pixels")
-            print(f"  Values > 1: {(first_patch > 1).sum().item()} pixels")
+            # Composite: with patch
+            composite = apply_patch_ocr_mode(val_image, patch, center_ratio=args.center_ratio)
+            composite_np = (composite.squeeze(0).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            cv2.imwrite(str(output_dir / f"{idx:02d}_composite.jpg"),
+                        cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR))
 
-        # Create debug directory for quantization comparison
-        debug_dir = output_dir / "quantization_debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
+            # OCR
+            control_result = ocr.predict(control_np)
+            control_text = control_result.text if control_result is not None else ""
+            composite_result = ocr.predict(composite_np)
+            composite_text = composite_result.text if composite_result is not None else ""
 
-        # Debug: save downscaling comparison for first patch only
-        print(f"\nSaving quantization debug outputs for first patch...")
-        if len(patches) > 0 and len(val_images) > 0:
-            first_patch = patches[0]
-            first_val_image = val_images[0]
+            rows.append({
+                'image_idx': idx,
+                'control_text': control_text,
+                'composite_text': composite_text,
+                'changed': control_text != composite_text,
+            })
+            print(f"  [{idx:02d}] control='{control_text}' | composite='{composite_text}'"
+                  + (" *" if control_text != composite_text else ""))
 
-            # Get image dimensions
-            img_h, img_w = first_val_image.shape[1], first_val_image.shape[2]
+        # Save CSV
+        csv_out = output_dir / "predictions.csv"
+        with open(csv_out, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'changed'])
+            writer.writeheader()
+            writer.writerows(rows)
 
-            # Method 1: Direct downscale from float32 generator output
-            patch_downscaled_float = F.interpolate(
-                first_patch.unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)  # [3, H, W] float32
-
-            # Save float-downscaled version
-            float_np = (patch_downscaled_float.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            float_bgr = cv2.cvtColor(float_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_downscaled_float32.png"), float_bgr)
-
-            # Method 2: Quantize to uint8 first, THEN downscale
-            # Convert patch to uint8 PNG format
-            patch_np = (first_patch.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
-
-            # Save original patch
-            cv2.imwrite(str(debug_dir / "patch_original.png"), patch_bgr)
-
-            # Convert back to tensor (simulating PNG save/load)
-            patch_rgb = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            patch_quantized = torch.from_numpy(np.transpose(patch_rgb, (2, 0, 1)))  # [3, H, W]
-
-            # Now downscale the quantized version
-            patch_downscaled_quantized = F.interpolate(
-                patch_quantized.unsqueeze(0),
-                size=(img_h, img_w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)  # [3, H, W]
-
-            # Save quantized-downscaled version
-            quant_np = (patch_downscaled_quantized.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            quant_bgr = cv2.cvtColor(quant_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_downscaled_quantized.png"), quant_bgr)
-
-            # Debug: Composite the patch around a grey rectangle (like apply_patch_ocr_mode does)
-            # Create a grey rectangle base image
-            grey_base = torch.full((3, img_h, img_w), 0.5, dtype=torch.float32)  # Mid-grey
-
-            # Create mask for center region (60% like in apply_patch_ocr_mode)
-            center_ratio = 0.6
-            center_h = int(img_h * center_ratio)
-            center_w = int(img_w * center_ratio)
-            pad_h = (img_h - center_h) // 2
-            pad_w = (img_w - center_w) // 2
-
-            center_mask = torch.zeros(1, img_h, img_w, dtype=torch.float32)
-            center_mask[:, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
-            center_mask = center_mask.expand(3, -1, -1)  # [3, H, W]
-
-            # Composite: grey rectangle in center, patch on borders
-            composite_grey = grey_base * center_mask + patch_downscaled_float * (1 - center_mask)
-            composite_grey = torch.clamp(composite_grey, 0, 1)
-
-            # Save composited version
-            comp_grey_np = (composite_grey.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            comp_grey_bgr = cv2.cvtColor(comp_grey_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_composited_grey_rect.png"), comp_grey_bgr)
-
-            # Debug 3: Composite grey rectangle on ORIGINAL patch (no downscaling)
-            # Get original patch dimensions
-            patch_h, patch_w = first_patch.shape[1], first_patch.shape[2]
-
-            # Create grey base at original patch size
-            grey_base_orig = torch.full((3, patch_h, patch_w), 0.5, dtype=torch.float32)
-
-            # Create mask for center region at original size
-            center_h_orig = int(patch_h * center_ratio)
-            center_w_orig = int(patch_w * center_ratio)
-            pad_h_orig = (patch_h - center_h_orig) // 2
-            pad_w_orig = (patch_w - center_w_orig) // 2
-
-            center_mask_orig = torch.zeros(1, patch_h, patch_w, dtype=torch.float32)
-            center_mask_orig[:, pad_h_orig:pad_h_orig + center_h_orig, pad_w_orig:pad_w_orig + center_w_orig] = 1.0
-            center_mask_orig = center_mask_orig.expand(3, -1, -1)
-
-            # Composite at original resolution
-            composite_orig = grey_base_orig * center_mask_orig + first_patch * (1 - center_mask_orig)
-            composite_orig = torch.clamp(composite_orig, 0, 1)
-
-            # Save
-            comp_orig_np = (composite_orig.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            comp_orig_bgr = cv2.cvtColor(comp_orig_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_composited_original_res.png"), comp_orig_bgr)
-
-            # Debug 4: Downscale patch to 64x128, then composite small grey square off-center
-            patch_small = F.interpolate(
-                first_patch.unsqueeze(0),
-                size=(64, 128),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)  # [3, 64, 128]
-
-            # Create small grey square (32x32) at position (10, 20) - top-left offset
-            grey_square = torch.full((3, 64, 128), 0.0, dtype=torch.float32)  # Start with zeros
-            square_size = 32
-            offset_y, offset_x = 10, 20
-            grey_square[:, offset_y:offset_y+square_size, offset_x:offset_x+square_size] = 0.5
-
-            # Create mask for the square
-            square_mask = torch.zeros(1, 64, 128, dtype=torch.float32)
-            square_mask[:, offset_y:offset_y+square_size, offset_x:offset_x+square_size] = 1.0
-            square_mask = square_mask.expand(3, -1, -1)
-
-            # Composite: grey square overlaid on patch
-            composite_small = patch_small * (1 - square_mask) + grey_square * square_mask
-            composite_small = torch.clamp(composite_small, 0, 1)
-
-            # Save
-            comp_small_np = (composite_small.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            comp_small_bgr = cv2.cvtColor(comp_small_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_64x128_with_grey_square.png"), comp_small_bgr)
-
-            # Debug 5: Composite a single white pixel at top-left corner on downscaled patch
-            patch_with_pixel = patch_downscaled_float.clone()  # Clone to avoid modifying original
-
-            # Set top-left pixel to white (1.0 in all channels)
-            patch_with_pixel[:, 0, 0] = 1.0
-
-            # Save
-            pixel_np = (patch_with_pixel.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            pixel_bgr = cv2.cvtColor(pixel_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_downscaled_with_white_pixel.png"), pixel_bgr)
-
-            # Debug 6: Composite 1x1 white rectangle at top-left using EXACT compositing logic
-            # Create white 1x1 "image"
-            white_pixel = torch.ones((3, img_h, img_w), dtype=torch.float32)
-
-            # Create mask for single pixel at [0, 0]
-            pixel_mask = torch.zeros(1, img_h, img_w, dtype=torch.float32)
-            pixel_mask[:, 0, 0] = 1.0
-            pixel_mask = pixel_mask.expand(3, -1, -1)  # [3, H, W]
-
-            # Composite: white pixel at [0,0], patch everywhere else
-            composite_1x1 = patch_downscaled_float * (1 - pixel_mask) + white_pixel * pixel_mask
-            composite_1x1 = torch.clamp(composite_1x1, 0, 1)
-
-            # Save
-            comp_1x1_np = (composite_1x1.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            comp_1x1_bgr = cv2.cvtColor(comp_1x1_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_composited_1x1_white.png"), comp_1x1_bgr)
-
-            # Debug 7: Identity operation - composite patch with all-zeros using all-ones mask
-            # This should return the patch unchanged, but let's see if mask ops introduce artifacts
-            zeros_image = torch.zeros((3, img_h, img_w), dtype=torch.float32)
-            ones_mask = torch.ones((3, img_h, img_w), dtype=torch.float32)
-
-            # Composite: patch everywhere (mask=1), zeros nowhere (mask=0 would show zeros)
-            # Result should be identical to patch_downscaled_float
-            identity_composite = zeros_image * (1 - ones_mask) + patch_downscaled_float * ones_mask
-            identity_composite = torch.clamp(identity_composite, 0, 1)
-
-            # Save
-            identity_np = (identity_composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            identity_bgr = cv2.cvtColor(identity_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_identity_composite.png"), identity_bgr)
-
-            # Debug 8: Just clamp the downscaled patch, no compositing at all
-            patch_clamped = torch.clamp(patch_downscaled_float, 0, 1)
-
-            clamped_np = (patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            clamped_bgr = cv2.cvtColor(clamped_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(debug_dir / "patch_downscaled_clamped.png"), clamped_bgr)
-
-            print(f"  Saved to {debug_dir}/")
-            print(f"    - patch_original.png (original generator output)")
-            print(f"    - patch_downscaled_float32.png (float → downscale)")
-            print(f"    - patch_downscaled_quantized.png (float → uint8 → float → downscale)")
-            print(f"    - patch_composited_grey_rect.png (patch on border, grey in center, downscaled)")
-            print(f"    - patch_composited_original_res.png (patch on border, grey in center, NO downscale)")
-            print(f"    - patch_64x128_with_grey_square.png (patch @ 64x128 with 32x32 grey square at offset)")
-            print(f"    - patch_downscaled_with_white_pixel.png (downscaled patch + 1 white pixel at [0,0])")
-            print(f"    - patch_composited_1x1_white.png (composited 1x1 white rect at [0,0] using mask logic)")
-            print(f"    - patch_identity_composite.png (zeros * 0 + patch * 1 - should be identical to patch)")
-
-        # Composite patches with validation samples (ONLY ONE IMAGE PER PATCH)
-        print(f"\nCompositing {len(patches)} patches with 1 validation sample each...")
-        print(f"Total outputs: {len(patches)} composite + control pairs")
-
-        pbar = tqdm(total=len(patches), desc="Compositing")
-
-        for patch_idx, patch in enumerate(patches):
-            # Use only first validation image
-            val_image = val_images[0]
-
-            try:
-                # Apply patch
-                composite = apply_patch_ocr_mode(val_image, patch, center_ratio=args.center_ratio)
-                composite = composite.squeeze(0)  # Remove batch dim
-
-                # Convert to numpy and save
-                composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
-
-                output_path = output_dir / f"composite_{patch_idx:04d}.jpg"
-                cv2.imwrite(str(output_path), composite_bgr)
-
-                # Apply grey control border (only save once)
-                if patch_idx == 0:
-                    control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-                    control = control.squeeze(0)  # Remove batch dim
-
-                    # Convert to numpy and save
-                    control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
-
-                    control_path = output_dir / f"control_0000.jpg"
-                    cv2.imwrite(str(control_path), control_bgr)
-
-            except Exception as e:
-                print(f"  Error processing patch {patch_idx}: {e}", file=sys.stderr)
-
-            pbar.update(1)
-
-        pbar.close()
-        print(f"\nSaved {len(patches)} composite images + 1 control to {output_dir}")
-        print("Done!")
+        changed = sum(r['changed'] for r in rows)
+        print(f"\nSaved {n} image pairs to {output_dir}")
+        print(f"CSV: {csv_out}")
+        print(f"Changed: {changed}/{n}")
         return
 
     # Initialize OCR model
