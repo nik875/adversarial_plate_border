@@ -439,7 +439,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
                 def _run(self, input_data):
                     """Run inference and return raw logits."""
                     outputs = self.session.run(None, {self.input_name: input_data})
-                    return outputs[0].squeeze(0)  # [seq_len, num_classes]
+                    return outputs[0].squeeze(1)  # [24, 1, 37] -> [24, 37] = [seq_len, num_classes]
 
                 def _decode(self, logits):
                     """Decode logits to text using CTC decoding."""
