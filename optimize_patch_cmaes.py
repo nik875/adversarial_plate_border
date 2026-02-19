@@ -651,7 +651,7 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
 
 
 def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, center_ratio=0.6):
-    """Evaluate patch by measuring logit differences between control and composite.
+    """Evaluate patch by measuring logit differences between control and composite (MSE).
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
@@ -661,9 +661,9 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
         center_ratio: Center ratio for compositing
 
     Returns:
-        Total logit delta (sum of absolute differences across all samples)
+        Total MSE across all samples
     """
-    total_logit_delta = 0.0
+    total_mse = 0.0
     num_evaluated = 0
 
     for val_image, control_logits in zip(val_images, control_logits_list):
@@ -678,26 +678,25 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
             # Get logits for composite
             composite_logits = ocr.get_logits(composite_np)
 
-            # Compute logit delta: sum of absolute differences
+            # Compute MSE between control and composite logits
             # Handle cases where logits have different shapes (shouldn't happen, but be safe)
             min_len = min(control_logits.shape[0], composite_logits.shape[0])
-            logit_delta = np.abs(
-                control_logits[:min_len] - composite_logits[:min_len]
-            ).sum()
-            total_logit_delta += logit_delta
+            logit_diff = control_logits[:min_len] - composite_logits[:min_len]
+            mse = np.mean(logit_diff ** 2)
+            total_mse += mse
 
             num_evaluated += 1
 
         except Exception as e:
-            # Treat errors as 0 delta (conservative)
+            # Treat errors as 0 MSE (conservative)
             num_evaluated += 1
             pass
 
-    return total_logit_delta if num_evaluated > 0 else 0.0
+    return total_mse if num_evaluated > 0 else 0.0
 
 
 def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, center_ratio=0.6, debug_dir=None, candidate_idx=0):
-    """Evaluate patch by measuring logit delta and save debug images.
+    """Evaluate patch by measuring logit MSE and save debug images.
 
     Args:
         patch: [3, H, W] tensor in [0, 1]
@@ -709,9 +708,9 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         candidate_idx: Index of the candidate being evaluated
 
     Returns:
-        Total logit delta
+        Total MSE across all samples
     """
-    total_logit_delta = 0.0
+    total_mse = 0.0
     num_evaluated = 0
     debug_results = []
 
@@ -727,12 +726,11 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
             # Get logits for composite
             composite_logits = ocr.get_logits(composite_np)
 
-            # Compute logit delta
+            # Compute MSE
             min_len = min(control_logits.shape[0], composite_logits.shape[0])
-            logit_delta = np.abs(
-                control_logits[:min_len] - composite_logits[:min_len]
-            ).sum()
-            total_logit_delta += logit_delta
+            logit_diff = control_logits[:min_len] - composite_logits[:min_len]
+            mse = np.mean(logit_diff ** 2)
+            total_mse += mse
 
             num_evaluated += 1
 
@@ -754,7 +752,7 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
                 # Track results
                 debug_results.append({
                     'img_idx': img_idx,
-                    'logit_delta': logit_delta,
+                    'mse': mse,
                     'control_logit_shape': control_logits.shape,
                     'composite_logit_shape': composite_logits.shape,
                 })
@@ -767,15 +765,15 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
     if debug_dir is not None and debug_results:
         summary_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_summary.txt"
         with open(summary_path, 'w') as f:
-            f.write(f"Candidate {candidate_idx} Debug Summary (Logit Delta Mode)\n")
+            f.write(f"Candidate {candidate_idx} Debug Summary (Logit MSE Mode)\n")
             f.write(f"{'=' * 80}\n")
-            f.write(f"Total logit delta: {total_logit_delta:.2f}\n\n")
+            f.write(f"Total MSE: {total_mse:.2f}\n\n")
             f.write(f"Per-image results:\n")
             for result in debug_results:
-                f.write(f"  Image {result['img_idx']:2d}: LogitDelta: {result['logit_delta']:10.2f} | "
+                f.write(f"  Image {result['img_idx']:2d}: MSE: {result['mse']:10.2f} | "
                        f"Shapes: {result['control_logit_shape']} vs {result['composite_logit_shape']}\n")
 
-    return total_logit_delta
+    return total_mse
 
 
 def main():
@@ -1172,10 +1170,10 @@ def main():
 
     # Precompute control OCR outputs once (with grey border)
     # For opencv-crnn, precompute logits; for others, precompute text
-    use_logit_delta = (args.ocr_model == 'opencv-crnn')
+    use_logit_mse = (args.ocr_model == 'opencv-crnn')
 
-    if use_logit_delta:
-        print("\nPrecomputing control logits (logit delta mode)...")
+    if use_logit_mse:
+        print("\nPrecomputing control logits (logit MSE mode)...")
         control_logits_list = []
         for val_image in tqdm(val_images, desc="Control logits"):
             try:
@@ -1257,7 +1255,7 @@ def main():
             cv2.imwrite(str(patch_path), patch_bgr)
 
         # Evaluate on sampled validation set with optional debug output
-        if use_logit_delta:
+        if use_logit_mse:
             # Logit delta mode (opencv-crnn only)
             if save_debug:
                 total_metric = evaluate_patch_logit_delta_with_debug(
@@ -1295,7 +1293,7 @@ def main():
         if total_metric > best_metric[0]:
             best_metric[0] = total_metric
             best_avg_metric[0] = avg_metric
-            if not use_logit_delta:
+            if not use_logit_mse:
                 best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
             best_z[0] = z.copy()
 
@@ -1308,8 +1306,8 @@ def main():
     print(f"  Population size: {args.popsize}")
     print(f"  Max iterations: {args.maxiter}")
     print(f"  Initial sigma: {args.sigma0}")
-    if use_logit_delta:
-        print(f"  Mode: Logit delta optimization (opencv-crnn)")
+    if use_logit_mse:
+        print(f"  Mode: Logit MSE optimization (opencv-crnn)")
     else:
         print(f"  Mode: Text edit distance optimization")
 
@@ -1336,8 +1334,8 @@ def main():
     num_samples_to_use = min(args.n_eval_samples, len(val_images))
     print(f"Full validation set: {len(val_images)} samples")
     print(f"Sampling {num_samples_to_use} samples randomly each iteration (different subset per iteration)")
-    if use_logit_delta:
-        print(f"Objective: Maximize logit delta (sum of absolute logit differences)")
+    if use_logit_mse:
+        print(f"Objective: Maximize logit MSE (mean squared error of logits)")
     else:
         print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
     print("=" * 80)
@@ -1379,10 +1377,10 @@ def main():
         avg_metric = np.mean(all_metrics) if all_metrics else 0
 
         # Update progress bar with current metrics
-        if use_logit_delta:
+        if use_logit_mse:
             pbar.set_postfix({
-                'best_delta': f'{best_avg_metric[0]:.2f}',
-                'avg_delta': f'{avg_metric:.2f}',
+                'best_mse': f'{best_avg_metric[0]:.2f}',
+                'avg_mse': f'{avg_metric:.2f}',
             })
         else:
             pbar.set_postfix({
@@ -1402,9 +1400,9 @@ def main():
     print("=" * 80)
     print(f"Completed {iteration} iterations (maxiter={args.maxiter})")
     print(f"Total evaluations: {eval_count[0]}")
-    if use_logit_delta:
-        print(f"Best total logit delta: {best_metric[0]:.2f}")
-        print(f"Best average logit delta: {best_avg_metric[0]:.2f}")
+    if use_logit_mse:
+        print(f"Best total logit MSE: {best_metric[0]:.2f}")
+        print(f"Best average logit MSE: {best_avg_metric[0]:.2f}")
     else:
         print(f"Best total edit distance: {best_metric[0]:.2f}")
         print(f"Best average edit distance: {best_avg_metric[0]:.2f}")
@@ -1447,15 +1445,15 @@ def main():
             f.write(f"  Center ratio: {args.center_ratio}\n")
             f.write(f"  OCR model type: {args.ocr_model}\n")
             f.write(f"  Device: {device}\n")
-            if use_logit_delta:
-                f.write(f"  Objective: Maximize logit delta (sum of absolute logit differences)\n\n")
+            if use_logit_mse:
+                f.write(f"  Objective: Maximize logit MSE (mean squared error of logits)\n\n")
             else:
                 f.write(f"  Objective: Maximize Levenshtein edit distance\n\n")
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
-            if use_logit_delta:
-                f.write(f"  Best total logit delta: {best_metric[0]:.2f}\n")
-                f.write(f"  Best average logit delta: {best_avg_metric[0]:.2f}\n")
+            if use_logit_mse:
+                f.write(f"  Best total logit MSE: {best_metric[0]:.2f}\n")
+                f.write(f"  Best average logit MSE: {best_avg_metric[0]:.2f}\n")
             else:
                 f.write(f"  Best total edit distance: {best_metric[0]:.2f}\n")
                 f.write(f"  Best average edit distance: {best_avg_metric[0]:.2f}\n")
