@@ -377,7 +377,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
         print("Initializing CRNN OCR model (PyTorch from ONNX)...")
         try:
             import onnx
-            from onnx2pytorch import ConvertModel
+            from onnx2torch import ConvertModel
 
             crnn_model_path = Path("CRNN_VGG_BiLSTM_CTC.onnx")
             crnn_dict_path = Path("alphabet_36.txt")
@@ -496,7 +496,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
         except ImportError as e:
             print(f"Error: Required package not installed: {e}", file=sys.stderr)
-            print("Install with: pip install onnx onnx2pytorch", file=sys.stderr)
+            print("Install with: pip install onnx onnx2torch", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
             print(f"Error: Could not initialize CRNN: {e}", file=sys.stderr)
@@ -834,7 +834,7 @@ def main():
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
             import onnx
-            import onnx2pytorch
+            import onnx2torch
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
