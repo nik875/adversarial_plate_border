@@ -856,6 +856,10 @@ def main():
     parser.add_argument('--outdir', default='cmaes_output',
                         help='Output directory for results (default: cmaes_output)')
 
+    # Optimization mode
+    parser.add_argument('--use-logit-mse', action='store_true',
+                        help='Optimize for logit MSE instead of text edit distance (only for opencv-crnn, default: text edit distance)')
+
     # Mode selection
     parser.add_argument('--composite-only', action='store_true',
                         help='Composite mode: just composite patches from run_dir with n validation samples and save, then exit (no optimization)')
@@ -1206,9 +1210,14 @@ def main():
     ocr = create_ocr_model(args.ocr_model, white_box=args.white_box)
     print("OCR model loaded")
 
+    # Determine optimization mode
+    use_logit_mse = args.use_logit_mse
+    if use_logit_mse and args.ocr_model != 'opencv-crnn':
+        print("Error: --use-logit-mse only works with --ocr-model opencv-crnn", file=sys.stderr)
+        sys.exit(1)
+
     # Precompute control OCR outputs once (with grey border)
-    # For opencv-crnn, precompute logits; for others, precompute text
-    use_logit_mse = (args.ocr_model == 'opencv-crnn')
+    # For logit MSE mode, precompute logits; for text mode, precompute text
 
     if use_logit_mse:
         print("\nPrecomputing control logits (logit MSE mode)...")
