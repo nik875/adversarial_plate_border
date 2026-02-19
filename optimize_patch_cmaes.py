@@ -1411,8 +1411,8 @@ def main():
         if use_logit_mse:
             avg_secondary = np.mean(all_secondary_metrics) if all_secondary_metrics else 0
             pbar.set_postfix({
-                'best_mse': f'{best_avg_metric[0]:.2f}',
-                'avg_mse': f'{avg_metric:.2f}',
+                'best_mse': f'{best_avg_metric[0]:.2e}',
+                'avg_mse': f'{avg_metric:.2e}',
                 'best_edit': f'{best_secondary_metric[0]:.1f}',
                 'avg_edit': f'{avg_secondary:.1f}',
             })
@@ -1435,7 +1435,7 @@ def main():
     print(f"Completed {iteration} iterations (maxiter={args.maxiter})")
     print(f"Total evaluations: {eval_count[0]}")
     if use_logit_mse:
-        print(f"Best average logit MSE: {best_avg_metric[0]:.2f}")
+        print(f"Best average logit MSE: {best_avg_metric[0]:.2e}")
         print(f"Best average edit distance: {best_secondary_metric[0]:.1f}")
         print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
     else:
@@ -1487,7 +1487,7 @@ def main():
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
             if use_logit_mse:
-                f.write(f"  Best average logit MSE: {best_avg_metric[0]:.2f}\n")
+                f.write(f"  Best average logit MSE: {best_avg_metric[0]:.2e}\n")
                 f.write(f"  Best average edit distance: {best_secondary_metric[0]:.1f}\n")
                 f.write(f"  Best misread percentage: {best_misread_pct[0]:.1f}%\n")
             else:
