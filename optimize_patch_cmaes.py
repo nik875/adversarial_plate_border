@@ -633,14 +633,16 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
-        ocr: OCR model instance with get_logits(image) method
+        ocr: OCR model instance with get_logits(image) method and predict(image) method
         control_logits_list: List of precomputed control logits (numpy arrays)
         center_ratio: Center ratio for compositing
 
     Returns:
-        Total MSE across all samples
+        Tuple of (total_mse, total_edit_distance, num_misreads)
     """
     total_mse = 0.0
+    total_edit_distance = 0
+    num_misreads = 0
     num_evaluated = 0
 
     for val_image, control_logits in zip(val_images, control_logits_list):
@@ -662,14 +664,36 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
             mse = np.mean(logit_diff ** 2)
             total_mse += mse
 
+            # Also compute edit distance for monitoring
+            # Get text prediction from composite
+            composite_result = ocr.predict(composite_np)
+            composite_text = composite_result.text if composite_result is not None else ""
+
+            # Decode control logits to text for comparison
+            control_indices = np.argmax(control_logits, axis=1)
+            control_text = ''
+            prev_idx = -1
+            for idx in control_indices:
+                if idx > 0 and idx != prev_idx:
+                    if idx - 1 < len(ocr.alphabet):
+                        control_text += ocr.alphabet[idx - 1]
+                prev_idx = idx
+
+            # Calculate edit distance
+            edit_dist = Levenshtein.distance(control_text, composite_text)
+            total_edit_distance += edit_dist
+
+            if composite_text != control_text:
+                num_misreads += 1
+
             num_evaluated += 1
 
         except Exception as e:
-            # Treat errors as 0 MSE (conservative)
+            # Treat errors conservatively
             num_evaluated += 1
             pass
 
-    return total_mse if num_evaluated > 0 else 0.0
+    return total_mse if num_evaluated > 0 else 0.0, total_edit_distance, num_misreads
 
 
 def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, center_ratio=0.6, debug_dir=None, candidate_idx=0):
@@ -678,16 +702,18 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
     Args:
         patch: [3, H, W] tensor in [0, 1]
         val_images: List of validation image tensors [3, H, W] in [0, 1]
-        ocr: OCR model instance with get_logits(image) method
+        ocr: OCR model instance with get_logits(image) method and predict(image) method
         control_logits_list: List of precomputed control logits (numpy arrays)
         center_ratio: Center ratio for compositing
         debug_dir: Directory to save debug images
         candidate_idx: Index of the candidate being evaluated
 
     Returns:
-        Total MSE across all samples
+        Tuple of (total_mse, total_edit_distance, num_misreads)
     """
     total_mse = 0.0
+    total_edit_distance = 0
+    num_misreads = 0
     num_evaluated = 0
     debug_results = []
 
@@ -708,6 +734,26 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
             logit_diff = control_logits[:min_len] - composite_logits[:min_len]
             mse = np.mean(logit_diff ** 2)
             total_mse += mse
+
+            # Also compute edit distance for monitoring
+            composite_result = ocr.predict(composite_np)
+            composite_text = composite_result.text if composite_result is not None else ""
+
+            # Decode control logits to text
+            control_indices = np.argmax(control_logits, axis=1)
+            control_text = ''
+            prev_idx = -1
+            for idx in control_indices:
+                if idx > 0 and idx != prev_idx:
+                    if idx - 1 < len(ocr.alphabet):
+                        control_text += ocr.alphabet[idx - 1]
+                prev_idx = idx
+
+            edit_dist = Levenshtein.distance(control_text, composite_text)
+            total_edit_distance += edit_dist
+
+            if composite_text != control_text:
+                num_misreads += 1
 
             num_evaluated += 1
 
@@ -730,6 +776,9 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
                 debug_results.append({
                     'img_idx': img_idx,
                     'mse': mse,
+                    'edit_distance': edit_dist,
+                    'control_text': control_text,
+                    'composite_text': composite_text,
                     'control_logit_shape': control_logits.shape,
                     'composite_logit_shape': composite_logits.shape,
                 })
@@ -744,13 +793,15 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         with open(summary_path, 'w') as f:
             f.write(f"Candidate {candidate_idx} Debug Summary (Logit MSE Mode)\n")
             f.write(f"{'=' * 80}\n")
-            f.write(f"Total MSE: {total_mse:.2f}\n\n")
+            f.write(f"Total MSE: {total_mse:.2f}\n")
+            f.write(f"Total edit distance: {total_edit_distance}\n")
+            f.write(f"Misreads: {num_misreads}/{len(val_images)}\n\n")
             f.write(f"Per-image results:\n")
             for result in debug_results:
-                f.write(f"  Image {result['img_idx']:2d}: MSE: {result['mse']:10.2f} | "
-                       f"Shapes: {result['control_logit_shape']} vs {result['composite_logit_shape']}\n")
+                f.write(f"  Image {result['img_idx']:2d}: MSE: {result['mse']:10.2f} | EditDist: {result['edit_distance']:2d} | "
+                       f"Control: '{result['control_text']:15s}' → Composite: '{result['composite_text']:15s}'\n")
 
-    return total_mse
+    return total_mse, total_edit_distance, num_misreads
 
 
 def main():
@@ -1195,12 +1246,14 @@ def main():
 
     # Define objective function for CMA-ES
     eval_count = [0]  # Track number of evaluations
-    best_metric = [0]  # Best edit distance or logit delta (depending on mode)
+    best_metric = [0]  # Best edit distance or logit MSE (depending on mode)
     best_avg_metric = [0]  # Average metric
-    best_misread_pct = [0]  # Only used in text mode
+    best_misread_pct = [0]  # Misread percentage (text mode) or avg edit distance (logit MSE mode)
+    best_secondary_metric = [0]  # For tracking secondary metric in logit MSE mode
     best_z = [None]
     current_iteration = [0]  # Track current iteration
     all_metrics = []  # Track all metrics for progress bar
+    all_secondary_metrics = []  # Track edit distance when in logit MSE mode
     sampled_indices = []  # Will hold random sample indices for current iteration
     sampled_val_images = []  # Will hold sampled validation images
     sampled_control_data = []  # Will hold sampled control texts or logits
@@ -1227,21 +1280,25 @@ def main():
 
         # Evaluate on sampled validation set with optional debug output
         if use_logit_mse:
-            # Logit delta mode (opencv-crnn only)
+            # Logit MSE mode (opencv-crnn only) - optimize MSE but track edit distance
             if save_debug:
-                total_metric = evaluate_patch_logit_delta_with_debug(
+                total_mse, total_edit_distance, misreads = evaluate_patch_logit_delta_with_debug(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
                     candidate_idx=candidate_idx
                 )
             else:
-                total_metric = evaluate_patch_logit_delta(
+                total_mse, total_edit_distance, misreads = evaluate_patch_logit_delta(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio
                 )
-            avg_metric = total_metric / len(sampled_val_images) if len(sampled_val_images) > 0 else 0
-            misreads = 0  # Not applicable in logit delta mode
+            # Primary metric is MSE for optimization
+            total_metric = total_mse
+            avg_metric = total_mse / len(sampled_val_images) if len(sampled_val_images) > 0 else 0
+            # Secondary metric is edit distance for reporting
+            avg_edit_distance = total_edit_distance / len(sampled_val_images) if len(sampled_val_images) > 0 else 0
+            all_secondary_metrics.append(avg_edit_distance)
         else:
             # Text edit distance mode (default)
             if save_debug:
@@ -1264,8 +1321,9 @@ def main():
         if total_metric > best_metric[0]:
             best_metric[0] = total_metric
             best_avg_metric[0] = avg_metric
-            if not use_logit_mse:
-                best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
+            best_misread_pct[0] = (misreads / len(sampled_val_images) * 100) if len(sampled_val_images) > 0 else 0
+            if use_logit_mse:
+                best_secondary_metric[0] = avg_edit_distance
             best_z[0] = z.copy()
 
         # Return negative metric (CMA-ES minimizes, we want to maximize)
@@ -1335,6 +1393,8 @@ def main():
 
         # Clear metrics for this iteration
         all_metrics.clear()
+        if use_logit_mse:
+            all_secondary_metrics.clear()
 
         # Evaluate all candidates with a nested progress bar
         for i, z in enumerate(solutions):
@@ -1349,9 +1409,12 @@ def main():
 
         # Update progress bar with current metrics
         if use_logit_mse:
+            avg_secondary = np.mean(all_secondary_metrics) if all_secondary_metrics else 0
             pbar.set_postfix({
                 'best_mse': f'{best_avg_metric[0]:.2f}',
                 'avg_mse': f'{avg_metric:.2f}',
+                'best_edit': f'{best_secondary_metric[0]:.1f}',
+                'avg_edit': f'{avg_secondary:.1f}',
             })
         else:
             pbar.set_postfix({
@@ -1372,8 +1435,9 @@ def main():
     print(f"Completed {iteration} iterations (maxiter={args.maxiter})")
     print(f"Total evaluations: {eval_count[0]}")
     if use_logit_mse:
-        print(f"Best total logit MSE: {best_metric[0]:.2f}")
         print(f"Best average logit MSE: {best_avg_metric[0]:.2f}")
+        print(f"Best average edit distance: {best_secondary_metric[0]:.1f}")
+        print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
     else:
         print(f"Best total edit distance: {best_metric[0]:.2f}")
         print(f"Best average edit distance: {best_avg_metric[0]:.2f}")
@@ -1423,8 +1487,9 @@ def main():
             f.write(f"Results:\n")
             f.write(f"  Total evaluations: {eval_count[0]}\n")
             if use_logit_mse:
-                f.write(f"  Best total logit MSE: {best_metric[0]:.2f}\n")
                 f.write(f"  Best average logit MSE: {best_avg_metric[0]:.2f}\n")
+                f.write(f"  Best average edit distance: {best_secondary_metric[0]:.1f}\n")
+                f.write(f"  Best misread percentage: {best_misread_pct[0]:.1f}%\n")
             else:
                 f.write(f"  Best total edit distance: {best_metric[0]:.2f}\n")
                 f.write(f"  Best average edit distance: {best_avg_metric[0]:.2f}\n")
