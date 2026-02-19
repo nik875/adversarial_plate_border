@@ -550,17 +550,12 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
                 input_tensor = self._preprocess(image)
                 with torch.no_grad():
                     out = self.model(input_tensor)
-                # In eval mode, doctr models return list of (text, conf) tuples
-                if isinstance(out, list):
+                # In eval mode, doctr returns a dict with 'preds': [(text, conf), ...]
+                if isinstance(out, dict):
+                    preds = out.get("preds", [])
+                    text = preds[0][0] if preds and preds[0] else ""
+                elif isinstance(out, list):
                     text = out[0][0] if out and out[0] else ""
-                elif isinstance(out, dict):
-                    # Training mode output - decode via postprocessor
-                    logits = list(out.values())[0]
-                    if hasattr(self.model, 'postprocessor'):
-                        decoded = self.model.postprocessor(logits)
-                        text = decoded[0][0] if decoded and decoded[0] else ""
-                    else:
-                        text = ""
                 else:
                     text = ""
 
