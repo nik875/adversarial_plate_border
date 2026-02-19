@@ -124,6 +124,58 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     return images, dimensions
 
 
+def load_validation_samples_from_preproc_csv(csv_path, num_samples):
+    """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
+
+    Args:
+        csv_path: Path to preproc_labels CSV (dataset.py format)
+        num_samples: Number of samples to load (randomly sampled if dataset is larger)
+
+    Returns:
+        Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
+    """
+    import pandas as pd
+    import torchvision.transforms as T
+
+    script_dir = Path(__file__).parent
+    sys.path.insert(0, str(script_dir))
+    try:
+        from dataset import AdversarialPatchDataset
+    except ImportError:
+        raise ImportError("Could not import AdversarialPatchDataset from dataset.py")
+
+    df = pd.read_csv(csv_path)
+    print(f"Loaded {len(df)} rows from {csv_path}")
+
+    # dataset.py loads images as BGR numpy arrays via cv2; convert to RGB for OCR models
+    transform = T.Compose([
+        T.Lambda(lambda x: cv2.cvtColor(x, cv2.COLOR_BGR2RGB)),
+        T.ToTensor(),
+    ])
+
+    dataset = AdversarialPatchDataset(df, transform=transform)
+
+    # Randomly sample indices if dataset is larger than num_samples
+    all_indices = list(range(len(dataset)))
+    if num_samples < len(all_indices):
+        sampled = random.sample(all_indices, num_samples)
+    else:
+        sampled = all_indices
+
+    images = []
+    dimensions = []
+    print(f"Loading {len(sampled)} samples from preproc dataset...")
+    for idx in sampled:
+        item = dataset[idx]
+        img_tensor = item['prep_image']  # [3, H, W] float in [0, 1]
+        height, width = img_tensor.shape[1], img_tensor.shape[2]
+        images.append(img_tensor)
+        dimensions.append((width, height))
+
+    print(f"Loaded {len(images)} samples")
+    return images, dimensions
+
+
 def apply_patch_ocr_mode(image, patch, center_ratio=0.6):
     """Apply adversarial patch to image (center region preserved).
 
@@ -895,6 +947,8 @@ def main():
     parser.add_argument('run_dir', help='Path to run directory with trained VAE')
     parser.add_argument('--csv', default=None,
                         help='Path to train_val_split CSV (default: auto-detect from run_dir)')
+    parser.add_argument('--preproc-csv', default=None,
+                        help='Path to preproc_labels CSV (dataset.py format). If provided, uses AdversarialPatchDataset instead of OCRDataset')
     parser.add_argument('--n-eval-samples', type=int, default=50,
                         help='Number of validation samples to evaluate on (default: 50)')
     parser.add_argument('--center-ratio', type=float, default=0.6,
@@ -977,32 +1031,41 @@ def main():
         print(f"Error: Run directory not found: {run_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Find CSV file
-    if args.csv:
-        csv_path = Path(args.csv)
-    else:
-        csv_files = list(run_dir.glob("**/*.csv"))
-        csv_path = None
-        for csv_file in csv_files:
-            if 'train_val_split' in csv_file.name or 'split' in csv_file.name:
-                csv_path = csv_file
-                break
+    # Find CSV file (only needed if not using --preproc-csv)
+    csv_path = None
+    if not args.preproc_csv:
+        if args.csv:
+            csv_path = Path(args.csv)
+        else:
+            csv_files = list(run_dir.glob("**/*.csv"))
+            for csv_file in csv_files:
+                if 'train_val_split' in csv_file.name or 'split' in csv_file.name:
+                    csv_path = csv_file
+                    break
 
-        if csv_path is None:
-            # Try current directory as fallback
-            cwd_csv = list(Path('.').glob("train_val_split_*.csv"))
-            if cwd_csv:
-                csv_path = cwd_csv[-1]
+            if csv_path is None:
+                cwd_csv = list(Path('.').glob("train_val_split_*.csv"))
+                if cwd_csv:
+                    csv_path = cwd_csv[-1]
 
-        if csv_path is None:
-            print("Error: Could not find train_val_split CSV file", file=sys.stderr)
-            sys.exit(1)
-
-    print(f"Using data split: {csv_path}")
+            if csv_path is None:
+                print("Error: Could not find train_val_split CSV file. "
+                      "Pass --csv or use --preproc-csv for a preproc_labels CSV.", file=sys.stderr)
+                sys.exit(1)
 
     # Load validation samples
-    print(f"\nLoading {args.n_eval_samples} validation samples...")
-    val_images, dimensions = load_validation_samples_from_csv(csv_path, args.n_eval_samples)
+    if args.preproc_csv:
+        preproc_csv_path = Path(args.preproc_csv)
+        if not preproc_csv_path.exists():
+            print(f"Error: preproc CSV not found: {preproc_csv_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Using preproc dataset: {preproc_csv_path}")
+        print(f"\nLoading {args.n_eval_samples} samples from preproc CSV...")
+        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples)
+    else:
+        print(f"Using data split: {csv_path}")
+        print(f"\nLoading {args.n_eval_samples} validation samples...")
+        val_images, dimensions = load_validation_samples_from_csv(csv_path, args.n_eval_samples)
 
     if not val_images:
         print("Error: No validation samples loaded", file=sys.stderr)
