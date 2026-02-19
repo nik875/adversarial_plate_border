@@ -833,13 +833,8 @@ def main():
                       file=sys.stderr)
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
-            try:
-                import onnx
-                import onnx2pytorch
-            except ImportError:
-                print("Error: Required packages not installed. Install with: pip install onnx onnx2pytorch",
-                      file=sys.stderr)
-                sys.exit(1)
+            import onnx
+            import onnx2pytorch
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
