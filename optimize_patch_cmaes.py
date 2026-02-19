@@ -656,6 +656,65 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
 
         return TrOCRWrapper(full_model, processor, device)
 
+    elif ocr_model_type == 'qwen3-vl':
+        print("Initializing Qwen3-VL-7B-Instruct...")
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from PIL import Image as PILImage
+
+        model_id = "Qwen/Qwen3-VL-7B-Instruct"
+        processor = AutoProcessor.from_pretrained(model_id)
+        full_model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        full_model.eval()
+        print(f"  Loaded {model_id}")
+
+        class Qwen3VLWrapper:
+            def __init__(self, full_model, processor):
+                self.full_model = full_model
+                self.processor = processor
+
+            def predict(self, image):
+                """Predict text from RGB uint8 image using Qwen3-VL."""
+                pil_image = PILImage.fromarray(image)
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": pil_image},
+                            {"type": "text", "text": "Read the text in this image. Respond with only the text, nothing else."},
+                        ],
+                    }
+                ]
+                inputs = self.processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                inputs = inputs.to(self.full_model.device)
+                with torch.no_grad():
+                    generated_ids = self.full_model.generate(**inputs, max_new_tokens=32)
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):]
+                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                text = self.processor.batch_decode(
+                    generated_ids_trimmed,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )[0].strip()
+
+                class Result:
+                    def __init__(self, text):
+                        self.text = text
+                return Result(text)
+
+        return Qwen3VLWrapper(full_model, processor)
+
     else:
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
 
@@ -958,7 +1017,7 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
-    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr'], default='fast-alpr',
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl'], default='fast-alpr',
                         help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
@@ -1147,7 +1206,8 @@ def main():
     use_logit_mse = args.use_logit_mse
     logit_capable_models = {'opencv-crnn', 'vitstr', 'trocr'}
     if use_logit_mse and args.ocr_model not in logit_capable_models:
-        print(f"Error: --use-logit-mse requires --ocr-model to be one of: {', '.join(logit_capable_models)}", file=sys.stderr)
+        print(f"Error: --use-logit-mse is not supported for '{args.ocr_model}'. "
+              f"Supported models: {', '.join(logit_capable_models)}", file=sys.stderr)
         sys.exit(1)
 
     # Always precompute control texts (used in both text and logit MSE mode)
