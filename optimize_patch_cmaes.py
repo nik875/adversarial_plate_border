@@ -155,24 +155,17 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples):
 
     dataset = AdversarialPatchDataset(df, transform=transform)
 
-    # Randomly sample indices if dataset is larger than num_samples
-    all_indices = list(range(len(dataset)))
-    if num_samples < len(all_indices):
-        sampled = random.sample(all_indices, num_samples)
-    else:
-        sampled = all_indices
-
     images = []
     dimensions = []
-    print(f"Loading {len(sampled)} samples from preproc dataset...")
-    for idx in sampled:
+    print(f"Loading all {len(dataset)} samples from preproc dataset...")
+    for idx in range(len(dataset)):
         item = dataset[idx]
         img_tensor = item['prep_image']  # [3, H, W] float in [0, 1]
         height, width = img_tensor.shape[1], img_tensor.shape[2]
         images.append(img_tensor)
         dimensions.append((width, height))
 
-    print(f"Loaded {len(images)} samples")
+    print(f"Loaded {len(images)} samples (will sample {min(num_samples, len(images))} per iteration)")
     return images, dimensions
 
 
