@@ -468,12 +468,12 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
                     return logits
 
-            crnn = CRNNWrapper(pytorch_model, alphabet)
+            crnn = CRNNWrapper(session, alphabet)
             return crnn
 
         except ImportError as e:
             print(f"Error: Required package not installed: {e}", file=sys.stderr)
-            print("Install with: pip install onnx onnx2torch", file=sys.stderr)
+            print("Install with: pip install onnxruntime", file=sys.stderr)
             sys.exit(1)
         except Exception as e:
             print(f"Error: Could not initialize CRNN: {e}", file=sys.stderr)
