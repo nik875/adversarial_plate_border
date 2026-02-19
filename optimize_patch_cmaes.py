@@ -661,7 +661,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
         from transformers import AutoModelForImageTextToText, AutoProcessor
         from PIL import Image as PILImage
 
-        model_id = "Qwen/Qwen3-VL-7B-Instruct"
+        model_id = "Qwen/Qwen3-VL-8B-Instruct"
         processor = AutoProcessor.from_pretrained(model_id)
         full_model = AutoModelForImageTextToText.from_pretrained(
             model_id,
@@ -698,15 +698,10 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
                 inputs = inputs.to(self.full_model.device)
                 with torch.no_grad():
                     generated_ids = self.full_model.generate(**inputs, max_new_tokens=32)
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):]
-                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                text = self.processor.batch_decode(
-                    generated_ids_trimmed,
+                text = self.processor.decode(
+                    generated_ids[0][inputs.input_ids.shape[-1]:],
                     skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )[0].strip()
+                ).strip()
 
                 class Result:
                     def __init__(self, text):
