@@ -104,7 +104,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     failed_samples = []
 
     print(f"\nLoading all {len(val_indices)} validation samples from combined dataset...")
-    for combined_idx in val_indices:
+    for combined_idx in tqdm(val_indices, desc="Loading samples"):
         try:
             item = combined_dataset[combined_idx]
             img_tensor = item['prep_image']
@@ -158,7 +158,7 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples):
     images = []
     dimensions = []
     print(f"Loading all {len(dataset)} samples from preproc dataset...")
-    for idx in range(len(dataset)):
+    for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
         img_tensor = item['prep_image']  # [3, H, W] float in [0, 1]
         height, width = img_tensor.shape[1], img_tensor.shape[2]
