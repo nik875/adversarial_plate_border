@@ -377,7 +377,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
         print("Initializing CRNN OCR model (PyTorch from ONNX)...")
         try:
             import onnx
-            from onnx2torch import ConvertModel
+            from onnx2torch import convert
 
             crnn_model_path = Path("CRNN_VGG_BiLSTM_CTC.onnx")
             crnn_dict_path = Path("alphabet_36.txt")
@@ -400,7 +400,7 @@ def create_ocr_model(ocr_model_type, white_box=False):
 
             # Convert to PyTorch
             print(f"  Converting model architecture...")
-            pytorch_model = ConvertModel(onnx_model)
+            pytorch_model = convert(onnx_model)
             pytorch_model.eval()
 
             with open(crnn_dict_path, 'r') as f:
