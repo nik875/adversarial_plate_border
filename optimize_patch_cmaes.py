@@ -523,28 +523,42 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
                 return tensor.unsqueeze(0).to(self.device)  # [1, 3, 32, 128]
 
             def get_logits(self, image):
-                """Return raw model output as numpy array."""
+                """Return raw model output as numpy array.
+
+                Must use training mode to get raw logits - eval mode applies
+                the postprocessor and returns decoded text (list), not tensors.
+                """
                 input_tensor = self._preprocess(image)
+                was_training = self.model.training
+                self.model.train()
                 with torch.no_grad():
                     out = self.model(input_tensor)
+                if not was_training:
+                    self.model.eval()
+                # In training mode, doctr models return a dict with logits
                 if isinstance(out, dict):
                     out = list(out.values())[0]
+                elif isinstance(out, (list, tuple)):
+                    # Unexpected in training mode, but handle gracefully
+                    out = out[0] if len(out) > 0 and isinstance(out[0], torch.Tensor) else torch.zeros(1, 1)
                 return out.squeeze(0).cpu().numpy()
 
             def predict(self, image):
-                """Predict text using the model's postprocessor."""
+                """Predict text using the model in eval mode."""
                 input_tensor = self._preprocess(image)
                 with torch.no_grad():
                     out = self.model(input_tensor)
-                if isinstance(out, dict):
+                # In eval mode, doctr models return list of (text, conf) tuples
+                if isinstance(out, list):
+                    text = out[0][0] if out and out[0] else ""
+                elif isinstance(out, dict):
+                    # Training mode output - decode via postprocessor
                     logits = list(out.values())[0]
-                else:
-                    logits = out
-                # Use postprocessor if available
-                if hasattr(self.model, 'postprocessor'):
-                    decoded = self.model.postprocessor(logits)
-                    # doctr postprocessor returns list of (text, conf) tuples
-                    text = decoded[0][0] if decoded and decoded[0] else ""
+                    if hasattr(self.model, 'postprocessor'):
+                        decoded = self.model.postprocessor(logits)
+                        text = decoded[0][0] if decoded and decoded[0] else ""
+                    else:
+                        text = ""
                 else:
                     text = ""
 
