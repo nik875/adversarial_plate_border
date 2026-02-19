@@ -352,16 +352,19 @@ def generate_patch_from_z(generator, z, device):
     return patch
 
 
-def create_ocr_model(ocr_model_type, white_box=False):
+def create_ocr_model(ocr_model_type, white_box=False, device=None):
     """Create OCR model based on type selection.
 
     Args:
-        ocr_model_type: 'fast-alpr' or 'opencv-crnn'
+        ocr_model_type: 'fast-alpr', 'opencv-crnn', 'vitstr', or 'trocr'
         white_box: If True and using fast-alpr, use smaller xs model
+        device: torch device for vitstr/trocr (if None, auto-detect)
 
     Returns:
         OCR model object with a predict(image) method
     """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if ocr_model_type == 'fast-alpr':
         from fast_alpr import ALPR
         ocr_model_name = "cct-xs-v1-global-model" if white_box else "cct-s-v1-global-model"
@@ -497,6 +500,104 @@ def create_ocr_model(ocr_model_type, white_box=False):
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+    elif ocr_model_type == 'vitstr':
+        print("Initializing ViTSTR model (doctr)...")
+        from doctr.models import vitstr_small
+
+        model = vitstr_small(pretrained=True)
+        model.eval()
+        model = model.to(device)
+        print(f"  Loaded vitstr_small on {device}")
+
+        class ViTSTRWrapper:
+            def __init__(self, model, device):
+                self.model = model
+                self.device = device
+
+            def _preprocess(self, image):
+                """Preprocess RGB uint8 image for ViTSTR."""
+                resized = cv2.resize(image, (128, 32))  # (W, H)
+                tensor = torch.from_numpy(resized).float() / 255.0
+                tensor = tensor.permute(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+                return tensor.unsqueeze(0).to(self.device)  # [1, 3, 32, 128]
+
+            def get_logits(self, image):
+                """Return raw model output as numpy array."""
+                input_tensor = self._preprocess(image)
+                with torch.no_grad():
+                    out = self.model(input_tensor)
+                if isinstance(out, dict):
+                    out = list(out.values())[0]
+                return out.squeeze(0).cpu().numpy()
+
+            def predict(self, image):
+                """Predict text using the model's postprocessor."""
+                input_tensor = self._preprocess(image)
+                with torch.no_grad():
+                    out = self.model(input_tensor)
+                if isinstance(out, dict):
+                    logits = list(out.values())[0]
+                else:
+                    logits = out
+                # Use postprocessor if available
+                if hasattr(self.model, 'postprocessor'):
+                    decoded = self.model.postprocessor(logits)
+                    # doctr postprocessor returns list of (text, conf) tuples
+                    text = decoded[0][0] if decoded and decoded[0] else ""
+                else:
+                    text = ""
+
+                class Result:
+                    def __init__(self, text):
+                        self.text = text
+                return Result(text)
+
+        return ViTSTRWrapper(model, device)
+
+    elif ocr_model_type == 'trocr':
+        print("Initializing TrOCR model (microsoft/trocr-small-printed)...")
+        from transformers import VisionEncoderDecoderModel, TrOCRProcessor
+        from PIL import Image as PILImage
+
+        processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+        full_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
+        full_model.eval()
+        full_model = full_model.to(device)
+        print(f"  Loaded trocr-small-printed on {device}")
+
+        class TrOCRWrapper:
+            def __init__(self, full_model, processor, device):
+                self.full_model = full_model
+                self.processor = processor
+                self.device = device
+
+            def _preprocess(self, image):
+                """Preprocess RGB uint8 image for TrOCR."""
+                pil_image = PILImage.fromarray(image)
+                pixel_values = self.processor(images=pil_image, return_tensors="pt").pixel_values
+                return pixel_values.to(self.device)
+
+            def get_logits(self, image):
+                """Return encoder last hidden state as numpy array [seq_len, hidden_size]."""
+                pixel_values = self._preprocess(image)
+                with torch.no_grad():
+                    encoder_out = self.full_model.encoder(pixel_values=pixel_values)
+                return encoder_out.last_hidden_state.squeeze(0).cpu().numpy()
+
+            def predict(self, image):
+                """Predict text using full encoder-decoder with generate()."""
+                pixel_values = self._preprocess(image)
+                with torch.no_grad():
+                    generated_ids = self.full_model.generate(pixel_values)
+                text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+                class Result:
+                    def __init__(self, text):
+                        self.text = text
+                return Result(text)
+
+        return TrOCRWrapper(full_model, processor, device)
 
     else:
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
@@ -644,7 +745,7 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
     return total_edit_distance, misreads, avg_edit_distance
 
 
-def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, center_ratio=0.6):
+def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6):
     """Evaluate patch by measuring logit differences between control and composite (MSE).
 
     Args:
@@ -652,6 +753,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
         val_images: List of validation image tensors [3, H, W] in [0, 1]
         ocr: OCR model instance with get_logits(image) method and predict(image) method
         control_logits_list: List of precomputed control logits (numpy arrays)
+        control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
 
     Returns:
@@ -662,7 +764,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
     num_misreads = 0
     num_evaluated = 0
 
-    for val_image, control_logits in zip(val_images, control_logits_list):
+    for val_image, control_logits, control_text in zip(val_images, control_logits_list, control_texts):
         try:
             # Create composite (with patch)
             composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
@@ -675,28 +777,14 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
             composite_logits = ocr.get_logits(composite_np)
 
             # Compute MSE between control and composite logits
-            # Handle cases where logits have different shapes (shouldn't happen, but be safe)
             min_len = min(control_logits.shape[0], composite_logits.shape[0])
             logit_diff = control_logits[:min_len] - composite_logits[:min_len]
             mse = np.mean(logit_diff ** 2)
             total_mse += mse
 
-            # Also compute edit distance for monitoring
-            # Get text prediction from composite
+            # Compute edit distance using precomputed control text
             composite_result = ocr.predict(composite_np)
             composite_text = composite_result.text if composite_result is not None else ""
-
-            # Decode control logits to text for comparison
-            control_indices = np.argmax(control_logits, axis=1)
-            control_text = ''
-            prev_idx = -1
-            for idx in control_indices:
-                if idx > 0 and idx != prev_idx:
-                    if idx - 1 < len(ocr.alphabet):
-                        control_text += ocr.alphabet[idx - 1]
-                prev_idx = idx
-
-            # Calculate edit distance
             edit_dist = Levenshtein.distance(control_text, composite_text)
             total_edit_distance += edit_dist
 
@@ -712,7 +800,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cent
     return total_mse if num_evaluated > 0 else 0.0, total_edit_distance, num_misreads
 
 
-def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
     """Evaluate patch by measuring logit MSE and save debug images.
 
     Args:
@@ -720,6 +808,7 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         val_images: List of validation image tensors [3, H, W] in [0, 1]
         ocr: OCR model instance with get_logits(image) method and predict(image) method
         control_logits_list: List of precomputed control logits (numpy arrays)
+        control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
         debug_dir: Directory to save debug images
         candidate_idx: Index of the candidate being evaluated
@@ -733,7 +822,7 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
     num_evaluated = 0
     debug_results = []
 
-    for img_idx, (val_image, control_logits) in enumerate(zip(val_images, control_logits_list)):
+    for img_idx, (val_image, control_logits, control_text) in enumerate(zip(val_images, control_logits_list, control_texts)):
         try:
             # Create composite (with patch)
             composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
@@ -751,20 +840,9 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
             mse = np.mean(logit_diff ** 2)
             total_mse += mse
 
-            # Also compute edit distance for monitoring
+            # Compute edit distance using precomputed control text
             composite_result = ocr.predict(composite_np)
             composite_text = composite_result.text if composite_result is not None else ""
-
-            # Decode control logits to text
-            control_indices = np.argmax(control_logits, axis=1)
-            control_text = ''
-            prev_idx = -1
-            for idx in control_indices:
-                if idx > 0 and idx != prev_idx:
-                    if idx - 1 < len(ocr.alphabet):
-                        control_text += ocr.alphabet[idx - 1]
-                prev_idx = idx
-
             edit_dist = Levenshtein.distance(control_text, composite_text)
             total_edit_distance += edit_dist
 
@@ -843,7 +921,7 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
-    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn'], default='fast-alpr',
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr'], default='fast-alpr',
                         help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
@@ -882,6 +960,10 @@ def main():
                 sys.exit(1)
         elif args.ocr_model == 'opencv-crnn':
             import onnxruntime
+        elif args.ocr_model == 'vitstr':
+            from doctr.models import vitstr_small
+        elif args.ocr_model == 'trocr':
+            from transformers import VisionEncoderDecoderModel, TrOCRProcessor
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
@@ -1207,62 +1289,45 @@ def main():
 
     # Initialize OCR model
     print(f"\nInitializing OCR model: {args.ocr_model}")
-    ocr = create_ocr_model(args.ocr_model, white_box=args.white_box)
+    ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device)
     print("OCR model loaded")
 
     # Determine optimization mode
     use_logit_mse = args.use_logit_mse
-    if use_logit_mse and args.ocr_model != 'opencv-crnn':
-        print("Error: --use-logit-mse only works with --ocr-model opencv-crnn", file=sys.stderr)
+    logit_capable_models = {'opencv-crnn', 'vitstr', 'trocr'}
+    if use_logit_mse and args.ocr_model not in logit_capable_models:
+        print(f"Error: --use-logit-mse requires --ocr-model to be one of: {', '.join(logit_capable_models)}", file=sys.stderr)
         sys.exit(1)
 
-    # Precompute control OCR outputs once (with grey border)
-    # For logit MSE mode, precompute logits; for text mode, precompute text
+    # Always precompute control texts (used in both text and logit MSE mode)
+    print("\nPrecomputing control OCR texts...")
+    control_texts = []
+    for val_image in tqdm(val_images, desc="Control OCR"):
+        try:
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_result = ocr.predict(control_np)
+            control_texts.append(control_result.text if control_result is not None else "")
+        except Exception as e:
+            control_texts.append("")
+    print(f"Precomputed {len(control_texts)} control texts")
 
+    # In logit MSE mode, also precompute control logits
     if use_logit_mse:
         print("\nPrecomputing control logits (logit MSE mode)...")
         control_logits_list = []
         for val_image in tqdm(val_images, desc="Control logits"):
             try:
-                # Create control (with grey border)
                 control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-                control = control.squeeze(0)  # Remove batch dim
-
-                # Convert to numpy for OCR
+                control = control.squeeze(0)
                 control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-                # Get logits
-                control_logits = ocr.get_logits(control_np)
-                control_logits_list.append(control_logits)
-
+                control_logits_list.append(ocr.get_logits(control_np))
             except Exception as e:
-                # Treat errors as zeros with default shape
-                control_logits_list.append(np.zeros((26, 37)))  # Default CRNN output shape
-
+                control_logits_list.append(None)
         print(f"Precomputed {len(control_logits_list)} control logits")
         control_data = control_logits_list
     else:
-        print("\nPrecomputing control OCR outputs (text mode)...")
-        control_texts = []
-        for val_image in tqdm(val_images, desc="Control OCR"):
-            try:
-                # Create control (with grey border)
-                control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-                control = control.squeeze(0)  # Remove batch dim
-
-                # Convert to numpy for OCR
-                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-                # Run OCR
-                control_result = ocr.predict(control_np)
-                control_text = control_result.text if control_result is not None else ""
-                control_texts.append(control_text)
-
-            except Exception as e:
-                # Treat errors as empty string
-                control_texts.append("")
-
-        print(f"Precomputed {len(control_texts)} control OCR outputs")
         control_data = control_texts
 
     # Create debug output directory
@@ -1282,6 +1347,7 @@ def main():
     sampled_indices = []  # Will hold random sample indices for current iteration
     sampled_val_images = []  # Will hold sampled validation images
     sampled_control_data = []  # Will hold sampled control texts or logits
+    sampled_control_texts = []  # Will hold sampled control texts (always, for edit distance)
 
     def objective(z, candidate_idx=None):
         """Objective function: returns negative metric (CMA-ES minimizes).
@@ -1308,14 +1374,14 @@ def main():
             # Logit MSE mode (opencv-crnn only) - optimize MSE but track edit distance
             if save_debug:
                 total_mse, total_edit_distance, misreads = evaluate_patch_logit_delta_with_debug(
-                    patch, sampled_val_images, ocr, sampled_control_data,
+                    patch, sampled_val_images, ocr, sampled_control_data, sampled_control_texts,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
                     candidate_idx=candidate_idx
                 )
             else:
                 total_mse, total_edit_distance, misreads = evaluate_patch_logit_delta(
-                    patch, sampled_val_images, ocr, sampled_control_data,
+                    patch, sampled_val_images, ocr, sampled_control_data, sampled_control_texts,
                     center_ratio=args.center_ratio
                 )
             # Primary metric is MSE for optimization
@@ -1415,6 +1481,7 @@ def main():
         sampled_indices = random.sample(range(len(val_images)), num_samples_to_use)
         sampled_val_images = [val_images[i] for i in sampled_indices]
         sampled_control_data = [control_data[i] for i in sampled_indices]
+        sampled_control_texts = [control_texts[i] for i in sampled_indices]
 
         # Clear metrics for this iteration
         all_metrics.clear()
