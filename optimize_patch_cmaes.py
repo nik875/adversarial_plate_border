@@ -678,13 +678,14 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
 
             def predict(self, image):
                 """Predict text from RGB uint8 image using Qwen3-VL."""
+                import re
                 pil_image = PILImage.fromarray(image)
                 messages = [
                     {
                         "role": "user",
                         "content": [
                             {"type": "image", "image": pil_image},
-                            {"type": "text", "text": "Read the text in this image. Respond with only the text, nothing else."},
+                            {"type": "text", "text": 'Read the text in this image. Respond in this exact format:\nThe text is: [text here]'},
                         ],
                     }
                 ]
@@ -698,10 +699,12 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
                 inputs = inputs.to(self.full_model.device)
                 with torch.no_grad():
                     generated_ids = self.full_model.generate(**inputs, max_new_tokens=32)
-                text = self.processor.decode(
+                raw = self.processor.decode(
                     generated_ids[0][inputs.input_ids.shape[-1]:],
                     skip_special_tokens=True,
-                ).strip()
+                )
+                match = re.search(r'The text is:\s*(.+)', raw)
+                text = match.group(1).strip() if match else ""
 
                 class Result:
                     def __init__(self, text):
