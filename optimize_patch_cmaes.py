@@ -1768,6 +1768,54 @@ def main():
         cv2.imwrite(str(patch_path), patch_bgr)
         print(f"\nSaved best patch to: {patch_path}")
 
+        # Evaluate best patch on all validation images and save results
+        print(f"\nEvaluating best patch on all {len(val_images)} validation images...")
+        best_patch_results_dir = output_dir / "best_patch_results"
+        best_patch_results_dir.mkdir(parents=True, exist_ok=True)
+
+        results_rows = []
+        for idx, (val_image, control_text) in enumerate(tqdm(zip(val_images, control_texts), total=len(val_images), desc="Best patch eval")):
+            # Create composite
+            composite = apply_patch_ocr_mode(val_image, best_patch_clamped, center_ratio=args.center_ratio)
+            composite = composite.squeeze(0)
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Run OCR on composite
+            composite_result = ocr.predict(composite_np)
+            composite_text = composite_result.text if composite_result is not None else ""
+
+            # Calculate edit distance
+            edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+            is_misread = (composite_text != control_text)
+
+            results_rows.append({
+                'image_idx': idx,
+                'control_text': control_text,
+                'composite_text': composite_text,
+                'edit_distance': edit_dist,
+                'is_misread': is_misread,
+            })
+
+            # Save control and composite images
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+
+            cv2.imwrite(str(best_patch_results_dir / f"best_patch_img{idx:04d}_control.jpg"), control_bgr)
+            cv2.imwrite(str(best_patch_results_dir / f"best_patch_img{idx:04d}_composite.jpg"), composite_bgr)
+
+        # Save results CSV
+        results_csv_path = best_patch_results_dir / "best_patch_results.csv"
+        with open(results_csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'])
+            writer.writeheader()
+            writer.writerows(results_rows)
+
+        print(f"Saved best patch evaluation to: {best_patch_results_dir}")
+        print(f"  Results CSV: {results_csv_path}")
+
         # Save latent code
         z_path = output_dir / "best_z.npy"
         np.save(z_path, best_z[0])
