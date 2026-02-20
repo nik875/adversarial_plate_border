@@ -1,1 +1,1 @@
-python optimize_patch_cmaes.py --device cpu --popsize 14 --n-eval-samples 25 --maxiter 100 --preproc-csv preproc_labels.csv --ocr-model gpt-5-mini --max-parallel 3 --control-labels-csv cmaes_control_labels.csv --outdir gpt-5-mini-results checkpoints/20260219_230904/
+python optimize_patch_cmaes.py --device cpu --popsize 14 --n-eval-samples 25 --maxiter 100 --preproc-csv preproc_labels.csv --ocr-model gpt-5-mini --max-parallel 3 --correct-text 'VRJ7774' --control-labels-csv cmaes_control_labels.csv --outdir gpt-5-mini-results checkpoints/20260219_230904/
