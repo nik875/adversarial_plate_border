@@ -1094,7 +1094,7 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
     return total_edit_distance, misreads, avg_edit_distance, per_image_data
 
 
-def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6):
+def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6, correct_text=None):
     """Evaluate patch by measuring logit differences between control and composite (MSE).
 
     Args:
@@ -1104,6 +1104,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cont
         control_logits_list: List of precomputed control logits (numpy arrays)
         control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
+        correct_text: Optional known correct text. If provided, secondary edit distance metric uses min(dist_to_control, dist_to_correct)
 
     Returns:
         Tuple of (total_mse, total_edit_distance, num_misreads)
@@ -1133,7 +1134,12 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cont
         # Compute edit distance using precomputed control text
         composite_result = ocr.predict(composite_np)
         composite_text = composite_result.text if composite_result is not None else ""
-        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        if correct_text is not None:
+            dist_to_correct = min(Levenshtein.distance(correct_text, composite_text), len(correct_text))
+            edit_dist = min(dist_to_control, dist_to_correct)
+        else:
+            edit_dist = dist_to_control
         total_edit_distance += edit_dist
 
         if composite_text != control_text:
@@ -1144,7 +1150,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cont
     return total_mse if num_evaluated > 0 else 0.0, total_edit_distance, num_misreads
 
 
-def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0, correct_text=None):
     """Evaluate patch by measuring logit MSE and save debug images.
 
     Args:
@@ -1156,6 +1162,7 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         center_ratio: Center ratio for compositing
         debug_dir: Directory to save debug images
         candidate_idx: Index of the candidate being evaluated
+        correct_text: Optional known correct text. If provided, secondary edit distance metric uses min(dist_to_control, dist_to_correct)
 
     Returns:
         Tuple of (total_mse, total_edit_distance, num_misreads)
@@ -1186,7 +1193,12 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         # Compute edit distance using precomputed control text
         composite_result = ocr.predict(composite_np)
         composite_text = composite_result.text if composite_result is not None else ""
-        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        if correct_text is not None:
+            dist_to_correct = min(Levenshtein.distance(correct_text, composite_text), len(correct_text))
+            edit_dist = min(dist_to_control, dist_to_correct)
+        else:
+            edit_dist = dist_to_control
         total_edit_distance += edit_dist
 
         if composite_text != control_text:
@@ -1636,12 +1648,14 @@ def main():
                     patch, sampled_val_images, ocr, sampled_control_data, sampled_control_texts,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
-                    candidate_idx=candidate_idx
+                    candidate_idx=candidate_idx,
+                    correct_text=correct_text
                 )
             else:
                 total_mse, total_edit_distance, misreads = evaluate_patch_logit_delta(
                     patch, sampled_val_images, ocr, sampled_control_data, sampled_control_texts,
-                    center_ratio=args.center_ratio
+                    center_ratio=args.center_ratio,
+                    correct_text=correct_text
                 )
             # Primary metric is MSE for optimization
             total_metric = total_mse
