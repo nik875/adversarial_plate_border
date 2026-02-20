@@ -1472,7 +1472,8 @@ def main():
         control_csv_path = Path(args.control_labels_csv)
         print(f"\nLoading control texts from: {control_csv_path}")
         control_df = pd.read_csv(control_csv_path)
-        control_texts = control_df['control_text'].tolist()
+        # Handle NaN values by converting to empty strings
+        control_texts = [str(ct) if pd.notna(ct) else "" for ct in control_df['control_text'].tolist()]
         if len(control_texts) != len(val_images):
             print(f"Warning: control CSV has {len(control_texts)} entries but {len(val_images)} validation images. "
                   f"Truncating/padding as needed.")
