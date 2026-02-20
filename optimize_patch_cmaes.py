@@ -795,7 +795,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             },
                             {
                                 "type": "text",
-                                "text": "This image shows a license plate. What is the plate number? Only the alphanumeric registration number, no state names or slogans. Don't reason, just answer. Respond in this exact format:\nThe text is: [plate number]\nNo additional outputs or text, strictly follow this format.",
+                                "text": "What characters are shown in this image? Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
@@ -816,15 +816,39 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                         time.sleep(5)
 
                 raw = response.choices[0].message.content or ""
+                # Strip "The text is:" prefix if present
                 match = re.search(r'The text is:\s*(.*)', raw)
-                if match:
-                    text = match.group(1).strip()
-                else:
-                    tqdm.write(f"  [gpt-5-mini] Unexpected response format: {raw!r}")
-                    text = raw.strip()
+                text = match.group(1).strip() if match else raw.strip()
 
-                # Normalize: remove hyphens, spaces, and uppercase
-                text = re.sub(r'[-\s]', '', text).upper()
+                # Extract plate number: find the best alphanumeric
+                # sequence that looks like a plate (has both letters and digits)
+                text_normalized = re.sub(r'[-\s]', '', text).upper()
+                # Find all contiguous alphanumeric groups from normalized text
+                # by splitting on non-alnum in the original then rejoining adjacent tokens
+                tokens = re.findall(r'[A-Za-z0-9]+', text)
+                # Look for tokens with both letters and digits (plate-like)
+                plate_candidates = []
+                for tok in tokens:
+                    tok_upper = tok.upper()
+                    has_letter = any(c.isalpha() for c in tok_upper)
+                    has_digit = any(c.isdigit() for c in tok_upper)
+                    if has_letter and has_digit and len(tok_upper) >= 4:
+                        plate_candidates.append(tok_upper)
+
+                # Also try combining adjacent tokens (e.g. "VRJ" + "7774")
+                for i in range(len(tokens) - 1):
+                    combined = (tokens[i] + tokens[i + 1]).upper()
+                    has_letter = any(c.isalpha() for c in combined)
+                    has_digit = any(c.isdigit() for c in combined)
+                    if has_letter and has_digit and len(combined) >= 4:
+                        plate_candidates.append(combined)
+
+                if plate_candidates:
+                    # Pick the longest candidate
+                    text = max(plate_candidates, key=len)
+                else:
+                    # Fallback: full normalized text
+                    text = text_normalized
 
                 class Result:
                     def __init__(self, text):
