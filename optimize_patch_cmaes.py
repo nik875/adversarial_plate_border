@@ -971,7 +971,8 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6, corr
     # Score
     total_edit_distance = 0
     misreads = 0
-    for control_text, composite_text in zip(control_texts, composite_texts):
+    per_image_data = []
+    for img_idx, (control_text, composite_text, composite_np) in enumerate(zip(control_texts, composite_texts, composite_nps)):
         dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
 
         if correct_text is not None:
@@ -982,12 +983,22 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6, corr
             edit_dist = dist_to_control
 
         total_edit_distance += edit_dist
-        if composite_text != control_text:
+        is_misread = (composite_text != control_text)
+        if is_misread:
             misreads += 1
+
+        per_image_data.append({
+            'img_idx': img_idx,
+            'composite_np': composite_np,
+            'control_text': control_text,
+            'composite_text': composite_text,
+            'edit_distance': edit_dist,
+            'is_misread': is_misread,
+        })
 
     num_evaluated = len(val_images)
     avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
-    return total_edit_distance, misreads, avg_edit_distance
+    return total_edit_distance, misreads, avg_edit_distance, per_image_data
 
 
 def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0, correct_text=None):
@@ -1003,12 +1014,13 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
         candidate_idx: Index of the candidate being evaluated
 
     Returns:
-        Tuple of (total_edit_distance, num_misreads, avg_edit_distance)
+        Tuple of (total_edit_distance, num_misreads, avg_edit_distance, per_image_data)
+        where per_image_data is a list of dicts with composite_np, control_text, composite_text, edit_distance, is_misread
     """
     total_edit_distance = 0
     misreads = 0
     num_evaluated = 0
-    debug_results = []
+    per_image_data = []
 
     for img_idx, (val_image, control_text) in enumerate(zip(val_images, control_texts)):
         # Create composite (with patch)
@@ -1038,6 +1050,16 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
 
         num_evaluated += 1
 
+        # Always collect per-image data (used for best_patches saving)
+        per_image_data.append({
+            'img_idx': img_idx,
+            'composite_np': composite_np,
+            'control_text': control_text,
+            'composite_text': composite_text,
+            'edit_distance': edit_dist,
+            'is_misread': is_misread,
+        })
+
         # Save debug images
         if debug_dir is not None:
             # Save composite
@@ -1053,18 +1075,9 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
             ctrl_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_img{img_idx:02d}_control.jpg"
             cv2.imwrite(str(ctrl_path), control_bgr)
 
-            # Track results
-            debug_results.append({
-                'img_idx': img_idx,
-                'control_text': control_text,
-                'composite_text': composite_text,
-                'edit_distance': edit_dist,
-                'is_misread': is_misread,
-            })
-
     # Save debug summary
     avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
-    if debug_dir is not None and debug_results:
+    if debug_dir is not None and per_image_data:
         summary_path = debug_dir / f"iter0_candidate{candidate_idx:02d}_summary.txt"
         with open(summary_path, 'w') as f:
             f.write(f"Candidate {candidate_idx} Debug Summary\n")
@@ -1073,13 +1086,13 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
             f.write(f"Average edit distance: {avg_edit_distance:.2f}\n")
             f.write(f"Total misreads: {misreads}/{len(val_images)} ({misreads/len(val_images)*100:.1f}%)\n\n")
             f.write(f"Per-image results:\n")
-            for result in debug_results:
+            for result in per_image_data:
                 status = "MISREAD" if result['is_misread'] else "MATCH"
                 f.write(f"  Image {result['img_idx']:2d}: {status:7s} | EditDist: {result['edit_distance']:2d} | "
                        f"Control: '{result['control_text']:15s}' → "
                        f"Composite: '{result['composite_text']:15s}'\n")
 
-    return total_edit_distance, misreads, avg_edit_distance
+    return total_edit_distance, misreads, avg_edit_distance, per_image_data
 
 
 def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, control_texts, center_ratio=0.6):
@@ -1556,14 +1569,16 @@ def main():
 
     best_patches_dir = output_dir / "best_patches"
     best_patches_dir.mkdir(parents=True, exist_ok=True)
+    best_count = [0]  # Counter for number of bests found
 
-    def save_best_patch(z, iteration, avg_metric):
-        """Save the patch and 10 composites whenever a new best is found."""
+    def save_best_patch(z, iteration, avg_metric, per_image_data):
+        """Save the patch, exact evaluation composites, and CSV whenever a new best is found."""
         patch = generate_patch_from_z(generator, z, device)
         patch_clamped = torch.clamp(patch, 0, 1)
         patch_np = (patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
-        tag = f"iter{iteration:04d}"
+        tag = f"best{best_count[0]:04d}_iter{iteration:04d}"
+        best_count[0] += 1
         save_dir = best_patches_dir / tag
         save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1571,14 +1586,25 @@ def main():
         patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(save_dir / "patch.png"), patch_bgr)
 
-        # Save 10 composites sampled from the full validation set
-        preview_indices = random.sample(range(len(val_images)), min(10, len(val_images)))
-        for j, idx in enumerate(preview_indices):
-            composite = apply_patch_ocr_mode(val_images[idx], patch_clamped, center_ratio=args.center_ratio)
-            composite = composite.squeeze(0)
-            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(save_dir / f"composite_{j:02d}.png"), composite_bgr)
+        # Save the exact composite images from the evaluation
+        for entry in per_image_data:
+            j = entry['img_idx']
+            composite_bgr = cv2.cvtColor(entry['composite_np'], cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(save_dir / f"composite_{j:02d}.jpg"), composite_bgr)
+
+        # Save CSV with per-image results (same format as debug output)
+        csv_path = save_dir / "results.csv"
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['img_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'])
+            writer.writeheader()
+            for entry in per_image_data:
+                writer.writerow({
+                    'img_idx': entry['img_idx'],
+                    'control_text': entry['control_text'],
+                    'composite_text': entry['composite_text'],
+                    'edit_distance': entry['edit_distance'],
+                    'is_misread': entry['is_misread'],
+                })
 
         tqdm.write(f"  [new best] iter={iteration} avg_metric={avg_metric:.4f} -> saved to {save_dir}")
 
@@ -1603,6 +1629,7 @@ def main():
             cv2.imwrite(str(patch_path), patch_bgr)
 
         # Evaluate on sampled validation set with optional debug output
+        eval_per_image_data = []
         if use_logit_mse:
             # Logit MSE mode (opencv-crnn only) - optimize MSE but track edit distance
             if save_debug:
@@ -1626,7 +1653,7 @@ def main():
         else:
             # Text edit distance mode (default)
             if save_debug:
-                total_metric, misreads, avg_metric = evaluate_patch_with_debug(
+                total_metric, misreads, avg_metric, eval_per_image_data = evaluate_patch_with_debug(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
@@ -1634,7 +1661,7 @@ def main():
                     correct_text=correct_text
                 )
             else:
-                total_metric, misreads, avg_metric = evaluate_patch(
+                total_metric, misreads, avg_metric, eval_per_image_data = evaluate_patch(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     correct_text=correct_text
@@ -1651,7 +1678,7 @@ def main():
             if use_logit_mse:
                 best_secondary_metric[0] = avg_edit_distance
             best_z[0] = z.copy()
-            save_best_patch(z, current_iteration[0], avg_metric)
+            save_best_patch(z, current_iteration[0], avg_metric, eval_per_image_data)
 
         # Return negative metric (CMA-ES minimizes, we want to maximize)
         return -total_metric
