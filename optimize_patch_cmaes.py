@@ -805,8 +805,11 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 match = re.search(r'The text is:\s*(.*)', raw)
                 text = match.group(1).strip() if match else raw.strip()
 
+                # Strip parenthetical notes (e.g. "(NOTE: NOT SURE; ...)")
+                text = re.sub(r'\([^)]*\)', '', text)
+
                 # Extract plate number: find the best alphanumeric
-                # sequence that looks like a plate (has both letters and digits)
+                # sequence that looks like a plate (has both letters and digits, 4-10 chars)
                 text_normalized = re.sub(r'[-\s]', '', text).upper()
                 tokens = re.findall(r'[A-Za-z0-9]+', text)
                 plate_candidates = []
@@ -814,19 +817,19 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                     tok_upper = tok.upper()
                     has_letter = any(c.isalpha() for c in tok_upper)
                     has_digit = any(c.isdigit() for c in tok_upper)
-                    if has_letter and has_digit and len(tok_upper) >= 4:
+                    if has_letter and has_digit and 4 <= len(tok_upper) <= 10:
                         plate_candidates.append(tok_upper)
 
                 for i in range(len(tokens) - 1):
                     combined = (tokens[i] + tokens[i + 1]).upper()
                     has_letter = any(c.isalpha() for c in combined)
                     has_digit = any(c.isdigit() for c in combined)
-                    if has_letter and has_digit and len(combined) >= 4:
+                    if has_letter and has_digit and 4 <= len(combined) <= 10:
                         plate_candidates.append(combined)
 
                 if plate_candidates:
                     return max(plate_candidates, key=len)
-                return text_normalized if text_normalized else None
+                return text_normalized[:10] if text_normalized else None
 
             def _make_request(self, b64, keep_last_on_refusal=False):
                 """Make a single API request with rate limit retry and refusal retry (max 3).
@@ -851,7 +854,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                             },
                             {
                                 "type": "text",
-                                "text": "What characters are shown in this image? Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
+                                "text": "What characters are shown in this image? Don't reason, just answer. If you're not sure, just take your best guess. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
