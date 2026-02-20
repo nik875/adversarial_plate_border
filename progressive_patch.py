@@ -708,6 +708,7 @@ class FoundationPatchGenerator(nn.Module):
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.use_omniglot = use_omniglot
 
         if self.use_vae_lora:
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
@@ -2782,6 +2783,306 @@ class ProgressivePatchTrainer:
         return history
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """Simple Levenshtein edit distance."""
+    a, b = a.upper(), b.upper()
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+class APIAttacker:
+    """
+    Black-box adversarial patch attack using an external vision API (e.g. OpenAI GPT-4o-mini).
+
+    Keeps the pre-trained generator frozen and uses CMA-ES to search the latent
+    z-space for codes that produce patches which maximise OCR edit distance as
+    measured by the API.
+
+    Workflow
+    --------
+    1. Load generator from checkpoint.
+    2. Load a small sample of license-plate images from an OCR dataset.
+    3. For each CMA-ES generation:
+       a. Generator produces one patch per z vector in the population.
+       b. Each patch is applied (as a border) to `attack_images` real images.
+       c. Each composited image is sent to the vision API; the predicted text is
+          compared against the true plate text via Levenshtein distance.
+       d. Mean edit distance across images is the fitness (CMA-ES minimises its
+          negation).
+    4. Save the best patches and a results CSV.
+    """
+
+    # System prompt sent to the vision model
+    _API_SYSTEM_PROMPT = (
+        "You are an OCR system. The user will show you an image of a vehicle "
+        "license plate. Respond with ONLY the license plate text — no punctuation, "
+        "no spaces, no explanation. If you cannot read it, respond with an empty string."
+    )
+
+    def __init__(
+        self,
+        generator_checkpoint: str,
+        api_model: str,
+        api_key: str,
+        ocr_dataset: str,
+        ocr_dataset_split: str = 'train',
+        attack_images: int = 8,
+        popsize: int = 16,
+        sigma0: float = 0.5,
+        max_generations: int = 100,
+        center_ratio: float = 0.6,
+        output_dir: str = 'api_attack_results',
+        device: str = None,
+    ):
+        import openai
+        import cma  # pycma
+
+        self.api_model = api_model
+        self.attack_images = attack_images
+        self.popsize = popsize
+        self.sigma0 = sigma0
+        self.max_generations = max_generations
+        self.center_ratio = center_ratio
+        self.output_dir = output_dir
+
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+            elif torch.backends.mps.is_available():
+                self.device = 'mps'
+            else:
+                self.device = 'cpu'
+        else:
+            self.device = device
+
+        self.client = openai.OpenAI(api_key=api_key)
+        self._cma = cma  # keep reference
+
+        # ── Load generator from checkpoint ──────────────────────────────────
+        print(f"Loading generator from {generator_checkpoint} ...")
+        ckpt = torch.load(generator_checkpoint, map_location=self.device)
+        basis_dim   = ckpt.get('basis_dim', 16)
+        patch_h, patch_w = ckpt.get('patch_size', (PATCH_HEIGHT, PATCH_WIDTH))
+        use_vae_lora = ckpt.get('use_vae_lora', True)
+        lora_rank    = ckpt.get('lora_rank', 8)
+        lora_alpha   = ckpt.get('lora_alpha', 16)
+        use_omniglot = ckpt.get('use_omniglot', True)
+
+        self.basis_dim   = basis_dim
+        self.patch_height = patch_h
+        self.patch_width  = patch_w
+
+        self.generator = FoundationPatchGenerator(
+            latent_dim=basis_dim,
+            patch_height=patch_h,
+            patch_width=patch_w,
+            num_layers=11,
+            use_vae_lora=use_vae_lora,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            use_bottleneck_refiner=True,
+            use_omniglot=use_omniglot,
+        ).to(self.device)
+
+        self.generator.load_state_dict(ckpt['generator_state_dict'])
+        self.generator.eval()
+        for p in self.generator.parameters():
+            p.requires_grad_(False)
+        print(f"Generator loaded (basis_dim={basis_dim}, patch={patch_h}×{patch_w})")
+
+        # ── Load images from OCR dataset ─────────────────────────────────────
+        print(f"Loading {attack_images} images from '{ocr_dataset}' ({ocr_dataset_split}) ...")
+        transform = T.Compose([T.ToTensor()])
+        dataset = OCRDataset(
+            dataset_name=ocr_dataset,
+            split=ocr_dataset_split,
+            transform=transform,
+            max_samples=attack_images * 4,  # load a few extra, then pick
+        )
+        indices = list(range(min(attack_images, len(dataset))))
+        self.images: List[dict] = [dataset[i] for i in indices]
+        print(f"Using {len(self.images)} images for fitness evaluation.")
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _apply_patch(self, image: torch.Tensor, patch: torch.Tensor) -> torch.Tensor:
+        """Overlay patch as a border; preserve center_ratio of the plate."""
+        _, H, W = image.shape
+        patch_resized = F.interpolate(
+            patch.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0)
+
+        center_h = int(H * self.center_ratio)
+        center_w = int(W * self.center_ratio)
+        pad_h = (H - center_h) // 2
+        pad_w = (W - center_w) // 2
+
+        mask = torch.zeros(1, H, W, device=image.device)
+        mask[:, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
+
+        composited = image * mask + patch_resized * (1 - mask)
+        return torch.clamp(composited, 0.0, 1.0)
+
+    def _tensor_to_b64(self, img_tensor: torch.Tensor) -> str:
+        """Convert [3, H, W] float tensor in [0,1] to a base-64 JPEG string."""
+        import io, base64
+        pil_img = T.ToPILImage()(img_tensor.cpu())
+        buf = io.BytesIO()
+        pil_img.save(buf, format='JPEG', quality=90)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    def _call_api(self, img_b64: str) -> str:
+        """Send one image to the vision API and return the raw text response."""
+        response = self.client.chat.completions.create(
+            model=self.api_model,
+            messages=[
+                {"role": "system", "content": self._API_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        }
+                    ],
+                },
+            ],
+            max_tokens=32,
+            temperature=0.0,
+        )
+        return response.choices[0].message.content.strip()
+
+    # ── fitness ──────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _evaluate_z(self, z_np: np.ndarray) -> float:
+        """
+        Generate a patch from z, apply it to all attack images, call the API,
+        and return the mean Levenshtein edit distance (higher = more disruption).
+        """
+        z = torch.tensor(z_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        patch = self.generator(z).squeeze(0)  # [3, H, W]
+
+        total_dist = 0
+        for item in self.images:
+            image   = item['prep_image'].to(self.device)  # [3, H, W]
+            true_text = item.get('text', '')
+
+            composited = self._apply_patch(image, patch)
+            img_b64    = self._tensor_to_b64(composited)
+
+            try:
+                predicted = self._call_api(img_b64)
+            except Exception as e:
+                print(f"  [API error] {e}")
+                predicted = true_text  # treat as no disruption on error
+
+            dist = _levenshtein(predicted, true_text)
+            total_dist += dist
+
+        mean_dist = total_dist / len(self.images)
+        return mean_dist
+
+    # ── main attack loop ─────────────────────────────────────────────────────
+
+    def attack(self) -> dict:
+        """
+        Run CMA-ES over the z space.
+
+        Returns a dict with the best z, best patch tensor, and per-generation history.
+        """
+        import cma
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        x0 = np.full(self.basis_dim, 0.5)   # start at centre of [0,1]^D
+        opts = cma.CMAOptions()
+        opts['popsize']  = self.popsize
+        opts['maxiter']  = self.max_generations
+        opts['verbose']  = 3
+        opts['bounds']   = [0.0, 1.0]        # keep z in [0,1]
+        opts['tolx']     = 1e-4
+        opts['tolfun']   = 1e-4
+
+        es = cma.CMAEvolutionStrategy(x0, self.sigma0, opts)
+
+        history = []
+        best_fitness = -np.inf
+        best_z       = x0.copy()
+
+        api_calls = 0
+        print(f"\nStarting CMA-ES attack: {self.max_generations} generations × "
+              f"popsize={self.popsize}, {self.attack_images} images/eval")
+        print(f"Total API calls (upper bound): "
+              f"{self.max_generations * self.popsize * self.attack_images}\n")
+
+        gen = 0
+        while not es.stop():
+            solutions = es.ask()   # list of z vectors
+
+            fitnesses = []
+            for z_np in tqdm(solutions, desc=f"Gen {gen+1:03d}", leave=False):
+                f = self._evaluate_z(z_np)
+                fitnesses.append(f)
+                api_calls += len(self.images)
+
+            # CMA-ES minimises, so negate edit distance
+            es.tell(solutions, [-f for f in fitnesses])
+            es.disp()
+
+            gen_best = max(fitnesses)
+            gen_mean = np.mean(fitnesses)
+            print(f"Gen {gen+1:3d} | best edit-dist={gen_best:.2f} | "
+                  f"mean={gen_mean:.2f} | API calls so far={api_calls}")
+
+            history.append({'generation': gen + 1, 'best': gen_best, 'mean': gen_mean})
+
+            if gen_best > best_fitness:
+                best_fitness = gen_best
+                best_z       = solutions[int(np.argmax(fitnesses))].copy()
+                # Save best patch
+                best_patch = self._z_to_patch_pil(best_z)
+                best_patch.save(os.path.join(self.output_dir, 'best_patch.png'))
+                print(f"  ✓ New best edit-dist={best_fitness:.2f} — patch saved.")
+
+            gen += 1
+
+        # Save final artefacts
+        self._save_results(best_z, best_fitness, history)
+        return {'best_z': best_z, 'best_fitness': best_fitness, 'history': history}
+
+    @torch.no_grad()
+    def _z_to_patch_pil(self, z_np: np.ndarray):
+        z = torch.tensor(z_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        patch = self.generator(z).squeeze(0)
+        return T.ToPILImage()(patch.cpu())
+
+    def _save_results(self, best_z: np.ndarray, best_fitness: float, history: list):
+        import pandas as pd
+        # Save best z
+        np.save(os.path.join(self.output_dir, 'best_z.npy'), best_z)
+        # Save history CSV
+        pd.DataFrame(history).to_csv(
+            os.path.join(self.output_dir, 'cmaes_history.csv'), index=False
+        )
+        # Save best patch as PNG
+        best_patch_pil = self._z_to_patch_pil(best_z)
+        best_patch_pil.save(os.path.join(self.output_dir, 'best_patch_final.png'))
+        print(f"\nResults saved to {self.output_dir}/")
+        print(f"  best_z.npy          — optimal latent code")
+        print(f"  best_patch_final.png — patch image")
+        print(f"  cmaes_history.csv   — per-generation fitness")
+        print(f"  Best edit distance: {best_fitness:.2f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Progressive Layer Diversity Training for Patch Generation')
     parser.add_argument('--basis-dim', type=int, default=16,
@@ -2837,7 +3138,7 @@ def main():
     parser.add_argument('--bottleneck-dim', type=int, default=256,
                         help='Hidden dimension of middle dense layer in bottleneck refiner (default: 256). '
                         'Controls expressivity: 256 (baseline) → 512 (more capacity, +35%% params) → 1024 (more capacity, +100%% params).')
-    parser.add_argument('--ocr-dataset', type=str, required=True,
+    parser.add_argument('--ocr-dataset', type=str, default=None,
                         help='Public OCR dataset(s) to use in OCR mode. '
                         'Supports single dataset (e.g., iiit5k) or multiple comma-separated datasets '
                         '(e.g., iiit5k,icdar2013,roboflow_lpr). Multiple datasets will be combined. '
@@ -2855,8 +3156,8 @@ def main():
                         help='Number of images to process per gradient update in OCR mode (default: 1). '
                         'Total patches = images_per_batch × patches_per_image. '
                         'Higher values give more diverse gradients but use more memory.')
-    parser.add_argument('--ocr-patches-per-image', type=int, required=True,
-                        help='Number of patches to generate per image in OCR mode. '
+    parser.add_argument('--ocr-patches-per-image', type=int, default=None,
+                        help='Number of patches to generate per image in OCR mode (required unless --api-model is set). '
                         'Total patches = images_per_batch × patches_per_image.')
     parser.add_argument('--use-vae-lora', action='store_true', default=True, dest='use_vae_lora',
                         help='Use LoRA for VAE decoder (default: True)')
@@ -2869,7 +3170,61 @@ def main():
     parser.add_argument('--no-omniglot', action='store_true', default=False,
                         help='Disable Omniglot character conditioning in the bottleneck refiner. '
                         'Reverts to the original architecture without character features.')
+
+    # ── API attack mode ────────────────────────────────────────────────────
+    parser.add_argument('--api-model', type=str, default=None,
+                        help='OpenAI vision model to attack (e.g. gpt-4o-mini). '
+                        'Enables black-box API attack mode using CMA-ES over the latent z-space. '
+                        'Requires --generator-checkpoint and --api-key (or OPENAI_API_KEY env var).')
+    parser.add_argument('--api-key', type=str, default=None,
+                        help='OpenAI API key. Falls back to OPENAI_API_KEY environment variable.')
+    parser.add_argument('--generator-checkpoint', type=str, default=None,
+                        help='Path to a generator .pt checkpoint to load for API attack mode '
+                        '(e.g. checkpoints/20260101_120000/checkpoint_epoch_0050/generator_epoch_0050.pt).')
+    parser.add_argument('--cmaes-popsize', type=int, default=16,
+                        help='CMA-ES population size — number of z vectors evaluated per generation (default: 16).')
+    parser.add_argument('--cmaes-sigma0', type=float, default=0.5,
+                        help='CMA-ES initial step size sigma0 (default: 0.5).')
+    parser.add_argument('--cmaes-generations', type=int, default=100,
+                        help='Maximum CMA-ES generations (default: 100).')
+    parser.add_argument('--attack-images', type=int, default=8,
+                        help='Number of real plate images to average fitness over per z evaluation (default: 8). '
+                        'More images → more robust fitness but more API calls.')
+    parser.add_argument('--api-attack-output', type=str, default='api_attack_results',
+                        help='Output directory for API attack results (default: api_attack_results).')
+
     args = parser.parse_args()
+
+    # ── API attack mode ────────────────────────────────────────────────────
+    if args.api_model is not None:
+        if args.generator_checkpoint is None:
+            raise ValueError("--generator-checkpoint is required when using --api-model")
+        api_key = args.api_key or os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError("Provide an API key via --api-key or the OPENAI_API_KEY env var")
+        if args.ocr_dataset is None:
+            raise ValueError("--ocr-dataset is required for image evaluation in API attack mode")
+
+        print(f"\n{'='*80}")
+        print(f"API ATTACK MODE — model: {args.api_model}")
+        print(f"{'='*80}")
+
+        attacker = APIAttacker(
+            generator_checkpoint=args.generator_checkpoint,
+            api_model=args.api_model,
+            api_key=api_key,
+            ocr_dataset=args.ocr_dataset,
+            ocr_dataset_split=args.ocr_dataset_split,
+            attack_images=args.attack_images,
+            popsize=args.cmaes_popsize,
+            sigma0=args.cmaes_sigma0,
+            max_generations=args.cmaes_generations,
+            output_dir=args.api_attack_output,
+        )
+        attacker.attack()
+        return
+
+    # ── Regular training mode ──────────────────────────────────────────────
 
     # Validate dataset argument
     dataset_list = [d.strip() for d in args.ocr_dataset.split(',')]
@@ -2879,6 +3234,9 @@ def main():
             raise ValueError(
                 f"Unknown dataset '{dataset_name}'. Available: {available_datasets}"
             )
+
+    if args.ocr_patches_per_image is None:
+        raise ValueError("--ocr-patches-per-image is required in training mode")
 
     # Validate checkpoint arguments
     if args.continue_run is not None and args.resume_from is not None:
