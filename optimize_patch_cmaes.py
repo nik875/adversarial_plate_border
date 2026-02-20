@@ -971,7 +971,7 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     total_edit_distance = 0
     misreads = 0
     for control_text, composite_text in zip(control_texts, composite_texts):
-        edit_dist = Levenshtein.distance(control_text, composite_text)
+        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
         total_edit_distance += edit_dist
         if composite_text != control_text:
             misreads += 1
@@ -1014,7 +1014,7 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
         composite_text = composite_result.text if composite_result is not None else ""
 
         # Calculate Levenshtein edit distance
-        edit_dist = Levenshtein.distance(control_text, composite_text)
+        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
         total_edit_distance += edit_dist
 
         # Count misread if texts differ
@@ -1107,7 +1107,7 @@ def evaluate_patch_logit_delta(patch, val_images, ocr, control_logits_list, cont
         # Compute edit distance using precomputed control text
         composite_result = ocr.predict(composite_np)
         composite_text = composite_result.text if composite_result is not None else ""
-        edit_dist = Levenshtein.distance(control_text, composite_text)
+        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
         total_edit_distance += edit_dist
 
         if composite_text != control_text:
@@ -1160,7 +1160,7 @@ def evaluate_patch_logit_delta_with_debug(patch, val_images, ocr, control_logits
         # Compute edit distance using precomputed control text
         composite_result = ocr.predict(composite_np)
         composite_text = composite_result.text if composite_result is not None else ""
-        edit_dist = Levenshtein.distance(control_text, composite_text)
+        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
         total_edit_distance += edit_dist
 
         if composite_text != control_text:
