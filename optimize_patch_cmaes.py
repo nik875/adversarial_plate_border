@@ -129,17 +129,20 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     return images, dimensions
 
 
-def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128)):
+def load_validation_samples_from_preproc_csv(csv_path, num_samples, center_ratio=0.6, crop_size=(64, 128)):
     """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
 
-    Loads the original (unprocessed) image for each sample and crops to the plate
-    region defined by orig_corners, resized to crop_size. This matches how
-    optimize_patch.py feeds images to OCR.
+    Loads the original (unprocessed) image for each sample and crops a region
+    around the plate that includes surrounding context for the border patch.
+    The plate corners are scaled outward by 1/center_ratio so that the plate
+    occupies center_ratio of the final crop, leaving the rest as border area
+    for apply_patch_ocr_mode to fill with the adversarial patch.
 
     Args:
         csv_path: Path to preproc_labels CSV (dataset.py format)
         num_samples: Number of samples to load (randomly sampled if dataset is larger)
-        crop_size: (height, width) to resize plate crops to (default: (64, 128))
+        center_ratio: Fraction of crop occupied by the plate (default: 0.6)
+        crop_size: (height, width) to resize crops to (default: (64, 128))
 
     Returns:
         Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
@@ -166,18 +169,31 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(6
 
     dataset = AdversarialPatchDataset(df, transform=transform)
 
+    # Scale factor: expand plate corners so plate is center_ratio of the crop
+    border_scale = 1.0 / center_ratio
+
     images = []
     dimensions = []
     print(f"Loading all {len(dataset)} samples from preproc dataset...")
+    print(f"  Border scale: {border_scale:.2f}x (center_ratio={center_ratio})")
     for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
         orig_img = item['orig_image']  # [3, H, W] float in [0, 1]
         orig_corners = item['orig_corners']  # [4, 2] plate corners in original image
+        img_h, img_w = orig_img.shape[1], orig_img.shape[2]
 
-        # Crop plate region from original image and resize
+        # Scale corners outward from plate center to include border area
+        center = orig_corners.mean(dim=0, keepdim=True)  # [1, 2]
+        expanded_corners = center + (orig_corners - center) * border_scale  # [4, 2]
+
+        # Clamp to image bounds
+        expanded_corners[:, 0] = expanded_corners[:, 0].clamp(0, img_w - 1)
+        expanded_corners[:, 1] = expanded_corners[:, 1].clamp(0, img_h - 1)
+
+        # Crop expanded region from original image and resize
         cropped = kornia.geometry.crop_and_resize(
             orig_img.unsqueeze(0),  # [1, 3, H, W]
-            orig_corners.unsqueeze(0),  # [1, 4, 2]
+            expanded_corners.unsqueeze(0),  # [1, 4, 2]
             crop_size,
             mode='bilinear',
             align_corners=True
@@ -187,7 +203,7 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(6
         images.append(cropped)
         dimensions.append((width, height))
 
-    print(f"Loaded {len(images)} plate crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
+    print(f"Loaded {len(images)} plate+border crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
     return images, dimensions
 
 
@@ -1244,7 +1260,7 @@ def main():
             sys.exit(1)
         print(f"Using preproc dataset: {preproc_csv_path}")
         print(f"\nLoading {args.n_eval_samples} samples from preproc CSV...")
-        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples)
+        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples, center_ratio=args.center_ratio)
     else:
         print(f"Using data split: {csv_path}")
         print(f"\nLoading {args.n_eval_samples} validation samples...")
