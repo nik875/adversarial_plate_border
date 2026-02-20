@@ -1365,6 +1365,34 @@ def main():
     sampled_control_data = []  # Will hold sampled control texts or logits
     sampled_control_texts = []  # Will hold sampled control texts (always, for edit distance)
 
+    best_patches_dir = output_dir / "best_patches"
+    best_patches_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_best_patch(z, iteration, avg_metric):
+        """Save the patch and 10 composites whenever a new best is found."""
+        patch = generate_patch_from_z(generator, z, device)
+        patch_clamped = torch.clamp(patch, 0, 1)
+        patch_np = (patch_clamped.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+        tag = f"iter{iteration:04d}"
+        save_dir = best_patches_dir / tag
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save the patch itself
+        patch_bgr = cv2.cvtColor(patch_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(save_dir / "patch.png"), patch_bgr)
+
+        # Save 10 composites sampled from the full validation set
+        preview_indices = random.sample(range(len(val_images)), min(10, len(val_images)))
+        for j, idx in enumerate(preview_indices):
+            composite = apply_patch_ocr_mode(val_images[idx], patch_clamped, center_ratio=args.center_ratio)
+            composite = composite.squeeze(0)
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(save_dir / f"composite_{j:02d}.png"), composite_bgr)
+
+        tqdm.write(f"  [new best] iter={iteration} avg_metric={avg_metric:.4f} -> saved to {save_dir}")
+
     def objective(z, candidate_idx=None):
         """Objective function: returns negative metric (CMA-ES minimizes).
 
@@ -1432,6 +1460,7 @@ def main():
             if use_logit_mse:
                 best_secondary_metric[0] = avg_edit_distance
             best_z[0] = z.copy()
+            save_best_patch(z, current_iteration[0], avg_metric)
 
         # Return negative metric (CMA-ES minimizes, we want to maximize)
         return -total_metric
