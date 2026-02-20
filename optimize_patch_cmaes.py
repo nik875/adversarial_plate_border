@@ -812,8 +812,14 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                     return max(plate_candidates, key=len)
                 return text_normalized if text_normalized else None
 
-            def _make_request(self, b64):
-                """Make a single API request with rate limit retry and refusal retry (max 3)."""
+            def _make_request(self, b64, keep_last_on_refusal=False):
+                """Make a single API request with rate limit retry and refusal retry (max 3).
+
+                Args:
+                    b64: base64-encoded image
+                    keep_last_on_refusal: if True, return last response on refusal exhaustion;
+                                         if False, return empty string
+                """
                 import time
                 messages = [
                     {
@@ -836,6 +842,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 ]
 
                 refusal_retries = 0
+                last_raw = ""
                 while True:
                     try:
                         response = self.client.chat.completions.create(
@@ -845,14 +852,20 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                             reasoning_effort="minimal",
                         )
                         raw = response.choices[0].message.content or ""
+                        last_raw = raw
                         parsed = self._parse_response(raw)
                         if parsed is not None:
                             return parsed
                         # Refusal detected
                         refusal_retries += 1
                         if refusal_retries >= 3:
-                            # Max retries exceeded, return empty string (count as correct read)
-                            return ""
+                            # Max retries exceeded
+                            if keep_last_on_refusal:
+                                # Return last response, parse it (even if it's a refusal)
+                                return self._parse_response(last_raw) or ""
+                            else:
+                                # Return empty string (count as correct read)
+                                return ""
                         tqdm.write("  [gpt-5-mini] Refusal/error detected, retrying... (attempt {}/3)".format(refusal_retries + 1))
                         time.sleep(1)
                     except openai.RateLimitError:
@@ -878,8 +891,14 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                         self.text = text
                 return Result(text)
 
-            def predict_batch(self, images, desc=None):
-                """Predict text from multiple RGB uint8 images in parallel."""
+            def predict_batch(self, images, desc=None, keep_last_on_refusal=False):
+                """Predict text from multiple RGB uint8 images in parallel.
+
+                Args:
+                    images: list of RGB uint8 images
+                    desc: progress bar description
+                    keep_last_on_refusal: if True, keep last response on refusal exhaustion
+                """
                 import time
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -890,7 +909,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 pbar = tqdm(total=len(b64s), desc=desc or "GPT-5 mini OCR", leave=False)
 
                 def submit_request(idx):
-                    return idx, self._make_request(b64s[idx])
+                    return idx, self._make_request(b64s[idx], keep_last_on_refusal=keep_last_on_refusal)
 
                 with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
                     futures = []
@@ -1463,7 +1482,7 @@ def main():
         # Run OCR (batch if available)
         if hasattr(ocr, 'predict_batch'):
             print(f"Running batch OCR on {len(control_nps)} control images (max_parallel={ocr.max_parallel})...")
-            results = ocr.predict_batch(control_nps, desc="Control OCR")
+            results = ocr.predict_batch(control_nps, desc="Control OCR", keep_last_on_refusal=True)
             control_texts = [r.text if r is not None else "" for r in results]
         else:
             control_texts = []
