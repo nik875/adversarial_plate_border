@@ -774,7 +774,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             },
                             {
                                 "type": "text",
-                                "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]",
+                                "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
