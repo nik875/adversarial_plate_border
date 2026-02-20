@@ -1167,6 +1167,8 @@ def main():
                         help='OpenAI API key for gpt-5-mini (can also be set via OPENAI_API_KEY env var)')
     parser.add_argument('--correct-text', default=None,
                         help='Known correct license plate text for all images. Skips control OCR computation.')
+    parser.add_argument('--control-labels-csv', default=None,
+                        help='Path to cmaes_control_labels.csv to load precomputed control texts (skips control OCR loop)')
 
     # Device
     parser.add_argument('--device', default=None,
@@ -1374,6 +1376,20 @@ def main():
     if args.correct_text is not None:
         print(f"\nUsing provided correct text for all images: '{args.correct_text}' (skipping control OCR)")
         control_texts = [args.correct_text] * len(val_images)
+    elif args.control_labels_csv is not None:
+        import pandas as pd
+        control_csv_path = Path(args.control_labels_csv)
+        print(f"\nLoading control texts from: {control_csv_path}")
+        control_df = pd.read_csv(control_csv_path)
+        control_texts = control_df['control_text'].tolist()
+        if len(control_texts) != len(val_images):
+            print(f"Warning: control CSV has {len(control_texts)} entries but {len(val_images)} validation images. "
+                  f"Truncating/padding as needed.")
+            if len(control_texts) > len(val_images):
+                control_texts = control_texts[:len(val_images)]
+            else:
+                control_texts.extend([""] * (len(val_images) - len(control_texts)))
+        print(f"Loaded {len(control_texts)} control texts from CSV")
     else:
         print("\nPrecomputing control OCR texts...")
         control_texts = []
@@ -1387,6 +1403,15 @@ def main():
             except Exception as e:
                 control_texts.append("")
         print(f"Precomputed {len(control_texts)} control texts")
+
+        # Save to cmaes_control_labels.csv for reuse
+        control_csv_path = output_dir / "cmaes_control_labels.csv"
+        with open(control_csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['idx', 'control_text'])
+            writer.writeheader()
+            for i, ct in enumerate(control_texts):
+                writer.writerow({'idx': i, 'control_text': ct})
+        print(f"Saved control texts to: {control_csv_path}")
 
     # In logit MSE mode, also precompute control logits
     if use_logit_mse:
