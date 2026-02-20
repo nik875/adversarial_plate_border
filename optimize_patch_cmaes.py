@@ -795,7 +795,9 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
 
                 raw = response.choices[0].message.content or ""
                 match = re.search(r'The text is:\s*(.+)', raw)
-                text = match.group(1).strip() if match else ""
+                if not match:
+                    tqdm.write(f"  [gpt-5-mini] Unexpected response format: {raw!r}")
+                text = match.group(1).strip() if match else raw.strip()
 
                 class Result:
                     def __init__(self, text):
