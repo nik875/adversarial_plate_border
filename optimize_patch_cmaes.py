@@ -1306,7 +1306,7 @@ def main():
 
     # Initialize OCR model
     print(f"\nInitializing OCR model: {args.ocr_model}")
-    ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device)
+    ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device, api_key=args.openai_api_key)
     print("OCR model loaded")
 
     # Determine optimization mode
