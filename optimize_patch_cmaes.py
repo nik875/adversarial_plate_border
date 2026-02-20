@@ -786,7 +786,8 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                         response = self.client.chat.completions.create(
                             model="gpt-5-mini",
                             messages=messages,
-                            max_completion_tokens=256,
+                            max_completion_tokens=64,
+                            reasoning_effort="none",
                         )
                         break
                     except openai.RateLimitError:
