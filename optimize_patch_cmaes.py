@@ -1002,7 +1002,7 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6, corr
             edit_dist = dist_to_control
 
         total_edit_distance += edit_dist
-        is_misread = (composite_text != control_text)
+        is_misread = (composite_text != control_text) and (correct_text is None or composite_text != correct_text)
         if is_misread:
             misreads += 1
 
@@ -1062,8 +1062,8 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
             edit_dist = dist_to_control
         total_edit_distance += edit_dist
 
-        # Count misread if texts differ
-        is_misread = (composite_text != control_text)
+        # Count misread if output matches neither control nor correct text
+        is_misread = (composite_text != control_text) and (correct_text is None or composite_text != correct_text)
         if is_misread:
             misreads += 1
 
@@ -1874,7 +1874,7 @@ def main():
                 edit_dist = min(dist_to_control, dist_to_correct)
             else:
                 edit_dist = dist_to_control
-            is_misread = (composite_text != control_text)
+            is_misread = (composite_text != control_text) and (correct_text is None or composite_text != correct_text)
 
             results_rows.append({
                 'image_idx': idx,
