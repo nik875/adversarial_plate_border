@@ -774,7 +774,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             },
                             {
                                 "type": "text",
-                                "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
+                                "text": "Read the text in this image. Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
@@ -786,7 +786,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                         response = self.client.chat.completions.create(
                             model="gpt-5-mini",
                             messages=messages,
-                            max_completion_tokens=64,
+                            max_completion_tokens=256,
                             reasoning_effort="minimal",
                         )
                         break
