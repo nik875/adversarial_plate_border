@@ -2321,6 +2321,7 @@ class ProgressivePatchTrainer:
                     'use_vae_lora': getattr(self.generator, 'use_vae_lora', False),
                     'lora_rank': getattr(self.generator, 'lora_rank', None),
                     'lora_alpha': getattr(self.generator, 'lora_alpha', None),
+                    'use_omniglot': getattr(self.generator, 'use_omniglot', False),
                 }
                 torch.save(checkpoint, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 

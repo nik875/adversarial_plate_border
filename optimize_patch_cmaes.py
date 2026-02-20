@@ -349,10 +349,12 @@ def load_generator(run_dir, device=None):
     use_vae_lora = checkpoint.get('use_vae_lora', True)
     lora_rank = checkpoint.get('lora_rank', 8)
     lora_alpha = checkpoint.get('lora_alpha', 16)
+    use_omniglot = checkpoint.get('use_omniglot', False)
 
     print(f"  Latent dim: {latent_dim}")
     print(f"  Patch size: {patch_height}x{patch_width}")
     print(f"  VAE LoRA: {use_vae_lora} (rank={lora_rank}, alpha={lora_alpha})")
+    print(f"  Omniglot conditioning: {use_omniglot}")
 
     # Create generator with same architecture
     generator = FoundationPatchGenerator(
@@ -362,6 +364,7 @@ def load_generator(run_dir, device=None):
         use_vae_lora=use_vae_lora,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        use_omniglot=use_omniglot,
     )
 
     # Load state dict
