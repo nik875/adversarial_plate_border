@@ -866,10 +866,8 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                             else:
                                 # Return empty string (count as correct read)
                                 return ""
-                        tqdm.write("  [gpt-5-mini] Refusal/error detected, retrying... (attempt {}/3)".format(refusal_retries + 1))
                         time.sleep(1)
                     except openai.RateLimitError:
-                        tqdm.write("  [gpt-5-mini] Rate limited, retrying in 5s...")
                         time.sleep(5)
 
             def _encode_image(self, image):
@@ -891,13 +889,14 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                         self.text = text
                 return Result(text)
 
-            def predict_batch(self, images, desc=None, keep_last_on_refusal=False):
+            def predict_batch(self, images, desc=None, keep_last_on_refusal=False, show_progress=True):
                 """Predict text from multiple RGB uint8 images in parallel.
 
                 Args:
                     images: list of RGB uint8 images
                     desc: progress bar description
                     keep_last_on_refusal: if True, keep last response on refusal exhaustion
+                    show_progress: if False, suppress the internal progress bar
                 """
                 import time
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -906,7 +905,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 b64s = [self._encode_image(img) for img in images]
 
                 results = [None] * len(b64s)
-                pbar = tqdm(total=len(b64s), desc=desc or "GPT-5 mini OCR", leave=False)
+                pbar = tqdm(total=len(b64s), desc=desc or "GPT-5 mini OCR", leave=False, disable=not show_progress)
 
                 def submit_request(idx):
                     return idx, self._make_request(b64s[idx], keep_last_on_refusal=keep_last_on_refusal)
@@ -960,7 +959,7 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6, corr
 
     # Run OCR (batch if available, sequential otherwise)
     if hasattr(ocr, 'predict_batch'):
-        results = ocr.predict_batch(composite_nps)
+        results = ocr.predict_batch(composite_nps, show_progress=False)
         composite_texts = [r.text if r is not None else "" for r in results]
     else:
         composite_texts = []
@@ -1726,7 +1725,7 @@ def main():
     iteration = 0
 
     # Create progress bar for iterations
-    pbar = tqdm(total=args.maxiter, desc="CMA-ES", unit="iter", position=0)
+    pbar = tqdm(total=args.maxiter, desc="CMA-ES", unit="iter", position=0, leave=True, dynamic_ncols=True)
 
     # Run for exactly maxiter iterations (disable all early stopping criteria)
     while iteration < args.maxiter:
@@ -1752,10 +1751,14 @@ def main():
             all_secondary_metrics.clear()
 
         # Evaluate all candidates with a nested progress bar
+        cand_pbar = tqdm(total=len(solutions), desc=f"iter {iteration}", unit="cand",
+                         position=1, leave=False, dynamic_ncols=True)
         for i, z in enumerate(solutions):
             # Pass candidate index only for first iteration
             fitness = objective(z, candidate_idx=i if iteration == 0 else None)
             fitness_values.append(fitness)
+            cand_pbar.update(1)
+        cand_pbar.close()
 
         es.tell(solutions, fitness_values)
 
