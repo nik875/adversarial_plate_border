@@ -441,7 +441,7 @@ def generate_patch_from_z(generator, z, device):
     return patch
 
 
-def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None):
+def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None, max_parallel=4):
     """Create OCR model based on type selection.
 
     Args:
@@ -770,17 +770,41 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
         client = openai.OpenAI(api_key=api_key)
 
         class GPT5MiniWrapper:
-            def __init__(self, client):
+            def __init__(self, client, max_parallel=4):
                 self.client = client
+                self.max_parallel = max_parallel
 
-            def predict(self, image):
-                """Predict text from RGB uint8 image using GPT-5 mini."""
+            def _parse_response(self, raw):
+                """Parse raw API response into plate text."""
+                match = re.search(r'The text is:\s*(.*)', raw)
+                text = match.group(1).strip() if match else raw.strip()
+
+                # Extract plate number: find the best alphanumeric
+                # sequence that looks like a plate (has both letters and digits)
+                text_normalized = re.sub(r'[-\s]', '', text).upper()
+                tokens = re.findall(r'[A-Za-z0-9]+', text)
+                plate_candidates = []
+                for tok in tokens:
+                    tok_upper = tok.upper()
+                    has_letter = any(c.isalpha() for c in tok_upper)
+                    has_digit = any(c.isdigit() for c in tok_upper)
+                    if has_letter and has_digit and len(tok_upper) >= 4:
+                        plate_candidates.append(tok_upper)
+
+                for i in range(len(tokens) - 1):
+                    combined = (tokens[i] + tokens[i + 1]).upper()
+                    has_letter = any(c.isalpha() for c in combined)
+                    has_digit = any(c.isdigit() for c in combined)
+                    if has_letter and has_digit and len(combined) >= 4:
+                        plate_candidates.append(combined)
+
+                if plate_candidates:
+                    return max(plate_candidates, key=len)
+                return text_normalized
+
+            def _make_request(self, b64):
+                """Make a single API request with rate limit retry."""
                 import time
-                pil_image = PILImage.fromarray(image)
-                buf = BytesIO()
-                pil_image.save(buf, format="PNG")
-                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
                 messages = [
                     {
                         "role": "system",
@@ -801,7 +825,6 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                     }
                 ]
 
-                time.sleep(0.1)
                 while True:
                     try:
                         response = self.client.chat.completions.create(
@@ -812,50 +835,61 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                         )
                         break
                     except openai.RateLimitError:
-                        print("\n  [gpt-5-mini] Rate limited, retrying in 5s...")
+                        tqdm.write("  [gpt-5-mini] Rate limited, retrying in 5s...")
                         time.sleep(5)
 
                 raw = response.choices[0].message.content or ""
-                # Strip "The text is:" prefix if present
-                match = re.search(r'The text is:\s*(.*)', raw)
-                text = match.group(1).strip() if match else raw.strip()
+                return self._parse_response(raw)
 
-                # Extract plate number: find the best alphanumeric
-                # sequence that looks like a plate (has both letters and digits)
-                text_normalized = re.sub(r'[-\s]', '', text).upper()
-                # Find all contiguous alphanumeric groups from normalized text
-                # by splitting on non-alnum in the original then rejoining adjacent tokens
-                tokens = re.findall(r'[A-Za-z0-9]+', text)
-                # Look for tokens with both letters and digits (plate-like)
-                plate_candidates = []
-                for tok in tokens:
-                    tok_upper = tok.upper()
-                    has_letter = any(c.isalpha() for c in tok_upper)
-                    has_digit = any(c.isdigit() for c in tok_upper)
-                    if has_letter and has_digit and len(tok_upper) >= 4:
-                        plate_candidates.append(tok_upper)
+            def _encode_image(self, image):
+                """Encode numpy image to base64 PNG."""
+                pil_image = PILImage.fromarray(image)
+                buf = BytesIO()
+                pil_image.save(buf, format="PNG")
+                return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-                # Also try combining adjacent tokens (e.g. "VRJ" + "7774")
-                for i in range(len(tokens) - 1):
-                    combined = (tokens[i] + tokens[i + 1]).upper()
-                    has_letter = any(c.isalpha() for c in combined)
-                    has_digit = any(c.isdigit() for c in combined)
-                    if has_letter and has_digit and len(combined) >= 4:
-                        plate_candidates.append(combined)
-
-                if plate_candidates:
-                    # Pick the longest candidate
-                    text = max(plate_candidates, key=len)
-                else:
-                    # Fallback: full normalized text
-                    text = text_normalized
+            def predict(self, image):
+                """Predict text from a single RGB uint8 image."""
+                import time
+                time.sleep(0.1)
+                b64 = self._encode_image(image)
+                text = self._make_request(b64)
 
                 class Result:
                     def __init__(self, text):
                         self.text = text
                 return Result(text)
 
-        return GPT5MiniWrapper(client)
+            def predict_batch(self, images):
+                """Predict text from multiple RGB uint8 images in parallel."""
+                import time
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                # Encode all images first
+                b64s = [self._encode_image(img) for img in images]
+
+                results = [None] * len(b64s)
+
+                def submit_request(idx):
+                    return idx, self._make_request(b64s[idx])
+
+                with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
+                    futures = []
+                    for i in range(len(b64s)):
+                        futures.append(executor.submit(submit_request, i))
+                        time.sleep(0.1)  # Stagger submissions
+
+                    for future in as_completed(futures):
+                        idx, text = future.result()
+                        results[idx] = text
+
+                class Result:
+                    def __init__(self, text):
+                        self.text = text
+
+                return [Result(t) for t in results]
+
+        return GPT5MiniWrapper(client, max_parallel=max_parallel)
 
     else:
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
@@ -874,32 +908,34 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     Returns:
         Tuple of (total_edit_distance, num_misreads, avg_edit_distance)
     """
+    # Prepare all composite images
+    composite_nps = []
+    for val_image in val_images:
+        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
+        composite = composite.squeeze(0)
+        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        composite_nps.append(composite_np)
+
+    # Run OCR (batch if available, sequential otherwise)
+    if hasattr(ocr, 'predict_batch'):
+        results = ocr.predict_batch(composite_nps)
+        composite_texts = [r.text if r is not None else "" for r in results]
+    else:
+        composite_texts = []
+        for composite_np in composite_nps:
+            result = ocr.predict(composite_np)
+            composite_texts.append(result.text if result is not None else "")
+
+    # Score
     total_edit_distance = 0
     misreads = 0
-    num_evaluated = 0
-
-    for val_image, control_text in zip(val_images, control_texts):
-        # Create composite (with patch)
-        composite = apply_patch_ocr_mode(val_image, patch, center_ratio=center_ratio)
-        composite = composite.squeeze(0)  # Remove batch dim
-
-        # Convert to numpy for OCR
-        composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-
-        # Run OCR on composite only (control already precomputed)
-        composite_result = ocr.predict(composite_np)
-        composite_text = composite_result.text if composite_result is not None else ""
-
-        # Calculate Levenshtein edit distance
+    for control_text, composite_text in zip(control_texts, composite_texts):
         edit_dist = Levenshtein.distance(control_text, composite_text)
         total_edit_distance += edit_dist
-
-        # Count misread if texts differ
         if composite_text != control_text:
             misreads += 1
 
-        num_evaluated += 1
-
+    num_evaluated = len(val_images)
     avg_edit_distance = total_edit_distance / num_evaluated if num_evaluated > 0 else 0
     return total_edit_distance, misreads, avg_edit_distance
 
@@ -1169,6 +1205,8 @@ def main():
                         help='Known correct license plate text for all images. Skips control OCR computation.')
     parser.add_argument('--control-labels-csv', default=None,
                         help='Path to cmaes_control_labels.csv to load precomputed control texts (skips control OCR loop)')
+    parser.add_argument('--max-parallel', type=int, default=4,
+                        help='Max parallel API requests for gpt-5-mini (default: 4)')
 
     # Device
     parser.add_argument('--device', default=None,
@@ -1305,7 +1343,7 @@ def main():
 
         # Initialize OCR model
         print(f"\nInitializing OCR model: {args.ocr_model}")
-        ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device, api_key=args.openai_api_key)
+        ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device, api_key=args.openai_api_key, max_parallel=args.max_parallel)
 
         n = 10
         images_to_use = val_images[:n]
@@ -1392,16 +1430,27 @@ def main():
         print(f"Loaded {len(control_texts)} control texts from CSV")
     else:
         print("\nPrecomputing control OCR texts...")
-        control_texts = []
-        for val_image in tqdm(val_images, desc="Control OCR"):
-            try:
-                control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-                control = control.squeeze(0)
-                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                control_result = ocr.predict(control_np)
-                control_texts.append(control_result.text if control_result is not None else "")
-            except Exception as e:
-                control_texts.append("")
+        # Prepare all control images
+        control_nps = []
+        for val_image in tqdm(val_images, desc="Preparing control images"):
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_nps.append(control_np)
+
+        # Run OCR (batch if available)
+        if hasattr(ocr, 'predict_batch'):
+            print(f"Running batch OCR on {len(control_nps)} control images (max_parallel={ocr.max_parallel})...")
+            results = ocr.predict_batch(control_nps)
+            control_texts = [r.text if r is not None else "" for r in results]
+        else:
+            control_texts = []
+            for control_np in tqdm(control_nps, desc="Control OCR"):
+                try:
+                    control_result = ocr.predict(control_np)
+                    control_texts.append(control_result.text if control_result is not None else "")
+                except Exception as e:
+                    control_texts.append("")
         print(f"Precomputed {len(control_texts)} control texts")
 
         # Save to cmaes_control_labels.csv for reuse
