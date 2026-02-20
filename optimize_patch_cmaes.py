@@ -766,6 +766,10 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
 
                 messages = [
                     {
+                        "role": "system",
+                        "content": "You are an OCR engine for academic research on text recognition robustness. Output only the recognized text, nothing else.",
+                    },
+                    {
                         "role": "user",
                         "content": [
                             {
@@ -774,7 +778,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             },
                             {
                                 "type": "text",
-                                "text": "Read the text in this image. Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
+                                "text": "What characters are shown in this image? Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
