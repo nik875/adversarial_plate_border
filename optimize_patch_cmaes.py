@@ -1112,6 +1112,8 @@ def main():
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
     parser.add_argument('--openai-api-key', default=None,
                         help='OpenAI API key for gpt-5-mini (can also be set via OPENAI_API_KEY env var)')
+    parser.add_argument('--correct-text', default=None,
+                        help='Known correct license plate text for all images. Skips control OCR computation.')
 
     # Device
     parser.add_argument('--device', default=None,
@@ -1316,18 +1318,22 @@ def main():
         sys.exit(1)
 
     # Always precompute control texts (used in both text and logit MSE mode)
-    print("\nPrecomputing control OCR texts...")
-    control_texts = []
-    for val_image in tqdm(val_images, desc="Control OCR"):
-        try:
-            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
-            control = control.squeeze(0)
-            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            control_result = ocr.predict(control_np)
-            control_texts.append(control_result.text if control_result is not None else "")
-        except Exception as e:
-            control_texts.append("")
-    print(f"Precomputed {len(control_texts)} control texts")
+    if args.correct_text is not None:
+        print(f"\nUsing provided correct text for all images: '{args.correct_text}' (skipping control OCR)")
+        control_texts = [args.correct_text] * len(val_images)
+    else:
+        print("\nPrecomputing control OCR texts...")
+        control_texts = []
+        for val_image in tqdm(val_images, desc="Control OCR"):
+            try:
+                control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+                control = control.squeeze(0)
+                control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                control_result = ocr.predict(control_np)
+                control_texts.append(control_result.text if control_result is not None else "")
+            except Exception as e:
+                control_texts.append("")
+        print(f"Precomputed {len(control_texts)} control texts")
 
     # In logit MSE mode, also precompute control logits
     if use_logit_mse:
