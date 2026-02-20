@@ -389,14 +389,14 @@ def load_generator(run_dir, device=None):
         use_omniglot=use_omniglot,
     )
 
-    # Load state dict, falling back to use_omniglot=False if there's a mismatch
+    # Load state dict, falling back to the opposite use_omniglot value if there's a mismatch
     try:
         generator.load_state_dict(checkpoint['generator_state_dict'])
     except RuntimeError as e:
-        if use_omniglot:
-            print(f"  Warning: state dict mismatch with use_omniglot=True, retrying with use_omniglot=False")
-            print(f"  ({e})")
-            use_omniglot = False
+        alt_omniglot = not use_omniglot
+        print(f"  Warning: state dict mismatch with use_omniglot={use_omniglot}, retrying with use_omniglot={alt_omniglot}")
+        print(f"  ({e})")
+        try:
             generator = FoundationPatchGenerator(
                 latent_dim=latent_dim,
                 patch_height=patch_height,
@@ -404,11 +404,12 @@ def load_generator(run_dir, device=None):
                 use_vae_lora=use_vae_lora,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
-                use_omniglot=False,
+                use_omniglot=alt_omniglot,
             )
             generator.load_state_dict(checkpoint['generator_state_dict'])
-        else:
-            raise
+            use_omniglot = alt_omniglot
+        except RuntimeError:
+            raise e  # Re-raise original error if both attempts fail
 
     # Use provided device or auto-detect
     if device is None:
