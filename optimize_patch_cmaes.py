@@ -132,6 +132,9 @@ def load_validation_samples_from_csv(csv_path, num_samples):
 def load_validation_samples_from_preproc_csv(csv_path, num_samples):
     """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
 
+    Crops each preprocessed image to the plate region defined by new_corners,
+    so that apply_patch_ocr_mode can treat the entire image as the plate area.
+
     Args:
         csv_path: Path to preproc_labels CSV (dataset.py format)
         num_samples: Number of samples to load (randomly sampled if dataset is larger)
@@ -141,6 +144,7 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples):
     """
     import pandas as pd
     import torchvision.transforms as T
+    import kornia
 
     script_dir = Path(__file__).parent
     sys.path.insert(0, str(script_dir))
@@ -166,11 +170,22 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples):
     for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
         img_tensor = item['prep_image']  # [3, H, W] float in [0, 1]
-        height, width = img_tensor.shape[1], img_tensor.shape[2]
-        images.append(img_tensor)
+        new_corners = item['new_corners']  # [4, 2] plate corners in preprocessed image
+
+        # Crop to plate region using corners
+        cropped = kornia.geometry.crop_and_resize(
+            img_tensor.unsqueeze(0),  # [1, 3, H, W]
+            new_corners.unsqueeze(0),  # [1, 4, 2]
+            (64, 128),  # Standard plate crop size (H, W)
+            mode='bilinear',
+            align_corners=True
+        ).squeeze(0)  # [3, 64, 128]
+
+        height, width = cropped.shape[1], cropped.shape[2]
+        images.append(cropped)
         dimensions.append((width, height))
 
-    print(f"Loaded {len(images)} samples (will sample {min(num_samples, len(images))} per iteration)")
+    print(f"Loaded {len(images)} plate crops (will sample {min(num_samples, len(images))} per iteration)")
     return images, dimensions
 
 
