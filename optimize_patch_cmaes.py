@@ -887,6 +887,15 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                                 # Return empty string (count as correct read)
                                 return ""
                         time.sleep(1)
+                    except openai.BadRequestError:
+                        # Content policy flag - treat same as refusal (retry up to 3 times)
+                        refusal_retries += 1
+                        if refusal_retries >= 3:
+                            if keep_last_on_refusal:
+                                return self._parse_response(last_raw) or ""
+                            else:
+                                return ""
+                        time.sleep(1)
                     except openai.RateLimitError:
                         time.sleep(5)
 
