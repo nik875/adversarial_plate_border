@@ -129,20 +129,16 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     return images, dimensions
 
 
-def load_validation_samples_from_preproc_csv(csv_path, num_samples, center_ratio=0.6, crop_size=(64, 128)):
+def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128)):
     """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
 
-    Loads the original (unprocessed) image for each sample and crops a region
-    around the plate that includes surrounding context for the border patch.
-    The plate corners are scaled outward by 1/center_ratio so that the plate
-    occupies center_ratio of the final crop, leaving the rest as border area
-    for apply_patch_ocr_mode to fill with the adversarial patch.
+    Loads the original (unprocessed) image for each sample and crops exactly to
+    the plate region defined by orig_corners, resized to crop_size.
 
     Args:
         csv_path: Path to preproc_labels CSV (dataset.py format)
         num_samples: Number of samples to load (randomly sampled if dataset is larger)
-        center_ratio: Fraction of crop occupied by the plate (default: 0.6)
-        crop_size: (height, width) to resize crops to (default: (64, 128))
+        crop_size: (height, width) to resize plate crops to (default: (64, 128))
 
     Returns:
         Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
@@ -169,31 +165,18 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, center_ratio
 
     dataset = AdversarialPatchDataset(df, transform=transform)
 
-    # Scale factor: expand plate corners so plate is center_ratio of the crop
-    border_scale = 1.0 / center_ratio
-
     images = []
     dimensions = []
     print(f"Loading all {len(dataset)} samples from preproc dataset...")
-    print(f"  Border scale: {border_scale:.2f}x (center_ratio={center_ratio})")
     for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
         orig_img = item['orig_image']  # [3, H, W] float in [0, 1]
         orig_corners = item['orig_corners']  # [4, 2] plate corners in original image
-        img_h, img_w = orig_img.shape[1], orig_img.shape[2]
 
-        # Scale corners outward from plate center to include border area
-        center = orig_corners.mean(dim=0, keepdim=True)  # [1, 2]
-        expanded_corners = center + (orig_corners - center) * border_scale  # [4, 2]
-
-        # Clamp to image bounds
-        expanded_corners[:, 0] = expanded_corners[:, 0].clamp(0, img_w - 1)
-        expanded_corners[:, 1] = expanded_corners[:, 1].clamp(0, img_h - 1)
-
-        # Crop expanded region from original image and resize
+        # Crop plate region from original image and resize
         cropped = kornia.geometry.crop_and_resize(
             orig_img.unsqueeze(0),  # [1, 3, H, W]
-            expanded_corners.unsqueeze(0),  # [1, 4, 2]
+            orig_corners.unsqueeze(0),  # [1, 4, 2]
             crop_size,
             mode='bilinear',
             align_corners=True
@@ -203,97 +186,98 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, center_ratio
         images.append(cropped)
         dimensions.append((width, height))
 
-    print(f"Loaded {len(images)} plate+border crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
+    print(f"Loaded {len(images)} plate crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
     return images, dimensions
 
 
 def apply_patch_ocr_mode(image, patch, center_ratio=0.6):
-    """Apply adversarial patch to image (center region preserved).
+    """Apply adversarial patch with plate image placed in the center.
+
+    The patch fills the entire output canvas. The plate image is resized to
+    center_ratio of the output dimensions and placed in the center, overwriting
+    the patch in that region.
 
     Args:
-        image: [3, H, W] or [1, 3, H, W] tensor in [0, 1]
+        image: [3, H, W] or [1, 3, H, W] plate crop tensor in [0, 1]
         patch: [3, patch_h, patch_w] tensor in [0, 1]
-        center_ratio: Fraction of image to preserve in center (default: 0.6)
+        center_ratio: Fraction of output occupied by the plate (default: 0.6)
 
     Returns:
-        result: [B, 3, H, W] patched image
+        result: [B, 3, out_H, out_W] composited image
     """
     # Handle single image
     if image.dim() == 3:
         image = image.unsqueeze(0)
 
     batch_size = image.shape[0]
-    image_height, image_width = image.shape[2], image.shape[3]
+    patch_height, patch_width = patch.shape[1], patch.shape[2]
 
-    # Resize patch to match image dimensions
-    patch_resized = F.interpolate(
-        patch.unsqueeze(0),  # [1, 3, patch_h, patch_w]
-        size=(image_height, image_width),
+    # Start with the full patch as the canvas
+    patch_canvas = patch.unsqueeze(0).repeat(batch_size, 1, 1, 1)  # [B, 3, pH, pW]
+
+    # Compute center region size
+    center_h = int(patch_height * center_ratio)
+    center_w = int(patch_width * center_ratio)
+    pad_h = (patch_height - center_h) // 2
+    pad_w = (patch_width - center_w) // 2
+
+    # Resize plate image to fit in the center region
+    plate_resized = F.interpolate(
+        image,  # [B, 3, H, W]
+        size=(center_h, center_w),
         mode='bilinear',
         align_corners=False
-    )  # [1, 3, H, W]
+    )  # [B, 3, center_h, center_w]
 
-    # Expand to batch size
-    patch_batch = patch_resized.repeat(batch_size, 1, 1, 1)  # [B, 3, H, W]
-
-    # Create center mask (1 in center, 0 on borders)
-    center_h = int(image_height * center_ratio)
-    center_w = int(image_width * center_ratio)
-
-    # Calculate padding to center the mask
-    pad_h = (image_height - center_h) // 2
-    pad_w = (image_width - center_w) // 2
-
-    # Create mask: 1 in center region, 0 elsewhere
-    center_mask = torch.zeros(batch_size, 1, image_height, image_width,
-                             dtype=torch.float32)
-    center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
-    center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
-
-    # Blend: keep original image in center, use patch on borders
-    result_image = image * center_mask + patch_batch * (1 - center_mask)
+    # Paste plate image into center of patch canvas
+    result_image = patch_canvas.clone()
+    result_image[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = plate_resized
     result_image = torch.clamp(result_image, 0, 1)
 
     return result_image
 
 
-def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5):
-    """Apply neutral grey border to image (center region preserved).
+def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5, output_size=(64, 128)):
+    """Place plate image in center of a neutral grey border.
+
+    The output canvas is filled with border_color. The plate image is resized
+    to center_ratio of the output dimensions and placed in the center.
 
     Args:
-        image: [3, H, W] or [1, 3, H, W] tensor in [0, 1]
-        center_ratio: Fraction of image to preserve in center (default: 0.6)
+        image: [3, H, W] or [1, 3, H, W] plate crop tensor in [0, 1]
+        center_ratio: Fraction of output occupied by the plate (default: 0.6)
         border_color: Value for neutral border (default: 0.5 = gray)
+        output_size: (height, width) of the output canvas (default: (64, 128))
 
     Returns:
-        result: [B, 3, H, W] image with grey border
+        result: [B, 3, out_H, out_W] image with grey border
     """
     # Handle single image
     if image.dim() == 3:
         image = image.unsqueeze(0)
 
     batch_size = image.shape[0]
-    image_height, image_width = image.shape[2], image.shape[3]
+    out_h, out_w = output_size
 
-    # Create center mask (1 in center, 0 on borders)
-    center_h = int(image_height * center_ratio)
-    center_w = int(image_width * center_ratio)
+    # Start with grey canvas
+    result_image = torch.full((batch_size, 3, out_h, out_w), border_color, dtype=torch.float32)
 
-    # Calculate padding to center the mask
-    pad_h = (image_height - center_h) // 2
-    pad_w = (image_width - center_w) // 2
+    # Compute center region size
+    center_h = int(out_h * center_ratio)
+    center_w = int(out_w * center_ratio)
+    pad_h = (out_h - center_h) // 2
+    pad_w = (out_w - center_w) // 2
 
-    # Create mask: 1 in center region, 0 elsewhere
-    center_mask = torch.zeros(batch_size, 1, image_height, image_width,
-                             dtype=torch.float32)
-    center_mask[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = 1.0
-    center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
+    # Resize plate image to fit in the center region
+    plate_resized = F.interpolate(
+        image,
+        size=(center_h, center_w),
+        mode='bilinear',
+        align_corners=False
+    )
 
-    # Create neutral border
-    neutral_border = torch.full_like(image, border_color)
-
-    # Blend: keep original image in center, use neutral border on borders
-    result_image = image * center_mask + neutral_border * (1 - center_mask)
+    # Paste plate image into center
+    result_image[:, :, pad_h:pad_h + center_h, pad_w:pad_w + center_w] = plate_resized
     result_image = torch.clamp(result_image, 0, 1)
 
     return result_image
@@ -1260,7 +1244,7 @@ def main():
             sys.exit(1)
         print(f"Using preproc dataset: {preproc_csv_path}")
         print(f"\nLoading {args.n_eval_samples} samples from preproc CSV...")
-        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples, center_ratio=args.center_ratio)
+        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples)
     else:
         print(f"Using data split: {csv_path}")
         print(f"\nLoading {args.n_eval_samples} validation samples...")
