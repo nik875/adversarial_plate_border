@@ -767,7 +767,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
 
         return Qwen3VLWrapper(full_model, processor)
 
-    elif ocr_model_type in ('gpt-5-mini', 'gpt-4o-mini'):
+    elif ocr_model_type in ('gpt-5-mini', 'gpt-5-nano', 'gpt-4o-mini'):
         import base64
         import re
         from io import BytesIO
@@ -779,8 +779,8 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
             raise ValueError(f"--openai-api-key is required for {ocr_model_type}")
 
         client = openai.OpenAI(api_key=api_key)
-        # gpt-5-mini is a reasoning model; gpt-4o-mini is not
-        _is_reasoning_model = (ocr_model_type == 'gpt-5-mini')
+        # gpt-5-* are reasoning models; gpt-4o-mini is not
+        _is_reasoning_model = ocr_model_type.startswith('gpt-5-')
         _model_api_id = ocr_model_type  # model IDs match the CLI names
 
         class GPT5MiniWrapper:
@@ -1293,7 +1293,7 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
-    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl', 'gpt-5-mini', 'gpt-4o-mini'], default='fast-alpr',
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl', 'gpt-5-mini', 'gpt-5-nano', 'gpt-4o-mini'], default='fast-alpr',
                         help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
@@ -1349,7 +1349,7 @@ def main():
             from doctr.models import vitstr_small
         elif args.ocr_model == 'trocr':
             from transformers import VisionEncoderDecoderModel, TrOCRProcessor
-        elif args.ocr_model in ('gpt-5-mini', 'gpt-4o-mini'):
+        elif args.ocr_model in ('gpt-5-mini', 'gpt-5-nano', 'gpt-4o-mini'):
             if openai is None:
                 print("Error: openai not installed. Install with: pip install openai",
                       file=sys.stderr)
