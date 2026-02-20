@@ -35,6 +35,11 @@ try:
 except ImportError:
     cma = None
 
+try:
+    import openai
+except ImportError:
+    openai = None
+
 
 def load_validation_samples_from_csv(csv_path, num_samples):
     """Load validation samples using combined dataset (matching training setup).
@@ -419,7 +424,7 @@ def generate_patch_from_z(generator, z, device):
     return patch
 
 
-def create_ocr_model(ocr_model_type, white_box=False, device=None):
+def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None):
     """Create OCR model based on type selection.
 
     Args:
@@ -734,6 +739,61 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None):
 
         return Qwen3VLWrapper(full_model, processor)
 
+    elif ocr_model_type == 'gpt-5-mini':
+        import base64
+        import re
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        if openai is None:
+            raise ImportError("openai not installed. Install with: pip install openai")
+        if not api_key:
+            raise ValueError("--openai-api-key is required for gpt-5-mini")
+
+        client = openai.OpenAI(api_key=api_key)
+
+        class GPT5MiniWrapper:
+            def __init__(self, client):
+                self.client = client
+
+            def predict(self, image):
+                """Predict text from RGB uint8 image using GPT-5 mini."""
+                pil_image = PILImage.fromarray(image)
+                buf = BytesIO()
+                pil_image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+                response = self.client.chat.completions.create(
+                    model="gpt-5-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{b64}"},
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]",
+                                },
+                            ],
+                        }
+                    ],
+                    max_tokens=32,
+                )
+
+                raw = response.choices[0].message.content or ""
+                match = re.search(r'The text is:\s*(.+)', raw)
+                text = match.group(1).strip() if match else ""
+
+                class Result:
+                    def __init__(self, text):
+                        self.text = text
+                return Result(text)
+
+        return GPT5MiniWrapper(client)
+
     else:
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
 
@@ -1036,10 +1096,12 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
-    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl'], default='fast-alpr',
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl', 'gpt-5-mini'], default='fast-alpr',
                         help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
+    parser.add_argument('--openai-api-key', default=None,
+                        help='OpenAI API key for gpt-5-mini (can also be set via OPENAI_API_KEY env var)')
 
     # Device
     parser.add_argument('--device', default=None,
@@ -1058,6 +1120,11 @@ def main():
                         help='Composite mode: just composite patches from run_dir with n validation samples and save, then exit (no optimization)')
 
     args = parser.parse_args()
+
+    # Resolve OpenAI API key: CLI arg takes precedence over env var
+    if args.openai_api_key is None:
+        import os
+        args.openai_api_key = os.environ.get('OPENAI_API_KEY', None)
 
     # Parse device
     if args.device is not None:
@@ -1079,6 +1146,15 @@ def main():
             from doctr.models import vitstr_small
         elif args.ocr_model == 'trocr':
             from transformers import VisionEncoderDecoderModel, TrOCRProcessor
+        elif args.ocr_model == 'gpt-5-mini':
+            if openai is None:
+                print("Error: openai not installed. Install with: pip install openai",
+                      file=sys.stderr)
+                sys.exit(1)
+            if not args.openai_api_key:
+                print("Error: --openai-api-key or OPENAI_API_KEY env var is required for gpt-5-mini",
+                      file=sys.stderr)
+                sys.exit(1)
 
         if cma is None:
             print("Error: cma not installed. Install with: pip install cma",
@@ -1162,7 +1238,7 @@ def main():
 
         # Initialize OCR model
         print(f"\nInitializing OCR model: {args.ocr_model}")
-        ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device)
+        ocr = create_ocr_model(args.ocr_model, white_box=args.white_box, device=device, api_key=args.openai_api_key)
 
         n = 10
         images_to_use = val_images[:n]
