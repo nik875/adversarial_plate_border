@@ -780,6 +780,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                     }
                 ]
 
+                time.sleep(0.1)
                 while True:
                     try:
                         response = self.client.chat.completions.create(
