@@ -774,8 +774,18 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 self.client = client
                 self.max_parallel = max_parallel
 
+            def _is_refusal(self, raw):
+                """Check if response is a refusal/error."""
+                raw_lower = raw.lower()
+                refusal_keywords = ['help', "can't", "cannot", "unable", "sorry", "not able", "inappropriate", 'i can']
+                return any(keyword in raw_lower for keyword in refusal_keywords)
+
             def _parse_response(self, raw):
-                """Parse raw API response into plate text."""
+                """Parse raw API response into plate text. Returns None if response is invalid."""
+                # Check for refusals/errors
+                if self._is_refusal(raw):
+                    return None
+
                 match = re.search(r'The text is:\s*(.*)', raw)
                 text = match.group(1).strip() if match else raw.strip()
 
@@ -800,10 +810,10 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
 
                 if plate_candidates:
                     return max(plate_candidates, key=len)
-                return text_normalized
+                return text_normalized if text_normalized else None
 
             def _make_request(self, b64):
-                """Make a single API request with rate limit retry."""
+                """Make a single API request with rate limit retry and refusal retry."""
                 import time
                 messages = [
                     {
@@ -833,13 +843,16 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                             max_completion_tokens=256,
                             reasoning_effort="minimal",
                         )
-                        break
+                        raw = response.choices[0].message.content or ""
+                        parsed = self._parse_response(raw)
+                        if parsed is not None:
+                            return parsed
+                        # Refusal detected, retry
+                        tqdm.write("  [gpt-5-mini] Refusal/error detected, retrying...")
+                        time.sleep(1)
                     except openai.RateLimitError:
                         tqdm.write("  [gpt-5-mini] Rate limited, retrying in 5s...")
                         time.sleep(5)
-
-                raw = response.choices[0].message.content or ""
-                return self._parse_response(raw)
 
             def _encode_image(self, image):
                 """Encode numpy image to base64 PNG."""
