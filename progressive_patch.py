@@ -708,6 +708,7 @@ class FoundationPatchGenerator(nn.Module):
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
+        self.use_omniglot = use_omniglot
 
         if self.use_vae_lora:
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
