@@ -129,15 +129,17 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     return images, dimensions
 
 
-def load_validation_samples_from_preproc_csv(csv_path, num_samples):
+def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128)):
     """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
 
-    Crops each preprocessed image to the plate region defined by new_corners,
-    so that apply_patch_ocr_mode can treat the entire image as the plate area.
+    Loads the original (unprocessed) image for each sample and crops to the plate
+    region defined by orig_corners, resized to crop_size. This matches how
+    optimize_patch.py feeds images to OCR.
 
     Args:
         csv_path: Path to preproc_labels CSV (dataset.py format)
         num_samples: Number of samples to load (randomly sampled if dataset is larger)
+        crop_size: (height, width) to resize plate crops to (default: (64, 128))
 
     Returns:
         Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
@@ -169,23 +171,23 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples):
     print(f"Loading all {len(dataset)} samples from preproc dataset...")
     for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
-        img_tensor = item['prep_image']  # [3, H, W] float in [0, 1]
-        new_corners = item['new_corners']  # [4, 2] plate corners in preprocessed image
+        orig_img = item['orig_image']  # [3, H, W] float in [0, 1]
+        orig_corners = item['orig_corners']  # [4, 2] plate corners in original image
 
-        # Crop to plate region using corners
+        # Crop plate region from original image and resize
         cropped = kornia.geometry.crop_and_resize(
-            img_tensor.unsqueeze(0),  # [1, 3, H, W]
-            new_corners.unsqueeze(0),  # [1, 4, 2]
-            (64, 128),  # Standard plate crop size (H, W)
+            orig_img.unsqueeze(0),  # [1, 3, H, W]
+            orig_corners.unsqueeze(0),  # [1, 4, 2]
+            crop_size,
             mode='bilinear',
             align_corners=True
-        ).squeeze(0)  # [3, 64, 128]
+        ).squeeze(0)  # [3, crop_h, crop_w]
 
         height, width = cropped.shape[1], cropped.shape[2]
         images.append(cropped)
         dimensions.append((width, height))
 
-    print(f"Loaded {len(images)} plate crops (will sample {min(num_samples, len(images))} per iteration)")
+    print(f"Loaded {len(images)} plate crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
     return images, dimensions
 
 
