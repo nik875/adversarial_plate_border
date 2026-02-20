@@ -1532,8 +1532,10 @@ def main():
     else:
         control_data = control_texts
 
-    # Create debug output directory
+    # Create debug output directory (clear previous run's output)
     debug_dir = output_dir / "debug_output"
+    if debug_dir.exists():
+        shutil.rmtree(debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     # Define objective function for CMA-ES
