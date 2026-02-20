@@ -758,30 +758,39 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
 
             def predict(self, image):
                 """Predict text from RGB uint8 image using GPT-5 mini."""
+                import time
                 pil_image = PILImage.fromarray(image)
                 buf = BytesIO()
                 pil_image.save(buf, format="PNG")
                 b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-                response = self.client.chat.completions.create(
-                    model="gpt-5-mini",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{b64}"},
-                                },
-                                {
-                                    "type": "text",
-                                    "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]",
-                                },
-                            ],
-                        }
-                    ],
-                    max_tokens=32,
-                )
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                            },
+                            {
+                                "type": "text",
+                                "text": "Read the text in this image. Respond in this exact format:\nThe text is: [text here]",
+                            },
+                        ],
+                    }
+                ]
+
+                while True:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model="gpt-5-mini",
+                            messages=messages,
+                            max_tokens=32,
+                        )
+                        break
+                    except openai.RateLimitError:
+                        print("\n  [gpt-5-mini] Rate limited, retrying in 5s...")
+                        time.sleep(5)
 
                 raw = response.choices[0].message.content or ""
                 match = re.search(r'The text is:\s*(.+)', raw)
