@@ -813,7 +813,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 return text_normalized if text_normalized else None
 
             def _make_request(self, b64):
-                """Make a single API request with rate limit retry and refusal retry."""
+                """Make a single API request with rate limit retry and refusal retry (max 3)."""
                 import time
                 messages = [
                     {
@@ -835,6 +835,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                     }
                 ]
 
+                refusal_retries = 0
                 while True:
                     try:
                         response = self.client.chat.completions.create(
@@ -847,8 +848,12 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                         parsed = self._parse_response(raw)
                         if parsed is not None:
                             return parsed
-                        # Refusal detected, retry
-                        tqdm.write("  [gpt-5-mini] Refusal/error detected, retrying...")
+                        # Refusal detected
+                        refusal_retries += 1
+                        if refusal_retries >= 3:
+                            # Max retries exceeded, return empty string (count as correct read)
+                            return ""
+                        tqdm.write("  [gpt-5-mini] Refusal/error detected, retrying... (attempt {}/3)".format(refusal_retries + 1))
                         time.sleep(1)
                     except openai.RateLimitError:
                         tqdm.write("  [gpt-5-mini] Rate limited, retrying in 5s...")
