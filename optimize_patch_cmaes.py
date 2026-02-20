@@ -795,7 +795,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             },
                             {
                                 "type": "text",
-                                "text": "What characters are shown in this image? Don't reason, just answer. Respond in this exact format:\nThe text is: [text here]\nNo additional outputs or text, strictly follow this format.",
+                                "text": "This image shows a license plate. What is the plate number? Only the alphanumeric registration number, no state names or slogans. Don't reason, just answer. Respond in this exact format:\nThe text is: [plate number]\nNo additional outputs or text, strictly follow this format.",
                             },
                         ],
                     }
@@ -822,6 +822,9 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                 else:
                     tqdm.write(f"  [gpt-5-mini] Unexpected response format: {raw!r}")
                     text = raw.strip()
+
+                # Normalize: remove hyphens, spaces, and uppercase
+                text = re.sub(r'[-\s]', '', text).upper()
 
                 class Result:
                     def __init__(self, text):
