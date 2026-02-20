@@ -936,7 +936,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
 
 
-def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
+def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6, correct_text=None):
     """Evaluate a patch by computing edit distance between control and composite OCR.
 
     Args:
@@ -945,6 +945,7 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
         ocr: OCR model instance with predict(image) method
         control_texts: List of precomputed control OCR texts
         center_ratio: Center ratio for compositing
+        correct_text: Optional known correct text. If provided, fitness is min(dist_to_control, dist_to_correct)
 
     Returns:
         Tuple of (total_edit_distance, num_misreads, avg_edit_distance)
@@ -971,7 +972,15 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     total_edit_distance = 0
     misreads = 0
     for control_text, composite_text in zip(control_texts, composite_texts):
-        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+
+        if correct_text is not None:
+            # Fitness is min of distance to control and distance to correct text
+            dist_to_correct = min(Levenshtein.distance(correct_text, composite_text), len(correct_text))
+            edit_dist = min(dist_to_control, dist_to_correct)
+        else:
+            edit_dist = dist_to_control
+
         total_edit_distance += edit_dist
         if composite_text != control_text:
             misreads += 1
@@ -981,7 +990,7 @@ def evaluate_patch(patch, val_images, ocr, control_texts, center_ratio=0.6):
     return total_edit_distance, misreads, avg_edit_distance
 
 
-def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0):
+def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_ratio=0.6, debug_dir=None, candidate_idx=0, correct_text=None):
     """Evaluate a patch and save debug images for all validation samples.
 
     Args:
@@ -1014,7 +1023,12 @@ def evaluate_patch_with_debug(patch, val_images, ocr, control_texts, center_rati
         composite_text = composite_result.text if composite_result is not None else ""
 
         # Calculate Levenshtein edit distance
-        edit_dist = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+        if correct_text is not None:
+            dist_to_correct = min(Levenshtein.distance(correct_text, composite_text), len(correct_text))
+            edit_dist = min(dist_to_control, dist_to_correct)
+        else:
+            edit_dist = dist_to_control
         total_edit_distance += edit_dist
 
         # Count misread if texts differ
@@ -1452,10 +1466,8 @@ def main():
         sys.exit(1)
 
     # Always precompute control texts (used in both text and logit MSE mode)
-    if args.correct_text is not None:
-        print(f"\nUsing provided correct text for all images: '{args.correct_text}' (skipping control OCR)")
-        control_texts = [args.correct_text] * len(val_images)
-    elif args.control_labels_csv is not None:
+    correct_text = args.correct_text  # Store for later use in fitness calculation
+    if args.control_labels_csv is not None:
         import pandas as pd
         control_csv_path = Path(args.control_labels_csv)
         print(f"\nLoading control texts from: {control_csv_path}")
@@ -1615,12 +1627,14 @@ def main():
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
-                    candidate_idx=candidate_idx
+                    candidate_idx=candidate_idx,
+                    correct_text=correct_text
                 )
             else:
                 total_metric, misreads, avg_metric = evaluate_patch(
                     patch, sampled_val_images, ocr, sampled_control_data,
-                    center_ratio=args.center_ratio
+                    center_ratio=args.center_ratio,
+                    correct_text=correct_text
                 )
 
         # Track for progress bar
@@ -1767,6 +1781,59 @@ def main():
         patch_path = output_dir / "best_patch.png"
         cv2.imwrite(str(patch_path), patch_bgr)
         print(f"\nSaved best patch to: {patch_path}")
+
+        # Evaluate best patch on all validation images and save results
+        print(f"\nEvaluating best patch on all {len(val_images)} validation images...")
+        best_patch_results_dir = output_dir / "best_patch_results"
+        best_patch_results_dir.mkdir(parents=True, exist_ok=True)
+
+        results_rows = []
+        for idx, (val_image, control_text) in enumerate(tqdm(zip(val_images, control_texts), total=len(val_images), desc="Best patch eval")):
+            # Create composite
+            composite = apply_patch_ocr_mode(val_image, best_patch_clamped, center_ratio=args.center_ratio)
+            composite = composite.squeeze(0)
+            composite_np = (composite.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+            # Run OCR on composite
+            composite_result = ocr.predict(composite_np)
+            composite_text = composite_result.text if composite_result is not None else ""
+
+            # Calculate edit distance
+            dist_to_control = min(Levenshtein.distance(control_text, composite_text), len(control_text))
+            if correct_text is not None:
+                dist_to_correct = min(Levenshtein.distance(correct_text, composite_text), len(correct_text))
+                edit_dist = min(dist_to_control, dist_to_correct)
+            else:
+                edit_dist = dist_to_control
+            is_misread = (composite_text != control_text)
+
+            results_rows.append({
+                'image_idx': idx,
+                'control_text': control_text,
+                'composite_text': composite_text,
+                'edit_distance': edit_dist,
+                'is_misread': is_misread,
+            })
+
+            # Save control and composite images
+            control = apply_neutral_border_ocr_mode(val_image, center_ratio=args.center_ratio, border_color=0.5)
+            control = control.squeeze(0)
+            control_np = (control.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            control_bgr = cv2.cvtColor(control_np, cv2.COLOR_RGB2BGR)
+            composite_bgr = cv2.cvtColor(composite_np, cv2.COLOR_RGB2BGR)
+
+            cv2.imwrite(str(best_patch_results_dir / f"best_patch_img{idx:04d}_control.jpg"), control_bgr)
+            cv2.imwrite(str(best_patch_results_dir / f"best_patch_img{idx:04d}_composite.jpg"), composite_bgr)
+
+        # Save results CSV
+        results_csv_path = best_patch_results_dir / "best_patch_results.csv"
+        with open(results_csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'])
+            writer.writeheader()
+            writer.writerows(results_rows)
+
+        print(f"Saved best patch evaluation to: {best_patch_results_dir}")
+        print(f"  Results CSV: {results_csv_path}")
 
         # Save latent code
         z_path = output_dir / "best_z.npy"
