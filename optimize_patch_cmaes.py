@@ -757,7 +757,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
 
         return Qwen3VLWrapper(full_model, processor)
 
-    elif ocr_model_type == 'gpt-5-mini':
+    elif ocr_model_type in ('gpt-5-mini', 'gpt-4o-mini'):
         import base64
         import re
         from io import BytesIO
@@ -766,13 +766,18 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
         if openai is None:
             raise ImportError("openai not installed. Install with: pip install openai")
         if not api_key:
-            raise ValueError("--openai-api-key is required for gpt-5-mini")
+            raise ValueError(f"--openai-api-key is required for {ocr_model_type}")
 
         client = openai.OpenAI(api_key=api_key)
+        # gpt-5-mini is a reasoning model; gpt-4o-mini is not
+        _is_reasoning_model = (ocr_model_type == 'gpt-5-mini')
+        _model_api_id = ocr_model_type  # model IDs match the CLI names
 
         class GPT5MiniWrapper:
-            def __init__(self, client, max_parallel=4):
+            def __init__(self, client, model_id, is_reasoning, max_parallel=4):
                 self.client = client
+                self.model_id = model_id
+                self.is_reasoning = is_reasoning
                 self.max_parallel = max_parallel
 
             def _is_refusal(self, raw):
@@ -846,12 +851,13 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 last_raw = ""
                 while True:
                     try:
-                        response = self.client.chat.completions.create(
-                            model="gpt-5-mini",
-                            messages=messages,
-                            max_completion_tokens=256,
-                            reasoning_effort="minimal",
-                        )
+                        api_kwargs = dict(model=self.model_id, messages=messages)
+                        if self.is_reasoning:
+                            api_kwargs['max_completion_tokens'] = 256
+                            api_kwargs['reasoning_effort'] = 'minimal'
+                        else:
+                            api_kwargs['max_tokens'] = 256
+                        response = self.client.chat.completions.create(**api_kwargs)
                         raw = response.choices[0].message.content or ""
                         last_raw = raw
                         parsed = self._parse_response(raw)
@@ -906,7 +912,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 b64s = [self._encode_image(img) for img in images]
 
                 results = [None] * len(b64s)
-                pbar = tqdm(total=len(b64s), desc=desc or "GPT-5 mini OCR", leave=False, disable=not show_progress)
+                pbar = tqdm(total=len(b64s), desc=desc or f"{self.model_id} OCR", leave=False, disable=not show_progress)
 
                 def submit_request(idx):
                     return idx, self._make_request(b64s[idx], keep_last_on_refusal=keep_last_on_refusal)
@@ -930,7 +936,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
 
                 return [Result(t) for t in results]
 
-        return GPT5MiniWrapper(client, max_parallel=max_parallel)
+        return GPT5MiniWrapper(client, model_id=_model_api_id, is_reasoning=_is_reasoning_model, max_parallel=max_parallel)
 
     else:
         raise ValueError(f"Unknown OCR model type: {ocr_model_type}")
@@ -1275,18 +1281,18 @@ def main():
                         help='Random seed for reproducibility (default: None)')
 
     # OCR model
-    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl', 'gpt-5-mini'], default='fast-alpr',
+    parser.add_argument('--ocr-model', choices=['fast-alpr', 'opencv-crnn', 'vitstr', 'trocr', 'qwen3-vl', 'gpt-5-mini', 'gpt-4o-mini'], default='fast-alpr',
                         help='OCR model to use (default: fast-alpr)')
     parser.add_argument('--white-box', action='store_true',
                         help='Use smaller xs model instead of s model (only for fast-alpr)')
     parser.add_argument('--openai-api-key', default=None,
-                        help='OpenAI API key for gpt-5-mini (can also be set via OPENAI_API_KEY env var)')
+                        help='OpenAI API key for gpt-5-mini / gpt-4o-mini (can also be set via OPENAI_API_KEY env var)')
     parser.add_argument('--correct-text', default=None,
                         help='Known correct license plate text for all images. Skips control OCR computation.')
     parser.add_argument('--control-labels-csv', default=None,
                         help='Path to cmaes_control_labels.csv to load precomputed control texts (skips control OCR loop)')
     parser.add_argument('--max-parallel', type=int, default=4,
-                        help='Max parallel API requests for gpt-5-mini (default: 4)')
+                        help='Max parallel API requests for gpt-5-mini / gpt-4o-mini (default: 4)')
 
     # Device
     parser.add_argument('--device', default=None,
@@ -1331,13 +1337,13 @@ def main():
             from doctr.models import vitstr_small
         elif args.ocr_model == 'trocr':
             from transformers import VisionEncoderDecoderModel, TrOCRProcessor
-        elif args.ocr_model == 'gpt-5-mini':
+        elif args.ocr_model in ('gpt-5-mini', 'gpt-4o-mini'):
             if openai is None:
                 print("Error: openai not installed. Install with: pip install openai",
                       file=sys.stderr)
                 sys.exit(1)
             if not args.openai_api_key:
-                print("Error: --openai-api-key or OPENAI_API_KEY env var is required for gpt-5-mini",
+                print(f"Error: --openai-api-key or OPENAI_API_KEY env var is required for {args.ocr_model}",
                       file=sys.stderr)
                 sys.exit(1)
 
