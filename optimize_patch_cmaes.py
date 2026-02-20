@@ -860,7 +860,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                         self.text = text
                 return Result(text)
 
-            def predict_batch(self, images):
+            def predict_batch(self, images, desc=None):
                 """Predict text from multiple RGB uint8 images in parallel."""
                 import time
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -869,6 +869,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                 b64s = [self._encode_image(img) for img in images]
 
                 results = [None] * len(b64s)
+                pbar = tqdm(total=len(b64s), desc=desc or "GPT-5 mini OCR", leave=False)
 
                 def submit_request(idx):
                     return idx, self._make_request(b64s[idx])
@@ -882,6 +883,9 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None,
                     for future in as_completed(futures):
                         idx, text = future.result()
                         results[idx] = text
+                        pbar.update(1)
+
+                pbar.close()
 
                 class Result:
                     def __init__(self, text):
@@ -1441,7 +1445,7 @@ def main():
         # Run OCR (batch if available)
         if hasattr(ocr, 'predict_batch'):
             print(f"Running batch OCR on {len(control_nps)} control images (max_parallel={ocr.max_parallel})...")
-            results = ocr.predict_batch(control_nps)
+            results = ocr.predict_batch(control_nps, desc="Control OCR")
             control_texts = [r.text if r is not None else "" for r in results]
         else:
             control_texts = []
