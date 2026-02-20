@@ -367,8 +367,26 @@ def load_generator(run_dir, device=None):
         use_omniglot=use_omniglot,
     )
 
-    # Load state dict
-    generator.load_state_dict(checkpoint['generator_state_dict'])
+    # Load state dict, falling back to use_omniglot=False if there's a mismatch
+    try:
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+    except RuntimeError as e:
+        if use_omniglot:
+            print(f"  Warning: state dict mismatch with use_omniglot=True, retrying with use_omniglot=False")
+            print(f"  ({e})")
+            use_omniglot = False
+            generator = FoundationPatchGenerator(
+                latent_dim=latent_dim,
+                patch_height=patch_height,
+                patch_width=patch_width,
+                use_vae_lora=use_vae_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                use_omniglot=False,
+            )
+            generator.load_state_dict(checkpoint['generator_state_dict'])
+        else:
+            raise
 
     # Use provided device or auto-detect
     if device is None:
