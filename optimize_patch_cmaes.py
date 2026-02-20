@@ -41,12 +41,13 @@ except ImportError:
     openai = None
 
 
-def load_validation_samples_from_csv(csv_path, num_samples):
+def load_validation_samples_from_csv(csv_path, num_samples, max_val_samples=None):
     """Load validation samples using combined dataset (matching training setup).
 
     Args:
         csv_path: Path to train_val_split CSV
-        num_samples: Number of samples to load
+        num_samples: Number of samples to draw per iteration
+        max_val_samples: If set, cap the total pool loaded from disk (randomly sampled)
 
     Returns:
         Tuple of (list of images as tensors [3, H, W] in [0, 1], list of (width, height) tuples)
@@ -77,6 +78,10 @@ def load_validation_samples_from_csv(csv_path, num_samples):
         raise ValueError(f"No validation samples found in {csv_path}")
 
     print(f"Found {len(val_indices)} validation samples in CSV")
+    if max_val_samples is not None and max_val_samples < len(val_indices):
+        import random as _random
+        val_indices = _random.sample(val_indices, max_val_samples)
+        print(f"Limiting val pool to {max_val_samples} randomly sampled indices")
     print(f"Datasets in CSV: {', '.join(sorted(dataset_names_in_csv))}")
 
     # Load and combine datasets in order
@@ -108,7 +113,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     dimensions = []
     failed_samples = []
 
-    print(f"\nLoading all {len(val_indices)} validation samples from combined dataset...")
+    print(f"\nLoading {len(val_indices)} validation samples from combined dataset...")
     for combined_idx in tqdm(val_indices, desc="Loading samples"):
         try:
             item = combined_dataset[combined_idx]
@@ -129,7 +134,7 @@ def load_validation_samples_from_csv(csv_path, num_samples):
     return images, dimensions
 
 
-def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128)):
+def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128), max_val_samples=None):
     """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
 
     Loads the original (unprocessed) image for each sample and crops exactly to
@@ -137,8 +142,9 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(6
 
     Args:
         csv_path: Path to preproc_labels CSV (dataset.py format)
-        num_samples: Number of samples to load (randomly sampled if dataset is larger)
+        num_samples: Number of samples to draw per iteration
         crop_size: (height, width) to resize plate crops to (default: (64, 128))
+        max_val_samples: If set, cap the total pool loaded from disk (randomly sampled)
 
     Returns:
         Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
@@ -157,6 +163,10 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(6
     df = pd.read_csv(csv_path)
     print(f"Loaded {len(df)} rows from {csv_path}")
 
+    if max_val_samples is not None and max_val_samples < len(df):
+        df = df.sample(n=max_val_samples, random_state=42).reset_index(drop=True)
+        print(f"Limiting val pool to {max_val_samples} randomly sampled rows")
+
     # dataset.py loads images as BGR numpy arrays via cv2; convert to RGB for OCR models
     transform = T.Compose([
         T.Lambda(lambda x: cv2.cvtColor(x, cv2.COLOR_BGR2RGB)),
@@ -167,7 +177,7 @@ def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(6
 
     images = []
     dimensions = []
-    print(f"Loading all {len(dataset)} samples from preproc dataset...")
+    print(f"Loading {len(dataset)} samples from preproc dataset...")
     for idx in tqdm(range(len(dataset)), desc="Loading samples"):
         item = dataset[idx]
         orig_img = item['orig_image']  # [3, H, W] float in [0, 1]
@@ -1266,7 +1276,9 @@ def main():
     parser.add_argument('--preproc-csv', default=None,
                         help='Path to preproc_labels CSV (dataset.py format). If provided, uses AdversarialPatchDataset instead of OCRDataset')
     parser.add_argument('--n-eval-samples', type=int, default=50,
-                        help='Number of validation samples to evaluate on (default: 50)')
+                        help='Number of validation samples to evaluate on per iteration (default: 50)')
+    parser.add_argument('--max-val-samples', type=int, default=None,
+                        help='Cap total validation pool loaded from disk (default: load all)')
     parser.add_argument('--center-ratio', type=float, default=0.6,
                         help='Center ratio for compositing (default: 0.6)')
 
@@ -1399,11 +1411,11 @@ def main():
             sys.exit(1)
         print(f"Using preproc dataset: {preproc_csv_path}")
         print(f"\nLoading {args.n_eval_samples} samples from preproc CSV...")
-        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples)
+        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples, max_val_samples=args.max_val_samples)
     else:
         print(f"Using data split: {csv_path}")
-        print(f"\nLoading {args.n_eval_samples} validation samples...")
-        val_images, dimensions = load_validation_samples_from_csv(csv_path, args.n_eval_samples)
+        print(f"\nLoading validation samples...")
+        val_images, dimensions = load_validation_samples_from_csv(csv_path, args.n_eval_samples, max_val_samples=args.max_val_samples)
 
     if not val_images:
         print("Error: No validation samples loaded", file=sys.stderr)
