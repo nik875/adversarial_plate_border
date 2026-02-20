@@ -787,7 +787,7 @@ def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None)
                             model="gpt-5-mini",
                             messages=messages,
                             max_completion_tokens=64,
-                            reasoning_effort="none",
+                            reasoning_effort="minimal",
                         )
                         break
                     except openai.RateLimitError:
