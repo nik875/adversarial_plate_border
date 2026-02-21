@@ -25,6 +25,9 @@ class EvalMetric(ABC):
         control_outputs = metric.precompute_control(control_images, model)
         results = metric.compute(composited, control_outputs, model)
         # results['primary'] is the main scalar (higher = more adversarial)
+
+    For richer per-image breakdown (e.g. saving composite images alongside
+    per-image scores), override compute_detailed().
     """
 
     @abstractmethod
@@ -68,6 +71,30 @@ class EvalMetric(ABC):
               'primary'      : main scalar (larger = more adversarial)
               'success_rate' : fraction of images where attack succeeded
         """
+
+    def compute_detailed(
+        self,
+        composited: List[Any],
+        control_outputs: List[Any],
+        model: torch.nn.Module,
+        **kwargs,
+    ):
+        """
+        Like compute() but also returns a per-image breakdown list.
+
+        Default implementation calls compute() and returns minimal per-image
+        dicts (just img_idx).  Override in subclasses for domain-specific fields
+        (e.g. predicted class, edit distance per image).
+
+        Returns:
+            (aggregate_dict, per_image_list)
+            aggregate_dict  : same as compute()
+            per_image_list  : list of dicts, one per image, each containing at
+                              least {'img_idx': int, 'success': bool}.
+        """
+        aggregate = self.compute(composited, control_outputs, model, **kwargs)
+        per_image = [{'img_idx': i, 'success': False} for i in range(len(composited))]
+        return aggregate, per_image
 
 
 # ---------------------------------------------------------------------------
@@ -118,15 +145,28 @@ class TopKAccuracyDrop(EvalMetric):
         model: torch.nn.Module,
         **kwargs,
     ) -> Dict[str, float]:
+        aggregate, _ = self.compute_detailed(composited, control_outputs, model, **kwargs)
+        return aggregate
+
+    @torch.no_grad()
+    def compute_detailed(
+        self,
+        composited: List[Tensor],
+        control_outputs: List[int],
+        model: torch.nn.Module,
+        **kwargs,
+    ):
         model.eval()
         successes = 0
         top1_drop = 0.0
+        per_image = []
 
-        for img, ctrl_pred in zip(composited, control_outputs):
+        for i, (img, ctrl_pred) in enumerate(zip(composited, control_outputs)):
             if img.dim() == 3:
                 img = img.unsqueeze(0)
             logits = model(img)
             top_k = logits.topk(self.k, dim=1).indices.squeeze(0).tolist()
+            pred_class = logits.argmax(dim=1).item()
 
             if self.target_class is not None:
                 success = (self.target_class in top_k)
@@ -135,15 +175,24 @@ class TopKAccuracyDrop(EvalMetric):
 
             if success:
                 successes += 1
-            if logits.argmax(dim=1).item() != ctrl_pred:
+            if pred_class != ctrl_pred:
                 top1_drop += 1.0
 
+            per_image.append({
+                'img_idx': i,
+                'control_class': ctrl_pred,
+                'pred_class': pred_class,
+                'success': success,
+                'top1_flipped': (pred_class != ctrl_pred),
+            })
+
         n = len(composited) if composited else 1
-        return {
-            'primary': top1_drop / n,          # fraction of Top-1 flips
-            'success_rate': successes / n,      # targeted or untargeted success
+        aggregate = {
+            'primary': top1_drop / n,
+            'success_rate': successes / n,
             'top1_drop': top1_drop / n,
         }
+        return aggregate, per_image
 
 
 # ---------------------------------------------------------------------------
