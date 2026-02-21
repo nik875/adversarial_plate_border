@@ -322,6 +322,48 @@ def get_ocr_layer_progression(max_epochs: int = 50, convergence_threshold: float
     ]
 
 
+class DilatedResidualSmoother(nn.Module):
+    """
+    Coarse-to-fine dilated conv chain with residual connections throughout.
+
+    Each block adds its output to a skip of the block input:
+    - Channel-changing blocks (3->16, 16->3) use a 1x1 projection on the skip.
+    - Same-channel blocks (16->16) use an identity skip.
+
+    This prevents signal collapse: even at random init the output is a
+    correction on top of the input rather than starting from scratch.
+    """
+    def __init__(self):
+        super().__init__()
+        # Block 1: long-range (3->16, dilation=32) + projection skip
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=32, dilation=32)
+        self.skip1 = nn.Conv2d(3, 16, kernel_size=1)
+
+        # Blocks 2-5: identity skips (16->16)
+        self.conv2 = nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16)
+        self.conv3 = nn.Conv2d(16, 16, kernel_size=3, padding=8,  dilation=8)
+        self.conv4 = nn.Conv2d(16, 16, kernel_size=5, padding=8,  dilation=4)
+        self.conv5 = nn.Conv2d(16, 16, kernel_size=5, padding=4,  dilation=2)
+
+        # Block 6: dense local (16->3) + projection skip, no activation (output is logit delta)
+        self.conv6 = nn.Conv2d(16, 3, kernel_size=7, padding=3)
+        self.skip6 = nn.Conv2d(16, 3, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Block 1 (3->16): projected skip
+        x = F.silu(self.conv1(x)) + self.skip1(x)
+
+        # Blocks 2-5 (16->16): identity skips
+        x = F.silu(self.conv2(x)) + x
+        x = F.silu(self.conv3(x)) + x
+        x = F.silu(self.conv4(x)) + x
+        x = F.silu(self.conv5(x)) + x
+
+        # Block 6 (16->3): projected skip, no activation
+        x = self.conv6(x) + self.skip6(x)
+        return x
+
+
 class BottleneckDenseRefiner(nn.Module):
     """
     Bottleneck dense refiner for patch refinement with minimal parameters.
@@ -391,22 +433,10 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
-        # Post-expansion smoothing: coarse-to-fine (high dilation → low)
-        # First establish cross-block coherence, then refine locally.
-        # Larger kernels at low dilation for dense local refinement.
-        self.post_expansion_smooth = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=32, dilation=32),  # long-range mixing
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=8, dilation=4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=4, dilation=2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=7, padding=3),               # dense local refinement
-        )
+        # Post-expansion smoothing: coarse-to-fine dilated convs with residuals throughout.
+        # DilatedResidualSmoother uses identity/projected skips at every block so
+        # signal is preserved and collapse to grey is prevented even at random init.
+        self.post_expansion_smooth = DilatedResidualSmoother()
 
         # Final activation to ensure output is in [0, 1] range
         # Kept separate so any future layers added won't bypass it
