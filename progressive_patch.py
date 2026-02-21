@@ -2216,6 +2216,26 @@ class ProgressivePatchTrainer:
                 })
                 pbar.update(1)
 
+                # Append batch metrics to live training history CSV
+                history_path = os.path.join(self.checkpoint_base, 'training_history.csv')
+                write_header = not os.path.exists(history_path)
+                with open(history_path, 'a', newline='') as _hf:
+                    _hw = csv.DictWriter(_hf, fieldnames=[
+                        'epoch', 'batch', 'div_loss', 'tv_loss', 'ssim_loss',
+                        'div_score', 'quality_score', 'lr'])
+                    if write_header:
+                        _hw.writeheader()
+                    _hw.writerow({
+                        'epoch': epoch,
+                        'batch': batch_count_global,
+                        'div_loss': f'{avg_diversity_loss:.6f}',
+                        'tv_loss': f'{avg_tv_loss:.6f}',
+                        'ssim_loss': f'{avg_spectrum_loss:.6f}',
+                        'div_score': f'{avg_raw_diversity:.6f}',
+                        'quality_score': f'{avg_log_quality:.6f}',
+                        'lr': scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else 0,
+                    })
+
                 # Save example patches periodically if configured
                 batch_count_global += 1
                 if self.save_examples_every is not None and batch_count_global % self.save_examples_every == 0:
