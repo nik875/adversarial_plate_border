@@ -1666,7 +1666,8 @@ def main():
     def objective(z, candidate_idx=None):
         """Objective function: returns negative metric (CMA-ES minimizes).
 
-        Metric is either edit distance (text mode) or logit delta (logit delta mode).
+        Text mode: metric = misread_fraction × avg_edit_distance.
+        Logit MSE mode: metric = avg logit MSE.
         """
         eval_count[0] += 1
 
@@ -1710,7 +1711,7 @@ def main():
         else:
             # Text edit distance mode (default)
             if save_debug:
-                total_metric, misreads, avg_metric, eval_per_image_data = evaluate_patch_with_debug(
+                total_edit_distance, misreads, avg_edit_distance, eval_per_image_data = evaluate_patch_with_debug(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     debug_dir=debug_dir,
@@ -1718,11 +1719,16 @@ def main():
                     correct_text=correct_text
                 )
             else:
-                total_metric, misreads, avg_metric, eval_per_image_data = evaluate_patch(
+                total_edit_distance, misreads, avg_edit_distance, eval_per_image_data = evaluate_patch(
                     patch, sampled_val_images, ocr, sampled_control_data,
                     center_ratio=args.center_ratio,
                     correct_text=correct_text
                 )
+            # Fitness = misread_fraction × avg_edit_distance (maximises both simultaneously)
+            n_sampled = len(sampled_val_images)
+            misread_fraction = misreads / n_sampled if n_sampled > 0 else 0.0
+            total_metric = misread_fraction * avg_edit_distance
+            avg_metric = total_metric
 
         # Track for progress bar
         all_metrics.append(avg_metric)
@@ -1749,7 +1755,7 @@ def main():
     if use_logit_mse:
         print(f"  Mode: Logit MSE optimization (opencv-crnn)")
     else:
-        print(f"  Mode: Text edit distance optimization")
+        print(f"  Mode: Misread fraction × average edit distance optimization")
 
     x0 = np.zeros(latent_dim)  # Start from zero (neutral latent code)
 
@@ -1777,7 +1783,7 @@ def main():
     if use_logit_mse:
         print(f"Objective: Maximize logit MSE (mean squared error of logits)")
     else:
-        print(f"Objective: Maximize Levenshtein edit distance between control and composite OCR")
+        print(f"Objective: Maximize misread_fraction × avg_edit_distance")
     print("=" * 80)
 
     iteration = 0
@@ -1834,8 +1840,8 @@ def main():
             })
         else:
             pbar.set_postfix({
-                'best_edit': f'{best_avg_metric[0]:.2f}',
-                'avg_edit': f'{avg_metric:.2f}',
+                'best_fit': f'{best_avg_metric[0]:.4f}',
+                'avg_fit': f'{avg_metric:.4f}',
                 'misread%': f'{best_misread_pct[0]:.1f}%'
             })
         pbar.update(1)
@@ -1855,8 +1861,7 @@ def main():
         print(f"Best average edit distance: {best_secondary_metric[0]:.1f}")
         print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
     else:
-        print(f"Best total edit distance: {best_metric[0]:.2f}")
-        print(f"Best average edit distance: {best_avg_metric[0]:.2f}")
+        print(f"Best fitness (misread_frac × avg_edit_dist): {best_metric[0]:.4f}")
         print(f"Best misread percentage: {best_misread_pct[0]:.1f}%")
 
     # Save best patch
