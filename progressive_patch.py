@@ -336,15 +336,13 @@ class BottleneckDenseRefiner(nn.Module):
     Seed conditioning: Latent seed z is projected and concatenated at bottleneck
     to provide learned guidance to the refinement process.
     """
-    def __init__(self, patch_height: int = 256, patch_width: int = 512, latent_dim: int = 16, bottleneck_dim: int = 256,
-                 use_omniglot: bool = True):
+    def __init__(self, patch_height: int = 256, patch_width: int = 512, latent_dim: int = 16, bottleneck_dim: int = 256):
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
         self.latent_dim = latent_dim
         self.bottleneck_dim = bottleneck_dim
-        self.use_omniglot = use_omniglot
 
         # Compress spatial dimensions with strided convolutions
         self.compress = nn.Sequential(
@@ -391,109 +389,80 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
-        # Post-expansion smoothing: coarse-to-fine (high dilation → low)
-        # First establish cross-block coherence, then refine locally.
-        # Larger kernels at low dilation for dense local refinement.
+        # Post-expansion smoothing with progressive kernel sizes
+        # Progressively larger kernels (3 → 7 → 9) to smooth the output
         self.post_expansion_smooth = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=32, dilation=32),  # long-range mixing
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # kernel 3, maintain size
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16),
+            nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=8, dilation=4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=4, dilation=2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=7, padding=3),               # dense local refinement
+            nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
         )
 
         # Final activation to ensure output is in [0, 1] range
         # Kept separate so any future layers added won't bypass it
         self.final_activation = nn.Sigmoid()
 
+        # Spatial propagation layers (same padding to preserve size)
+        # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
+        self.spatial_layers = nn.Sequential(
+            nn.Conv2d(10, 32, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+        )
+
         # Multi-scale regional decomposition
         # Different scales capture different contextual information
         self.scales = [8, 16, 32, 64]  # Patch sizes
 
-        if use_omniglot:
-            # Load Omniglot decoder for character generation
-            print("Loading Omniglot decoder for character conditioning...")
-            omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
-            if omniglot_decoder_path.exists():
-                self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
-                self.omniglot_decoder.train()
-                print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path} (trainable)")
-            else:
-                raise FileNotFoundError(f"Omniglot decoder not found at {omniglot_decoder_path}. "
-                                      f"Please ensure omniglot_ae_export/decoder_traced.pt exists.")
-
-            # Create scale-specific dense MLPs for seed-conditioned feature generation
-            # Each MLP takes z and outputs a spatial feature map (channel dim encodes seed)
-            self.scale_mlps = nn.ModuleDict()
-            self.char_embed_dim = 32  # Channel dimension that encodes seed info
-
-            for scale in self.scales:
-                num_patches_h = patch_height // scale
-                num_patches_w = patch_width // scale
-                output_size = self.char_embed_dim * num_patches_h * num_patches_w
-
-                # Dense MLP: z[16] → 64 → 64 → char_embed_dim * num_patches
-                mlp = nn.Sequential(
-                    nn.Linear(latent_dim, 64),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(64, 64),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(64, output_size),
-                )
-                self.scale_mlps[str(scale)] = mlp
-
-            self.scale_convs = nn.ModuleDict()
-            for scale in self.scales:
-                # Each scale gets its own 1x1 conv to compress 32 → 3 channels
-                self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
-
-            # Per-pixel scale attention: learns spatially-varying weights for each scale
-            # Takes spatial_features [B, 32, H, W] and outputs [B, num_scales, H, W]
-            self.scale_attention = nn.Sequential(
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, len(self.scales), kernel_size=1),
-            )
-
-            # Spatial propagation layers (same padding to preserve size)
-            # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
-            self.spatial_layers = nn.Sequential(
-                nn.Conv2d(10, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-            )
+        # Load Omniglot decoder for character generation
+        print("Loading Omniglot decoder for character conditioning...")
+        omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
+        if omniglot_decoder_path.exists():
+            self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
+            self.omniglot_decoder.eval()
+            for param in self.omniglot_decoder.parameters():
+                param.requires_grad = False
+            print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path}")
         else:
-            print("Omniglot character conditioning disabled.")
-            # Spatial propagation layers without character features
-            # Input: [original_patch (3ch), refined_patch (3ch)] = 6 channels
-            self.spatial_layers = nn.Sequential(
-                nn.Conv2d(6, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-            )
+            raise FileNotFoundError(f"Omniglot decoder not found at {omniglot_decoder_path}. "
+                                  f"Please ensure omniglot_ae_export/decoder_traced.pt exists.")
 
-            self.scale_convs = nn.ModuleDict()
-            for scale in self.scales:
-                self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
+        # Create scale-specific dense MLPs for seed-conditioned feature generation
+        # Each MLP takes z and outputs a spatial feature map (channel dim encodes seed)
+        self.scale_mlps = nn.ModuleDict()
+        self.char_embed_dim = 32  # Channel dimension that encodes seed info
 
-            # Per-pixel scale attention
-            self.scale_attention = nn.Sequential(
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+        for scale in self.scales:
+            num_patches_h = patch_height // scale
+            num_patches_w = patch_width // scale
+            output_size = self.char_embed_dim * num_patches_h * num_patches_w
+
+            # Dense MLP: z[16] → 64 → 64 → char_embed_dim * num_patches
+            mlp = nn.Sequential(
+                nn.Linear(latent_dim, 64),
                 nn.SiLU(inplace=True),
-                nn.Conv2d(64, len(self.scales), kernel_size=1),
+                nn.Linear(64, 64),
+                nn.SiLU(inplace=True),
+                nn.Linear(64, output_size),
             )
+            self.scale_mlps[str(scale)] = mlp
+
+        self.scale_convs = nn.ModuleDict()
+        for scale in self.scales:
+            # Each scale gets its own 1x1 conv to compress 32 → 3 channels
+            self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
+
+        # Per-pixel scale attention: learns spatially-varying weights for each scale
+        # Takes spatial_features [B, 32, H, W] and outputs [B, num_scales, H, W]
+        self.scale_attention = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(64, len(self.scales), kernel_size=1),
+        )
 
         # Initialize weights
         for m in self.modules():
@@ -556,55 +525,52 @@ class BottleneckDenseRefiner(nn.Module):
                 align_corners=True
             )
 
-        if self.use_omniglot:
-            # Generate seed-conditioned character features for each scale
-            # MLP: z[B, 16] → [B, num_patches * 32]
-            # Reshape: [B, num_patches, 32]
-            # Flatten: [B*num_patches, 32]
-            # Decoder: → [B*num_patches, 1, 56, 56]
-            # Downscale and reshape: [B, 1, H, W]
-            char_features_list = []
-            for scale in self.scales:
-                mlp = self.scale_mlps[str(scale)]
-                num_patches_h = self.patch_height // scale
-                num_patches_w = self.patch_width // scale
-                num_patches = num_patches_h * num_patches_w
+        # Generate seed-conditioned character features for each scale
+        # MLP: z[B, 16] → [B, num_patches * 32]
+        # Reshape: [B, num_patches, 32]
+        # Flatten: [B*num_patches, 32]
+        # Decoder: → [B*num_patches, 1, 56, 56]
+        # Downscale and reshape: [B, 1, H, W]
+        char_features_list = []
+        for scale in self.scales:
+            mlp = self.scale_mlps[str(scale)]
+            num_patches_h = self.patch_height // scale
+            num_patches_w = self.patch_width // scale
+            num_patches = num_patches_h * num_patches_w
 
-                # MLP output: [B, num_patches * 32]
-                mlp_output = mlp(z)
+            # MLP output: [B, num_patches * 32]
+            mlp_output = mlp(z)
 
-                # Reshape to [B, num_patches, 32]
-                char_embeddings = mlp_output.view(batch_size, num_patches, self.char_embed_dim)
+            # Reshape to [B, num_patches, 32]
+            char_embeddings = mlp_output.view(batch_size, num_patches, self.char_embed_dim)
 
-                # Flatten to [B*num_patches, 32]
-                char_embeddings_flat = char_embeddings.view(batch_size * num_patches, self.char_embed_dim)
+            # Flatten to [B*num_patches, 32]
+            char_embeddings_flat = char_embeddings.view(batch_size * num_patches, self.char_embed_dim)
 
-                # Pass through Omniglot decoder: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
+            # Pass through Omniglot decoder: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
+            with torch.no_grad():
                 self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
                 characters = self.omniglot_decoder(char_embeddings_flat)
 
-                # Downscale characters to scale size: [B*num_patches, 1, scale, scale]
-                characters_resized = F.interpolate(
-                    characters,
-                    size=(scale, scale),
-                    mode='bilinear',
-                    align_corners=True
-                )
+            # Downscale characters to scale size: [B*num_patches, 1, scale, scale]
+            characters_resized = F.interpolate(
+                characters,
+                size=(scale, scale),
+                mode='bilinear',
+                align_corners=True
+            )
 
-                # Reshape back to [B, 1, H, W]
-                characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
-                characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
-                char_scale = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
+            # Reshape back to [B, 1, H, W]
+            characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
+            characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
+            char_scale = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
 
-                char_features_list.append(char_scale)
+            char_features_list.append(char_scale)
 
-            # Concatenate original patch, refined patch, and character features from all scales
-            # [B, 3] + [B, 3] + [B, 1] + [B, 1] + [B, 1] + [B, 1] = [B, 10]
-            combined = torch.cat([patches, refined] + char_features_list, dim=1)  # [B, 10, H, W]
-        else:
-            # No Omniglot: just concatenate original patch and refined patch
-            # [B, 3] + [B, 3] = [B, 6]
-            combined = torch.cat([patches, refined], dim=1)  # [B, 6, H, W]
+        # Multi-scale regional decomposition
+        # Concatenate original patch, refined patch, and character features from all scales
+        # [B, 3] + [B, 3] + [B, 1] + [B, 1] + [B, 1] + [B, 1] = [B, 10]
+        combined = torch.cat([patches, refined] + char_features_list, dim=1)  # [B, 10, H, W]
 
         # Spatial propagation: propagate information without changing size
         spatial_features = self.spatial_layers(combined)  # [B, 32, H, W]
@@ -682,8 +648,7 @@ class FoundationPatchGenerator(nn.Module):
     """Patch generator using Stable Diffusion VAE decoder with trainable adapter and CNN refinement"""
     def __init__(self, latent_dim: int, patch_height: int = 256, patch_width: int = 512, num_layers: int = 11,
                  use_vae_lora: bool = True, lora_rank: int = 8, lora_alpha: int = 16,
-                 use_bottleneck_refiner: bool = False, bottleneck_dim: int = 256,
-                 use_omniglot: bool = True):
+                 use_bottleneck_refiner: bool = False, bottleneck_dim: int = 256):
         super().__init__()
 
         self.latent_dim = latent_dim
@@ -712,7 +677,6 @@ class FoundationPatchGenerator(nn.Module):
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.use_omniglot = use_omniglot
 
         if self.use_vae_lora:
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
@@ -808,8 +772,7 @@ class FoundationPatchGenerator(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         # Bottleneck dense refiner for final refinement
-        self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim,
-                                                         use_omniglot=use_omniglot)
+        self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim)
         print(f"Bottleneck dense refiner enabled for final patch refinement (with seed conditioning, bottleneck_dim={bottleneck_dim})")
 
         print(f"CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
@@ -902,7 +865,6 @@ class ProgressivePatchTrainer:
                  lora_rank: int = 8,
                  lora_alpha: int = 16,
                  bottleneck_dim: int = 256,
-                 use_omniglot: bool = True,
                  save_examples_every: Optional[int] = None):
         self.basis_dim = basis_dim
         self.diversity_weight = diversity_weight
@@ -916,7 +878,6 @@ class ProgressivePatchTrainer:
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.bottleneck_dim = bottleneck_dim
-        self.use_omniglot = use_omniglot
 
         # Require ocr_patches_per_image
         if ocr_patches_per_image is None:
@@ -1037,8 +998,7 @@ class ProgressivePatchTrainer:
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             use_bottleneck_refiner=True,
-            bottleneck_dim=bottleneck_dim,
-            use_omniglot=use_omniglot
+            bottleneck_dim=bottleneck_dim
         ).to(self.device)
 
         # Activation capture for diversity metric
@@ -1115,18 +1075,8 @@ class ProgressivePatchTrainer:
         from datetime import datetime
 
         # Get indices from the random_split
-        # Handle both torch.Tensor and list/array indices
-        if hasattr(train_dataset, 'indices'):
-            indices = train_dataset.indices
-            train_indices = set(indices.tolist() if hasattr(indices, 'tolist') else indices)
-        else:
-            train_indices = set()
-
-        if hasattr(val_dataset, 'indices'):
-            indices = val_dataset.indices
-            val_indices = set(indices.tolist() if hasattr(indices, 'tolist') else indices)
-        else:
-            val_indices = set()
+        train_indices = set(train_dataset.indices) if hasattr(train_dataset, 'indices') else set()
+        val_indices = set(val_dataset.indices) if hasattr(val_dataset, 'indices') else set()
 
         # Build metadata for all samples
         split_data = []
@@ -1430,6 +1380,7 @@ class ProgressivePatchTrainer:
         image_height, image_width = image.shape[2], image.shape[3]
 
         # Resize patch to match image dimensions
+        # patch is [3, patch_h, patch_w], need to add batch dim and resize
         patch_resized = F.interpolate(
             patch.unsqueeze(0),  # [1, 3, patch_h, patch_w]
             size=(image_height, image_width),
@@ -2325,7 +2276,6 @@ class ProgressivePatchTrainer:
                     'use_vae_lora': getattr(self.generator, 'use_vae_lora', False),
                     'lora_rank': getattr(self.generator, 'lora_rank', None),
                     'lora_alpha': getattr(self.generator, 'lora_alpha', None),
-                    'use_omniglot': getattr(self.generator, 'use_omniglot', False),
                 }
                 torch.save(checkpoint, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 
@@ -2870,9 +2820,6 @@ def main():
                         help='LoRA rank (default: 8)')
     parser.add_argument('--lora-alpha', type=int, default=16,
                         help='LoRA alpha (default: 16)')
-    parser.add_argument('--no-omniglot', action='store_true', default=False,
-                        help='Disable Omniglot character conditioning in the bottleneck refiner. '
-                        'Reverts to the original architecture without character features.')
     args = parser.parse_args()
 
     # Validate dataset argument
@@ -2920,7 +2867,6 @@ def main():
         'lora_rank': args.lora_rank,
         'lora_alpha': args.lora_alpha,
         'bottleneck_dim': args.bottleneck_dim,
-        'use_omniglot': not args.no_omniglot,
         'save_examples_every': args.save_examples_every
     }
 
