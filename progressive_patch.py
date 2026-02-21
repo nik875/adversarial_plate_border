@@ -478,11 +478,6 @@ class BottleneckDenseRefiner(nn.Module):
                 )
                 self.scale_mlps[str(scale)] = mlp
 
-            self.scale_convs = nn.ModuleDict()
-            for scale in self.scales:
-                # Each scale gets its own 1x1 conv to compress 32 → 3 channels
-                self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
-
             # Spatial propagation layers (same padding to preserve size)
             # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
             self.spatial_layers = nn.Sequential(
@@ -506,23 +501,24 @@ class BottleneckDenseRefiner(nn.Module):
                 nn.SiLU(inplace=True),
             )
 
-            self.scale_convs = nn.ModuleDict()
-            for scale in self.scales:
-                self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
+        # 16 learned channel projections (32→3 each): different learnable ways of combining
+        # spatial features into RGB. Blended per-pixel by the attention. Named proj_modes
+        # since these are no longer tied to any spatial scale — the unfold/fold was removed.
+        self.num_modes = 16
+        self.proj_modes = nn.ModuleList([nn.Conv2d(32, 3, kernel_size=1) for _ in range(self.num_modes)])
 
-        # Scale attention: z → low-res grid → learned ConvTranspose upsampling → full-res weights.
-        # Grid is at 1/32 resolution (8×16 for 256×512 patches). ConvTranspose chain is fully
-        # learned — no fixed interpolation kernel — giving globally coherent spatial attention.
+        # Attention: z → low-res grid → learned ConvTranspose upsampling → full-res blend weights.
+        # Grid at 1/32 resolution (8×16 for 256×512). ConvTranspose chain is fully learned —
+        # no fixed interpolation — giving globally coherent, z-conditioned spatial attention.
         self.attn_grid_h = patch_height // 32
         self.attn_grid_w = patch_width // 32
-        num_scales = len(self.scales)
-        self.attention_proj = nn.Linear(latent_dim, num_scales * self.attn_grid_h * self.attn_grid_w)
+        self.attention_proj = nn.Linear(latent_dim, self.num_modes * self.attn_grid_h * self.attn_grid_w)
         self.attention_upsample = nn.Sequential(
-            nn.ConvTranspose2d(num_scales, 16, kernel_size=4, stride=4),          # 8×16  → 32×64
+            nn.ConvTranspose2d(self.num_modes, 32, kernel_size=4, stride=4),           # 8×16  → 32×64
             nn.SiLU(inplace=True),
-            nn.ConvTranspose2d(16, 8, kernel_size=4, stride=4),                   # 32×64 → 128×256 (approx)
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=4),                       # 32×64 → 128×256
             nn.SiLU(inplace=True),
-            nn.ConvTranspose2d(8, num_scales, kernel_size=4, stride=2, padding=1),# → 256×512
+            nn.ConvTranspose2d(16, self.num_modes, kernel_size=4, stride=2, padding=1),# → 256×512
         )
 
         # Initialize weights
@@ -645,22 +641,17 @@ class BottleneckDenseRefiner(nn.Module):
         # Spatial propagation: propagate information without changing size
         spatial_features = self.spatial_layers(combined)  # [B, 32, H, W]
 
-        # Apply each scale's 1x1 conv directly to spatial_features.
-        # The unfold/fold block splitting was a no-op since weights are shared across all
-        # blocks — a 1x1 conv with shared weights is identical whether or not you unfold first.
-        scale_outputs = [self.scale_convs[str(scale)](spatial_features) for scale in self.scales]
+        # Apply each projection mode's 1x1 conv to get 16 different RGB interpretations
+        mode_outputs = torch.stack([m(spatial_features) for m in self.proj_modes], dim=1)  # [B, 16, 3, H, W]
 
-        # Compute per-pixel scale weights via z → low-res grid → learned ConvTranspose upsample
-        attn_grid = self.attention_proj(z).view(B, len(self.scales), self.attn_grid_h, self.attn_grid_w)
-        spatial_scale_weights = self.attention_upsample(attn_grid)  # [B, num_scales, H, W]
-        spatial_scale_weights = torch.softmax(spatial_scale_weights, dim=1)  # Normalize over scales per pixel
+        # Compute per-pixel blend weights via z → low-res grid → learned ConvTranspose upsample
+        attn_grid = self.attention_proj(z).view(B, self.num_modes, self.attn_grid_h, self.attn_grid_w)
+        blend_weights = self.attention_upsample(attn_grid)          # [B, 16, H, W]
+        blend_weights = torch.softmax(blend_weights, dim=1)         # normalize over modes per pixel
+        blend_weights = blend_weights.unsqueeze(2)                  # [B, 16, 1, H, W]
 
-        # Weighted average of all scales with per-pixel weights
-        refined_patches = torch.zeros_like(patches)  # [B, 3, H, W]
-        for scale_idx, scale_output in enumerate(scale_outputs):
-            # scale_output: [B, 3, H, W]
-            # spatial_scale_weights[:, scale_idx:scale_idx+1]: [B, 1, H, W]
-            refined_patches = refined_patches + spatial_scale_weights[:, scale_idx:scale_idx+1] * scale_output
+        # Weighted sum over modes: [B, 16, 3, H, W] * [B, 16, 1, H, W] → [B, 3, H, W]
+        refined_patches = (mode_outputs * blend_weights).sum(dim=1)
 
         # Apply nonlinearity before final smoothing
         refined_patches = torch.nn.functional.silu(refined_patches)
