@@ -1383,9 +1383,12 @@ def main():
         torch.manual_seed(args.seed)
         print(f"Set random seed: {args.seed}")
 
-    # Create output directory
+    # Create output directory (always fresh — delete previous run's output)
     output_dir = Path(args.outdir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Deleted existing output directory: {output_dir}")
+    output_dir.mkdir(parents=True)
 
     # Load run directory
     run_dir = Path(args.run_dir)
@@ -1444,12 +1447,6 @@ def main():
         print("\n" + "="*80)
         print("COMPOSITE-ONLY MODE")
         print("="*80)
-
-        # Delete and recreate output directory
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-            print(f"Deleted existing output directory: {output_dir}")
-        output_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize OCR model
         print(f"\nInitializing OCR model: {args.ocr_model}")
