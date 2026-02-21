@@ -483,14 +483,6 @@ class BottleneckDenseRefiner(nn.Module):
                 # Each scale gets its own 1x1 conv to compress 32 → 3 channels
                 self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
 
-            # Per-pixel scale attention: learns spatially-varying weights for each scale
-            # Takes spatial_features [B, 32, H, W] and outputs [B, num_scales, H, W]
-            self.scale_attention = nn.Sequential(
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, len(self.scales), kernel_size=1),
-            )
-
             # Spatial propagation layers (same padding to preserve size)
             # Input: [original_patch (3ch), refined_patch (3ch), char_scale_8 (1ch), char_scale_16 (1ch), char_scale_32 (1ch), char_scale_64 (1ch)] = 10 channels
             self.spatial_layers = nn.Sequential(
@@ -518,12 +510,20 @@ class BottleneckDenseRefiner(nn.Module):
             for scale in self.scales:
                 self.scale_convs[str(scale)] = nn.Conv2d(32, 3, kernel_size=1)
 
-            # Per-pixel scale attention
-            self.scale_attention = nn.Sequential(
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, len(self.scales), kernel_size=1),
-            )
+        # Scale attention: z → low-res grid → learned ConvTranspose upsampling → full-res weights.
+        # Grid is at 1/32 resolution (8×16 for 256×512 patches). ConvTranspose chain is fully
+        # learned — no fixed interpolation kernel — giving globally coherent spatial attention.
+        self.attn_grid_h = patch_height // 32
+        self.attn_grid_w = patch_width // 32
+        num_scales = len(self.scales)
+        self.attention_proj = nn.Linear(latent_dim, num_scales * self.attn_grid_h * self.attn_grid_w)
+        self.attention_upsample = nn.Sequential(
+            nn.ConvTranspose2d(num_scales, 16, kernel_size=4, stride=4),          # 8×16  → 32×64
+            nn.SiLU(inplace=True),
+            nn.ConvTranspose2d(16, 8, kernel_size=4, stride=4),                   # 32×64 → 128×256 (approx)
+            nn.SiLU(inplace=True),
+            nn.ConvTranspose2d(8, num_scales, kernel_size=4, stride=2, padding=1),# → 256×512
+        )
 
         # Initialize weights
         for m in self.modules():
@@ -653,8 +653,9 @@ class BottleneckDenseRefiner(nn.Module):
             scale_output = self._process_scale(spatial_features, scale, batch_size)
             scale_outputs.append(scale_output)
 
-        # Compute per-pixel scale weights
-        spatial_scale_weights = self.scale_attention(spatial_features)  # [B, num_scales, H, W]
+        # Compute per-pixel scale weights via z → low-res grid → learned ConvTranspose upsample
+        attn_grid = self.attention_proj(z).view(B, len(self.scales), self.attn_grid_h, self.attn_grid_w)
+        spatial_scale_weights = self.attention_upsample(attn_grid)  # [B, num_scales, H, W]
         spatial_scale_weights = torch.softmax(spatial_scale_weights, dim=1)  # Normalize over scales per pixel
 
         # Weighted average of all scales with per-pixel weights
