@@ -1497,7 +1497,7 @@ def main():
         # Save CSV
         csv_out = output_dir / "predictions.csv"
         with open(csv_out, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'changed'])
+            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'changed'], escapechar='\\')
             writer.writeheader()
             writer.writerows(rows)
 
@@ -1565,7 +1565,7 @@ def main():
         # Save to cmaes_control_labels.csv for reuse
         control_csv_path = output_dir / "cmaes_control_labels.csv"
         with open(control_csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['idx', 'control_text'])
+            writer = csv.DictWriter(f, fieldnames=['idx', 'control_text'], escapechar='\\')
             writer.writeheader()
             for i, ct in enumerate(control_texts):
                 writer.writerow({'idx': i, 'control_text': ct})
@@ -1637,7 +1637,7 @@ def main():
         # Save CSV with per-image results (same format as debug output)
         csv_path = save_dir / "results.csv"
         with open(csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['img_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'])
+            writer = csv.DictWriter(f, fieldnames=['img_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'], escapechar='\\')
             writer.writeheader()
             for entry in per_image_data:
                 writer.writerow({
@@ -1906,7 +1906,7 @@ def main():
         # Save results CSV
         results_csv_path = best_patch_results_dir / "best_patch_results.csv"
         with open(results_csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'])
+            writer = csv.DictWriter(f, fieldnames=['image_idx', 'control_text', 'composite_text', 'edit_distance', 'is_misread'], escapechar='\\')
             writer.writeheader()
             writer.writerows(results_rows)
 
