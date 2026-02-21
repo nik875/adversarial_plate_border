@@ -391,14 +391,21 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
-        # Post-expansion smoothing with progressive kernel sizes
-        # Progressively larger kernels (3 → 7 → 9) to smooth the output
+        # Post-expansion smoothing with dilated convolutions for large receptive field
+        # Exponentially increasing dilation (1,2,4,8,16,32) gives RF=127 pixels
+        # using only 3x3 kernels, enough to mix across 64x64 scale blocks
         self.post_expansion_smooth = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),  # kernel 3, maintain size
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),              # dilation=1, RF=3
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=7, padding=3),  # kernel 7, maintain size
+            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2), # RF=7
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=9, padding=4),  # kernel 9, maintain size
+            nn.Conv2d(16, 16, kernel_size=3, padding=4, dilation=4), # RF=15
+            nn.SiLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8), # RF=31
+            nn.SiLU(inplace=True),
+            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16), # RF=63
+            nn.SiLU(inplace=True),
+            nn.Conv2d(16, 3, kernel_size=3, padding=32, dilation=32),  # RF=127
         )
 
         # Final activation to ensure output is in [0, 1] range
