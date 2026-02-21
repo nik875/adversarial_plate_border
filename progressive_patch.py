@@ -645,13 +645,10 @@ class BottleneckDenseRefiner(nn.Module):
         # Spatial propagation: propagate information without changing size
         spatial_features = self.spatial_layers(combined)  # [B, 32, H, W]
 
-        # Process at multiple scales
-        scale_outputs = []
-
-        for scale_idx, scale in enumerate(self.scales):
-            # Extract spatial patches of this scale
-            scale_output = self._process_scale(spatial_features, scale, batch_size)
-            scale_outputs.append(scale_output)
+        # Apply each scale's 1x1 conv directly to spatial_features.
+        # The unfold/fold block splitting was a no-op since weights are shared across all
+        # blocks — a 1x1 conv with shared weights is identical whether or not you unfold first.
+        scale_outputs = [self.scale_convs[str(scale)](spatial_features) for scale in self.scales]
 
         # Compute per-pixel scale weights via z → low-res grid → learned ConvTranspose upsample
         attn_grid = self.attention_proj(z).view(B, len(self.scales), self.attn_grid_h, self.attn_grid_w)
@@ -680,43 +677,6 @@ class BottleneckDenseRefiner(nn.Module):
 
         return refined_patches
 
-    def _process_scale(self, spatial_features: torch.Tensor, scale: int, batch_size: int) -> torch.Tensor:
-        """
-        Process features at a specific scale.
-
-        Args:
-            spatial_features: [B, 32, H, W] propagated features
-            scale: Patch size (8, 16, 32, or 64)
-            batch_size: Batch size
-
-        Returns:
-            output: [B, 3, H, W] refined patch at this scale
-        """
-        B, C, H, W = spatial_features.shape
-        device = spatial_features.device
-
-        # Calculate patch grid dimensions
-        num_patches_h = H // scale
-        num_patches_w = W // scale
-
-        # Unfold into patches: [B, C, num_patches_h, scale, num_patches_w, scale]
-        patches = spatial_features.unfold(2, scale, scale).unfold(3, scale, scale)
-        # Reshape to [B, C, num_patches_h, num_patches_w, scale, scale]
-        patches = patches.permute(0, 1, 2, 4, 3, 5).contiguous()
-        # Reshape to [B*num_patches_h*num_patches_w, C, scale, scale]
-        num_total_patches = num_patches_h * num_patches_w
-        patches = patches.view(B * num_total_patches, C, scale, scale)
-
-        # Apply scale-specific 1x1 conv to compress to 3 channels
-        conv_layer = self.scale_convs[str(scale)]
-        patch_output = conv_layer(patches)  # [B*num_patches, 3, scale, scale]
-
-        # Reshape back to full image
-        patch_output = patch_output.view(B, num_patches_h, num_patches_w, 3, scale, scale)
-        patch_output = patch_output.permute(0, 3, 1, 4, 2, 5).contiguous()
-        patch_output = patch_output.view(B, 3, H, W)
-
-        return patch_output
 
 
 class FoundationPatchGenerator(nn.Module):
