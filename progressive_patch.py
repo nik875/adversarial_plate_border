@@ -495,7 +495,7 @@ class BottleneckDenseRefiner(nn.Module):
                 nn.Conv2d(64, len(self.scales), kernel_size=1),
             )
 
-        # Initialize weights
+        # Initialize weights: kaiming for intermediate layers (SiLU activations)
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -505,6 +505,20 @@ class BottleneckDenseRefiner(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+
+        # Override final output layers with better initialization for sigmoid/saturating outputs.
+        # Kaiming assumes ReLU and produces large initial logits that saturate sigmoid.
+        # post_expansion_smooth final conv (16→3) feeds directly into Sigmoid: use near-zero normal
+        # so outputs start near 0.5 and gradients aren't immediately killed.
+        nn.init.normal_(self.post_expansion_smooth[-1].weight, mean=0, std=0.01)
+        nn.init.zeros_(self.post_expansion_smooth[-1].bias)
+
+        if use_omniglot:
+            # scale_convs (32→3, 1x1): use xavier since output feeds attention-weighted sum then SiLU
+            for conv in self.scale_convs.values():
+                nn.init.xavier_normal_(conv.weight)
+                if conv.bias is not None:
+                    nn.init.zeros_(conv.bias)
 
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
@@ -800,12 +814,15 @@ class FoundationPatchGenerator(nn.Module):
             nn.Sigmoid()  # Ensure output is in [0, 1]
         )
 
-        # Initialize projector weights
+        # Initialize projector weights: kaiming for intermediate, xavier for final output
         for m in self.patch_projector.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+        # Final conv (32→3) feeds into Sigmoid: xavier avoids saturation at init
+        nn.init.xavier_normal_(self.patch_projector[-2].weight)
+        nn.init.zeros_(self.patch_projector[-2].bias)
 
         # Bottleneck dense refiner for final refinement
         self.bottleneck_refiner = BottleneckDenseRefiner(patch_height, patch_width, latent_dim, bottleneck_dim,
