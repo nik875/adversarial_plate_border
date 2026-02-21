@@ -392,20 +392,20 @@ class BottleneckDenseRefiner(nn.Module):
         )
 
         # Post-expansion smoothing with dilated convolutions for large receptive field
-        # Exponentially increasing dilation (1,2,4,8,16,32) gives RF=127 pixels
-        # using only 3x3 kernels, enough to mix across 64x64 scale blocks
+        # Larger kernels at low dilation for dense local smoothing,
+        # 3x3 at high dilation for long-range connectivity. Total RF=131 pixels.
         self.post_expansion_smooth = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),              # dilation=1, RF=3
+            nn.Conv2d(3, 16, kernel_size=7, padding=3),               # dense local, RF=7
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=2, dilation=2), # RF=7
+            nn.Conv2d(16, 16, kernel_size=5, padding=4, dilation=2),  # RF=15
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=4, dilation=4), # RF=15
+            nn.Conv2d(16, 16, kernel_size=5, padding=8, dilation=4),  # RF=31
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8), # RF=31
+            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8),  # RF=47
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16), # RF=63
+            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16), # RF=79
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=3, padding=32, dilation=32),  # RF=127
+            nn.Conv2d(16, 3, kernel_size=3, padding=32, dilation=32),  # RF=143
         )
 
         # Final activation to ensure output is in [0, 1] range
