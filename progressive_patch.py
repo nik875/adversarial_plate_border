@@ -2222,8 +2222,7 @@ class ProgressivePatchTrainer:
                     save_subdir = os.path.join(example_samples_dir, f"epoch_{epoch:04d}_batch_{batch_count_global:06d}")
                     # Generate 10 samples for the last layer only
                     last_layer_idx = len(self.layer_configs) - 1
-                    if self.save_basis_safe(epoch, save_subdir, num_samples=10, save_generator=False, layer_idx=last_layer_idx):
-                        print(f"   ✓ Saved periodic samples for final layer")
+                    self.save_basis_safe(epoch, save_subdir, num_samples=10, save_generator=False, layer_idx=last_layer_idx)
 
         # Return average losses per update
         avg_diversity_loss = total_diversity_loss / max(num_updates, 1)
