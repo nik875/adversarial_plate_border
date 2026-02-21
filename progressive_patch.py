@@ -2693,6 +2693,25 @@ class ProgressivePatchTrainer:
             'learning_rate': []
         }
 
+        # Trim or wipe the live history CSV so resumed runs don't produce duplicate rows.
+        # On fresh start (start_epoch=1): delete any stale CSV.
+        # On resume (start_epoch>1): keep rows with epoch < start_epoch, drop the rest.
+        history_csv_path = os.path.join(self.checkpoint_base, 'training_history.csv')
+        if os.path.exists(history_csv_path):
+            if start_epoch == 1:
+                os.remove(history_csv_path)
+            else:
+                with open(history_csv_path, 'r', newline='') as _hf:
+                    rows = list(csv.DictReader(_hf))
+                kept = [r for r in rows if int(r['epoch']) < start_epoch]
+                with open(history_csv_path, 'w', newline='') as _hf:
+                    if kept:
+                        writer = csv.DictWriter(_hf, fieldnames=kept[0].keys())
+                        writer.writeheader()
+                        writer.writerows(kept)
+                    else:
+                        os.remove(history_csv_path)
+
         best_train_loss = float('inf')
         best_epoch = 0
 
