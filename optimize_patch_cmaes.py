@@ -1571,6 +1571,22 @@ def main():
                 writer.writerow({'idx': i, 'control_text': ct})
         print(f"Saved control texts to: {control_csv_path}")
 
+    # If correct_text is given, discard images where the model doesn't output correct_text
+    # on the clean image — these images aren't reliable baselines for measuring disruption.
+    if correct_text is not None:
+        before = len(val_images)
+        filtered = [(img, ct, dim) for img, ct, dim in zip(val_images, control_texts, dimensions)
+                    if ct == correct_text]
+        if filtered:
+            val_images, control_texts, dimensions = map(list, zip(*filtered))
+        else:
+            val_images, control_texts, dimensions = [], [], []
+        print(f"Filtered dataset: kept {len(val_images)}/{before} images "
+              f"where model reads '{correct_text}' on clean image")
+        if not val_images:
+            print("ERROR: No images remaining after filtering. Check --correct-text value.", file=sys.stderr)
+            sys.exit(1)
+
     # In logit MSE mode, also precompute control logits
     if use_logit_mse:
         print("\nPrecomputing control logits (logit MSE mode)...")
