@@ -415,10 +415,8 @@ class BottleneckDenseRefiner(nn.Module):
             omniglot_decoder_path = Path(__file__).parent / "omniglot_ae_export" / "decoder_traced.pt"
             if omniglot_decoder_path.exists():
                 self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
-                self.omniglot_decoder.eval()
-                for param in self.omniglot_decoder.parameters():
-                    param.requires_grad = False
-                print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path}")
+                self.omniglot_decoder.train()
+                print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path} (trainable)")
             else:
                 raise FileNotFoundError(f"Omniglot decoder not found at {omniglot_decoder_path}. "
                                       f"Please ensure omniglot_ae_export/decoder_traced.pt exists.")
@@ -575,9 +573,8 @@ class BottleneckDenseRefiner(nn.Module):
                 char_embeddings_flat = char_embeddings.view(batch_size * num_patches, self.char_embed_dim)
 
                 # Pass through Omniglot decoder: [B*num_patches, 32] → [B*num_patches, 1, 56, 56]
-                with torch.no_grad():
-                    self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
-                    characters = self.omniglot_decoder(char_embeddings_flat)
+                self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
+                characters = self.omniglot_decoder(char_embeddings_flat)
 
                 # Downscale characters to scale size: [B*num_patches, 1, scale, scale]
                 characters_resized = F.interpolate(
