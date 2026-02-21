@@ -24,6 +24,10 @@ strategy:
   type: border
   center_ratio: 0.6
   neutral_color: 0.5
+  # ── sticker strategy options (used when type: sticker) ──────────────────
+  # sticker_h: 64        # height of patch on image (pixels); omit = use generator output size
+  # sticker_w: 64        # width of patch on image (pixels); omit = use generator output size
+  # bbox: [x0, y0, x1, y1]   # fixed placement; overrides random sampling when set
 
 # Metric: Top-1 accuracy drop (untargeted)
 metric:

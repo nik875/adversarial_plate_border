@@ -204,13 +204,17 @@ class GenericPatchTrainer:
         self._current_activations = None
         return act
 
-    def _composited_model_input(self, image: Tensor, patch: Tensor) -> Tensor:
+    def _composited_model_input(
+        self, image: Tensor, patch: Tensor, **strategy_kwargs
+    ) -> Tensor:
         """
         Apply strategy + domain preprocessing to get model-ready input.
 
+        strategy_kwargs are forwarded to strategy.apply() (e.g. bbox for StickerStrategy).
+
         Returns: model input Tensor
         """
-        composited, _ = self.strategy.apply(image, patch)
+        composited, _ = self.strategy.apply(image, patch, **strategy_kwargs)
         return self.domain.preprocess_for_model(composited)
 
     def _neutral_model_input(self, image: Tensor) -> Tensor:
@@ -218,11 +222,11 @@ class GenericPatchTrainer:
         baseline_img = self.domain.get_baseline_image(image)
         return self.domain.preprocess_for_model(baseline_img)
 
-    def _visibility_mask_for(self, patch: Tensor) -> Tensor:
+    def _visibility_mask_for(self, patch: Tensor, **strategy_kwargs) -> Tensor:
         """Get the visibility mask for a dummy application of the strategy."""
         H, W = self.patch_height, self.patch_width
         dummy = torch.zeros(1, 3, H, W, device=self._device)
-        _, mask = self.strategy.apply(dummy, patch)
+        _, mask = self.strategy.apply(dummy, patch, **strategy_kwargs)
         return mask
 
     # ------------------------------------------------------------------
@@ -286,6 +290,13 @@ class GenericPatchTrainer:
                             if baseline_act is None:
                                 continue
 
+                        # ---- sample placement once for this image ----
+                        # All patches_per_image patches share the same placement so
+                        # diversity is measured at a consistent composite position.
+                        strategy_kwargs = self.strategy.sample_kwargs(
+                            image, self.patch_height, self.patch_width
+                        )
+
                         # ---- generate patches ----
                         patches = []
                         patch_acts = []
@@ -295,7 +306,9 @@ class GenericPatchTrainer:
                             patches.append(patch)
 
                             # activation with patch (needs grad)
-                            model_inp = self._composited_model_input(image, patch)
+                            model_inp = self._composited_model_input(
+                                image, patch, **strategy_kwargs
+                            )
                             act = self._get_activations(model_inp, use_grad=True)
                             patch_acts.append(act if act is not None else baseline_act.detach())
 
@@ -326,7 +339,7 @@ class GenericPatchTrainer:
 
                         # ---- TV + spectrum losses ----
                         patches_stacked = torch.stack(patches, dim=0)  # [P, 3, H, W]
-                        vis_mask = self._visibility_mask_for(patches[0])
+                        vis_mask = self._visibility_mask_for(patches[0], **strategy_kwargs)
 
                         tv_val = self.tv_weight * total_variation_loss(patches_stacked, vis_mask)
                         spec_val = self.spectrum_weight * compute_spectrum_loss(patches_stacked, vis_mask)

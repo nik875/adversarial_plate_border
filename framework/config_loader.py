@@ -131,6 +131,8 @@ def _build_strategy(strategy_cfg: dict):
             bbox = tuple(bbox)
         return StickerStrategy(
             bbox=bbox,
+            sticker_h=strategy_cfg.get('sticker_h', None),
+            sticker_w=strategy_cfg.get('sticker_w', None),
             neutral_color=strategy_cfg.get('neutral_color', 0.5),
         )
     elif strategy_type in ('perturbation', 'additive'):

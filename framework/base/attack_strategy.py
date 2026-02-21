@@ -8,8 +8,9 @@ An AttackStrategy encapsulates *how* a patch is composited onto a clean image:
 """
 from __future__ import annotations
 
+import random
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,7 +24,27 @@ class AttackStrategy(ABC):
     Every strategy must implement:
       - apply()         : composite patch onto image, return (composited, visibility_mask)
       - apply_neutral() : place a neutral (grey) placeholder instead of adversarial patch
+
+    Optionally override:
+      - sample_kwargs() : return strategy-specific kwargs to be shared across all patches
+                          for a single image (e.g., a random bbox for StickerStrategy).
     """
+
+    def sample_kwargs(
+        self,
+        image: Tensor,
+        patch_h: int,
+        patch_w: int,
+    ) -> Dict:
+        """
+        Sample per-image kwargs to pass into apply() / apply_neutral().
+
+        Called once per image before the patches_per_image loop, so all
+        patches for that image see the same transform (e.g. same random bbox).
+
+        Default: returns {}, meaning apply() uses its own defaults.
+        """
+        return {}
 
     @abstractmethod
     def apply(
@@ -196,23 +217,63 @@ class StickerStrategy(AttackStrategy):
     Paste the (resized) patch at a fixed bounding box on the image.
     The rest of the image remains unchanged.
 
+    The on-image sticker size is controlled by sticker_h / sticker_w and is
+    independent of the generator's output patch resolution — the patch tensor
+    is always resized to fit the placed region.
+
     bbox should be (x_min, y_min, x_max, y_max) in pixel coordinates relative
-    to the image spatial dimensions.  If not provided at construction time,
-    it must be supplied as a kwarg to apply().
+    to the image spatial dimensions.  If bbox is provided at construction time,
+    sticker_h / sticker_w are ignored and the fixed bbox is always used.
     """
 
     def __init__(
         self,
         bbox: Optional[Tuple[int, int, int, int]] = None,
+        sticker_h: Optional[int] = None,
+        sticker_w: Optional[int] = None,
         neutral_color: float = 0.5,
     ):
         """
         Args:
-            bbox: (x_min, y_min, x_max, y_max) default paste region.
+            bbox: (x_min, y_min, x_max, y_max) fixed paste region.  When set,
+                  placement is always at this bbox regardless of sticker_h/w.
+            sticker_h: Height of the placed sticker in image pixels.
+                       Defaults to the generator patch height passed to sample_kwargs.
+            sticker_w: Width of the placed sticker in image pixels.
+                       Defaults to the generator patch width passed to sample_kwargs.
             neutral_color: grey value for apply_neutral.
         """
         self.bbox = bbox
+        self.sticker_h = sticker_h
+        self.sticker_w = sticker_w
         self.neutral_color = neutral_color
+
+    def sample_kwargs(
+        self,
+        image: Tensor,
+        patch_h: int,
+        patch_w: int,
+    ) -> Dict:
+        """
+        Sample a random bbox for this image.
+
+        If self.bbox is set, returns it as-is (fixed placement).
+        Otherwise, places a sticker of size (sticker_h × sticker_w) at a
+        uniformly random position within the image.  sticker_h / sticker_w
+        fall back to patch_h / patch_w when not configured.
+        """
+        if self.bbox is not None:
+            return {'bbox': self.bbox}
+
+        sh = self.sticker_h if self.sticker_h is not None else patch_h
+        sw = self.sticker_w if self.sticker_w is not None else patch_w
+
+        img_h, img_w = image.shape[2], image.shape[3]
+        max_x = max(img_w - sw, 0)
+        max_y = max(img_h - sh, 0)
+        x0 = random.randint(0, max_x)
+        y0 = random.randint(0, max_y)
+        return {'bbox': (x0, y0, x0 + sw, y0 + sh)}
 
     def _resolve_bbox(self, image: Tensor, bbox) -> Tuple[int, int, int, int]:
         if bbox is not None:
