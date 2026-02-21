@@ -391,21 +391,21 @@ class BottleneckDenseRefiner(nn.Module):
             nn.Tanh()  # Output symmetric refinement in [-1, 1]
         )
 
-        # Post-expansion smoothing with dilated convolutions for large receptive field
-        # Larger kernels at low dilation for dense local smoothing,
-        # 3x3 at high dilation for long-range connectivity. Total RF=131 pixels.
+        # Post-expansion smoothing: coarse-to-fine (high dilation → low)
+        # First establish cross-block coherence, then refine locally.
+        # Larger kernels at low dilation for dense local refinement.
         self.post_expansion_smooth = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=7, padding=3),               # dense local, RF=7
+            nn.Conv2d(3, 16, kernel_size=3, padding=32, dilation=32),  # long-range mixing
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=4, dilation=2),  # RF=15
+            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16),
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=5, padding=8, dilation=4),  # RF=31
+            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8),
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=8, dilation=8),  # RF=47
+            nn.Conv2d(16, 16, kernel_size=5, padding=8, dilation=4),
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 16, kernel_size=3, padding=16, dilation=16), # RF=79
+            nn.Conv2d(16, 16, kernel_size=5, padding=4, dilation=2),
             nn.SiLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=3, padding=32, dilation=32),  # RF=143
+            nn.Conv2d(16, 3, kernel_size=7, padding=3),               # dense local refinement
         )
 
         # Final activation to ensure output is in [0, 1] range
