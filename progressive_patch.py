@@ -1413,48 +1413,49 @@ class ProgressivePatchTrainer:
         """
         Apply adversarial patch in OCR mode (simplified for cropped license plates).
 
-        The patch fills the entire output canvas. The plate image is resized to
-        center_ratio of the patch dimensions and placed in the center, overwriting
-        the patch in that region.
+        In OCR mode, we work with cropped license plate images directly.
+        The patch is resized to match the image dimensions, then the center region
+        is cut out and replaced with the original plate content.
 
         Args:
             image: [B, 3, H, W] - cropped license plate images
             patch: [3, patch_h, patch_w] - generated adversarial patch (256x512)
-            center_ratio: Fraction of output occupied by the plate (default: 0.6)
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
 
         Returns:
-            result_image: [B, 3, pH, pW] - patch with plate in center
-            center_mask: [B, 3, pH, pW] - mask showing plate region (1) vs patch (0)
+            result_image: [B, 3, H, W] - image with patch applied as border
+            center_mask: [B, 3, H, W] - mask showing preserved center region
         """
         batch_size = image.shape[0]
-        patch_height, patch_width = patch.shape[1], patch.shape[2]
+        image_height, image_width = image.shape[2], image.shape[3]
 
-        # Start with the full patch as the canvas
-        patch_canvas = patch.unsqueeze(0).repeat(batch_size, 1, 1, 1)  # [B, 3, pH, pW]
-
-        # Compute center region size
-        center_h = int(patch_height * center_ratio)
-        center_w = int(patch_width * center_ratio)
-        pad_h = (patch_height - center_h) // 2
-        pad_w = (patch_width - center_w) // 2
-
-        # Resize plate image to fit in the center region
-        plate_resized = F.interpolate(
-            image,  # [B, 3, H, W]
-            size=(center_h, center_w),
+        # Resize patch to match image dimensions
+        patch_resized = F.interpolate(
+            patch.unsqueeze(0),  # [1, 3, patch_h, patch_w]
+            size=(image_height, image_width),
             mode='bilinear',
             align_corners=False
-        )  # [B, 3, center_h, center_w]
+        )  # [1, 3, H, W]
 
-        # Create center mask
-        center_mask = torch.zeros(batch_size, 1, patch_height, patch_width,
+        # Expand to batch size
+        patch_batch = patch_resized.repeat(batch_size, 1, 1, 1)  # [B, 3, H, W]
+
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
+
+        # Calculate padding to center the mask
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
+
+        # Create mask: 1 in center region, 0 elsewhere
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
                                  dtype=torch.float32, device=self.device)
         center_mask[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = 1.0
-        center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, pH, pW]
+        center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
 
-        # Paste plate image into center of patch canvas
-        result_image = patch_canvas.clone()
-        result_image[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = plate_resized
+        # Blend: keep original image in center, use patch on borders
+        result_image = image * center_mask + patch_batch * (1 - center_mask)
         result_image = torch.clamp(result_image, 0, 1)
 
         return result_image, center_mask
@@ -1462,7 +1463,7 @@ class ProgressivePatchTrainer:
     def apply_neutral_border_ocr_mode(self, image: torch.Tensor, center_ratio: float = 0.6,
                                        border_color: float = 0.5) -> torch.Tensor:
         """
-        Place plate image in center of a neutral gray border for baseline comparison.
+        Apply a neutral gray/black border in OCR mode for fair baseline comparison.
 
         This matches the spatial structure of apply_patch_ocr_mode but uses a neutral color
         instead of adversarial content. Used for baseline computation so the only difference
@@ -1471,39 +1472,34 @@ class ProgressivePatchTrainer:
 
         Args:
             image: [B, 3, H, W] - cropped license plate images
-            center_ratio: Fraction of output occupied by the plate (default: 0.6)
+            center_ratio: Fraction of image to preserve in center (default: 0.6)
             border_color: Value for neutral border (default: 0.5 = gray)
 
         Returns:
-            result_image: [B, 3, H, W] - plate centered on neutral border
+            result_image: [B, 3, H, W] - image with neutral border applied
         """
         batch_size = image.shape[0]
         image_height, image_width = image.shape[2], image.shape[3]
 
-        # Use OCR input shape as output size to match apply_patch_ocr_mode
-        out_h = self.ocr_input_shape[0] if hasattr(self, 'ocr_input_shape') else image_height
-        out_w = self.ocr_input_shape[1] if hasattr(self, 'ocr_input_shape') else image_width
+        # Create center mask (1 in center, 0 on borders)
+        center_h = int(image_height * center_ratio)
+        center_w = int(image_width * center_ratio)
 
-        # Start with grey canvas
-        result_image = torch.full((batch_size, 3, out_h, out_w), border_color,
-                                  dtype=torch.float32, device=self.device)
+        # Calculate padding to center the mask
+        pad_h = (image_height - center_h) // 2
+        pad_w = (image_width - center_w) // 2
 
-        # Compute center region size
-        center_h = int(out_h * center_ratio)
-        center_w = int(out_w * center_ratio)
-        pad_h = (out_h - center_h) // 2
-        pad_w = (out_w - center_w) // 2
+        # Create mask: 1 in center region, 0 elsewhere
+        center_mask = torch.zeros(batch_size, 1, image_height, image_width,
+                                 dtype=torch.float32, device=self.device)
+        center_mask[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = 1.0
+        center_mask = center_mask.expand(-1, 3, -1, -1)  # [B, 3, H, W]
 
-        # Resize plate image to fit in the center region
-        plate_resized = F.interpolate(
-            image,
-            size=(center_h, center_w),
-            mode='bilinear',
-            align_corners=False
-        )
+        # Create neutral border (gray by default)
+        neutral_border = torch.full_like(image, border_color)
 
-        # Paste plate image into center
-        result_image[:, :, pad_h:pad_h+center_h, pad_w:pad_w+center_w] = plate_resized
+        # Blend: keep original image in center, use neutral border on borders
+        result_image = image * center_mask + neutral_border * (1 - center_mask)
         result_image = torch.clamp(result_image, 0, 1)
 
         return result_image
