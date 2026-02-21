@@ -645,7 +645,7 @@ class BottleneckDenseRefiner(nn.Module):
         mode_outputs = torch.stack([m(spatial_features) for m in self.proj_modes], dim=1)  # [B, 16, 3, H, W]
 
         # Compute per-pixel blend weights via z → low-res grid → learned ConvTranspose upsample
-        attn_grid = self.attention_proj(z).view(B, self.num_modes, self.attn_grid_h, self.attn_grid_w)
+        attn_grid = self.attention_proj(z).view(batch_size, self.num_modes, self.attn_grid_h, self.attn_grid_w)
         blend_weights = self.attention_upsample(attn_grid)          # [B, 16, H, W]
         blend_weights = torch.softmax(blend_weights, dim=1)         # normalize over modes per pixel
         blend_weights = blend_weights.unsqueeze(2)                  # [B, 16, 1, H, W]
