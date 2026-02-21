@@ -1,0 +1,66 @@
+# Reference configuration: adversarial patch attack on ResNet-50 (ImageNet)
+#
+# Usage (training):
+#   python framework/scripts/train_domain.py framework/configs/classification_resnet50.yaml
+#
+# Usage (CMA-ES black-box):
+#   python framework/scripts/cmaes_domain.py <run_dir> \
+#       --config framework/configs/classification_resnet50.yaml \
+#       --maxiter 100
+
+domain: classification
+
+model:
+  type: resnet50
+  pretrained: true
+
+dataset:
+  root: /data/imagenet
+  split: val
+  max_samples: 500        # cap dataset size for quick experiments
+
+# Attack strategy: border surrounds the subject at center_ratio
+strategy:
+  type: border
+  center_ratio: 0.6
+  neutral_color: 0.5
+
+# Metric: Top-1 accuracy drop (untargeted)
+metric:
+  type: top1_accuracy_drop
+  k: 1
+  # target_class: 207     # uncomment for targeted attack (e.g., class 207 = golden retriever)
+
+# Patch spatial dimensions (must match model.input_shape or be resized)
+patch:
+  height: 224
+  width: 224
+
+# Trainer hyperparameters
+trainer:
+  basis_dim: 16             # latent code dimension
+  patches_per_image: 4      # patches generated per training image per step
+  images_per_batch: 1       # images processed per gradient update
+  max_epochs: 100
+  learning_rate: 1.0e-4
+  vae_lr_ratio: 0.1         # VAE LR = learning_rate * vae_lr_ratio
+  lr_min: 1.0e-6
+  diversity_weight: 1.0
+  quality_weight: 1.0
+  performance_weight: 1.0
+  tv_weight: 2.5
+  spectrum_weight: 1.0
+  use_vae_lora: true
+  lora_rank: 8
+  lora_alpha: 16
+  bottleneck_dim: 256
+  use_omniglot: false
+  output_dir: framework_output/classification_resnet50
+  val_split: 0.2
+
+# CMA-ES parameters (for cmaes_domain.py)
+cmaes:
+  popsize: 20
+  maxiter: 100
+  sigma0: 0.5
+  n_eval_samples: 50
