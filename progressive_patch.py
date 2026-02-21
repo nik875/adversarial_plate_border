@@ -522,6 +522,12 @@ class BottleneckDenseRefiner(nn.Module):
         """
         batch_size = patches.shape[0]
 
+        # Save logit of input patches for residual connection at the end.
+        # Converts the upstream VAE output (already Sigmoid-bounded, [0,1]) to logit space
+        # so we can add the refiner's correction before the final Sigmoid.
+        # At init the correction is small so output ≈ input patches (not grey).
+        patches_logit = torch.logit(patches.clamp(1e-6, 1 - 1e-6))  # [B, 3, H, W]
+
         # Compress spatial dimensions
         compressed = self.compress(patches)  # [B, 128, 32, 64]
 
@@ -633,6 +639,10 @@ class BottleneckDenseRefiner(nn.Module):
 
         # Apply post-multi-scale smoothing with progressive kernel sizes
         refined_patches = self.post_expansion_smooth(refined_patches)  # [B, 3, H, W]
+
+        # Residual: add logit of input patches so refiner output is a correction on top of VAE.
+        # Prevents collapse to grey: at init the correction is small, so output ≈ VAE patches.
+        refined_patches = refined_patches + patches_logit
 
         # Apply final activation to ensure output is strictly in [0, 1]
         refined_patches = self.final_activation(refined_patches)
