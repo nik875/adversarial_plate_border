@@ -1,0 +1,105 @@
+# ===========================================================================
+# Ensemble Adversarial Training — Reference Configuration
+# ===========================================================================
+#
+# Usage:
+#   python framework/scripts/train_ensemble.py framework/configs/ensemble_example.yaml
+#   python framework/scripts/train_ensemble.py framework/configs/ensemble_example.yaml \
+#       --epochs 1 --max-steps 2 --device cpu
+#
+# This file uses synthetic models and datasets (no real checkpoints required)
+# so it can serve as an immediate smoke test.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Compute
+# ---------------------------------------------------------------------------
+compute_device: cpu    # set to "cuda" or "mps" for GPU
+
+# ---------------------------------------------------------------------------
+# Number of distinct strategies (used to size the TaskEncoder one-hot).
+# Must be >= max strategy_id + 1 across all model entries.
+# ---------------------------------------------------------------------------
+num_strategies: 3      # 0 = border, 1 = sticker, 2 = perturbation
+
+# ---------------------------------------------------------------------------
+# Model pool
+# Each entry is registered with the EnsembleModelPool at startup.
+# The "architecture" key is interpreted by train_ensemble.py.
+# ---------------------------------------------------------------------------
+models:
+  - name: simple_cnn_border
+    architecture: simple_cnn     # handled by train_ensemble.py (synthetic model)
+    num_classes: 10
+    domain_type: classification
+    strategy: border
+    strategy_id: 0
+    input_shape: [64, 64]
+    center_ratio: 0.6
+
+  - name: simple_cnn_sticker
+    architecture: simple_cnn
+    num_classes: 10
+    domain_type: classification
+    strategy: sticker
+    strategy_id: 1
+    input_shape: [64, 64]
+    sticker_h: 32
+    sticker_w: 32
+
+# ---------------------------------------------------------------------------
+# Dataset pool
+# Each entry is registered with the LazyDatasetPool.
+# Set synthetic: true to generate random images on-the-fly (no real images).
+# ---------------------------------------------------------------------------
+datasets:
+  - name: synthetic_dataset
+    root: /tmp/synthetic_images    # created automatically if synthetic: true
+    domain_type: generic
+    max_samples: 100
+    synthetic: true                # train_ensemble.py creates random PNG images here
+
+# ---------------------------------------------------------------------------
+# Priors (character-texture decoders)
+# Leave empty for no character conditioning.
+# ---------------------------------------------------------------------------
+priors: []
+
+# ---------------------------------------------------------------------------
+# TaskEncoder hyperparameters
+# ---------------------------------------------------------------------------
+task_encoder:
+  hidden_dim: 64
+  num_layers: 2
+  alpha: 0.5
+
+# ---------------------------------------------------------------------------
+# Generator hyperparameters
+# ---------------------------------------------------------------------------
+generator:
+  latent_dim: 16
+  patch_height: 64
+  patch_width: 64
+  use_vae_lora: false          # set true for real training (requires SDXL VAE)
+  lora_rank: 4
+  lora_alpha: 8
+  bottleneck_dim: 64
+  char_embed_dim: 32
+
+# ---------------------------------------------------------------------------
+# EnsembleTrainer hyperparameters
+# ---------------------------------------------------------------------------
+trainer:
+  k_neurons: 100               # use 10000 for real training
+  patches_per_batch: 2
+  diversity_weight: 1.0
+  quality_weight: 1.0
+  tv_weight: 2.5
+  spectrum_weight: 1.0
+  learning_rate: 1.0e-4
+  vae_lr_ratio: 0.1
+  lr_min: 1.0e-6
+  max_epochs: 10
+  steps_per_epoch: 5           # use 100+ for real training
+  save_every_epochs: 5
+  output_dir: ensemble_output

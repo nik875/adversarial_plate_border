@@ -660,6 +660,576 @@ class TestIntegration(unittest.TestCase):
 
 
 # =============================================================================
+# Test: TaskEncoder
+# =============================================================================
+
+class TestTaskEncoder(unittest.TestCase):
+    """Test TaskEncoder initialization and forward pass."""
+
+    def setUp(self):
+        from framework.task_encoder import TaskEncoder
+        self.TaskEncoder = TaskEncoder
+
+    def test_init(self):
+        enc = self.TaskEncoder(
+            num_models=3, num_strategies=3, num_datasets=2,
+            latent_dim=8, hidden_dim=32, num_layers=2, alpha=0.5,
+        )
+        self.assertIsNotNone(enc)
+
+    def test_zero_delta_at_init(self):
+        """Final Linear is zero-initialized → task_delta = 0 → z_enriched = z."""
+        enc = self.TaskEncoder(
+            num_models=3, num_strategies=3, num_datasets=2,
+            latent_dim=8, hidden_dim=32, num_layers=2, alpha=0.5,
+        )
+        z = torch.randn(2, 8)
+        mi = torch.zeros(2, dtype=torch.long)
+        si = torch.zeros(2, dtype=torch.long)
+        di = torch.zeros(2, dtype=torch.long)
+        z_enc = enc(z, mi, si, di)
+        self.assertTrue(torch.allclose(z_enc, z),
+                        msg="z_enriched should equal z at init (delta=0)")
+
+    def test_forward_shape(self):
+        enc = self.TaskEncoder(
+            num_models=4, num_strategies=3, num_datasets=5, latent_dim=16,
+        )
+        B = 3
+        z = torch.randn(B, 16)
+        mi = torch.randint(0, 4, (B,))
+        si = torch.randint(0, 3, (B,))
+        di = torch.randint(0, 5, (B,))
+        out = enc(z, mi, si, di)
+        self.assertEqual(out.shape, (B, 16))
+
+    def test_alpha_bounds_shift(self):
+        """z_enriched should be within alpha=1.0 of z (since Tanh ∈ [-1,1])."""
+        enc = self.TaskEncoder(
+            num_models=2, num_strategies=2, num_datasets=2,
+            latent_dim=8, hidden_dim=16, num_layers=2, alpha=1.0,
+        )
+        # Give the final layer non-zero weights so delta isn't trivially 0
+        with torch.no_grad():
+            enc.mlp[-2].weight.fill_(0.1)
+            enc.mlp[-2].bias.fill_(0.0)
+
+        z = torch.zeros(1, 8)
+        mi = torch.tensor([0]); si = torch.tensor([0]); di = torch.tensor([0])
+        z_enc = enc(z, mi, si, di)
+        diff = (z_enc - z).abs().max().item()
+        self.assertLessEqual(diff, 1.0 + 1e-5,
+                             msg="shift must be ≤ alpha * 1 = 1.0")
+
+
+# =============================================================================
+# Test: NeuronSampler
+# =============================================================================
+
+class TestNeuronSampler(unittest.TestCase):
+    """Test NeuronSampler layer discovery and activation capture."""
+
+    def setUp(self):
+        from framework.neuron_sampler import NeuronSampler
+        self.NeuronSampler = NeuronSampler
+        self.device = torch.device('cpu')
+
+    def _tiny_model(self):
+        return SimpleTestModel(num_classes=5)
+
+    def test_discover_layers(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        shapes = sampler.discover_layers(model, (3, 32, 32))
+        self.assertGreater(len(shapes), 0, "Should find at least one layer")
+        # All values should be non-empty tuples
+        for name, shape in shapes.items():
+            self.assertIsInstance(shape, tuple)
+            self.assertGreater(len(shape), 0)
+
+    def test_discover_layers_cached(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        shapes1 = sampler.discover_layers(model, (3, 32, 32))
+        shapes2 = sampler.discover_layers(model, (3, 32, 32))
+        self.assertIs(shapes1, shapes2, "Second call should return cached dict")
+
+    def test_sample_neurons_length(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        k = 50
+        neurons = sampler.sample_neurons(model, k, (3, 32, 32))
+        self.assertEqual(len(neurons), k)
+        for name, flat_idx in neurons:
+            self.assertIsInstance(name, str)
+            self.assertIsInstance(flat_idx, int)
+
+    def test_sample_neurons_spread(self):
+        """Neurons should be sampled from more than one layer."""
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        neurons = sampler.sample_neurons(model, 200, (3, 32, 32))
+        unique_layers = len(set(name for name, _ in neurons))
+        self.assertGreater(unique_layers, 1,
+                           msg="Neurons should span multiple layers")
+
+    def test_capture_no_grad(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        k = 20
+        neurons = sampler.sample_neurons(model, k, (3, 32, 32))
+        inp = torch.randn(1, 3, 32, 32)
+        acts = sampler.capture_sampled_activations(model, inp, neurons, no_grad=True)
+
+        self.assertEqual(acts.shape, (k,))
+        self.assertFalse(acts.requires_grad, "no_grad=True should return detached tensor")
+
+    def test_capture_with_grad(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        k = 10
+        neurons = sampler.sample_neurons(model, k, (3, 32, 32))
+        inp = torch.randn(1, 3, 32, 32, requires_grad=True)
+        acts = sampler.capture_sampled_activations(model, inp, neurons, no_grad=False)
+
+        self.assertEqual(acts.shape, (k,))
+        # Gradient should flow through inp
+        acts.sum().backward()
+        self.assertIsNotNone(inp.grad)
+
+    def test_invalidate(self):
+        sampler = self.NeuronSampler(self.device)
+        model = self._tiny_model()
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+
+        sampler.discover_layers(model, (3, 32, 32))
+        self.assertIn(id(model), sampler._shape_cache)
+        sampler.invalidate(model)
+        self.assertNotIn(id(model), sampler._shape_cache)
+
+
+# =============================================================================
+# Test: LazyDatasetPool
+# =============================================================================
+
+class TestDatasetPool(unittest.TestCase):
+    """Test LazyDatasetPool registration, discovery, and sampling."""
+
+    def setUp(self):
+        from framework.dataset_pool import LazyDatasetPool, SampledItem
+        self.LazyDatasetPool = LazyDatasetPool
+        self.SampledItem = SampledItem
+
+    def _make_png_dir(self, tmpdir: str, n: int = 5) -> str:
+        """Create n small synthetic PNG images in tmpdir."""
+        from PIL import Image
+        import numpy as np
+        d = Path(tmpdir) / 'imgs'
+        d.mkdir(exist_ok=True)
+        for i in range(n):
+            arr = np.random.randint(0, 256, (32, 32, 3), dtype=np.uint8)
+            Image.fromarray(arr, 'RGB').save(d / f'img_{i}.png')
+        return str(d)
+
+    def test_register_and_num_datasets(self):
+        pool = self.LazyDatasetPool()
+        id0 = pool.register('d0', '/tmp/fake0')
+        id1 = pool.register('d1', '/tmp/fake1')
+        self.assertEqual(pool.num_datasets(), 2)
+        self.assertEqual(id0, 0)
+        self.assertEqual(id1, 1)
+
+    def test_register_paths_and_sample(self):
+        import tempfile
+        from PIL import Image
+        import numpy as np
+
+        pool = self.LazyDatasetPool()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a real image
+            p = Path(tmpdir) / 'test.png'
+            arr = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+            Image.fromarray(arr, 'RGB').save(str(p))
+
+            did = pool.register_paths('synthetic', [str(p)])
+            item = pool.sample_from(did)
+
+        self.assertIsInstance(item, self.SampledItem)
+        self.assertEqual(item.image.shape[0], 3)
+        self.assertEqual(item.dataset_id, did)
+
+    def test_sample_returns_correct_dtype(self):
+        import tempfile
+        from PIL import Image
+        import numpy as np
+
+        pool = self.LazyDatasetPool()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / 'x.png'
+            Image.fromarray(
+                np.random.randint(0, 256, (32, 32, 3), dtype=np.uint8), 'RGB'
+            ).save(str(p))
+            did = pool.register_paths('test', [str(p)])
+            item = pool.sample_from(did)
+
+        self.assertEqual(item.image.dtype, torch.float32)
+        self.assertGreaterEqual(item.image.min().item(), 0.0)
+        self.assertLessEqual(item.image.max().item(), 1.0 + 1e-5)
+
+
+# =============================================================================
+# Test: PriorRegistry
+# =============================================================================
+
+class TestPriorRegistry(unittest.TestCase):
+    """Test PriorRegistry initialization (no JIT decoder needed for basic tests)."""
+
+    def setUp(self):
+        from framework.priors import PriorRegistry
+        self.PriorRegistry = PriorRegistry
+
+    def test_init_empty(self):
+        reg = self.PriorRegistry(patch_height=64, patch_width=64, latent_dim=8)
+        self.assertEqual(reg.num_output_channels, 0)
+
+    def test_forward_empty(self):
+        """Empty registry forward should return empty list."""
+        reg = self.PriorRegistry(patch_height=64, patch_width=64, latent_dim=8)
+        z = torch.randn(2, 8)
+        out = reg(z)
+        self.assertEqual(out, [])
+
+    def test_num_output_channels_formula(self):
+        """num_output_channels = num_priors × 4 (4 scales)."""
+        reg = self.PriorRegistry(patch_height=64, patch_width=64, latent_dim=8)
+        # Simulate 2 priors without actually loading JIT decoders
+        reg._decoders['fake1'] = None
+        reg._decoders['fake2'] = None
+        self.assertEqual(reg.num_output_channels, 8)
+
+    def test_add_prior_missing_file(self):
+        """add_prior with non-existent file should raise FileNotFoundError."""
+        reg = self.PriorRegistry(patch_height=64, patch_width=64, latent_dim=8)
+        with self.assertRaises(FileNotFoundError):
+            reg.add_prior('missing', '/nonexistent/path/decoder.pt')
+
+
+# =============================================================================
+# Test: EnsembleModelPool
+# =============================================================================
+
+class TestEnsembleModelPool(unittest.TestCase):
+    """Test EnsembleModelPool register/sample/on_device."""
+
+    def setUp(self):
+        from framework.ensemble import EnsembleModelPool
+        from framework.base.attack_strategy import BorderStrategy
+        self.EnsembleModelPool = EnsembleModelPool
+        self.BorderStrategy = BorderStrategy
+
+    def _make_entry(self, pool, name: str, strategy_id: int = 0):
+        model = SimpleTestModel(num_classes=5)
+        pool.register(
+            name=name,
+            model=model,
+            domain_type='classification',
+            strategy=self.BorderStrategy(),
+            strategy_id=strategy_id,
+            input_shape=(64, 64),
+            preprocess_fn=lambda x: x,
+        )
+
+    def test_register_freezes_params(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'model_a')
+        entry = pool.get_entry(0)
+        for p in entry._model.parameters():
+            self.assertFalse(p.requires_grad, "All params should be frozen")
+
+    def test_register_moves_to_cpu(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'model_b')
+        entry = pool.get_entry(0)
+        for p in entry._model.parameters():
+            self.assertEqual(p.device.type, 'cpu')
+
+    def test_num_models(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'a', strategy_id=0)
+        self._make_entry(pool, 'b', strategy_id=1)
+        self.assertEqual(pool.num_models(), 2)
+
+    def test_num_strategies(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'a', strategy_id=0)
+        self._make_entry(pool, 'b', strategy_id=0)   # same strategy
+        self._make_entry(pool, 'c', strategy_id=1)
+        self.assertEqual(pool.num_strategies(), 2)
+
+    def test_sample_entry_random(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'a')
+        entry = pool.sample_entry()
+        self.assertEqual(entry.name, 'a')
+
+    def test_on_device_cpu(self):
+        pool = self.EnsembleModelPool(compute_device=torch.device('cpu'))
+        self._make_entry(pool, 'test')
+        entry = pool.get_entry(0)
+        with pool.on_device(entry) as model:
+            self.assertIsNotNone(model)
+            inp = torch.randn(1, 3, 64, 64)
+            out = model(inp)
+            self.assertEqual(out.shape[0], 1)
+        # Model should be back on CPU after context exit
+        for p in entry._model.parameters():
+            self.assertEqual(p.device.type, 'cpu')
+
+
+# =============================================================================
+# Test: EnsembleTrainer smoke test
+# =============================================================================
+
+class TestEnsembleTrainer(unittest.TestCase):
+    """Smoke-test EnsembleTrainer._train_step() on CPU with synthetic data."""
+
+    def _build_trainer(self, tmpdir: str):
+        """Build a minimal EnsembleTrainer for testing."""
+        import tempfile
+        from PIL import Image
+        import numpy as np
+        from framework.ensemble import EnsembleModelPool, EnsembleTrainer
+        from framework.task_encoder import TaskEncoder
+        from framework.dataset_pool import LazyDatasetPool
+        from framework.neuron_sampler import NeuronSampler
+        from framework.base.attack_strategy import BorderStrategy
+
+        device = torch.device('cpu')
+
+        # Minimal model
+        model = SimpleTestModel(num_classes=5)
+
+        # Dataset pool with a real image
+        img_path = Path(tmpdir) / 'test.png'
+        arr = np.random.randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        Image.fromarray(arr, 'RGB').save(str(img_path))
+
+        dataset_pool = LazyDatasetPool()
+        dataset_pool.register_paths('test', [str(img_path)])
+
+        # Ensemble pool
+        pool = EnsembleModelPool(compute_device=device)
+        pool.register(
+            name='tiny_cnn',
+            model=model,
+            domain_type='classification',
+            strategy=BorderStrategy(),
+            strategy_id=0,
+            input_shape=(64, 64),
+            preprocess_fn=lambda x: x,
+        )
+
+        # TaskEncoder
+        task_enc = TaskEncoder(
+            num_models=1, num_strategies=3, num_datasets=1,
+            latent_dim=4, hidden_dim=16, num_layers=2,
+        )
+
+        # Tiny generator (no VAE — can't load SDXL in unit tests)
+        # We'll use a mock generator that just returns random patches
+        class MockGenerator(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.latent_dim = 4
+                self.patch_height = 64
+                self.patch_width = 64
+                self.conv = nn.Conv2d(1, 3, 1)
+
+            def forward(self, z, z_enriched=None):
+                B = z.shape[0]
+                noise = torch.rand(B, 3, 64, 64)
+                return self.conv(noise[:, :1])  # [B, 3, 64, 64]
+
+            # Stubs so EnsembleTrainer can navigate
+            @property
+            def vae(self):
+                return nn.Module()
+
+            @property
+            def bottleneck_refiner(self):
+                return None
+
+        gen = MockGenerator()
+
+        sampler = NeuronSampler(device)
+
+        trainer = EnsembleTrainer(
+            ensemble=pool,
+            dataset_pool=dataset_pool,
+            task_encoder=task_enc,
+            generator=gen,
+            neuron_sampler=sampler,
+            k_neurons=10,
+            patches_per_batch=2,
+            diversity_weight=1.0,
+            quality_weight=1.0,
+            tv_weight=0.0,      # off to keep test fast
+            spectrum_weight=0.0,
+            learning_rate=1e-3,
+            max_epochs=1,
+            output_dir=tmpdir,
+            save_every_epochs=1,
+            device=device,
+        )
+        return trainer
+
+    def test_train_step_runs(self):
+        """A single _train_step should complete without error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = self._build_trainer(tmpdir)
+            # Build a real optimizer for the mock generator
+            optimizer = torch.optim.Adam(
+                list(trainer.generator.parameters())
+                + list(trainer.task_encoder.parameters()), lr=1e-3
+            )
+            optimizer.zero_grad()
+            info = trainer._train_step(optimizer)
+            self.assertIn('loss', info)
+            self.assertIsInstance(info['loss'], float)
+
+    def test_train_loop_runs(self):
+        """Full train() with 2 steps should complete without error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer = self._build_trainer(tmpdir)
+            trainer.train(steps_per_epoch=2, max_steps=2)
+
+
+# =============================================================================
+# Test: EnsembleConfig loading
+# =============================================================================
+
+class TestEnsembleConfigLoader(unittest.TestCase):
+    """Test load_ensemble_config() with a minimal YAML."""
+
+    def test_load_ensemble_config_minimal(self):
+        from framework.config_loader import load_ensemble_config
+
+        config_path = _PROJECT_ROOT / 'framework' / 'configs' / 'ensemble_example.yaml'
+        if not config_path.exists():
+            self.skipTest(f"Ensemble config not found: {config_path}")
+
+        cfg = load_ensemble_config(str(config_path))
+
+        self.assertIsNotNone(cfg.ensemble_pool)
+        self.assertIsNotNone(cfg.dataset_pool)
+        self.assertIsNotNone(cfg.task_encoder)
+        self.assertIsNotNone(cfg.generator_cfg)
+        self.assertIsNotNone(cfg.trainer_cfg)
+        self.assertIsInstance(cfg.models_cfg, list)
+
+    def test_task_encoder_dimensions(self):
+        """TaskEncoder dimensions should match YAML model/dataset counts."""
+        from framework.config_loader import load_ensemble_config
+
+        config_path = _PROJECT_ROOT / 'framework' / 'configs' / 'ensemble_example.yaml'
+        if not config_path.exists():
+            self.skipTest(f"Ensemble config not found: {config_path}")
+
+        cfg = load_ensemble_config(str(config_path))
+        te = cfg.task_encoder
+        # ensemble_example.yaml has 2 models and 1 dataset
+        self.assertEqual(te.num_models, len(cfg.models_cfg))
+        self.assertEqual(te.num_datasets, cfg.dataset_pool.num_datasets())
+
+
+# =============================================================================
+# Test: migrate_checkpoint
+# =============================================================================
+
+class TestMigrateCheckpoint(unittest.TestCase):
+    """Test that migrate_checkpoint correctly upgrades old state dicts."""
+
+    def test_attention_proj_migration(self):
+        from framework.generator_loader import migrate_checkpoint
+
+        # Simulate an old state dict with a single Linear attention_proj
+        old_sd = {
+            'bottleneck_refiner.attention_proj.weight': torch.randn(32, 16),
+            'bottleneck_refiner.attention_proj.bias':   torch.zeros(32),
+        }
+        new_sd = migrate_checkpoint(old_sd)
+
+        self.assertIn('bottleneck_refiner.attention_proj.0.weight', new_sd)
+        self.assertIn('bottleneck_refiner.attention_proj.2.weight', new_sd)
+        self.assertIn('bottleneck_refiner.attention_proj.4.weight', new_sd)
+        # Old keys should be gone
+        self.assertNotIn('bottleneck_refiner.attention_proj.weight', new_sd)
+        # Final layer should carry old weights
+        self.assertTrue(torch.allclose(
+            new_sd['bottleneck_refiner.attention_proj.4.weight'],
+            old_sd['bottleneck_refiner.attention_proj.weight']
+        ))
+
+    def test_cnn_refiner_channel_migration(self):
+        from framework.generator_loader import migrate_checkpoint
+
+        old_sd = {
+            'cnn_refiner.0.weight': torch.randn(64, 4, 3, 3),
+        }
+        new_sd = migrate_checkpoint(old_sd)
+
+        self.assertEqual(new_sd['cnn_refiner.0.weight'].shape, (64, 7, 3, 3))
+        # First 4 channels should be unchanged
+        self.assertTrue(torch.allclose(
+            new_sd['cnn_refiner.0.weight'][:, :4],
+            old_sd['cnn_refiner.0.weight']
+        ))
+        # Extra 3 channels should be zero
+        self.assertTrue(
+            new_sd['cnn_refiner.0.weight'][:, 4:].abs().max().item() == 0.0
+        )
+
+    def test_no_migration_needed(self):
+        """State dict without old keys should pass through unchanged."""
+        from framework.generator_loader import migrate_checkpoint
+
+        sd = {
+            'some_param': torch.randn(3, 3),
+            'cnn_refiner.0.weight': torch.randn(64, 7, 3, 3),  # already 7 ch
+        }
+        new_sd = migrate_checkpoint(sd)
+        # cnn_refiner already has 7 channels → no change
+        self.assertEqual(new_sd['cnn_refiner.0.weight'].shape, (64, 7, 3, 3))
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -682,6 +1252,15 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestGeneratorLoader))
     suite.addTests(loader.loadTestsFromTestCase(TestLosses))
     suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
+    # --- New ensemble tests ---
+    suite.addTests(loader.loadTestsFromTestCase(TestTaskEncoder))
+    suite.addTests(loader.loadTestsFromTestCase(TestNeuronSampler))
+    suite.addTests(loader.loadTestsFromTestCase(TestDatasetPool))
+    suite.addTests(loader.loadTestsFromTestCase(TestPriorRegistry))
+    suite.addTests(loader.loadTestsFromTestCase(TestEnsembleModelPool))
+    suite.addTests(loader.loadTestsFromTestCase(TestEnsembleTrainer))
+    suite.addTests(loader.loadTestsFromTestCase(TestEnsembleConfigLoader))
+    suite.addTests(loader.loadTestsFromTestCase(TestMigrateCheckpoint))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

@@ -23,6 +23,14 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from diffusers import AutoencoderKL
 
+# PriorRegistry is imported lazily inside BottleneckDenseRefiner to avoid
+# a circular import if priors.py ever imports from generator.py.
+# Type-hint only:
+try:
+    from framework.priors import PriorRegistry as _PriorRegistry
+except ImportError:
+    _PriorRegistry = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # LoRA modules
@@ -167,15 +175,26 @@ class BottleneckDenseRefiner(nn.Module):
         patch_width: int = 512,
         latent_dim: int = 16,
         bottleneck_dim: int = 256,
-        use_omniglot: bool = True,
+        prior_registry: Optional[object] = None,
     ):
+        """
+        Args:
+            patch_height:    output patch height in pixels
+            patch_width:     output patch width in pixels
+            latent_dim:      latent code dimensionality
+            bottleneck_dim:  width of the dense bottleneck layer
+            prior_registry:  optional PriorRegistry; if provided its num_output_channels
+                             extra channels are concatenated before spatial_layers.
+                             Pass None for no character conditioning.
+        """
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
         self.latent_dim = latent_dim
         self.bottleneck_dim = bottleneck_dim
-        self.use_omniglot = use_omniglot
+        # Store for attribute lookup (e.g. by checkpoint savers)
+        self.prior_registry: Optional[object] = prior_registry
 
         self.compress = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, stride=4, padding=1),
@@ -217,62 +236,40 @@ class BottleneckDenseRefiner(nn.Module):
         self.post_expansion_smooth = DilatedResidualSmoother()
         self.final_activation = nn.Sigmoid()
 
-        self.scales = [8, 16, 32, 64]
+        # Compute number of extra channels from PriorRegistry (0 if None)
+        prior_channels = 0
+        if prior_registry is not None:
+            prior_channels = prior_registry.num_output_channels
 
-        if use_omniglot:
-            print("Loading Omniglot decoder for character conditioning...")
-            omniglot_decoder_path = Path(__file__).parent.parent / "omniglot_ae_export" / "decoder_traced.pt"
-            if omniglot_decoder_path.exists():
-                self.omniglot_decoder = torch.jit.load(str(omniglot_decoder_path), map_location="cpu")
-                self.omniglot_decoder.train()
-                print(f"✓ Omniglot decoder loaded from {omniglot_decoder_path} (trainable)")
-            else:
-                raise FileNotFoundError(
-                    f"Omniglot decoder not found at {omniglot_decoder_path}. "
-                    f"Please ensure omniglot_ae_export/decoder_traced.pt exists."
-                )
-
-            self.scale_mlps = nn.ModuleDict()
-            self.char_embed_dim = 32
-
-            for scale in self.scales:
-                num_patches_h = patch_height // scale
-                num_patches_w = patch_width // scale
-                output_size = self.char_embed_dim * num_patches_h * num_patches_w
-                mlp = nn.Sequential(
-                    nn.Linear(latent_dim, 64),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(64, 64),
-                    nn.SiLU(inplace=True),
-                    nn.Linear(64, output_size),
-                )
-                self.scale_mlps[str(scale)] = mlp
-
-            self.spatial_layers = nn.Sequential(
-                nn.Conv2d(10, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-            )
+        spatial_in_channels = 3 + 3 + prior_channels  # patches + refined + prior feats
+        if prior_channels > 0:
+            print(f"PriorRegistry active: {prior_channels} extra channels "
+                  f"({prior_channels // 4} prior(s) × 4 scales)")
         else:
-            print("Omniglot character conditioning disabled.")
-            self.spatial_layers = nn.Sequential(
-                nn.Conv2d(6, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(64, 32, kernel_size=3, padding=1),
-                nn.SiLU(inplace=True),
-            )
+            print("No character-prior conditioning (prior_registry=None).")
+
+        self.spatial_layers = nn.Sequential(
+            nn.Conv2d(spatial_in_channels, 32, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
+        )
 
         self.num_modes = 16
         self.proj_modes = nn.ModuleList([nn.Conv2d(32, 3, kernel_size=1) for _ in range(self.num_modes)])
 
         self.attn_grid_h = patch_height // 32
         self.attn_grid_w = patch_width // 32
-        self.attention_proj = nn.Linear(latent_dim, self.num_modes * self.attn_grid_h * self.attn_grid_w)
+        # Change A: deeper attention projection (3-layer MLP instead of single Linear)
+        self.attention_proj = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.SiLU(inplace=True),
+            nn.Linear(128, 256),
+            nn.SiLU(inplace=True),
+            nn.Linear(256, self.num_modes * self.attn_grid_h * self.attn_grid_w),
+        )
         self.attention_upsample = nn.Sequential(
             nn.ConvTranspose2d(self.num_modes, 32, kernel_size=4, stride=4),
             nn.SiLU(inplace=True),
@@ -317,29 +314,10 @@ class BottleneckDenseRefiner(nn.Module):
             refined = F.interpolate(refined, size=(self.patch_height, self.patch_width),
                                     mode='bilinear', align_corners=True)
 
-        if self.use_omniglot:
-            char_features_list = []
-            for scale in self.scales:
-                mlp = self.scale_mlps[str(scale)]
-                num_patches_h = self.patch_height // scale
-                num_patches_w = self.patch_width // scale
-                num_patches = num_patches_h * num_patches_w
-
-                mlp_output = mlp(z)
-                char_embeddings = mlp_output.view(batch_size, num_patches, self.char_embed_dim)
-                char_embeddings_flat = char_embeddings.view(batch_size * num_patches, self.char_embed_dim)
-
-                self.omniglot_decoder = self.omniglot_decoder.to(char_embeddings_flat.device)
-                characters = self.omniglot_decoder(char_embeddings_flat)
-
-                characters_resized = F.interpolate(characters, size=(scale, scale),
-                                                   mode='bilinear', align_corners=True)
-                characters_resized = characters_resized.view(batch_size, num_patches_h, num_patches_w, 1, scale, scale)
-                characters_resized = characters_resized.permute(0, 3, 1, 4, 2, 5).contiguous()
-                char_scale = characters_resized.view(batch_size, 1, self.patch_height, self.patch_width)
-                char_features_list.append(char_scale)
-
-            combined = torch.cat([patches, refined] + char_features_list, dim=1)
+        if self.prior_registry is not None:
+            # Change B: use PriorRegistry instead of hardcoded omniglot
+            prior_feats = self.prior_registry(z)   # List[[B, 1, H, W]]
+            combined = torch.cat([patches, refined] + prior_feats, dim=1)
         else:
             combined = torch.cat([patches, refined], dim=1)
 
@@ -382,17 +360,38 @@ class FoundationPatchGenerator(nn.Module):
         lora_alpha: int = 16,
         use_bottleneck_refiner: bool = True,
         bottleneck_dim: int = 256,
-        use_omniglot: bool = True,
+        use_omniglot: bool = False,
+        prior_registry: Optional[object] = None,
     ):
+        """
+        Args:
+            latent_dim:       latent code dimensionality (z has shape [B, latent_dim])
+            patch_height:     output patch height in pixels
+            patch_width:      output patch width in pixels
+            num_layers:       number of layers in the progressive layer schedule
+            use_vae_lora:     if True, inject LoRA into the VAE decoder
+            lora_rank:        LoRA rank
+            lora_alpha:       LoRA alpha scaling factor
+            use_bottleneck_refiner: kept for API compatibility; refiner always built
+            bottleneck_dim:   dense bottleneck layer width
+            use_omniglot:     DEPRECATED — kept for backward compatibility with trainer.py.
+                              If True and prior_registry is None, a PriorRegistry with the
+                              default omniglot decoder is constructed automatically.
+            prior_registry:   PriorRegistry instance (takes precedence over use_omniglot).
+                              Pass None and use_omniglot=False for no character priors.
+        """
         super().__init__()
 
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
+        # Store for backward compat (trainer.py reads this via getattr)
+        self.use_omniglot = use_omniglot
 
+        # VAE latent space dimensions — FIXED by SDXL VAE (do NOT change)
         self.vae_latent_h = patch_height // 8
         self.vae_latent_w = patch_width // 8
-        self.vae_latent_channels = 4
+        self.vae_latent_channels = 4   # fixed SD VAE channel count
         self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
 
         print("Loading Stable Diffusion VAE decoder...")
@@ -406,7 +405,26 @@ class FoundationPatchGenerator(nn.Module):
         self.use_vae_lora = use_vae_lora
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.use_omniglot = use_omniglot
+
+        # Resolve prior_registry: explicit arg takes precedence over use_omniglot
+        if prior_registry is not None:
+            self._prior_registry = prior_registry
+        elif use_omniglot:
+            # Backward-compat: auto-build a PriorRegistry with the omniglot decoder
+            from framework.priors import PriorRegistry
+            omni_path = Path(__file__).parent.parent / "omniglot_ae_export" / "decoder_traced.pt"
+            if omni_path.exists():
+                _reg = PriorRegistry(patch_height, patch_width, latent_dim)
+                _reg.add_prior('omniglot', str(omni_path))
+                self._prior_registry = _reg
+                print(f"✓ Omniglot prior auto-loaded from {omni_path}")
+            else:
+                raise FileNotFoundError(
+                    f"use_omniglot=True but omniglot decoder not found at {omni_path}. "
+                    f"Use prior_registry= to specify an explicit PriorRegistry instead."
+                )
+        else:
+            self._prior_registry = None
 
         if self.use_vae_lora:
             print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
@@ -439,8 +457,10 @@ class FoundationPatchGenerator(nn.Module):
             nn.Sigmoid()
         )
 
+        # Change C: first Conv2d now takes 7 channels:
+        #   3 (vae_output) + 3 (btl_out from BottleneckDenseRefiner) + 1 (skip scalar)
         self.cnn_refiner = nn.Sequential(
-            nn.Conv2d(4, 64, kernel_size=3, padding=1),
+            nn.Conv2d(7, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
@@ -481,40 +501,60 @@ class FoundationPatchGenerator(nn.Module):
 
         self.bottleneck_refiner = BottleneckDenseRefiner(
             patch_height, patch_width, latent_dim, bottleneck_dim,
-            use_omniglot=use_omniglot)
+            prior_registry=self._prior_registry)
         print(f"Bottleneck dense refiner enabled (bottleneck_dim={bottleneck_dim})")
-        print("CNN refiner initialized: 4 → 64 → 64 → 128 → 128 → 64 → 64 channels")
+        print("CNN refiner initialized: 7 → 64 → 64 → 128 → 128 → 64 → 64 channels")
         print("Patch projector: 65 → 32 → 3 channels (1×1 convolutions)")
 
-    def forward(self, z: Tensor) -> Tensor:
+    def forward(self, z: Tensor, z_enriched: Optional[Tensor] = None) -> Tensor:
         """
+        Change D: new execution order — bottleneck runs BEFORE the CNN.
+
+        The CNN now sees both the enriched bottleneck output and the original
+        high-resolution VAE pixels via a skip, giving gradients a direct path
+        from the patch loss back to the VAE without passing through the lossy
+        bottleneck pooling.
+
         Args:
-            z: [B, latent_dim]
+            z:          [B, latent_dim]   base latent codes
+            z_enriched: [B, latent_dim]   task-conditioned codes (from TaskEncoder).
+                        If None, falls back to z (backward-compatible with trainer.py).
+
         Returns:
             patches: [B, 3, patch_height, patch_width] in [0, 1]
         """
-        batch_size = z.shape[0]
+        if z_enriched is None:
+            z_enriched = z
 
-        vae_latent_flat = self.adapter(z)
+        batch_size = z_enriched.shape[0]
+
+        # 1. VAE decode: z_enriched → vae_latent → vae_output
+        vae_latent_flat = self.adapter(z_enriched)
         vae_latent = vae_latent_flat.view(
-            batch_size, self.vae_latent_channels, self.vae_latent_h, self.vae_latent_w)
+            batch_size, self.vae_latent_channels,
+            self.vae_latent_h, self.vae_latent_w)
 
         vae_output = self.vae.decode(vae_latent).sample
         vae_output = torch.clamp(vae_output, 0.0, 1.0)
 
         if vae_output.shape[2] != self.patch_height or vae_output.shape[3] != self.patch_width:
-            vae_output = F.interpolate(vae_output, size=(self.patch_height, self.patch_width),
-                                       mode='bilinear', align_corners=True)
+            vae_output = F.interpolate(
+                vae_output, size=(self.patch_height, self.patch_width),
+                mode='bilinear', align_corners=True)
 
-        skip_scale = self.skip_projection(z).view(batch_size, 1, 1, 1)
+        # 2. Bottleneck refiner (now BEFORE CNN)
+        btl_out = self.bottleneck_refiner(vae_output, z_enriched)   # [B, 3, H, W]
+
+        # 3. Skip scalar
+        skip_scale = self.skip_projection(z_enriched).view(batch_size, 1, 1, 1)
         skip_features = skip_scale.expand(batch_size, 1, self.patch_height, self.patch_width)
 
-        cnn_input = torch.cat([vae_output, skip_features], dim=1)
-        cnn_output = self.cnn_refiner(cnn_input)
+        # 4. CNN: 7-channel input (vae_output | btl_out | skip)
+        cnn_input = torch.cat([vae_output, btl_out, skip_features], dim=1)  # [B, 7, H, W]
+        cnn_output = self.cnn_refiner(cnn_input)                             # [B, 64, H, W]
 
-        projector_input = torch.cat([cnn_output, skip_features], dim=1)
-        patches = self.patch_projector(projector_input)
-
-        patches = self.bottleneck_refiner(patches, z)
+        # 5. Projector: 65-channel input (cnn_output | skip)
+        projector_input = torch.cat([cnn_output, skip_features], dim=1)     # [B, 65, H, W]
+        patches = self.patch_projector(projector_input)                      # [B, 3, H, W]
 
         return patches

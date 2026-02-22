@@ -134,6 +134,76 @@ def load_generator(
     return generator, latent_dim, device
 
 
+def migrate_checkpoint(state_dict: dict) -> dict:
+    """
+    Migrate a FoundationPatchGenerator state dict to the new architecture.
+
+    Changes handled:
+        A. attention_proj: Linear → Sequential (3-layer MLP)
+           Old key: bottleneck_refiner.attention_proj.{weight,bias}
+           New keys: bottleneck_refiner.attention_proj.{0,2,4}.{weight,bias}
+           Strategy: copy old weights into the last layer (index 4) of the MLP.
+
+        B. cnn_refiner first Conv2d: in_channels 4 → 7
+           Old key shape: cnn_refiner.0.weight  [64, 4, 3, 3]
+           New key shape: cnn_refiner.0.weight  [64, 7, 3, 3]
+           Strategy: zero-pad the extra 3 channels.
+
+    Args:
+        state_dict: raw state dict loaded from a pre-ensemble checkpoint
+
+    Returns:
+        Migrated state dict compatible with the new architecture
+    """
+    import copy
+    sd = copy.deepcopy(state_dict)
+
+    # ------------------------------------------------------------------
+    # Change A: attention_proj Linear → Sequential
+    # ------------------------------------------------------------------
+    old_attn_w = 'bottleneck_refiner.attention_proj.weight'
+    old_attn_b = 'bottleneck_refiner.attention_proj.bias'
+
+    if old_attn_w in sd:
+        old_w = sd.pop(old_attn_w)   # [out, latent_dim]
+        old_b = sd.pop(old_attn_b, None)
+
+        in_dim = old_w.shape[1]  # latent_dim
+
+        # New Sequential keys: .0 (Linear 128), .2 (Linear 256), .4 (Linear out)
+        # Initialise intermediate layers with kaiming normal
+        w0 = torch.empty(128, in_dim)
+        torch.nn.init.kaiming_normal_(w0, mode='fan_out', nonlinearity='relu')
+        sd['bottleneck_refiner.attention_proj.0.weight'] = w0
+        sd['bottleneck_refiner.attention_proj.0.bias'] = torch.zeros(128)
+
+        w2 = torch.empty(256, 128)
+        torch.nn.init.kaiming_normal_(w2, mode='fan_out', nonlinearity='relu')
+        sd['bottleneck_refiner.attention_proj.2.weight'] = w2
+        sd['bottleneck_refiner.attention_proj.2.bias'] = torch.zeros(256)
+
+        # Final layer carries the original trained weights
+        sd['bottleneck_refiner.attention_proj.4.weight'] = old_w
+        sd['bottleneck_refiner.attention_proj.4.bias'] = (
+            old_b if old_b is not None else torch.zeros(old_w.shape[0])
+        )
+        print("  migrate_checkpoint: attention_proj Linear → Sequential (A)")
+
+    # ------------------------------------------------------------------
+    # Change C: cnn_refiner.0.weight in_channels 4 → 7
+    # ------------------------------------------------------------------
+    cnn_w_key = 'cnn_refiner.0.weight'
+    if cnn_w_key in sd:
+        old_w = sd[cnn_w_key]   # [64, 4, 3, 3]
+        if old_w.shape[1] == 4:
+            out_c, in_c, kh, kw = old_w.shape
+            extra = torch.zeros(out_c, 3, kh, kw, dtype=old_w.dtype)
+            sd[cnn_w_key] = torch.cat([old_w, extra], dim=1)  # [64, 7, 3, 3]
+            print("  migrate_checkpoint: cnn_refiner.0.weight 4 → 7 channels (C)")
+
+    return sd
+
+
 def generate_patch_from_z(
     generator: FoundationPatchGenerator,
     z: np.ndarray,

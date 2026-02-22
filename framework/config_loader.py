@@ -29,9 +29,9 @@ Example YAML:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import yaml
@@ -45,6 +45,24 @@ class DomainConfig:
     metric: Any                   # EvalMetric instance
     target_model: Any             # The frozen target model (same as domain_adapter.model)
     raw: Dict                     # Original YAML dict for extra fields
+
+
+@dataclass
+class EnsembleConfig:
+    """
+    Instantiated objects from an ensemble YAML config.
+
+    The ensemble_pool and dataset_pool are returned pre-configured
+    from the YAML; models are registered by the calling script.
+    """
+    ensemble_pool: Any            # EnsembleModelPool (models registered by caller)
+    dataset_pool: Any             # LazyDatasetPool (paths registered from YAML)
+    prior_registry: Any           # PriorRegistry or None
+    task_encoder: Any             # TaskEncoder
+    generator_cfg: Dict           # dict of generator hyperparameters
+    trainer_cfg: Dict             # dict of EnsembleTrainer hyperparameters
+    models_cfg: List[Dict]        # raw list of model configs from YAML
+    raw: Dict                     # full original YAML dict
 
 
 def load_domain_config(config_path: str | Path) -> DomainConfig:
@@ -70,6 +88,127 @@ def load_domain_config(config_path: str | Path) -> DomainConfig:
         strategy=strategy,
         metric=metric,
         target_model=domain_adapter.model,
+        raw=cfg,
+    )
+
+
+def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
+    """
+    Parse an ensemble YAML config and instantiate framework objects.
+
+    Objects built:
+        - EnsembleModelPool  (empty — caller registers models from models_cfg)
+        - LazyDatasetPool    (datasets registered from YAML)
+        - PriorRegistry      (priors loaded from YAML; empty list = None)
+        - TaskEncoder        (dimensions inferred from YAML)
+
+    Args:
+        config_path: path to ensemble .yaml config
+
+    Returns:
+        EnsembleConfig
+
+    Example YAML structure::
+
+        compute_device: cpu
+        models:
+          - name: resnet50
+            domain_type: classification
+            strategy: border
+            strategy_id: 0
+            input_shape: [224, 224]
+        datasets:
+          - name: imagenet
+            root: /data/imagenet/val
+            max_samples: 1000
+        priors: []
+        task_encoder:
+          hidden_dim: 128
+          num_layers: 3
+          alpha: 0.5
+        generator:
+          latent_dim: 16
+          patch_height: 256
+          patch_width: 512
+        trainer:
+          k_neurons: 10000
+          patches_per_batch: 4
+    """
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    from framework.ensemble import EnsembleModelPool
+    from framework.dataset_pool import LazyDatasetPool
+    from framework.priors import PriorRegistry
+    from framework.task_encoder import TaskEncoder
+
+    # Compute device
+    device_str = cfg.get('compute_device', 'cpu')
+    compute_device = torch.device(device_str)
+
+    # Build EnsembleModelPool (empty — models registered by caller)
+    ensemble_pool = EnsembleModelPool(compute_device=compute_device)
+
+    # Dimensions for TaskEncoder
+    models_cfg: List[Dict] = cfg.get('models', [])
+    num_models = max(len(models_cfg), 1)
+    num_strategies = cfg.get('num_strategies', 3)
+    datasets_cfg: List[Dict] = cfg.get('datasets', [])
+    num_datasets = max(len(datasets_cfg), 1)
+
+    # Build LazyDatasetPool
+    dataset_pool = LazyDatasetPool()
+    for ds in datasets_cfg:
+        root = ds.get('root', '/tmp/no_data')
+        dataset_pool.register(
+            name=ds.get('name', 'unnamed'),
+            root=root,
+            domain_type=ds.get('domain_type', 'generic'),
+            max_samples=ds.get('max_samples', None),
+        )
+
+    # Build PriorRegistry (if priors specified)
+    priors_cfg: List[Dict] = cfg.get('priors', [])
+    gen_cfg = cfg.get('generator', {})
+    latent_dim = gen_cfg.get('latent_dim', 16)
+    patch_height = gen_cfg.get('patch_height', 256)
+    patch_width = gen_cfg.get('patch_width', 512)
+
+    prior_registry: Optional[PriorRegistry] = None
+    if priors_cfg:
+        prior_registry = PriorRegistry(
+            patch_height=patch_height,
+            patch_width=patch_width,
+            latent_dim=latent_dim,
+            char_embed_dim=gen_cfg.get('char_embed_dim', 32),
+        )
+        for p in priors_cfg:
+            prior_registry.add_prior(
+                name=p['name'],
+                decoder_path=p['decoder_path'],
+                decoder_latent_dim=p.get('decoder_latent_dim', 32),
+            )
+
+    # Build TaskEncoder
+    te_cfg = cfg.get('task_encoder', {})
+    task_encoder = TaskEncoder(
+        num_models=num_models,
+        num_strategies=num_strategies,
+        num_datasets=num_datasets,
+        latent_dim=latent_dim,
+        hidden_dim=te_cfg.get('hidden_dim', 128),
+        num_layers=te_cfg.get('num_layers', 3),
+        alpha=te_cfg.get('alpha', 0.5),
+    )
+
+    return EnsembleConfig(
+        ensemble_pool=ensemble_pool,
+        dataset_pool=dataset_pool,
+        prior_registry=prior_registry,
+        task_encoder=task_encoder,
+        generator_cfg=gen_cfg,
+        trainer_cfg=cfg.get('trainer', {}),
+        models_cfg=models_cfg,
         raw=cfg,
     )
 
