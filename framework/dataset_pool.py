@@ -27,33 +27,16 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
-
-try:
-    from torchvision import transforms as _tv_transforms
-    _DEFAULT_TRANSFORM = _tv_transforms.Compose([
-        _tv_transforms.Resize((224, 224)),
-        _tv_transforms.ToTensor(),
-    ])
-except ImportError:
-    _tv_transforms = None  # type: ignore
-    _DEFAULT_TRANSFORM = None  # set below
+from torchvision import transforms
 
 
-def _pil_to_tensor_224(img: Image.Image) -> Tensor:
-    """Fallback transform: PIL → [3, 224, 224] float32 in [0, 1]."""
-    img = img.resize((224, 224), Image.BILINEAR)
-    import numpy as np
-    arr = torch.from_numpy(np.array(img, dtype='float32') / 255.0)
-    if arr.dim() == 2:
-        arr = arr.unsqueeze(-1).expand(-1, -1, 3)
-    return arr.permute(2, 0, 1).contiguous()
-
-
-if _DEFAULT_TRANSFORM is None:
-    _DEFAULT_TRANSFORM = _pil_to_tensor_224  # type: ignore
+# Default transform used when no custom transform is provided
+_DEFAULT_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
 _IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'JPEG', 'JPG', 'PNG', 'webp'}
 

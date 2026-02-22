@@ -33,20 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor, optim
+import torchvision.transforms as T
 from tqdm import tqdm
-
-try:
-    import torchvision.transforms as _T
-    _to_pil = _T.ToPILImage()
-except ImportError:
-    _T = None  # type: ignore
-
-    def _to_pil(tensor: Tensor):  # type: ignore[assignment]
-        """Fallback: [3, H, W] float32 → PIL Image (no torchvision)."""
-        import numpy as np
-        from PIL import Image
-        arr = (tensor.clamp(0, 1) * 255).byte().permute(1, 2, 0).numpy()
-        return Image.fromarray(arr, mode='RGB')
 
 from framework.base.attack_strategy import AttackStrategy
 from framework.dataset_pool import LazyDatasetPool
@@ -483,7 +471,7 @@ class EnsembleTrainer:
             z = torch.randn(4, self.generator.latent_dim, device=self._device)
             patches = self.generator(z)
             for i, patch in enumerate(patches):
-                _to_pil(patch.cpu()).save(
+                T.ToPILImage()(patch.cpu()).save(
                     ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}.png'
                 )
 
