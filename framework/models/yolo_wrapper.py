@@ -5,6 +5,8 @@ yolo_wrapper.py — YOLOv8s object detection wrapper.
   - Input: [B, 3, 640, 640] float32 in [0, 1]  (no further normalization)
   - Output: [B, 84, 8400] raw detection tensor
     (84 = 4 bbox coords + 80 COCO class scores; 8400 anchors)
+    NOTE: DetectionModel.forward() returns a (predictions, raw_outputs) tuple
+    in eval mode; YOLOv8Wrapper.forward() unpacks and returns only out[0].
   - NeuronSampler hooks into C2f / SPPF / Conv leaf modules — output ignored
   - Frozen (eval mode, no gradients)
 
@@ -33,8 +35,12 @@ class YOLOv8Wrapper(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Direct DetectionModel forward — no postprocessing
-        return self.model(x)   # [B, 84, 8400] in eval mode
+        # DetectionModel returns (predictions, raw_outputs) tuple in eval mode.
+        # predictions: [B, 84, 8400];  raw_outputs: list of feature tensors.
+        out = self.model(x)
+        if isinstance(out, (tuple, list)):
+            return out[0]
+        return out
 
     @staticmethod
     def get_preprocess_fn() -> Callable:
