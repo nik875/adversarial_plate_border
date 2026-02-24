@@ -190,7 +190,7 @@ class ChannelMixer(nn.Module):
         patch_width: int = 512,
         latent_dim: int = 16,
         num_taesd: int = 6,
-        num_modes: int = 16,
+        num_modes: int = 6,
     ):
         super().__init__()
 
