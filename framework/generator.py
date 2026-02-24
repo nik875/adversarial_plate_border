@@ -428,17 +428,9 @@ class FoundationPatchGenerator(nn.Module):
         if self.adapter.bias is not None:
             nn.init.constant_(self.adapter.bias, 0)
 
-        self.skip_projection = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.SiLU(inplace=True),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-        # Change C: first Conv2d now takes 7 channels:
-        #   3 (vae_output) + 3 (btl_out from BottleneckDenseRefiner) + 1 (skip scalar)
+        # CNN input: 3 (vae_output) + 3 (btl_out)
         self.cnn_refiner = nn.Sequential(
-            nn.Conv2d(7, 64, kernel_size=3, padding=1),
+            nn.Conv2d(6, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
@@ -465,7 +457,7 @@ class FoundationPatchGenerator(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         self.patch_projector = nn.Sequential(
-            nn.Conv2d(65, 32, kernel_size=1),
+            nn.Conv2d(64, 32, kernel_size=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(32, 3, kernel_size=1),
             nn.Sigmoid()
@@ -481,8 +473,8 @@ class FoundationPatchGenerator(nn.Module):
             patch_height, patch_width, latent_dim, bottleneck_dim,
             prior_registry=self._prior_registry)
         print(f"Bottleneck dense refiner enabled (bottleneck_dim={bottleneck_dim})")
-        print("CNN refiner initialized: 7 → 64 → 64 → 128 → 128 → 64 → 64 channels")
-        print("Patch projector: 65 → 32 → 3 channels (1×1 convolutions)")
+        print("CNN refiner initialized: 6 → 64 → 64 → 128 → 128 → 64 → 64 channels")
+        print("Patch projector: 64 → 32 → 3 channels (1×1 convolutions)")
 
     def forward(self, z: Tensor, z_enriched: Optional[Tensor] = None) -> Tensor:
         """
@@ -523,17 +515,12 @@ class FoundationPatchGenerator(nn.Module):
         # 2. Bottleneck refiner: generated purely from z (no vae_output input)
         btl_out = self.bottleneck_refiner(z_enriched)   # [B, 3, H, W]
 
-        # 3. Skip scalar
-        skip_scale = self.skip_projection(z_enriched).view(batch_size, 1, 1, 1)
-        skip_features = skip_scale.expand(batch_size, 1, self.patch_height, self.patch_width)
+        # 3. CNN: 6-channel input (vae_output | btl_out)
+        cnn_input = torch.cat([vae_output, btl_out], dim=1)   # [B, 6, H, W]
+        cnn_output = self.cnn_refiner(cnn_input)               # [B, 64, H, W]
 
-        # 4. CNN: 7-channel input (vae_output | btl_out | skip)
-        cnn_input = torch.cat([vae_output, btl_out, skip_features], dim=1)  # [B, 7, H, W]
-        cnn_output = self.cnn_refiner(cnn_input)                             # [B, 64, H, W]
-
-        # 5. Projector: 65-channel input (cnn_output | skip)
-        projector_input = torch.cat([cnn_output, skip_features], dim=1)     # [B, 65, H, W]
-        patches = self.patch_projector(projector_input)                      # [B, 3, H, W]
+        # 4. Projector: 64-channel input
+        patches = self.patch_projector(cnn_output)             # [B, 3, H, W]
 
         return patches
 
