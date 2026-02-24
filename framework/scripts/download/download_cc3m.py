@@ -81,7 +81,7 @@ def run_img2dataset(url_tsv: Path, output_dir: Path, processes: int) -> None:
         '--input_format',     'tsv',
         '--url_col',          'url',
         '--caption_col',      'caption',
-        '--output_dir',       str(output_dir),
+        '--output_folder',    str(output_dir),
         '--output_format',    'files',         # plain JPEG files, no WebDataset
         '--image_size',       '640',
         '--resize_mode',      'keep_ratio',
@@ -90,7 +90,7 @@ def run_img2dataset(url_tsv: Path, output_dir: Path, processes: int) -> None:
         '--processes_count',  str(processes),
         '--thread_count',     '64',
         '--retries',          '2',
-        '--enable_wandb',     'False',
+        '--enable_wandb=False',
     ]
     print(f'\n==> Running img2dataset  ({processes} processes, 64 threads each)...')
     print('    This will take a while. Progress is logged by img2dataset.')

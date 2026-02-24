@@ -84,28 +84,29 @@ def prepare_url_list(full_csv: Path, url_list: Path, num_samples: int, seed: int
     print(f'   Wrote {len(urls):,} URLs → {url_list}')
 
 
-def run_img2dataset(url_list: Path, output_dir: Path, processes: int) -> None:
+def run_img2dataset(url_list: Path, output_dir: Path, processes: int, num_samples: int = 10000) -> None:
     try:
         import img2dataset  # noqa: F401
     except ImportError:
         sys.exit('ERROR: pip install img2dataset')
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    shard_size = min(10000, num_samples)
     cmd = [
         'img2dataset',
         '--url_list',                str(url_list),
         '--input_format',            'csv',
         '--url_col',                 'url',
-        '--output_dir',              str(output_dir),
+        '--output_folder',           str(output_dir),
         '--output_format',           'files',
         '--image_size',              '640',
         '--resize_mode',             'keep_ratio',
         '--min_image_size',          '64',
-        '--number_sample_per_shard', '10000',
+        '--number_sample_per_shard', str(shard_size),
         '--processes_count',         str(processes),
         '--thread_count',            '64',
         '--retries',                 '2',
-        '--enable_wandb',            'False',
+        '--enable_wandb=False',
     ]
     print(f'\n==> Running img2dataset  ({processes} processes, 64 threads each)...')
     print('    Images are resized to 640px long-edge on-the-fly — no full-res intermediates.')
@@ -139,7 +140,7 @@ def main():
     prepare_url_list(full_csv, url_list, args.num_samples, args.seed)
 
     images_dir = out / 'images'
-    run_img2dataset(url_list, images_dir, args.processes)
+    run_img2dataset(url_list, images_dir, args.processes, args.num_samples)
 
     n = sum(1 for _ in images_dir.rglob('*.jpg'))
     print(f'\nDone. Open Images subset: {n:,} images → {images_dir}')
