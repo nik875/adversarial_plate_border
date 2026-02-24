@@ -46,7 +46,7 @@ def main():
     done_flag = out / '.done'
 
     if done_flag.exists():
-        n = len(list((out / 'train_val_images').glob('*.jpg')))
+        n = len(list((out / 'train_val_images').rglob('*.jpg')))
         print(f'TextVQA already downloaded ({n:,} images) → {out}  (delete .done to re-run)')
         return
 
@@ -68,7 +68,7 @@ def main():
     zip_path.unlink()
 
     done_flag.touch()
-    n = len(list((out / 'train_val_images').glob('*.jpg')))
+    n = len(list((out / 'train_val_images').rglob('*.jpg')))
     print(f'   Saved {n:,} images → {out / "train_val_images"}')
 
 
