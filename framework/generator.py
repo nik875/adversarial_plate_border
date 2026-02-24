@@ -149,11 +149,11 @@ class DilatedResidualSmoother(nn.Module):
         self.skip6 = nn.Conv2d(16, 3, kernel_size=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.silu(self.conv1(x)) + self.skip1(x)
-        x = F.silu(self.conv2(x)) + x
-        x = F.silu(self.conv3(x)) + x
-        x = F.silu(self.conv4(x)) + x
-        x = F.silu(self.conv5(x)) + x
+        x = F.leaky_relu(self.conv1(x)) + self.skip1(x)
+        x = F.leaky_relu(self.conv2(x)) + x
+        x = F.leaky_relu(self.conv3(x)) + x
+        x = F.leaky_relu(self.conv4(x)) + x
+        x = F.leaky_relu(self.conv5(x)) + x
         x = self.conv6(x) + self.skip6(x)
         return x
 
@@ -199,25 +199,25 @@ class BottleneckDenseRefiner(nn.Module):
         self.seed_embed_dim = 512
         self.seed_projection = nn.Sequential(
             nn.Linear(latent_dim, 256),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(256, self.seed_embed_dim),
         )
 
         bottleneck_with_seed_dim = self.seed_embed_dim
         self.dense = nn.Sequential(
             nn.Linear(bottleneck_with_seed_dim, 512),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(512, self.bottleneck_dim),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(self.bottleneck_dim, 4096),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
         )
 
         self.expand = nn.Sequential(
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4, padding=0),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.ConvTranspose2d(32, 3, kernel_size=4, stride=4, padding=0),
             nn.Tanh()
         )
@@ -239,11 +239,11 @@ class BottleneckDenseRefiner(nn.Module):
 
         self.spatial_layers = nn.Sequential(
             nn.Conv2d(spatial_in_channels, 32, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
         )
 
         self.num_modes = 16
@@ -254,16 +254,16 @@ class BottleneckDenseRefiner(nn.Module):
         # Change A: deeper attention projection (3-layer MLP instead of single Linear)
         self.attention_proj = nn.Sequential(
             nn.Linear(latent_dim, 128),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(128, 256),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Linear(256, self.num_modes * self.attn_grid_h * self.attn_grid_w),
         )
         self.attention_upsample = nn.Sequential(
             nn.ConvTranspose2d(self.num_modes, 32, kernel_size=4, stride=4),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.ConvTranspose2d(32, 16, kernel_size=4, stride=4),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.ConvTranspose2d(16, self.num_modes, kernel_size=4, stride=2, padding=1),
         )
 
@@ -309,7 +309,7 @@ class BottleneckDenseRefiner(nn.Module):
         blend_weights = blend_weights.unsqueeze(2)
 
         refined_patches = (mode_outputs * blend_weights).sum(dim=1)
-        refined_patches = F.silu(refined_patches)
+        refined_patches = F.leaky_relu(refined_patches)
         refined_patches = self.post_expansion_smooth(refined_patches)
         refined_patches = self.final_activation(refined_patches)
 
@@ -432,22 +432,22 @@ class FoundationPatchGenerator(nn.Module):
         self.cnn_refiner = nn.Sequential(
             nn.Conv2d(6, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.GroupNorm(8, 128),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.GroupNorm(8, 128),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
         )
 
         for m in self.cnn_refiner.modules():
@@ -458,7 +458,7 @@ class FoundationPatchGenerator(nn.Module):
 
         self.patch_projector = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=1),
-            nn.SiLU(inplace=True),
+            nn.LeakyReLU(inplace=True),
             nn.Conv2d(32, 3, kernel_size=1),
             nn.Sigmoid()
         )
