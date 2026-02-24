@@ -109,7 +109,7 @@ datasets:
     domain_type: web_natural
 
   - name: openimages
-    root: ~/.cache/openimages             # download_openimages.py  ~1M images at 640px
+    root: ~/.cache/openimages/images      # download_openimages.py  ~1M images at 640px
     domain_type: detection
 
   - name: synthetic

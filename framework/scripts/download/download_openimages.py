@@ -1,107 +1,150 @@
 #!/usr/bin/env python3
 """
-Download an Open Images V7 subset via FiftyOne Zoo.
+Download an Open Images V7 subset via img2dataset.
 
-FiftyOne handles shard selection, parallel downloading from AWS S3,
-and deduplication automatically.
+img2dataset downloads and resizes to 640px on-the-fly, writing final JPEGs
+directly — no full-resolution intermediate copies are ever stored on disk.
+
+Pipeline:
+  1. Download the Open Images V7 train image list CSV from GCS (public, no auth)
+  2. Optionally shuffle and truncate to --num-samples rows
+  3. Run img2dataset to fetch and resize images in parallel
 
 Requires:
-  pip install fiftyone
+  pip install img2dataset
 
-Output layout (flat per-split dirs, compatible with LazyDatasetPool):
-  <output_dir>/data/*.jpg    (FiftyOne default export structure)
+Stats: ~1.7M train images available in Open Images V7
+
+Output layout (sharded, compatible with LazyDatasetPool recursive glob):
+  <output_dir>/00000/*.jpg
+  <output_dir>/00001/*.jpg
+  ...
 
 Usage:
-  python download_openimages.py --output-dir /data/openimages
-  python download_openimages.py --output-dir /data/openimages --num-samples 150000
-  python download_openimages.py --output-dir /data/openimages --num-samples 150000 --split validation
+  python download_openimages.py --output-dir ~/.cache/openimages
+  python download_openimages.py --output-dir ~/.cache/openimages --num-samples 1000000 --processes 16
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import os
+import random
+import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+
+
+# Public GCS — no auth required
+_OI_TRAIN_CSV_URL = (
+    'https://storage.googleapis.com/openimages/2018_04/train/'
+    'train-images-boxable-with-rotation.csv'
+)
+
+
+def _progress(count, block_size, total_size):
+    if total_size <= 0:
+        return
+    pct = min(count * block_size / total_size * 100, 100)
+    print(f'\r   {pct:5.1f}%', end='', flush=True)
+
+
+def download_image_list(csv_path: Path) -> None:
+    print(f'==> Downloading Open Images V7 train image list...')
+    urllib.request.urlretrieve(_OI_TRAIN_CSV_URL, csv_path, reporthook=_progress)
+    print()
+    n = sum(1 for _ in csv_path.open()) - 1  # subtract header
+    print(f'   {n:,} images listed → {csv_path}')
+
+
+def prepare_url_list(full_csv: Path, url_list: Path, num_samples: int, seed: int) -> None:
+    """Read OriginalURL column, shuffle, truncate, write a plain URL-per-line file."""
+    print(f'\n==> Sampling {num_samples:,} URLs...')
+    urls = []
+    with full_csv.open(newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            url = row.get('OriginalURL', '')
+            if url:
+                urls.append(url)
+
+    random.seed(seed)
+    random.shuffle(urls)
+    urls = urls[:num_samples]
+
+    with url_list.open('w') as f:
+        f.write('url\n')
+        for u in urls:
+            f.write(u + '\n')
+
+    print(f'   Wrote {len(urls):,} URLs → {url_list}')
+
+
+def run_img2dataset(url_list: Path, output_dir: Path, processes: int) -> None:
+    try:
+        import img2dataset  # noqa: F401
+    except ImportError:
+        sys.exit('ERROR: pip install img2dataset')
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, '-m', 'img2dataset',
+        '--url_list',                str(url_list),
+        '--input_format',            'csv',
+        '--url_col',                 'url',
+        '--output_dir',              str(output_dir),
+        '--output_format',           'files',
+        '--image_size',              '640',
+        '--resize_mode',             'keep_ratio',
+        '--min_image_size',          '64',
+        '--number_sample_per_shard', '10000',
+        '--processes_count',         str(processes),
+        '--thread_count',            '64',
+        '--retries',                 '2',
+        '--enable_wandb',            'False',
+        '--save_additional_columns', '[]',
+    ]
+    print(f'\n==> Running img2dataset  ({processes} processes, 64 threads each)...')
+    print('    Images are resized to 640px long-edge on-the-fly — no full-res intermediates.')
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(f'img2dataset exited with code {result.returncode}')
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir',  default=os.path.expanduser('~/.cache/openimages'))
-    ap.add_argument('--num-samples', type=int, default=1_000_000,
-                    help='Number of images to download (default: 1M, ~75 GB after 640px resize)')
-    ap.add_argument('--split',       default='train',
-                    choices=['train', 'validation', 'test'],
-                    help='Dataset split (default: train)')
-    ap.add_argument('--seed',        type=int, default=42)
-    ap.add_argument('--max-size',    type=int, default=640,
-                    help='Downscale long edge to this size after download (default: 640)')
+    ap.add_argument('--output-dir',   default=os.path.expanduser('~/.cache/openimages'))
+    ap.add_argument('--num-samples',  type=int, default=1_000_000,
+                    help='Images to download (default: 1M, ~75 GB at 640px)')
+    ap.add_argument('--processes',    type=int, default=16)
+    ap.add_argument('--seed',         type=int, default=42)
+    ap.add_argument('--skip-csv',     action='store_true',
+                    help='Skip CSV download if openimages_train.csv already exists')
     args = ap.parse_args()
 
-    try:
-        import fiftyone.zoo as foz          # noqa: PLC0415
-        import fiftyone as fo               # noqa: PLC0415
-        from PIL import Image as PILImage   # noqa: PLC0415
-    except ImportError:
-        sys.exit(
-            'ERROR: fiftyone not installed.\n'
-            '  pip install fiftyone\n'
-            '  (fiftyone handles AWS S3 download + deduplication automatically)'
-        )
-
     out = Path(args.output_dir)
-    done_flag = out / '.done'
-    if done_flag.exists():
-        print(f'Open Images already downloaded → {out}  (delete .done to re-run)')
-        return
-
     out.mkdir(parents=True, exist_ok=True)
 
-    print(f'==> Downloading Open Images V7  ({args.num_samples:,} images, split={args.split})...')
-    print('    First run downloads index files (~200 MB). Subsequent runs are incremental.')
+    full_csv = out / 'openimages_train_full.csv'
+    url_list = out / 'openimages_urls.csv'
 
-    dataset = foz.load_zoo_dataset(
-        'open-images-v7',
-        split=args.split,
-        max_samples=args.num_samples,
-        shuffle=True,
-        seed=args.seed,
-        label_types=[],         # images only — no annotation download
-        dataset_name=f'openimages_{args.split}_{args.num_samples}',
-    )
+    if not args.skip_csv or not full_csv.exists():
+        download_image_list(full_csv)
+    else:
+        print(f'Skipping CSV download, using existing {full_csv}')
 
-    # Export as a flat directory of images (LazyDatasetPool just needs files)
-    print(f'\n==> Exporting images to {out}...')
-    dataset.export(
-        export_dir=str(out),
-        dataset_type=fo.types.ImageDirectory,
-        overwrite=True,
-    )
+    prepare_url_list(full_csv, url_list, args.num_samples, args.seed)
 
-    # Resize exported images so long edge <= max_size (in-place)
-    max_size = args.max_size
-    print(f'\n==> Resizing images to max {max_size}px long edge...')
-    all_imgs = list(out.rglob('*.jpg')) + list(out.rglob('*.png')) + list(out.rglob('*.jpeg'))
-    resized = 0
-    for p in all_imgs:
-        try:
-            with PILImage.open(p) as img:
-                w, h = img.size
-                if max(w, h) > max_size:
-                    scale = max_size / max(w, h)
-                    img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
-                    img.save(p, format='JPEG', quality=90)
-                    resized += 1
-        except Exception:
-            pass  # skip corrupt files
-        if (resized + 1) % 50_000 == 0:
-            print(f'   resized {resized:,}/{len(all_imgs):,}')
+    images_dir = out / 'images'
+    run_img2dataset(url_list, images_dir, args.processes)
 
-    n = len(all_imgs)
-    done_flag.touch()
-    print(f'   Saved {n:,} images ({resized:,} resized) → {out}')
-
-    # Clean up fiftyone internal dataset to free cache
-    dataset.delete()
+    n = sum(1 for _ in images_dir.rglob('*.jpg'))
+    print(f'\nDone. Open Images subset: {n:,} images → {images_dir}')
+    if n < args.num_samples * 0.5:
+        print(f'WARNING: low yield ({n:,}/{args.num_samples:,}). '
+              f'Open Images original URLs (Flickr etc.) may have liveness issues. '
+              f'Consider increasing --num-samples.')
 
 
 if __name__ == '__main__':

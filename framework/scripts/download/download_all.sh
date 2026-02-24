@@ -73,7 +73,7 @@ echo ">>> [5/5] Open Images V7 subset (150k detection-style images)"
 python "$SCRIPT_DIR/download_openimages.py" \
     --output-dir "$DATA_ROOT/openimages" \
     --num-samples 1000000 \
-    --max-size 640
+    --processes "$JOBS"
 echo ""
 
 # ---- Summary ----------------------------------------------------------------
