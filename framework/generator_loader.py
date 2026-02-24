@@ -2,9 +2,12 @@
 Generator loader — self-contained module for loading a trained FoundationPatchGenerator
 and generating patches from latent codes.
 
-Imports FoundationPatchGenerator from framework/generator.py (not progressive_patch.py).
+Imports FoundationPatchGenerator from framework/generator.py.
 Both optimize_patch_cmaes.py (via --domain framework) and framework/scripts/cmaes_domain.py
 import from here.
+
+NOTE: Old SDXL-LoRA checkpoints are architecturally incompatible with the new multi-TAESD
+architecture. A clear RuntimeError is raised rather than silently loading mismatched weights.
 """
 from __future__ import annotations
 
@@ -89,41 +92,41 @@ def load_generator(
 
     ckpt = torch.load(latest_checkpoint, map_location='cpu')
 
+    # Reject old SDXL-LoRA checkpoints immediately
+    if 'use_vae_lora' in ckpt:
+        raise RuntimeError(
+            "Checkpoint is from the old SDXL-LoRA architecture and is not compatible "
+            "with the new multi-TAESD generator. Start a new training run."
+        )
+
     latent_dim = ckpt['basis_dim']
     patch_height, patch_width = ckpt['patch_size']
-    use_vae_lora = ckpt.get('use_vae_lora', True)
-    lora_rank = ckpt.get('lora_rank', 8)
-    lora_alpha = ckpt.get('lora_alpha', 16)
-    use_omniglot = ckpt.get('use_omniglot', False)
+    num_taesd             = ckpt.get('num_taesd', 6)
+    transformer_d_model   = ckpt.get('transformer_d_model', 256)
+    transformer_nhead     = ckpt.get('transformer_nhead', 4)
+    transformer_d_ff      = ckpt.get('transformer_d_ff', 1024)
+    transformer_enc_layers = ckpt.get('transformer_enc_layers', 2)
+    transformer_dec_layers = ckpt.get('transformer_dec_layers', 2)
 
-    print(f"  Latent dim: {latent_dim}")
-    print(f"  Patch size: {patch_height}x{patch_width}")
-    print(f"  VAE LoRA: {use_vae_lora} (rank={lora_rank}, alpha={lora_alpha})")
-    print(f"  Omniglot conditioning: {use_omniglot}")
+    print(f"  Latent dim:          {latent_dim}")
+    print(f"  Patch size:          {patch_height}x{patch_width}")
+    print(f"  Num TAESD decoders:  {num_taesd}")
+    print(f"  Transformer d_model: {transformer_d_model}, nhead={transformer_nhead}, "
+          f"d_ff={transformer_d_ff}")
+    print(f"  Transformer layers:  enc={transformer_enc_layers}, dec={transformer_dec_layers}")
 
-    def _build_and_load(omniglot_flag):
-        gen = FoundationPatchGenerator(
-            latent_dim=latent_dim,
-            patch_height=patch_height,
-            patch_width=patch_width,
-            use_vae_lora=use_vae_lora,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            use_omniglot=omniglot_flag,
-        )
-        gen.load_state_dict(ckpt['generator_state_dict'])
-        return gen
-
-    try:
-        generator = _build_and_load(use_omniglot)
-    except RuntimeError as e:
-        alt = not use_omniglot
-        print(f"  Warning: state dict mismatch with use_omniglot={use_omniglot}, "
-              f"retrying with use_omniglot={alt}")
-        try:
-            generator = _build_and_load(alt)
-        except RuntimeError:
-            raise e  # re-raise original
+    generator = FoundationPatchGenerator(
+        latent_dim=latent_dim,
+        patch_height=patch_height,
+        patch_width=patch_width,
+        num_taesd=num_taesd,
+        transformer_d_model=transformer_d_model,
+        transformer_nhead=transformer_nhead,
+        transformer_d_ff=transformer_d_ff,
+        transformer_enc_layers=transformer_enc_layers,
+        transformer_dec_layers=transformer_dec_layers,
+    )
+    generator.load_state_dict(ckpt['generator_state_dict'])
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -132,76 +135,6 @@ def load_generator(
 
     print(f"Generator loaded on device={device}")
     return generator, latent_dim, device
-
-
-def migrate_checkpoint(state_dict: dict) -> dict:
-    """
-    Migrate a FoundationPatchGenerator state dict to the new architecture.
-
-    Changes handled:
-        A. attention_proj: Linear → Sequential (3-layer MLP)
-           Old key: bottleneck_refiner.attention_proj.{weight,bias}
-           New keys: bottleneck_refiner.attention_proj.{0,2,4}.{weight,bias}
-           Strategy: copy old weights into the last layer (index 4) of the MLP.
-
-        B. cnn_refiner first Conv2d: in_channels 4 → 7
-           Old key shape: cnn_refiner.0.weight  [64, 4, 3, 3]
-           New key shape: cnn_refiner.0.weight  [64, 7, 3, 3]
-           Strategy: zero-pad the extra 3 channels.
-
-    Args:
-        state_dict: raw state dict loaded from a pre-ensemble checkpoint
-
-    Returns:
-        Migrated state dict compatible with the new architecture
-    """
-    import copy
-    sd = copy.deepcopy(state_dict)
-
-    # ------------------------------------------------------------------
-    # Change A: attention_proj Linear → Sequential
-    # ------------------------------------------------------------------
-    old_attn_w = 'bottleneck_refiner.attention_proj.weight'
-    old_attn_b = 'bottleneck_refiner.attention_proj.bias'
-
-    if old_attn_w in sd:
-        old_w = sd.pop(old_attn_w)   # [out, latent_dim]
-        old_b = sd.pop(old_attn_b, None)
-
-        in_dim = old_w.shape[1]  # latent_dim
-
-        # New Sequential keys: .0 (Linear 128), .2 (Linear 256), .4 (Linear out)
-        # Initialise intermediate layers with kaiming normal
-        w0 = torch.empty(128, in_dim)
-        torch.nn.init.kaiming_normal_(w0, mode='fan_out', nonlinearity='relu')
-        sd['bottleneck_refiner.attention_proj.0.weight'] = w0
-        sd['bottleneck_refiner.attention_proj.0.bias'] = torch.zeros(128)
-
-        w2 = torch.empty(256, 128)
-        torch.nn.init.kaiming_normal_(w2, mode='fan_out', nonlinearity='relu')
-        sd['bottleneck_refiner.attention_proj.2.weight'] = w2
-        sd['bottleneck_refiner.attention_proj.2.bias'] = torch.zeros(256)
-
-        # Final layer carries the original trained weights
-        sd['bottleneck_refiner.attention_proj.4.weight'] = old_w
-        sd['bottleneck_refiner.attention_proj.4.bias'] = (
-            old_b if old_b is not None else torch.zeros(old_w.shape[0])
-        )
-        print("  migrate_checkpoint: attention_proj Linear → Sequential (A)")
-
-    # ------------------------------------------------------------------
-    # Change C: cnn_refiner.0.weight in_channels 4 → 7
-    # ------------------------------------------------------------------
-    cnn_w_key = 'cnn_refiner.0.weight'
-    if cnn_w_key in sd:
-        old_w = sd[cnn_w_key]   # [64, 4, 3, 3]
-        if old_w.shape[1] == 4:
-            out_c, in_c, kh, kw = old_w.shape
-            extra = torch.zeros(out_c, 3, kh, kw, dtype=old_w.dtype)
-            sd[cnn_w_key] = torch.cat([old_w, extra], dim=1)  # [64, 7, 3, 3]
-            print("  migrate_checkpoint: cnn_refiner.0.weight 4 → 7 channels (C)")
-
-    return sd
 
 
 def generate_patch_from_z(

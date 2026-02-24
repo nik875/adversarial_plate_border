@@ -16,8 +16,7 @@ The script:
     1. Parses the YAML config via load_ensemble_config().
     2. Builds synthetic or real models from the 'models' section.
     3. Creates synthetic image directories if datasets.synthetic=true.
-    4. Instantiates FoundationPatchGenerator (without VAE if use_vae_lora=false
-       and the SDXL VAE weights are unavailable — falls back to a tiny mock VAE).
+    4. Instantiates FoundationPatchGenerator (multi-TAESD architecture).
     5. Runs EnsembleTrainer.train().
 """
 from __future__ import annotations
@@ -141,26 +140,20 @@ def _build_strategy(model_cfg: Dict[str, Any]):
 # Generator factory (handles missing SDXL VAE gracefully)
 # ---------------------------------------------------------------------------
 
-def _build_generator(gen_cfg: Dict[str, Any], prior_registry=None) -> Any:
-    """
-    Build a FoundationPatchGenerator from config dict.
-
-    If use_vae_lora=true but the SDXL VAE weights are unavailable (no internet
-    or HF cache), this will raise; set use_vae_lora=false in the YAML for
-    offline / smoke-test usage.
-    """
+def _build_generator(gen_cfg: Dict[str, Any]) -> Any:
+    """Build a FoundationPatchGenerator (multi-TAESD architecture) from config dict."""
     from framework.generator import FoundationPatchGenerator
 
     return FoundationPatchGenerator(
         latent_dim=gen_cfg.get('latent_dim', 16),
-        patch_height=gen_cfg.get('patch_height', 64),
-        patch_width=gen_cfg.get('patch_width', 64),
-        use_vae_lora=gen_cfg.get('use_vae_lora', False),
-        lora_rank=gen_cfg.get('lora_rank', 4),
-        lora_alpha=gen_cfg.get('lora_alpha', 8),
-        bottleneck_dim=gen_cfg.get('bottleneck_dim', 64),
-        use_omniglot=False,
-        prior_registry=prior_registry,
+        patch_height=gen_cfg.get('patch_height', 512),
+        patch_width=gen_cfg.get('patch_width', 512),
+        num_taesd=gen_cfg.get('num_taesd', 6),
+        transformer_d_model=gen_cfg.get('transformer_d_model', 256),
+        transformer_nhead=gen_cfg.get('transformer_nhead', 4),
+        transformer_d_ff=gen_cfg.get('transformer_d_ff', 1024),
+        transformer_enc_layers=gen_cfg.get('transformer_enc_layers', 2),
+        transformer_dec_layers=gen_cfg.get('transformer_dec_layers', 2),
     )
 
 
@@ -269,7 +262,7 @@ def main():
     # ------------------------------------------------------------------
     # Build generator
     # ------------------------------------------------------------------
-    generator = _build_generator(ensemble_cfg.generator_cfg, ensemble_cfg.prior_registry)
+    generator = _build_generator(ensemble_cfg.generator_cfg)
 
     # ------------------------------------------------------------------
     # Build NeuronSampler
@@ -292,7 +285,7 @@ def main():
         tv_weight=float(trainer_cfg.get('tv_weight', 2.5)),
         spectrum_weight=float(trainer_cfg.get('spectrum_weight', 1.0)),
         learning_rate=float(trainer_cfg.get('learning_rate', 1e-4)),
-        vae_lr_ratio=float(trainer_cfg.get('vae_lr_ratio', 0.1)),
+        vae_lr_ratio=float(trainer_cfg.get('taesd_lr_ratio', trainer_cfg.get('vae_lr_ratio', 0.1))),
         lr_min=float(trainer_cfg.get('lr_min', 1e-6)),
         max_epochs=int(trainer_cfg.get('max_epochs', 10)),
         output_dir=str(trainer_cfg.get('output_dir', 'ensemble_output')),

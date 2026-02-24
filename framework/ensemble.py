@@ -210,10 +210,9 @@ class EnsembleTrainer:
         - Two on_device() calls per step (ctrl_acts no_grad, adv_acts with_grad)
 
     Optimizer groups (AdamW):
-        - VAE LoRA params:         lr = learning_rate * vae_lr_ratio
+        - TAESD decoder params:    lr = learning_rate * vae_lr_ratio
         - TaskEncoder params:      lr = learning_rate
-        - PriorRegistry scale_mlps:lr = learning_rate * vae_lr_ratio
-        - All other generator params: lr = learning_rate
+        - All other generator params (adapters, transformers, channel_mixer): lr = learning_rate
     """
 
     def __init__(
@@ -267,42 +266,33 @@ class EnsembleTrainer:
     # ------------------------------------------------------------------
 
     def _build_optimizer(self, total_steps: int):
-        """Build AdamW with 4 parameter groups + cosine annealing scheduler."""
+        """Build AdamW with 3 parameter groups + cosine annealing scheduler."""
         gen = self.generator
 
-        # Group 1: VAE LoRA params
-        vae_params = [p for p in gen.vae.parameters() if p.requires_grad]
+        # Group 1: TAESD decoder params (lower LR — pretrained)
+        taesd_params = [
+            p for name, p in gen.named_parameters()
+            if 'taesd_decoders.' in name and p.requires_grad
+        ]
 
         # Group 2: TaskEncoder params
         task_params = list(self.task_encoder.parameters())
 
-        # Group 3: PriorRegistry scale_mlps (inside bottleneck_refiner)
-        prior_params: List[nn.Parameter] = []
-        br = getattr(gen, 'bottleneck_refiner', None)
-        if br is not None:
-            pr = getattr(br, 'prior_registry', None)
-            if pr is not None and hasattr(pr, 'scale_mlps'):
-                prior_params = list(pr.scale_mlps.parameters())
-
-        # Group 4: all other generator params
-        vae_ids = {id(p) for p in vae_params}
-        prior_ids = {id(p) for p in prior_params}
+        # Group 3: all other generator params (adapters, transformers, channel_mixer)
+        taesd_ids = {id(p) for p in taesd_params}
         other_gen_params = [
             p for n, p in gen.named_parameters()
-            if p.requires_grad
-            and id(p) not in vae_ids
-            and id(p) not in prior_ids
+            if p.requires_grad and id(p) not in taesd_ids
         ]
 
-        vae_lr = self.learning_rate * self.vae_lr_ratio
+        taesd_lr = self.learning_rate * self.vae_lr_ratio
         optimizer = optim.AdamW([
-            {'params': vae_params,      'lr': vae_lr,              'name': 'vae_lora'},
-            {'params': task_params,     'lr': self.learning_rate,   'name': 'task_encoder'},
-            {'params': prior_params,    'lr': vae_lr,              'name': 'prior_mlps'},
-            {'params': other_gen_params,'lr': self.learning_rate,   'name': 'generator_custom'},
+            {'params': taesd_params,     'lr': taesd_lr,            'name': 'taesd_decoders'},
+            {'params': task_params,      'lr': self.learning_rate,   'name': 'task_encoder'},
+            {'params': other_gen_params, 'lr': self.learning_rate,   'name': 'generator_custom'},
         ])
 
-        lrs = [vae_lr, self.learning_rate, vae_lr, self.learning_rate]
+        lrs = [taesd_lr, self.learning_rate, self.learning_rate]
         scheduler = optim.lr_scheduler.LambdaLR(
             optimizer,
             lr_lambda=[
@@ -445,25 +435,24 @@ class EnsembleTrainer:
         ckpt_dir = self.output_dir / subdir
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        pr = None
-        br = getattr(self.generator, 'bottleneck_refiner', None)
-        if br is not None:
-            pr = getattr(br, 'prior_registry', None)
-
+        gen = self.generator
         ckpt = {
-            'generator_state_dict':    self.generator.state_dict(),
+            'generator_state_dict':    gen.state_dict(),
             'task_encoder_state_dict': self.task_encoder.state_dict(),
-            'epoch': epoch,
-            'config': {
-                'latent_dim':       self.generator.latent_dim,
-                'patch_height':     self.generator.patch_height,
-                'patch_width':      self.generator.patch_width,
-                'k_neurons':        self.k_neurons,
-                'patches_per_batch':self.patches_per_batch,
+            'basis_dim':               gen.latent_dim,
+            'patch_size':              [gen.patch_height, gen.patch_width],
+            'num_taesd':               gen.num_taesd,
+            'transformer_d_model':     gen.transformer_d_model,
+            'transformer_nhead':       gen.transformer_nhead,
+            'transformer_d_ff':        gen.transformer_d_ff,
+            'transformer_enc_layers':  gen.transformer_enc_layers,
+            'transformer_dec_layers':  gen.transformer_dec_layers,
+            'training_info': {
+                'epoch':             epoch,
+                'k_neurons':         self.k_neurons,
+                'patches_per_batch': self.patches_per_batch,
             },
         }
-        if pr is not None:
-            ckpt['prior_registry_state_dict'] = pr.state_dict()
 
         ckpt_path = ckpt_dir / f'ensemble_epoch_{epoch:04d}.pt'
         torch.save(ckpt, ckpt_path)

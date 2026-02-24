@@ -1,125 +1,29 @@
 """
-FoundationPatchGenerator — self-contained reproduction of the generator architecture.
+FoundationPatchGenerator — multi-stream TAESD architecture.
 
-No imports from progressive_patch.py.  Architecture is identical to progressive_patch.py
-lines 58–868 so checkpoints saved by either copy are mutually compatible.
+Architecture:
+  - 6 TAESD decoder copies (AutoencoderTiny, encoder deleted, fully trainable)
+  - 6 linear adapters  Linear(latent_dim, vae_latent_dim)
+  - 6 LightPatchTransformers (spatial transformer encoder-decoder)
+  - 1 ChannelMixer (spatially-varying attention blend, 18→3 channels)
+
+Output: 512×512 adversarial patch in [0, 1].
 
 Contains:
-  - LoRALinear
-  - LoRAConv2d
-  - inject_lora_into_vae_decoder
-  - DilatedResidualSmoother
-  - BottleneckDenseRefiner
+  - DilatedResidualSmoother  (used by ChannelMixer)
+  - LightPatchTransformer
+  - ChannelMixer
   - FoundationPatchGenerator
 """
 from __future__ import annotations
 
-import math
-from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from torch import nn, Tensor
-from diffusers import AutoencoderKL
-
-# PriorRegistry is imported lazily inside BottleneckDenseRefiner to avoid
-# a circular import if priors.py ever imports from generator.py.
-# Type-hint only:
-try:
-    from framework.priors import PriorRegistry as _PriorRegistry
-except ImportError:
-    _PriorRegistry = None  # type: ignore
-
-
-# ---------------------------------------------------------------------------
-# LoRA modules
-# ---------------------------------------------------------------------------
-
-class LoRALinear(nn.Module):
-    """Linear layer with LoRA adaptation (base weights stored as buffers)."""
-
-    def __init__(self, linear_layer: nn.Linear, r: int = 8, lora_alpha: int = 16):
-        super().__init__()
-        self.r = r
-        self.lora_alpha = lora_alpha
-
-        self.register_buffer('weight', linear_layer.weight.detach())
-        if linear_layer.bias is not None:
-            self.register_buffer('bias', linear_layer.bias.detach())
-        else:
-            self.register_buffer('bias', None)
-
-        self.lora_A = nn.Parameter(torch.zeros(r, linear_layer.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(linear_layer.out_features, r))
-        self.scaling = lora_alpha / r
-
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-    def forward(self, x: Tensor) -> Tensor:
-        result = F.linear(x, self.weight, self.bias)
-        lora_out = (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
-        return result + lora_out
-
-
-class LoRAConv2d(nn.Module):
-    """Conv2d with LoRA using 1×1 convolutions (base weights stored as buffers)."""
-
-    def __init__(self, conv_layer: nn.Conv2d, r: int = 8, lora_alpha: int = 16):
-        super().__init__()
-        self.r = r
-        self.lora_alpha = lora_alpha
-        self.padding = conv_layer.padding
-        self.stride = conv_layer.stride
-        self.dilation = conv_layer.dilation
-        self.groups = conv_layer.groups
-
-        self.register_buffer('weight', conv_layer.weight.detach())
-        if conv_layer.bias is not None:
-            self.register_buffer('bias', conv_layer.bias.detach())
-        else:
-            self.register_buffer('bias', None)
-
-        self.lora_down = nn.Conv2d(conv_layer.in_channels, r, kernel_size=1, bias=False)
-        self.lora_up = nn.Conv2d(r, conv_layer.out_channels, kernel_size=1, bias=False)
-        self.scaling = lora_alpha / r
-
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
-
-    def forward(self, x: Tensor) -> Tensor:
-        result = F.conv2d(x, self.weight, self.bias,
-                          stride=self.stride, padding=self.padding,
-                          dilation=self.dilation, groups=self.groups)
-        lora_out = self.lora_up(self.lora_down(x)) * self.scaling
-        return result + lora_out
-
-
-def inject_lora_into_vae_decoder(vae, r: int = 8, lora_alpha: int = 16) -> dict:
-    """
-    Inject LoRA into ALL Conv2d and Linear layers in the VAE decoder.
-
-    Returns dict mapping module path → LoRA module.
-    """
-    lora_modules = {}
-
-    def wrap_all(module, prefix):
-        for name, child in module.named_children():
-            full_name = f"{prefix}.{name}" if prefix else name
-            if isinstance(child, nn.Conv2d):
-                wrapped = LoRAConv2d(child, r, lora_alpha)
-                setattr(module, name, wrapped)
-                lora_modules[full_name] = wrapped
-            elif isinstance(child, nn.Linear):
-                wrapped = LoRALinear(child, r, lora_alpha)
-                setattr(module, name, wrapped)
-                lora_modules[full_name] = wrapped
-            else:
-                wrap_all(child, full_name)
-
-    wrap_all(vae.decoder, 'decoder')
-    return lora_modules
+from diffusers import AutoencoderTiny
 
 
 # ---------------------------------------------------------------------------
@@ -159,86 +63,152 @@ class DilatedResidualSmoother(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# BottleneckDenseRefiner
+# LightPatchTransformer
 # ---------------------------------------------------------------------------
 
-class BottleneckDenseRefiner(nn.Module):
+class LightPatchTransformer(nn.Module):
     """
-    Bottleneck dense refiner for patch refinement with seed conditioning.
+    Lightweight spatial transformer that learns to spatially transform a
+    512×512 TAESD output into an improved 512×512 patch.
 
-    Architecture: compress spatial dims → dense bottleneck (+ z injection) → expand back.
+    Architecture:
+        - patch_embed: Conv2d(3, d_model, 16, 16) → [B, 1024, d_model]
+        - 2-layer transformer encoder with gradient checkpointing
+        - 2-layer transformer decoder with gradient checkpointing
+        - output_proj: Linear(d_model, 768) → reshape → [B, 3, 512, 512]
+
+    Gradient checkpointing is applied per-layer, trading ~33% extra compute
+    for significant peak-memory savings on large [B, 1024, 1024] attention maps.
     """
 
     def __init__(
         self,
-        patch_height: int = 256,
-        patch_width: int = 512,
-        latent_dim: int = 16,
-        bottleneck_dim: int = 256,
-        prior_registry: Optional[object] = None,
+        d_model: int = 256,
+        nhead: int = 4,
+        d_ff: int = 1024,
+        num_enc_layers: int = 2,
+        num_dec_layers: int = 2,
     ):
+        super().__init__()
+
+        # Patch embedding: Conv2d produces [B, d_model, 32, 32] for 512×512 input
+        self.patch_embed = nn.Conv2d(3, d_model, kernel_size=16, stride=16)
+
+        # Learnable positional embeddings: 32×32 = 1024 tokens
+        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, 1024, d_model))
+        nn.init.trunc_normal_(self.encoder_pos_embed, std=0.02)
+
+        # Encoder
+        self.encoder_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=d_ff,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(num_enc_layers)
+        ])
+
+        # Decoder queries and positional embeddings
+        self.decoder_queries = nn.Parameter(torch.zeros(1, 1024, d_model))
+        nn.init.trunc_normal_(self.decoder_queries, std=0.02)
+
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1024, d_model))
+        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
+
+        # Decoder
+        self.decoder_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=d_ff,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(num_dec_layers)
+        ])
+
+        # Output projection: d_model → 16×16×3 = 768 values per patch token
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, 768)  # 768 = 16*16*3
+
+    def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            patch_height:    output patch height in pixels
-            patch_width:     output patch width in pixels
-            latent_dim:      latent code dimensionality
-            bottleneck_dim:  width of the dense bottleneck layer
-            prior_registry:  optional PriorRegistry; if provided its num_output_channels
-                             extra channels are concatenated before spatial_layers.
-                             Pass None for no character conditioning.
+            x: [B, 3, 512, 512] TAESD output in [0, 1]
+
+        Returns:
+            [B, 3, 512, 512] spatially transformed patch in [0, 1]
         """
+        B = x.shape[0]
+
+        # Embed patches: [B, 3, 512, 512] → [B, d_model, 32, 32] → [B, 1024, d_model]
+        tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
+        tokens = tokens + self.encoder_pos_embed
+
+        # Encoder with gradient checkpointing
+        for layer in self.encoder_layers:
+            tokens = cp.checkpoint(layer, tokens, use_reentrant=False)
+        encoder_out = tokens
+
+        # Decoder with gradient checkpointing
+        queries = self.decoder_queries.expand(B, -1, -1) + self.decoder_pos_embed
+        for layer in self.decoder_layers:
+            queries = cp.checkpoint(layer, queries, encoder_out, use_reentrant=False)
+
+        # Project to pixel space: [B, 1024, d_model] → [B, 1024, 768]
+        out = self.output_proj(self.output_norm(queries))
+
+        # Reshape to image: [B, 1024, 768] → [B, 3, 512, 512]
+        # 1024 = 32×32 patch grid, 768 = 3×16×16 pixels per patch
+        out = out.view(B, 32, 32, 3, 16, 16)
+        out = out.permute(0, 3, 1, 4, 2, 5).contiguous()  # [B, 3, 32, 16, 32, 16]
+        return torch.sigmoid(out.view(B, 3, 512, 512))
+
+
+# ---------------------------------------------------------------------------
+# ChannelMixer
+# ---------------------------------------------------------------------------
+
+class ChannelMixer(nn.Module):
+    """
+    Spatially-varying channel mixing attention mechanism.
+
+    Takes the concatenated outputs of N=6 TAESD streams (18 channels) and
+    the latent code z, and blends them via learned spatial attention into a
+    single [B, 3, patch_height, patch_width] output.
+
+    Architecture mirrors the spatial attention section of BottleneckDenseRefiner,
+    adapted for 18-channel input and 512×512 output.
+    """
+
+    def __init__(
+        self,
+        patch_height: int = 512,
+        patch_width: int = 512,
+        latent_dim: int = 16,
+        num_taesd: int = 6,
+        num_modes: int = 16,
+    ):
         super().__init__()
 
         self.patch_height = patch_height
         self.patch_width = patch_width
-        self.latent_dim = latent_dim
-        self.bottleneck_dim = bottleneck_dim
-        # Store for attribute lookup (e.g. by checkpoint savers)
-        self.prior_registry: Optional[object] = prior_registry
+        self.num_modes = num_modes
 
-        self.seed_embed_dim = 512
-        self.seed_projection = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(256, self.seed_embed_dim),
-        )
+        # Low-resolution attention grid
+        self.attn_grid_h = patch_height // 32
+        self.attn_grid_w = patch_width  // 32
 
-        bottleneck_with_seed_dim = self.seed_embed_dim
-        self.dense = nn.Sequential(
-            nn.Linear(bottleneck_with_seed_dim, 512),
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(512, self.bottleneck_dim),
-            nn.LeakyReLU(inplace=True),
-            nn.Linear(self.bottleneck_dim, 4096),
-            nn.LeakyReLU(inplace=True),
-        )
+        # Input channels: num_taesd streams × 3 RGB channels
+        in_channels = num_taesd * 3
 
-        self.expand = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4, padding=0),
-            nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=4, padding=0),
-            nn.Tanh()
-        )
-
-        self.post_expansion_smooth = DilatedResidualSmoother()
-        self.final_activation = nn.Sigmoid()
-
-        # Compute number of extra channels from PriorRegistry (0 if None)
-        prior_channels = 0
-        if prior_registry is not None:
-            prior_channels = prior_registry.num_output_channels
-
-        spatial_in_channels = 3 + 3 + prior_channels  # vae_output + refined + prior feats
-        if prior_channels > 0:
-            print(f"PriorRegistry active: {prior_channels} extra channels "
-                  f"({prior_channels // 4} prior(s) × 4 scales)")
-        else:
-            print("No character-prior conditioning (prior_registry=None).")
-
+        # Spatial feature extraction from concatenated stream outputs
         self.spatial_layers = nn.Sequential(
-            nn.Conv2d(spatial_in_channels, 32, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.LeakyReLU(inplace=True),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(inplace=True),
@@ -246,27 +216,35 @@ class BottleneckDenseRefiner(nn.Module):
             nn.LeakyReLU(inplace=True),
         )
 
-        self.num_modes = 16
-        self.proj_modes = nn.ModuleList([nn.Conv2d(32, 3, kernel_size=1) for _ in range(self.num_modes)])
+        # Per-mode 3-channel projection heads
+        self.proj_modes = nn.ModuleList([
+            nn.Conv2d(32, 3, kernel_size=1)
+            for _ in range(num_modes)
+        ])
 
-        self.attn_grid_h = patch_height // 32
-        self.attn_grid_w = patch_width // 32
-        # Change A: deeper attention projection (3-layer MLP instead of single Linear)
+        # Attention weight generation from latent code
         self.attention_proj = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.LeakyReLU(inplace=True),
             nn.Linear(128, 256),
             nn.LeakyReLU(inplace=True),
-            nn.Linear(256, self.num_modes * self.attn_grid_h * self.attn_grid_w),
+            nn.Linear(256, num_modes * self.attn_grid_h * self.attn_grid_w),
         )
+
+        # Upsample attention grid from (attn_grid_h, attn_grid_w) → (patch_height, patch_width)
+        # For default 512×512: 16×16 → 64×64 → 256×256 → 512×512
         self.attention_upsample = nn.Sequential(
-            nn.ConvTranspose2d(self.num_modes, 32, kernel_size=4, stride=4),
+            nn.ConvTranspose2d(num_modes, 32, kernel_size=4, stride=4),
             nn.LeakyReLU(inplace=True),
             nn.ConvTranspose2d(32, 16, kernel_size=4, stride=4),
             nn.LeakyReLU(inplace=True),
-            nn.ConvTranspose2d(16, self.num_modes, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(16, num_modes, kernel_size=4, stride=2, padding=1),
         )
 
+        self.post_smooth = DilatedResidualSmoother()
+        self.final_activation = nn.Sigmoid()
+
+        # Weight initialization
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -278,52 +256,38 @@ class BottleneckDenseRefiner(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"BottleneckDenseRefiner initialized: ~{total_params:,} parameters")
+        print(f"ChannelMixer initialized: ~{total_params:,} parameters")
 
-    def forward(self, z: Tensor, vae_output: Optional[Tensor] = None) -> Tensor:
+    def forward(self, combined: Tensor, z: Tensor) -> Tensor:
         """
-        Generate patch features from the latent code z.
-
         Args:
-            z:          [B, latent_dim]  latent code driving the dense path
-            vae_output: [B, 3, H, W]    VAE decoder output; concatenated with the
-                        dense-refined output before spatial attention.
+            combined: [B, 18, H, W]  concatenated stream outputs
+            z:        [B, latent_dim] latent code for attention conditioning
+
+        Returns:
+            [B, 3, H, W] blended patch in [0, 1]
         """
         batch_size = z.shape[0]
 
-        seed_embed = self.seed_projection(z)
-        refined_features = self.dense(seed_embed)
-        refined_features = refined_features.view(batch_size, 128, 4, 8)
-        refined = self.expand(refined_features)
+        # Spatial feature extraction
+        spatial_features = self.spatial_layers(combined)              # [B, 32, H, W]
+        mode_outputs = torch.stack(
+            [m(spatial_features) for m in self.proj_modes], dim=1
+        )                                                             # [B, num_modes, 3, H, W]
 
-        if refined.shape[2] != self.patch_height or refined.shape[3] != self.patch_width:
-            refined = F.interpolate(refined, size=(self.patch_height, self.patch_width),
-                                    mode='bilinear', align_corners=True)
-
-        if vae_output is not None and vae_output.shape[2:] != refined.shape[2:]:
-            vae_output = F.interpolate(vae_output, size=refined.shape[2:],
-                                       mode='bilinear', align_corners=True)
-
-        if self.prior_registry is not None:
-            prior_feats = self.prior_registry(z)   # List[[B, 1, H, W]]
-            combined = torch.cat([vae_output, refined] + prior_feats, dim=1)
-        else:
-            combined = torch.cat([vae_output, refined], dim=1)
-
-        spatial_features = self.spatial_layers(combined)
-        mode_outputs = torch.stack([m(spatial_features) for m in self.proj_modes], dim=1)
-
-        attn_grid = self.attention_proj(z).view(batch_size, self.num_modes, self.attn_grid_h, self.attn_grid_w)
-        blend_weights = self.attention_upsample(attn_grid)
+        # Spatial attention weights from latent code
+        attn_grid = self.attention_proj(z).view(
+            batch_size, self.num_modes, self.attn_grid_h, self.attn_grid_w
+        )                                                             # [B, num_modes, gh, gw]
+        blend_weights = self.attention_upsample(attn_grid)            # [B, num_modes, H, W]
         blend_weights = torch.softmax(blend_weights, dim=1)
-        blend_weights = blend_weights.unsqueeze(2)
+        blend_weights = blend_weights.unsqueeze(2)                    # [B, num_modes, 1, H, W]
 
-        refined_patches = (mode_outputs * blend_weights).sum(dim=1)
+        # Weighted sum across modes
+        refined_patches = (mode_outputs * blend_weights).sum(dim=1)  # [B, 3, H, W]
         refined_patches = F.leaky_relu(refined_patches)
-        refined_patches = self.post_expansion_smooth(refined_patches)
-        refined_patches = self.final_activation(refined_patches)
-
-        return refined_patches
+        refined_patches = self.post_smooth(refined_patches)
+        return self.final_activation(refined_patches)
 
 
 # ---------------------------------------------------------------------------
@@ -334,171 +298,98 @@ class FoundationPatchGenerator(nn.Module):
     """
     Patch generator: latent code z → adversarial patch in [0, 1].
 
-    Pipeline: z → adapter → SD VAE decoder (LoRA) → CNN refiner → patch projector → BottleneckDenseRefiner
+    Pipeline:
+        z → 6 adapters → 6 TAESD decoders → 6 spatial transformers
+        → concatenate [B, 18, H, W] → ChannelMixer → patch [B, 3, H, W]
+
+    All TAESD decoders are fully trainable (no frozen weights).
+    Gradient checkpointing is applied inside each LightPatchTransformer.
     """
 
     def __init__(
         self,
-        latent_dim: int,
-        patch_height: int = 256,
+        latent_dim: int = 16,
+        patch_height: int = 512,
         patch_width: int = 512,
-        num_layers: int = 11,
-        use_vae_lora: bool = True,
-        lora_rank: int = 8,
-        lora_alpha: int = 16,
-        use_bottleneck_refiner: bool = True,
-        bottleneck_dim: int = 256,
-        use_omniglot: bool = False,
-        prior_registry: Optional[object] = None,
+        num_taesd: int = 6,
+        transformer_d_model: int = 256,
+        transformer_nhead: int = 4,
+        transformer_d_ff: int = 1024,
+        transformer_enc_layers: int = 2,
+        transformer_dec_layers: int = 2,
     ):
-        """
-        Args:
-            latent_dim:       latent code dimensionality (z has shape [B, latent_dim])
-            patch_height:     output patch height in pixels
-            patch_width:      output patch width in pixels
-            num_layers:       number of layers in the progressive layer schedule
-            use_vae_lora:     if True, inject LoRA into the VAE decoder
-            lora_rank:        LoRA rank
-            lora_alpha:       LoRA alpha scaling factor
-            use_bottleneck_refiner: kept for API compatibility; refiner always built
-            bottleneck_dim:   dense bottleneck layer width
-            use_omniglot:     DEPRECATED — kept for backward compatibility with trainer.py.
-                              If True and prior_registry is None, a PriorRegistry with the
-                              default omniglot decoder is constructed automatically.
-            prior_registry:   PriorRegistry instance (takes precedence over use_omniglot).
-                              Pass None and use_omniglot=False for no character priors.
-        """
         super().__init__()
 
         self.latent_dim = latent_dim
         self.patch_height = patch_height
         self.patch_width = patch_width
-        # Store for backward compat (trainer.py reads this via getattr)
-        self.use_omniglot = use_omniglot
+        self.num_taesd = num_taesd
 
-        # VAE latent space dimensions — FIXED by SDXL VAE (do NOT change)
+        # Store transformer hyperparams as attributes for checkpoint serialisation
+        self.transformer_d_model = transformer_d_model
+        self.transformer_nhead = transformer_nhead
+        self.transformer_d_ff = transformer_d_ff
+        self.transformer_enc_layers = transformer_enc_layers
+        self.transformer_dec_layers = transformer_dec_layers
+
+        # TAESD latent space: 4 channels, H/8 × W/8
         self.vae_latent_h = patch_height // 8
-        self.vae_latent_w = patch_width // 8
-        self.vae_latent_channels = 4   # fixed SD VAE channel count
-        self.vae_latent_dim = self.vae_latent_channels * self.vae_latent_h * self.vae_latent_w
+        self.vae_latent_w = patch_width  // 8
+        self.vae_latent_dim = 4 * self.vae_latent_h * self.vae_latent_w
 
-        print("Loading Stable Diffusion VAE decoder...")
-        self.vae = AutoencoderKL.from_pretrained(
-            "stabilityai/sdxl-vae",
-            torch_dtype=torch.float32
-        )
-        del self.vae.encoder
-        self.vae.encoder = None
+        # 6 adapters: Linear(latent_dim → vae_latent_dim) each
+        self.adapters = nn.ModuleList([
+            nn.Linear(latent_dim, self.vae_latent_dim)
+            for _ in range(num_taesd)
+        ])
+        for adapter in self.adapters:
+            nn.init.kaiming_normal_(adapter.weight, mode='fan_out', nonlinearity='relu')
+            if adapter.bias is not None:
+                nn.init.constant_(adapter.bias, 0)
 
-        self.use_vae_lora = use_vae_lora
-        self.lora_rank = lora_rank
-        self.lora_alpha = lora_alpha
+        # 6 TAESD decoder copies (encoder deleted, fully trainable)
+        print(f"Loading {num_taesd} TAESD decoder copies from madebyollin/taesd ...")
+        self.taesd_decoders = nn.ModuleList()
+        for i in range(num_taesd):
+            vae = AutoencoderTiny.from_pretrained(
+                "madebyollin/taesd",
+                torch_dtype=torch.float32,
+            )
+            del vae.encoder
+            vae.encoder = None
+            self.taesd_decoders.append(vae)
+            print(f"  TAESD decoder {i + 1}/{num_taesd} loaded")
 
-        # Resolve prior_registry: explicit arg takes precedence over use_omniglot
-        if prior_registry is not None:
-            self._prior_registry = prior_registry
-        elif use_omniglot:
-            # Backward-compat: auto-build a PriorRegistry with the omniglot decoder
-            from framework.priors import PriorRegistry
-            omni_path = Path(__file__).parent.parent / "omniglot_ae_export" / "decoder_traced.pt"
-            if omni_path.exists():
-                _reg = PriorRegistry(patch_height, patch_width, latent_dim)
-                _reg.add_prior('omniglot', str(omni_path))
-                self._prior_registry = _reg
-                print(f"✓ Omniglot prior auto-loaded from {omni_path}")
-            else:
-                raise FileNotFoundError(
-                    f"use_omniglot=True but omniglot decoder not found at {omni_path}. "
-                    f"Use prior_registry= to specify an explicit PriorRegistry instead."
-                )
-        else:
-            self._prior_registry = None
+        # 6 spatial transformers
+        self.transformers = nn.ModuleList([
+            LightPatchTransformer(
+                d_model=transformer_d_model,
+                nhead=transformer_nhead,
+                d_ff=transformer_d_ff,
+                num_enc_layers=transformer_enc_layers,
+                num_dec_layers=transformer_dec_layers,
+            )
+            for _ in range(num_taesd)
+        ])
+        print(f"LightPatchTransformer ×{num_taesd} initialized "
+              f"(d_model={transformer_d_model}, nhead={transformer_nhead}, "
+              f"d_ff={transformer_d_ff}, "
+              f"enc={transformer_enc_layers}, dec={transformer_dec_layers})")
 
-        if self.use_vae_lora:
-            print(f"Injecting LoRA (rank={self.lora_rank}, alpha={self.lora_alpha})...")
-            self.vae_lora_modules = inject_lora_into_vae_decoder(
-                self.vae, r=self.lora_rank, lora_alpha=self.lora_alpha)
+        # 1 channel mixer (knows how many input streams to expect)
+        self.channel_mixer = ChannelMixer(patch_height, patch_width, latent_dim, num_taesd)
 
-            vae_lora_params = sum(p.numel() for p in self.vae.parameters() if p.requires_grad)
-            vae_base_params = sum(b.numel() for b in self.vae.buffers())
-            print(f"  LoRA injected into {len(self.vae_lora_modules)} modules")
-            print(f"  VAE base (frozen): {vae_base_params:,}")
-            print(f"  VAE LoRA (trainable): {vae_lora_params:,}")
-            if vae_base_params > 0:
-                print(f"  Reduction: {100 * (1 - vae_lora_params / vae_base_params):.2f}%")
-        else:
-            print("VAE full fine-tuning enabled")
-            self.vae_lora_modules = None
-
-        self.vae.train()
-        print(f"VAE loaded. Latent space: [{self.vae_latent_channels}, {self.vae_latent_h}, {self.vae_latent_w}]")
-
-        self.adapter = nn.Linear(latent_dim, self.vae_latent_dim)
-        nn.init.kaiming_normal_(self.adapter.weight, mode='fan_out', nonlinearity='relu')
-        if self.adapter.bias is not None:
-            nn.init.constant_(self.adapter.bias, 0)
-
-        # CNN input: 3 (vae_output) + 3 (btl_out)
-        self.cnn_refiner = nn.Sequential(
-            nn.Conv2d(6, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.LeakyReLU(inplace=True),
-        )
-
-        for m in self.cnn_refiner.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-        self.patch_projector = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=1),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(32, 3, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        for m in self.patch_projector.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-        self.bottleneck_refiner = BottleneckDenseRefiner(
-            patch_height, patch_width, latent_dim, bottleneck_dim,
-            prior_registry=self._prior_registry)
-        print(f"Bottleneck dense refiner enabled (bottleneck_dim={bottleneck_dim})")
-        print("CNN refiner initialized: 6 → 64 → 64 → 128 → 128 → 64 → 64 channels")
-        print("Patch projector: 64 → 32 → 3 channels (1×1 convolutions)")
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"FoundationPatchGenerator total parameters: {total_params:,}")
 
     def forward(self, z: Tensor, z_enriched: Optional[Tensor] = None) -> Tensor:
         """
-        Change D: new execution order — bottleneck runs BEFORE the CNN.
-
-        The CNN now sees both the enriched bottleneck output and the original
-        high-resolution VAE pixels via a skip, giving gradients a direct path
-        from the patch loss back to the VAE without passing through the lossy
-        bottleneck pooling.
+        Generate an adversarial patch from latent codes.
 
         Args:
-            z:          [B, latent_dim]   base latent codes
-            z_enriched: [B, latent_dim]   task-conditioned codes (from TaskEncoder).
-                        If None, falls back to z (backward-compatible with trainer.py).
+            z:          [B, latent_dim]  base latent codes
+            z_enriched: [B, latent_dim]  task-conditioned codes (from TaskEncoder).
+                        If None, falls back to z.
 
         Returns:
             patches: [B, 3, patch_height, patch_width] in [0, 1]
@@ -506,33 +397,37 @@ class FoundationPatchGenerator(nn.Module):
         if z_enriched is None:
             z_enriched = z
 
-        batch_size = z_enriched.shape[0]
+        B = z_enriched.shape[0]
 
-        # 1. VAE decode: z_enriched → vae_latent → vae_output
-        vae_latent_flat = self.adapter(z_enriched)
-        vae_latent = vae_latent_flat.view(
-            batch_size, self.vae_latent_channels,
-            self.vae_latent_h, self.vae_latent_w)
+        stream_outputs = []
+        for adapter, taesd, transformer in zip(
+            self.adapters, self.taesd_decoders, self.transformers
+        ):
+            # Adapt latent code to TAESD latent space
+            latent = adapter(z_enriched).view(
+                B, 4, self.vae_latent_h, self.vae_latent_w
+            )
 
-        vae_output = self.vae.decode(vae_latent).sample
-        vae_output = torch.clamp(vae_output, 0.0, 1.0)
+            # TAESD decode
+            taesd_out = torch.clamp(taesd.decode(latent).sample, 0.0, 1.0)
 
-        if vae_output.shape[2] != self.patch_height or vae_output.shape[3] != self.patch_width:
-            vae_output = F.interpolate(
-                vae_output, size=(self.patch_height, self.patch_width),
-                mode='bilinear', align_corners=True)
+            # Resize to target patch size if needed
+            if taesd_out.shape[2:] != (self.patch_height, self.patch_width):
+                taesd_out = F.interpolate(
+                    taesd_out,
+                    size=(self.patch_height, self.patch_width),
+                    mode='bilinear',
+                    align_corners=True,
+                )
 
-        # 2. Bottleneck refiner: dense path from z; spatial attention sees vae_output too
-        btl_out = self.bottleneck_refiner(z_enriched, vae_output=vae_output)   # [B, 3, H, W]
+            # Spatial transformer refinement
+            stream_outputs.append(transformer(taesd_out))
 
-        # 3. CNN: 6-channel input (vae_output | btl_out)
-        cnn_input = torch.cat([vae_output, btl_out], dim=1)   # [B, 6, H, W]
-        cnn_output = self.cnn_refiner(cnn_input)               # [B, 64, H, W]
+        # Concatenate all stream outputs: [B, 18, H, W]
+        combined = torch.cat(stream_outputs, dim=1)
 
-        # 4. Projector: 64-channel input
-        patches = self.patch_projector(cnn_output)             # [B, 3, H, W]
-
-        return patches
+        # Channel mixing with spatial attention: [B, 3, H, W]
+        return self.channel_mixer(combined, z_enriched)
 
     def forward_clean(self, z: Tensor) -> Tensor:
         """Convenience alias: forward without task conditioning (z_enriched=z)."""

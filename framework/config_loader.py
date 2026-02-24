@@ -101,8 +101,8 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
     Objects built:
         - EnsembleModelPool  (empty — caller registers models from models_cfg)
         - LazyDatasetPool    (datasets registered from YAML)
-        - PriorRegistry      (priors loaded from YAML; empty list = None)
         - TaskEncoder        (dimensions inferred from YAML)
+        - prior_registry     always None (PriorRegistry removed)
 
     Args:
         config_path: path to ensemble .yaml config
@@ -141,7 +141,6 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
 
     from framework.ensemble import EnsembleModelPool
     from framework.dataset_pool import LazyDatasetPool
-    from framework.priors import PriorRegistry
     from framework.task_encoder import TaskEncoder
 
     # Compute device
@@ -199,27 +198,10 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
                 max_samples=ds.get('max_samples', None),
             )
 
-    # Build PriorRegistry (if priors specified)
-    priors_cfg: List[Dict] = cfg.get('priors', [])
+    # PriorRegistry is no longer used — always None
+    prior_registry = None
     gen_cfg = cfg.get('generator', {})
     latent_dim = gen_cfg.get('latent_dim', 16)
-    patch_height = gen_cfg.get('patch_height', 256)
-    patch_width = gen_cfg.get('patch_width', 512)
-
-    prior_registry: Optional[PriorRegistry] = None
-    if priors_cfg:
-        prior_registry = PriorRegistry(
-            patch_height=patch_height,
-            patch_width=patch_width,
-            latent_dim=latent_dim,
-            char_embed_dim=gen_cfg.get('char_embed_dim', 32),
-        )
-        for p in priors_cfg:
-            prior_registry.add_prior(
-                name=p['name'],
-                decoder_path=p['decoder_path'],
-                decoder_latent_dim=p.get('decoder_latent_dim', 32),
-            )
 
     # Build TaskEncoder
     te_cfg = cfg.get('task_encoder', {})
