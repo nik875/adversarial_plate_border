@@ -70,7 +70,7 @@ def main():
         print('==> ImageNet-1K validation (50k images)...')
         val_dir.mkdir(parents=True, exist_ok=True)
         ds = load_dataset('ILSVRC/imagenet-1k', split='validation',
-                          token=token, trust_remote_code=True)
+                          token=token)
         for i, sample in enumerate(ds):
             cls_dir = val_dir / f'{sample["label"]:04d}'
             cls_dir.mkdir(exist_ok=True)
@@ -95,7 +95,7 @@ def main():
     print(f'\n==> ImageNet-1K training subset ({args.train_samples:,} images, streaming)...')
     train_dir.mkdir(parents=True, exist_ok=True)
     ds_train = load_dataset('ILSVRC/imagenet-1k', split='train',
-                            token=token, trust_remote_code=True, streaming=True)
+                            token=token, streaming=True)
     saved = 0
     for sample in ds_train:
         if saved >= args.train_samples:
