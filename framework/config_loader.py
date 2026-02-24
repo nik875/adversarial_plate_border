@@ -29,9 +29,11 @@ Example YAML:
 """
 from __future__ import annotations
 
+import csv
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -156,16 +158,46 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
     datasets_cfg: List[Dict] = cfg.get('datasets', [])
     num_datasets = max(len(datasets_cfg), 1)
 
+    # Load manifest if specified at top level of YAML
+    manifest_path = cfg.get('manifest')
+    manifest: Dict[Tuple[str, str], List[str]] = {}
+    if manifest_path:
+        mp = Path(manifest_path).expanduser()
+        if mp.exists():
+            with open(mp, newline='') as _f:
+                for row in csv.DictReader(_f):
+                    key = (row['dataset'], row['split'])
+                    manifest.setdefault(key, []).append(row['path'])
+        else:
+            warnings.warn(
+                f"Manifest file not found: {mp}. "
+                "Falling back to glob-based dataset loading."
+            )
+
     # Build LazyDatasetPool
     dataset_pool = LazyDatasetPool()
     for ds in datasets_cfg:
-        root = ds.get('root', '/tmp/no_data')
-        dataset_pool.register(
-            name=ds.get('name', 'unnamed'),
-            root=root,
-            domain_type=ds.get('domain_type', 'generic'),
-            max_samples=ds.get('max_samples', None),
-        )
+        name = ds.get('name', 'unnamed')
+        domain_type = ds.get('domain_type', 'generic')
+        split = ds.get('split')
+
+        if manifest and split is not None:
+            paths = manifest.get((name, split), [])
+            if paths:
+                dataset_pool.register_paths(name, paths, domain_type)
+            else:
+                warnings.warn(
+                    f"No paths found in manifest for dataset='{name}' "
+                    f"split='{split}'. Dataset will be skipped."
+                )
+        else:
+            root = ds.get('root', '/tmp/no_data')
+            dataset_pool.register(
+                name=name,
+                root=root,
+                domain_type=domain_type,
+                max_samples=ds.get('max_samples', None),
+            )
 
     # Build PriorRegistry (if priors specified)
     priors_cfg: List[Dict] = cfg.get('priors', [])

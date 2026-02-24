@@ -167,7 +167,7 @@ echo "============================================================"
 echo ""
 
 # ---- 1. ImageNet-1K (requires HF_TOKEN) ------------------------------------
-echo ">>> [1/5] ImageNet-1K val (50k) + train (full 1.28M images)"
+echo ">>> [1/5] ImageNet-1K val (50k) + train (1.28M) + test (~100k images)"
 if [[ -z "${HF_TOKEN:-}" ]]; then
     echo "    SKIP: HF_TOKEN not set."
     echo "    To download ImageNet:"
@@ -210,10 +210,16 @@ python "$SCRIPT_DIR/download_openimages.py" \
     --processes "$JOBS"
 echo ""
 
+# ---- Manifest generation ---------------------------------------------------
+echo ">>> Generating dataset manifest CSV..."
+python "$SCRIPT_DIR/generate_manifest.py" --data-root "$DATA_ROOT"
+echo ""
+
 # ---- Summary ----------------------------------------------------------------
 echo "============================================================"
 echo "  Download complete. Final image counts:"
-for dir in imagenet/val imagenet/train coco/train2017 coco/val2017 \
+for dir in imagenet/val imagenet/train imagenet/test \
+           coco/train2017 coco/val2017 \
            textvqa/train_val_images cc3m/images openimages/images; do
     full="$DATA_ROOT/$dir"
     if [[ -d "$full" ]]; then
