@@ -11,10 +11,11 @@ vlm.py — SmolVLM-500M-Instruct wrapper (Vision-Language Model).
   - Frozen (eval mode, no gradients)
 
 pixel_values shape: (B, num_images, 3, H, W)  — SmolVLM convention (one image per sample)
-pixel_attention_mask shape: (B, num_images, H//14, W//14)  — SigLIP patch_size=14
+pixel_attention_mask shape: (B, num_images, H, W)  — in PIXEL space, NOT patch space.
+  The outer Idefics3 model downsamples to patch space internally (patch_size=16).
+  SmolVLM-500M SigLIP: patch_size=16, 512//16=32 → 32×32=1024 patches per image.
 
 If runtime raises a stride error on expand(), call .contiguous() on the buffers.
-If pixel_attention_mask is rejected, fall back to passing None (model handles it).
 """
 from __future__ import annotations
 
@@ -70,12 +71,12 @@ class SmolVLMWrapper(nn.Module):
         # SmolVLM expects pixel_values: (B, num_images, 3, H, W)
         pixel_values = x_norm.unsqueeze(1)   # [B, 1, 3, 512, 512]
 
-        # pixel_attention_mask: (B, num_images, H//patch_size, W//patch_size)
-        # SigLIP patch_size = 14; 512 // 14 = 36
-        h_p = x.shape[2] // 14
-        w_p = x.shape[3] // 14
+        # pixel_attention_mask must be in PIXEL space (B, num_images, H, W).
+        # The outer Idefics3/SmolVLM model downsamples to patch space internally
+        # using its vision_config.patch_size (=16 for SmolVLM-500M).
+        # Passing patch-space dims here causes a double-downsampling shape mismatch.
         pixel_attention_mask = torch.ones(
-            B, 1, h_p, w_p, device=x.device, dtype=torch.bool
+            B, 1, x.shape[2], x.shape[3], device=x.device, dtype=torch.bool
         )
 
         outputs = self.model(
