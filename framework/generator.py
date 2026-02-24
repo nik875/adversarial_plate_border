@@ -558,3 +558,7 @@ class FoundationPatchGenerator(nn.Module):
         patches = self.patch_projector(projector_input)                      # [B, 3, H, W]
 
         return patches
+
+    def forward_clean(self, z: Tensor) -> Tensor:
+        """Convenience alias: forward without task conditioning (z_enriched=z)."""
+        return self.forward(z)
