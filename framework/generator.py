@@ -143,6 +143,7 @@ class LightPatchTransformer(nn.Module):
             [B, 3, 512, 512] spatially transformed patch in [0, 1]
         """
         B = x.shape[0]
+        x_orig = x  # Save original input for residual connection
 
         # Embed patches: [B, 3, 512, 512] → [B, d_model, 32, 32] → [B, 1024, d_model]
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
@@ -165,7 +166,12 @@ class LightPatchTransformer(nn.Module):
         # 1024 = 32×32 patch grid, 768 = 3×16×16 pixels per patch
         out = out.view(B, 32, 32, 3, 16, 16)
         out = out.permute(0, 3, 1, 4, 2, 5).contiguous()  # [B, 3, 32, 16, 32, 16]
-        return torch.sigmoid(out.view(B, 3, 512, 512))
+        out = out.view(B, 3, 512, 512)
+
+        # Residual connection: ensure transformer refines input rather than replacing it
+        out = out + x_orig
+
+        return torch.sigmoid(out)
 
 
 # ---------------------------------------------------------------------------
