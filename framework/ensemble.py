@@ -349,7 +349,8 @@ class EnsembleTrainer:
 
             # --- 2. Sample strategy placement kwargs ---
             strategy_kwargs = entry.strategy.sample_kwargs(
-                image, gen.patch_height, gen.patch_width
+                image, gen.patch_height, gen.patch_width,
+                model_input_shape=entry.input_shape
             )
 
             # --- 3. Control activation (no_grad, no patch) ---

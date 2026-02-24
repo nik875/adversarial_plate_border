@@ -233,41 +233,59 @@ class StickerStrategy(AttackStrategy):
         sticker_h: Optional[int] = None,
         sticker_w: Optional[int] = None,
         neutral_color: float = 0.5,
+        area_fraction: float = 0.05,
     ):
         """
         Args:
             bbox: (x_min, y_min, x_max, y_max) fixed paste region.  When set,
                   placement is always at this bbox regardless of sticker_h/w.
-            sticker_h: Height of the placed sticker in image pixels.
-                       Defaults to the generator patch height passed to sample_kwargs.
-            sticker_w: Width of the placed sticker in image pixels.
-                       Defaults to the generator patch width passed to sample_kwargs.
+            sticker_h: Height of the placed sticker. If None, computed from area_fraction.
+            sticker_w: Width of the placed sticker. If None, computed from area_fraction.
             neutral_color: grey value for apply_neutral.
+            area_fraction: Fraction of model input area (default 0.05 = 5%).
+                          Used to compute sticker size when sticker_h/w are None.
         """
         self.bbox = bbox
         self.sticker_h = sticker_h
         self.sticker_w = sticker_w
         self.neutral_color = neutral_color
+        self.area_fraction = area_fraction
 
     def sample_kwargs(
         self,
         image: Tensor,
         patch_h: int,
         patch_w: int,
+        model_input_shape: Optional[Tuple[int, int]] = None,
     ) -> Dict:
         """
         Sample a random bbox for this image.
 
         If self.bbox is set, returns it as-is (fixed placement).
         Otherwise, places a sticker of size (sticker_h × sticker_w) at a
-        uniformly random position within the image.  sticker_h / sticker_w
-        fall back to patch_h / patch_w when not configured.
+        uniformly random position within the image.
+
+        If sticker_h/w are not configured:
+          - If model_input_shape is provided, compute size as area_fraction of model input area
+          - Otherwise, fall back to patch_h / patch_w
         """
         if self.bbox is not None:
             return {'bbox': self.bbox}
 
-        sh = self.sticker_h if self.sticker_h is not None else patch_h
-        sw = self.sticker_w if self.sticker_w is not None else patch_w
+        sh = self.sticker_h
+        sw = self.sticker_w
+
+        # Compute sticker size from area_fraction if not explicitly set
+        if sh is None or sw is None:
+            if model_input_shape is not None:
+                model_h, model_w = model_input_shape
+                target_area = self.area_fraction * model_h * model_w
+                # Aspect ratio 2:1 (width:height)
+                sh = int((target_area / 2) ** 0.5)
+                sw = int((target_area * 2) ** 0.5)
+            else:
+                sh = sh if sh is not None else patch_h
+                sw = sw if sw is not None else patch_w
 
         img_h, img_w = image.shape[2], image.shape[3]
         max_x = max(img_w - sw, 0)

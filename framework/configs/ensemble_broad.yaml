@@ -42,8 +42,6 @@ models:
     domain_type: classification
     strategy: sticker
     strategy_id: 1
-    sticker_h: 64
-    sticker_w: 128
 
   - name: swin_t_border
     architecture: swin_t
@@ -68,8 +66,6 @@ models:
     domain_type: detection
     strategy: sticker
     strategy_id: 1
-    sticker_h: 128
-    sticker_w: 256
 
   - name: trocr_base_border
     architecture: trocr_base
