@@ -132,7 +132,7 @@ class TestAttackStrategies(unittest.TestCase):
         pad_h = (self.img_h - center_h) // 2
         pad_w = (self.img_w - center_w) // 2
         border = neutral[:, :, :pad_h, :]
-        self.assertTrue(border.abs() - 0.5 < 0.1)
+        self.assertTrue(((border - 0.5).abs() < 0.1).all())
 
     def test_border_strategy_sample_kwargs(self):
         """Test BorderStrategy.sample_kwargs() returns empty dict."""
@@ -348,8 +348,9 @@ class TestGenerator(unittest.TestCase):
         params_no_lora = sum(p.numel() for p in gen_no_lora.parameters() if p.requires_grad)
         params_lora = sum(p.numel() for p in gen_lora.parameters() if p.requires_grad)
 
-        # LoRA should add parameters
-        self.assertGreater(params_lora, params_no_lora)
+        # use_vae_lora=True freezes base VAE weights and adds only LoRA adapters,
+        # so LoRA training has *fewer* trainable params than full fine-tuning.
+        self.assertGreater(params_no_lora, params_lora)
 
 
 # =============================================================================
@@ -489,8 +490,8 @@ class TestTrainer(unittest.TestCase):
 
             def get_layer_progression(self):
                 return [
-                    LayerConfig(name='conv1', out_channels=16),
-                    LayerConfig(name='conv2', out_channels=32),
+                    LayerConfig(name='conv1', description='first conv'),
+                    LayerConfig(name='conv2', description='second conv'),
                 ]
 
             def build_dataset(self, split='train'):
@@ -534,14 +535,16 @@ class TestGeneratorLoader(unittest.TestCase):
             patch_width=32,
             use_vae_lora=False,
         )
+        gen.eval()
 
-        z = torch.randn(2, 8)
-        patches = generate_patch_from_z(gen, z)
+        # generate_patch_from_z takes a 1-D numpy array and a device
+        device = torch.device('cpu')
+        z_np = torch.randn(8).numpy()
+        patch = generate_patch_from_z(gen, z_np, device)
 
-        # Check output
-        self.assertEqual(len(patches), 2)
-        self.assertEqual(patches[0].shape, (3, 32, 32))
-        self.assertTrue(patches[0].min() >= 0 and patches[0].max() <= 1)
+        # Check output: single patch [3, H, W]
+        self.assertEqual(patch.shape, (3, 32, 32))
+        self.assertTrue(patch.min() >= 0 and patch.max() <= 1)
 
 
 # =============================================================================
@@ -579,14 +582,18 @@ class TestLosses(unittest.TestCase):
         """Test compute_activation_diversity."""
         from framework.losses import compute_activation_diversity
 
-        # Mock activations
-        patch_acts = [torch.randn(1, 32) for _ in range(4)]
-        baseline_acts = [torch.randn(1, 32) for _ in range(4)]
+        # Use clearly-orthogonal activations so log-det is guaranteed positive.
+        # Four 32-d basis vectors (first 4 standard basis directions).
+        patch_acts    = [torch.zeros(1, 32) for _ in range(4)]
+        baseline_acts = [torch.zeros(1, 32) for _ in range(4)]
+        for i in range(4):
+            patch_acts[i][0, i] = 1.0   # delta[i] = e_i (orthogonal unit vectors)
 
         div_score = compute_activation_diversity(patch_acts, baseline_acts)
 
         self.assertIsNotNone(div_score)
-        # Should be a positive scalar (log-det)
+        self.assertTrue(torch.isfinite(div_score).item(), "log-det should be finite")
+        # Orthogonal unit vectors → Gram = I + eps*I → log-det > 0
         self.assertTrue(div_score.item() > 0)
 
 
