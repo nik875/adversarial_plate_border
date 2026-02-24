@@ -507,7 +507,9 @@ class EnsembleTrainer:
         steps_per_epoch = max(1, math.ceil(total_images / self.images_per_batch))
         total_steps = steps_per_epoch * self.max_epochs + 1
 
-        optimizer, scheduler = self._build_optimizer(total_steps)
+        # If max_steps is set, design the LR schedule for that budget
+        schedule_steps = max_steps if max_steps is not None else total_steps
+        optimizer, scheduler = self._build_optimizer(schedule_steps)
 
         start_epoch = 1
         start_step  = 0
