@@ -74,17 +74,18 @@ task_encoder:
   alpha: 0.5
 
 # ---------------------------------------------------------------------------
-# Generator hyperparameters
+# Generator hyperparameters (multi-TAESD architecture)
 # ---------------------------------------------------------------------------
 generator:
   latent_dim: 16
-  patch_height: 64
-  patch_width: 64
-  use_vae_lora: false          # set true for real training (requires SDXL VAE)
-  lora_rank: 4
-  lora_alpha: 8
-  bottleneck_dim: 64
-  char_embed_dim: 32
+  patch_height: 512
+  patch_width: 512
+  num_taesd: 6
+  transformer_d_model: 256
+  transformer_nhead: 4
+  transformer_d_ff: 1024
+  transformer_enc_layers: 2
+  transformer_dec_layers: 2
 
 # ---------------------------------------------------------------------------
 # EnsembleTrainer hyperparameters
@@ -97,7 +98,7 @@ trainer:
   tv_weight: 2.5
   spectrum_weight: 1.0
   learning_rate: 1.0e-4
-  vae_lr_ratio: 0.1
+  taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
   max_epochs: 10
   steps_per_epoch: 5           # use 100+ for real training

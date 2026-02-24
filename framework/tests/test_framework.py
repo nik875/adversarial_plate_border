@@ -2,7 +2,8 @@
 """
 Comprehensive framework test suite.
 
-Tests all major components: domains, strategies, metrics, generator, trainer, config loading.
+Tests all major components: strategies, metrics, generator (multi-TAESD),
+LightPatchTransformer, ChannelMixer, trainer, ensemble, config loading.
 Designed to catch integration issues before cloud deployment.
 
 Usage:
@@ -287,70 +288,94 @@ class TestMetrics(unittest.TestCase):
 # =============================================================================
 
 class TestGenerator(unittest.TestCase):
-    """Test FoundationPatchGenerator."""
+    """Test FoundationPatchGenerator (multi-TAESD architecture).
+
+    These tests download madebyollin/taesd (~1.3 MB) from HuggingFace on first run;
+    subsequent runs use the local cache.
+    """
 
     def setUp(self):
         from framework.generator import FoundationPatchGenerator
         self.FoundationPatchGenerator = FoundationPatchGenerator
         self.device = 'cpu'
 
-    def test_generator_init(self):
-        """Test generator initialization."""
-        gen = self.FoundationPatchGenerator(
-            latent_dim=16,
-            patch_height=64,
-            patch_width=64,
-            use_vae_lora=True,
-            lora_rank=4,
-            lora_alpha=8,
-            use_omniglot=False,
+    def _build_tiny_gen(self, latent_dim: int = 8):
+        """Build a minimal generator for CPU tests (single stream, tiny transformer)."""
+        return self.FoundationPatchGenerator(
+            latent_dim=latent_dim,
+            patch_height=512,
+            patch_width=512,
+            num_taesd=1,
+            transformer_d_model=32,
+            transformer_nhead=4,
+            transformer_d_ff=64,
+            transformer_enc_layers=1,
+            transformer_dec_layers=1,
         )
+
+    def test_generator_init(self):
+        """Test generator initialization and stored hyperparameters."""
+        gen = self._build_tiny_gen(latent_dim=16)
         gen = gen.to(self.device)
 
         self.assertIsNotNone(gen)
         self.assertEqual(gen.latent_dim, 16)
+        self.assertEqual(gen.patch_height, 512)
+        self.assertEqual(gen.patch_width, 512)
+        self.assertEqual(gen.num_taesd, 1)
+        self.assertEqual(gen.transformer_d_model, 32)
+
+    def test_generator_architecture(self):
+        """New architecture attributes present; old LoRA/VAE/BDR attributes absent."""
+        gen = self._build_tiny_gen()
+
+        # New architecture attributes
+        self.assertTrue(hasattr(gen, 'adapters'))
+        self.assertTrue(hasattr(gen, 'taesd_decoders'))
+        self.assertTrue(hasattr(gen, 'transformers'))
+        self.assertTrue(hasattr(gen, 'channel_mixer'))
+
+        # Old architecture attributes must NOT exist
+        self.assertFalse(hasattr(gen, 'vae'),              "SDXL vae should be gone")
+        self.assertFalse(hasattr(gen, 'bottleneck_refiner'), "BDR should be gone")
+        self.assertFalse(hasattr(gen, 'adapter'),           "single adapter should be gone")
+        self.assertFalse(hasattr(gen, 'cnn_refiner'),       "CNN refiner should be gone")
 
     def test_generator_forward(self):
-        """Test generator forward pass."""
-        gen = self.FoundationPatchGenerator(
-            latent_dim=8,
-            patch_height=32,
-            patch_width=32,
-            use_vae_lora=False,
-        )
+        """Forward pass produces [B, 3, 512, 512] in [0, 1]."""
+        gen = self._build_tiny_gen()
         gen = gen.to(self.device)
 
         z = torch.randn(2, 8, device=self.device)
         with torch.no_grad():
             patches = gen.forward_clean(z)
 
-        # Check shape and values
-        self.assertEqual(patches.shape, (2, 3, 32, 32))
+        self.assertEqual(patches.shape, (2, 3, 512, 512))
         self.assertTrue(patches.min() >= 0 and patches.max() <= 1)
 
-    def test_generator_lora_parameters(self):
-        """Test that LoRA adds trainable parameters."""
-        gen_no_lora = self.FoundationPatchGenerator(
-            latent_dim=8,
-            patch_height=32,
-            patch_width=32,
-            use_vae_lora=False,
-        )
+    def test_generator_z_enriched(self):
+        """Forward with separate z and z_enriched both work."""
+        gen = self._build_tiny_gen()
+        gen = gen.to(self.device)
 
-        gen_lora = self.FoundationPatchGenerator(
-            latent_dim=8,
-            patch_height=32,
-            patch_width=32,
-            use_vae_lora=True,
-            lora_rank=4,
-        )
+        z = torch.randn(1, 8, device=self.device)
+        z_enriched = torch.randn(1, 8, device=self.device)
+        with torch.no_grad():
+            patches = gen(z, z_enriched)
 
-        params_no_lora = sum(p.numel() for p in gen_no_lora.parameters() if p.requires_grad)
-        params_lora = sum(p.numel() for p in gen_lora.parameters() if p.requires_grad)
+        self.assertEqual(patches.shape, (1, 3, 512, 512))
+        self.assertTrue(patches.min() >= 0 and patches.max() <= 1)
 
-        # use_vae_lora=True freezes base VAE weights and adds only LoRA adapters,
-        # so LoRA training has *fewer* trainable params than full fine-tuning.
-        self.assertGreater(params_no_lora, params_lora)
+    def test_generator_backward(self):
+        """Backward pass flows through gradient checkpointing back to z."""
+        gen = self._build_tiny_gen()
+        gen.train()
+
+        z = torch.randn(1, 8, requires_grad=True)
+        patches = gen(z)
+        patches.mean().backward()
+
+        self.assertIsNotNone(z.grad, "Gradients should flow back to z")
 
 
 # =============================================================================
@@ -475,7 +500,8 @@ class TestTrainer(unittest.TestCase):
         class MockDomain(DomainAdapter):
             @property
             def input_shape(self):
-                return (64, 64)
+                # Must be 512×512: LightPatchTransformer has fixed 1024-token embeddings
+                return (512, 512)
 
             @property
             def model(self):
@@ -509,6 +535,12 @@ class TestTrainer(unittest.TestCase):
             basis_dim=8,
             patches_per_image=2,
             images_per_batch=1,
+            num_taesd=1,
+            transformer_d_model=32,
+            transformer_nhead=4,
+            transformer_d_ff=64,
+            transformer_enc_layers=1,
+            transformer_dec_layers=1,
             max_epochs=1,
             output_dir=tempfile.mkdtemp(),
         )
@@ -522,29 +554,57 @@ class TestTrainer(unittest.TestCase):
 # =============================================================================
 
 class TestGeneratorLoader(unittest.TestCase):
-    """Test load_generator and generate_patch_from_z."""
+    """Test generate_patch_from_z and checkpoint loading behaviour."""
+
+    def _tiny_gen(self, latent_dim: int = 8):
+        from framework.generator import FoundationPatchGenerator
+        return FoundationPatchGenerator(
+            latent_dim=latent_dim,
+            patch_height=512,
+            patch_width=512,
+            num_taesd=1,
+            transformer_d_model=32,
+            transformer_nhead=4,
+            transformer_d_ff=64,
+            transformer_enc_layers=1,
+            transformer_dec_layers=1,
+        )
 
     def test_generate_patch_from_z(self):
-        """Test generate_patch_from_z function."""
+        """generate_patch_from_z returns [3, 512, 512] float tensor in [0, 1]."""
         from framework.generator_loader import generate_patch_from_z
-        from framework.generator import FoundationPatchGenerator
 
-        gen = FoundationPatchGenerator(
-            latent_dim=8,
-            patch_height=32,
-            patch_width=32,
-            use_vae_lora=False,
-        )
+        gen = self._tiny_gen()
         gen.eval()
 
-        # generate_patch_from_z takes a 1-D numpy array and a device
         device = torch.device('cpu')
         z_np = torch.randn(8).numpy()
         patch = generate_patch_from_z(gen, z_np, device)
 
-        # Check output: single patch [3, H, W]
-        self.assertEqual(patch.shape, (3, 32, 32))
+        self.assertEqual(patch.shape, (3, 512, 512))
         self.assertTrue(patch.min() >= 0 and patch.max() <= 1)
+
+    def test_load_generator_rejects_old_checkpoint(self):
+        """load_generator raises RuntimeError for old SDXL-LoRA checkpoints."""
+        from framework.generator_loader import load_generator
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_dir = Path(tmpdir) / 'training_complete_final_model'
+            ckpt_dir.mkdir()
+            old_ckpt = {
+                'generator_state_dict': {},
+                'basis_dim': 16,
+                'patch_size': [256, 512],
+                'use_vae_lora': True,   # old-format marker
+                'lora_rank': 8,
+                'lora_alpha': 16,
+            }
+            torch.save(old_ckpt, ckpt_dir / 'generator_epoch_0001.pt')
+
+            with self.assertRaises(RuntimeError) as ctx:
+                load_generator(tmpdir)
+
+            self.assertIn('SDXL-LoRA', str(ctx.exception))
 
 
 # =============================================================================
@@ -567,7 +627,7 @@ class TestLosses(unittest.TestCase):
         self.assertTrue(loss.item() >= 0)
 
     def test_spectrum_loss(self):
-        """Test compute_spectrum_loss."""
+        """Test compute_spectrum_loss returns a finite scalar."""
         from framework.losses import compute_spectrum_loss
 
         patches = torch.rand(2, 3, 32, 32)
@@ -576,7 +636,8 @@ class TestLosses(unittest.TestCase):
         loss = compute_spectrum_loss(patches, mask)
 
         self.assertIsNotNone(loss)
-        self.assertTrue(loss.item() >= 0)
+        # SSIM-based loss can be any real value; just require it is finite
+        self.assertTrue(torch.isfinite(loss))
 
     def test_activation_diversity(self):
         """Test compute_activation_diversity."""
@@ -1069,29 +1130,26 @@ class TestEnsembleTrainer(unittest.TestCase):
             latent_dim=4, hidden_dim=16, num_layers=2,
         )
 
-        # Tiny generator (no VAE — can't load SDXL in unit tests)
-        # We'll use a mock generator that just returns random patches
+        # Tiny mock generator (avoids downloading TAESD in trainer unit tests)
         class MockGenerator(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.latent_dim = 4
                 self.patch_height = 64
                 self.patch_width = 64
+                # Attributes read by _save_checkpoint
+                self.num_taesd = 2
+                self.transformer_d_model = 64
+                self.transformer_nhead = 4
+                self.transformer_d_ff = 128
+                self.transformer_enc_layers = 1
+                self.transformer_dec_layers = 1
                 self.conv = nn.Conv2d(1, 3, 1)
 
             def forward(self, z, z_enriched=None):
                 B = z.shape[0]
-                noise = torch.rand(B, 3, 64, 64)
-                return self.conv(noise[:, :1])  # [B, 3, 64, 64]
-
-            # Stubs so EnsembleTrainer can navigate
-            @property
-            def vae(self):
-                return nn.Module()
-
-            @property
-            def bottleneck_refiner(self):
-                return None
+                noise = torch.rand(B, 1, 64, 64)
+                return torch.clamp(self.conv(noise), 0.0, 1.0)  # [B, 3, 64, 64]
 
         gen = MockGenerator()
 
@@ -1177,63 +1235,75 @@ class TestEnsembleConfigLoader(unittest.TestCase):
 
 
 # =============================================================================
-# Test: migrate_checkpoint
+# Test: LightPatchTransformer
 # =============================================================================
 
-class TestMigrateCheckpoint(unittest.TestCase):
-    """Test that migrate_checkpoint correctly upgrades old state dicts."""
+class TestLightPatchTransformer(unittest.TestCase):
+    """Test LightPatchTransformer shape correctness and gradient checkpointing."""
 
-    def test_attention_proj_migration(self):
-        from framework.generator_loader import migrate_checkpoint
+    def setUp(self):
+        from framework.generator import LightPatchTransformer
+        self.LightPatchTransformer = LightPatchTransformer
 
-        # Simulate an old state dict with a single Linear attention_proj
-        old_sd = {
-            'bottleneck_refiner.attention_proj.weight': torch.randn(32, 16),
-            'bottleneck_refiner.attention_proj.bias':   torch.zeros(32),
-        }
-        new_sd = migrate_checkpoint(old_sd)
-
-        self.assertIn('bottleneck_refiner.attention_proj.0.weight', new_sd)
-        self.assertIn('bottleneck_refiner.attention_proj.2.weight', new_sd)
-        self.assertIn('bottleneck_refiner.attention_proj.4.weight', new_sd)
-        # Old keys should be gone
-        self.assertNotIn('bottleneck_refiner.attention_proj.weight', new_sd)
-        # Final layer should carry old weights
-        self.assertTrue(torch.allclose(
-            new_sd['bottleneck_refiner.attention_proj.4.weight'],
-            old_sd['bottleneck_refiner.attention_proj.weight']
-        ))
-
-    def test_cnn_refiner_channel_migration(self):
-        from framework.generator_loader import migrate_checkpoint
-
-        old_sd = {
-            'cnn_refiner.0.weight': torch.randn(64, 4, 3, 3),
-        }
-        new_sd = migrate_checkpoint(old_sd)
-
-        self.assertEqual(new_sd['cnn_refiner.0.weight'].shape, (64, 7, 3, 3))
-        # First 4 channels should be unchanged
-        self.assertTrue(torch.allclose(
-            new_sd['cnn_refiner.0.weight'][:, :4],
-            old_sd['cnn_refiner.0.weight']
-        ))
-        # Extra 3 channels should be zero
-        self.assertTrue(
-            new_sd['cnn_refiner.0.weight'][:, 4:].abs().max().item() == 0.0
+    def _tiny(self):
+        return self.LightPatchTransformer(
+            d_model=32, nhead=4, d_ff=64,
+            num_enc_layers=1, num_dec_layers=1,
         )
 
-    def test_no_migration_needed(self):
-        """State dict without old keys should pass through unchanged."""
-        from framework.generator_loader import migrate_checkpoint
+    def test_forward_shape(self):
+        """Output should be [B, 3, 512, 512] in [0, 1]."""
+        t = self._tiny()
+        t.eval()
+        with torch.no_grad():
+            x = torch.rand(2, 3, 512, 512)
+            out = t(x)
+        self.assertEqual(out.shape, (2, 3, 512, 512))
+        self.assertTrue(out.min() >= 0 and out.max() <= 1)
 
-        sd = {
-            'some_param': torch.randn(3, 3),
-            'cnn_refiner.0.weight': torch.randn(64, 7, 3, 3),  # already 7 ch
-        }
-        new_sd = migrate_checkpoint(sd)
-        # cnn_refiner already has 7 channels → no change
-        self.assertEqual(new_sd['cnn_refiner.0.weight'].shape, (64, 7, 3, 3))
+    def test_backward_through_checkpointing(self):
+        """Gradients should flow back through gradient-checkpointed layers."""
+        t = self._tiny()
+        t.train()
+        x = torch.rand(1, 3, 512, 512, requires_grad=True)
+        out = t(x)
+        out.mean().backward()
+        self.assertIsNotNone(x.grad)
+
+
+# =============================================================================
+# Test: ChannelMixer
+# =============================================================================
+
+class TestChannelMixer(unittest.TestCase):
+    """Test ChannelMixer output shape and spatial attention."""
+
+    def setUp(self):
+        from framework.generator import ChannelMixer
+        self.ChannelMixer = ChannelMixer
+
+    def test_forward_shape(self):
+        """Output should be [B, 3, 512, 512] in [0, 1]."""
+        mixer = self.ChannelMixer(patch_height=512, patch_width=512,
+                                  latent_dim=16, num_taesd=6)
+        mixer.eval()
+        with torch.no_grad():
+            combined = torch.rand(2, 18, 512, 512)  # 6 streams × 3 channels
+            z = torch.randn(2, 16)
+            out = mixer(combined, z)
+        self.assertEqual(out.shape, (2, 3, 512, 512))
+        self.assertTrue(out.min() >= 0 and out.max() <= 1)
+
+    def test_forward_different_num_taesd(self):
+        """ChannelMixer adapts to arbitrary num_taesd."""
+        mixer = self.ChannelMixer(patch_height=512, patch_width=512,
+                                  latent_dim=8, num_taesd=3)
+        mixer.eval()
+        with torch.no_grad():
+            combined = torch.rand(1, 9, 512, 512)   # 3 streams × 3 channels
+            z = torch.randn(1, 8)
+            out = mixer(combined, z)
+        self.assertEqual(out.shape, (1, 3, 512, 512))
 
 
 # =============================================================================
@@ -1254,12 +1324,14 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestAttackStrategies))
     suite.addTests(loader.loadTestsFromTestCase(TestMetrics))
     suite.addTests(loader.loadTestsFromTestCase(TestGenerator))
+    suite.addTests(loader.loadTestsFromTestCase(TestLightPatchTransformer))
+    suite.addTests(loader.loadTestsFromTestCase(TestChannelMixer))
     suite.addTests(loader.loadTestsFromTestCase(TestConfigLoader))
     suite.addTests(loader.loadTestsFromTestCase(TestTrainer))
     suite.addTests(loader.loadTestsFromTestCase(TestGeneratorLoader))
     suite.addTests(loader.loadTestsFromTestCase(TestLosses))
     suite.addTests(loader.loadTestsFromTestCase(TestIntegration))
-    # --- New ensemble tests ---
+    # --- Ensemble tests ---
     suite.addTests(loader.loadTestsFromTestCase(TestTaskEncoder))
     suite.addTests(loader.loadTestsFromTestCase(TestNeuronSampler))
     suite.addTests(loader.loadTestsFromTestCase(TestDatasetPool))
@@ -1267,7 +1339,6 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestEnsembleModelPool))
     suite.addTests(loader.loadTestsFromTestCase(TestEnsembleTrainer))
     suite.addTests(loader.loadTestsFromTestCase(TestEnsembleConfigLoader))
-    suite.addTests(loader.loadTestsFromTestCase(TestMigrateCheckpoint))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

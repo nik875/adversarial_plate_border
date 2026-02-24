@@ -57,15 +57,16 @@ class GenericPatchTrainer:
         performance_weight: float = 1.0,
         tv_weight: float = 2.5,
         spectrum_weight: float = 1.0,
-        use_vae_lora: bool = True,
-        lora_rank: int = 8,
-        lora_alpha: int = 16,
-        bottleneck_dim: int = 256,
-        use_omniglot: bool = False,
+        num_taesd: int = 6,
+        transformer_d_model: int = 256,
+        transformer_nhead: int = 4,
+        transformer_d_ff: int = 1024,
+        transformer_enc_layers: int = 2,
+        transformer_dec_layers: int = 2,
         output_dir: str = "framework_output",
         save_examples_every: Optional[int] = None,
         learning_rate: float = 1e-4,
-        vae_lr_ratio: float = 0.1,
+        taesd_lr_ratio: float = 0.1,
         lr_min: float = 1e-6,
         max_epochs: int = 100,
         val_split: float = 0.2,
@@ -85,7 +86,7 @@ class GenericPatchTrainer:
         self.output_dir = Path(output_dir)
         self.save_examples_every = save_examples_every
         self.learning_rate = learning_rate
-        self.vae_lr_ratio = vae_lr_ratio
+        self.taesd_lr_ratio = taesd_lr_ratio
         self.lr_min = lr_min
         self.max_epochs = max_epochs
 
@@ -124,19 +125,17 @@ class GenericPatchTrainer:
 
         print(f"Dataset: {train_n} train / {val_n} val")
 
-        # Build generator (self-contained, no import from progressive_patch)
-        num_layers = len(self.layer_configs)
+        # Build generator
         self.generator = FoundationPatchGenerator(
             latent_dim=basis_dim,
             patch_height=H,
             patch_width=W,
-            num_layers=num_layers,
-            use_vae_lora=use_vae_lora,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            use_bottleneck_refiner=True,
-            bottleneck_dim=bottleneck_dim,
-            use_omniglot=use_omniglot,
+            num_taesd=num_taesd,
+            transformer_d_model=transformer_d_model,
+            transformer_nhead=transformer_nhead,
+            transformer_d_ff=transformer_d_ff,
+            transformer_enc_layers=transformer_enc_layers,
+            transformer_dec_layers=transformer_dec_layers,
         ).to(_device)
 
         # Hook state for capturing activations from target model
@@ -429,15 +428,18 @@ class GenericPatchTrainer:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         with torch.no_grad():
             if save_generator:
+                gen = self.generator
                 ckpt = {
-                    'generator_state_dict': self.generator.state_dict(),
-                    'epoch': epoch,
-                    'basis_dim': self.basis_dim,
-                    'patch_size': (self.patch_height, self.patch_width),
-                    'use_vae_lora': getattr(self.generator, 'use_vae_lora', False),
-                    'lora_rank': getattr(self.generator, 'lora_rank', None),
-                    'lora_alpha': getattr(self.generator, 'lora_alpha', None),
-                    'use_omniglot': getattr(self.generator, 'use_omniglot', False),
+                    'generator_state_dict': gen.state_dict(),
+                    'basis_dim':            gen.latent_dim,
+                    'patch_size':           [gen.patch_height, gen.patch_width],
+                    'num_taesd':            gen.num_taesd,
+                    'transformer_d_model':  gen.transformer_d_model,
+                    'transformer_nhead':    gen.transformer_nhead,
+                    'transformer_d_ff':     gen.transformer_d_ff,
+                    'transformer_enc_layers': gen.transformer_enc_layers,
+                    'transformer_dec_layers': gen.transformer_dec_layers,
+                    'training_info':        {'epoch': epoch},
                 }
                 torch.save(ckpt, f"{save_dir}/generator_epoch_{epoch:04d}.pt")
 
@@ -463,14 +465,16 @@ class GenericPatchTrainer:
         Args:
             resume_from: optional path to a checkpoint directory to resume from.
         """
-        # Build optimizer: separate LR for VAE vs custom layers
-        vae_params = [p for p in self.generator.vae.parameters() if p.requires_grad]
+        # Build optimizer: lower LR for TAESD decoders (pretrained), full LR for rest
+        taesd_params = [p for n, p in self.generator.named_parameters()
+                        if 'taesd_decoders.' in n and p.requires_grad]
+        taesd_ids = {id(p) for p in taesd_params}
         custom_params = [p for n, p in self.generator.named_parameters()
-                         if 'vae' not in n and p.requires_grad]
+                         if p.requires_grad and id(p) not in taesd_ids]
 
-        vae_lr = self.learning_rate * self.vae_lr_ratio
+        taesd_lr = self.learning_rate * self.taesd_lr_ratio
         optimizer = optim.AdamW([
-            {'params': vae_params, 'lr': vae_lr, 'name': 'vae_lora'},
+            {'params': taesd_params, 'lr': taesd_lr,            'name': 'taesd_decoders'},
             {'params': custom_params, 'lr': self.learning_rate, 'name': 'custom'},
         ])
 
@@ -482,8 +486,8 @@ class GenericPatchTrainer:
             optimizer,
             lr_lambda=[
                 lambda step: (
-                    self.lr_min / vae_lr +
-                    (1 - self.lr_min / vae_lr) *
+                    self.lr_min / taesd_lr +
+                    (1 - self.lr_min / taesd_lr) *
                     (1 + math.cos(math.pi * step / total_steps)) / 2
                 ),
                 lambda step: (
