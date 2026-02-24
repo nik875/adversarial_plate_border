@@ -344,7 +344,10 @@ class FoundationPatchGenerator(nn.Module):
         for adapter in self.adapters:
             nn.init.kaiming_normal_(adapter.weight, mode='fan_out', nonlinearity='relu')
             if adapter.bias is not None:
-                nn.init.constant_(adapter.bias, 0)
+                # Random bias per stream so each TAESD decoder starts in a
+                # different region of latent space, producing diverse outputs
+                # from step 0 rather than collapsing to the same color.
+                nn.init.normal_(adapter.bias, mean=0.0, std=1.0)
 
         # 6 TAESD decoder copies (encoder deleted, fully trainable)
         print(f"Loading {num_taesd} TAESD decoder copies from madebyollin/taesd ...")
