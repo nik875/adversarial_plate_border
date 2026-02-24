@@ -192,6 +192,10 @@ class LazyDatasetPool:
     def num_datasets(self) -> int:
         return len(self._entries)
 
+    def total_images(self) -> int:
+        """Return total number of images across all registered datasets (triggers path discovery)."""
+        return sum(len(self._ensure_paths(did)) for did in self._entries)
+
     def dataset_name(self, dataset_id: int) -> str:
         return self._entries[dataset_id]['name']
 

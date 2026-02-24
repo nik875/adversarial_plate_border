@@ -285,7 +285,8 @@ def main():
         generator=generator,
         neuron_sampler=sampler,
         k_neurons=int(trainer_cfg.get('k_neurons', 100)),
-        patches_per_batch=int(trainer_cfg.get('patches_per_batch', 2)),
+        patches_per_image=int(trainer_cfg.get('patches_per_image', 8)),
+        images_per_batch=int(trainer_cfg.get('images_per_batch', 32)),
         diversity_weight=float(trainer_cfg.get('diversity_weight', 1.0)),
         quality_weight=float(trainer_cfg.get('quality_weight', 1.0)),
         tv_weight=float(trainer_cfg.get('tv_weight', 2.5)),
@@ -303,7 +304,6 @@ def main():
     # Train
     # ------------------------------------------------------------------
     trainer.train(
-        steps_per_epoch=int(trainer_cfg.get('steps_per_epoch', 5)),
         resume_from=args.resume,
         max_steps=args.max_steps,
     )

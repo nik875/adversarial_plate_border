@@ -102,13 +102,14 @@ class BorderStrategy(AttackStrategy):
 
     def __init__(
         self,
-        center_ratio: float = 0.6,
+        center_ratio: float = 0.91,
         output_size: Optional[Tuple[int, int]] = None,
         neutral_color: float = 0.5,
     ):
         """
         Args:
-            center_ratio: Fraction of output canvas occupied by the subject (default 0.6).
+            center_ratio: Fraction of output canvas occupied by the subject (default 0.91,
+                          equivalent to border_scale=1.1: patch is 10% larger than subject).
             output_size: (H, W) of the output canvas.  If None, matches patch size.
             neutral_color: Grey value [0,1] used in apply_neutral (default 0.5).
         """

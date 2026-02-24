@@ -161,9 +161,9 @@ generator:
 # ---------------------------------------------------------------------------
 trainer:
   max_epochs: 100
-  steps_per_epoch: 200
+  patches_per_image: 8
+  images_per_batch: 32
   k_neurons: 10000
-  patches_per_batch: 4
   learning_rate: 1.0e-4
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
@@ -172,4 +172,4 @@ trainer:
   tv_weight: 2.5
   spectrum_weight: 1.0
   output_dir: runs/broad_ensemble
-  save_every_epochs: 10
+  save_every_epochs: 1

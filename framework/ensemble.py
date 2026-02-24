@@ -65,8 +65,9 @@ class EnsembleModelPool:
     """
     Pool of frozen target models, each paired with an attack strategy.
 
-    Models are kept on CPU between steps; on_device() temporarily moves
-    one model to the compute device for a forward pass.
+    All models are moved to compute_device at registration time and kept
+    there permanently.  on_device() is retained as a no-op context manager
+    for API compatibility but no longer moves anything.
 
     Usage::
 
@@ -122,7 +123,7 @@ class EnsembleModelPool:
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)
-        model = model.cpu()
+        model = model.to(self.compute_device)
 
         model_id = self._next_id
         self._next_id += 1
@@ -162,22 +163,10 @@ class EnsembleModelPool:
     @contextmanager
     def on_device(self, entry: ModelEntry) -> Generator[nn.Module, None, None]:
         """
-        Context manager: move model CPU → compute_device, yield, move back.
-
-        Memory-safe: only one model lives on GPU at a time.
-        Clears CUDA cache after moving back to CPU.
+        No-op context manager — all models are permanently on compute_device.
+        Retained for API compatibility.
         """
-        model = entry._model
-        try:
-            model = model.to(self.compute_device)
-            yield model
-        finally:
-            model = model.cpu()
-            entry._model = model
-            if self.compute_device.type == 'cuda':
-                torch.cuda.empty_cache()
-            elif self.compute_device.type == 'mps':
-                torch.mps.empty_cache()
+        yield entry._model
 
     # ------------------------------------------------------------------
     # Metadata
@@ -207,7 +196,15 @@ class EnsembleTrainer:
         - 10,000 random neurons drawn from ALL layers (no fixed layer progression)
         - Per-step control baseline (no precomputed profiles)
         - TaskEncoder conditions z on model/strategy/dataset metadata
-        - Two on_device() calls per step (ctrl_acts no_grad, adv_acts with_grad)
+        - Gradient accumulation over images_per_batch images per optimizer step
+
+    Each optimizer step:
+        for i in range(images_per_batch):
+            sample image + model
+            generate patches_per_image patches
+            compute loss / images_per_batch
+            loss.backward()           ← accumulates into .grad
+        optimizer.step()              ← one update per images_per_batch images
 
     Optimizer groups (AdamW):
         - TAESD decoder params:    lr = learning_rate * vae_lr_ratio
@@ -223,7 +220,8 @@ class EnsembleTrainer:
         generator: FoundationPatchGenerator,
         neuron_sampler: NeuronSampler,
         k_neurons: int = 10_000,
-        patches_per_batch: int = 4,
+        patches_per_image: int = 8,
+        images_per_batch: int = 32,
         diversity_weight: float = 1.0,
         quality_weight: float = 1.0,
         tv_weight: float = 2.5,
@@ -243,7 +241,8 @@ class EnsembleTrainer:
         self.neuron_sampler = neuron_sampler
 
         self.k_neurons = k_neurons
-        self.patches_per_batch = patches_per_batch
+        self.patches_per_image = patches_per_image
+        self.images_per_batch = images_per_batch
         self.diversity_weight = diversity_weight
         self.quality_weight = quality_weight
         self.tv_weight = tv_weight
@@ -315,123 +314,131 @@ class EnsembleTrainer:
         optimizer: optim.Optimizer,
     ) -> Dict[str, float]:
         """
-        One gradient update across a randomly sampled (model, strategy, dataset, image).
+        One optimizer update accumulating gradients over images_per_batch images.
 
-        Returns dict of scalar loss values for logging.
+        For each image:
+            - Sample a random model + image
+            - Generate patches_per_image patches
+            - Compute loss / images_per_batch and call backward()
+        Then return averaged loss stats for logging (optimizer.step() is in the caller).
         """
         gen = self.generator
         device = self._device
+        P = self.patches_per_image
+        N = self.images_per_batch
 
-        # --- 1. Sample a random model entry and image ---
-        entry = self.ensemble.sample_entry()
-        item = self.dataset_pool.sample()
+        acc: Dict[str, float] = {
+            'loss': 0.0, 'diversity': 0.0, 'quality': 0.0,
+            'tv': 0.0, 'spectrum': 0.0, 'model': '',
+        }
 
-        # image: [3, H, W] → [1, 3, H, W] on device
-        image = item.image.unsqueeze(0).to(device)
+        for _ in range(N):
+            # --- 1. Sample a random model entry and image ---
+            entry = self.ensemble.sample_entry()
+            item = self.dataset_pool.sample()
 
-        # --- 2. Sample strategy placement kwargs ---
-        strategy_kwargs = entry.strategy.sample_kwargs(
-            image, gen.patch_height, gen.patch_width
-        )
+            # image: [3, H, W] → [1, 3, H, W] on device
+            image = item.image.unsqueeze(0).to(device)
 
-        # --- 3. Control activation (no_grad, no patch) ---
-        with self.ensemble.on_device(entry) as model:
-            model = model.to(device)
-            neutral_inp = entry.preprocess_fn(
-                entry.strategy.apply_neutral(image, **strategy_kwargs)
-            )
-            sample_shape = (3, *entry.input_shape)
-            sampled_neurons = self.neuron_sampler.sample_neurons(
-                model, self.k_neurons, sample_shape
-            )
-            ctrl_acts = self.neuron_sampler.capture_sampled_activations(
-                model, neutral_inp, sampled_neurons, no_grad=True
-            ).to(device)   # [k], detached, no grad
-
-        # --- 4. Generate P patches conditioned on task metadata ---
-        P = self.patches_per_batch
-        z = torch.randn(P, gen.latent_dim, device=device)
-
-        model_idx    = torch.full((P,), entry.model_id,    device=device, dtype=torch.long)
-        strategy_idx = torch.full((P,), entry.strategy_id, device=device, dtype=torch.long)
-        dataset_idx  = torch.full((P,), item.dataset_id,   device=device, dtype=torch.long)
-
-        # Clamp indices to valid range (defensive)
-        model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
-        strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
-        dataset_idx  = dataset_idx.clamp(0, self.task_encoder.num_datasets - 1)
-
-        z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)  # [P, D]
-        patches = gen(z, z_enriched)   # [P, 3, H, W]
-
-        # --- 5. Adversarial activations (with grad) + losses + backward ---
-        # NOTE: loss.backward() must run *inside* on_device so model weights
-        # remain on the compute device during the backward pass.
-        adv_acts_list: List[Tensor] = []
-        vis_mask = None
-        with self.ensemble.on_device(entry) as model:
-            model = model.to(device)
-            for p_idx in range(P):
-                patch = patches[p_idx]   # [3, pH, pW]
-                composited, mask = entry.strategy.apply(image, patch, **strategy_kwargs)
-                if vis_mask is None:
-                    # Capture mask from first apply call using the real image,
-                    # not a dummy — avoids OOB bbox if image is larger than patch.
-                    vis_mask = mask  # [1, 1, pH, pW]
-                adv_inp = entry.preprocess_fn(composited)
-                adv_acts = self.neuron_sampler.capture_sampled_activations(
-                    model, adv_inp, sampled_neurons, no_grad=False
-                )   # [k], has grad_fn
-                adv_acts_list.append(adv_acts)
-
-            # --- 6. Compute losses and backward (model still on device) ---
-            # Deltas: [P, k]
-            deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)
-
-            # Diversity: log-det of Gram matrix of unit-normalised deltas
-            eps = max(1e-6, 1e-2 / P)
-            normalized = F.normalize(deltas, p=2, dim=1)   # [P, k]
-            gram = normalized @ normalized.T               # [P, P]
-            gram = gram + eps * torch.eye(P, device=device)
-            sign, log_det = torch.slogdet(gram)
-            if torch.isnan(log_det) or sign <= 0:
-                log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
-
-            # Quality: mean RMS of normalized deltas across patches
-            ctrl_std = ctrl_acts.std() + 1e-8
-            norm_deltas_sq = (deltas / ctrl_std) ** 2      # [P, k]
-            per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()  # [P]
-            quality = per_patch_rms.mean() + 1e-8           # scalar
-
-            total_act_loss = -(
-                self.diversity_weight * log_det
-                + self.quality_weight * torch.log(quality)
+            # --- 2. Sample strategy placement kwargs ---
+            strategy_kwargs = entry.strategy.sample_kwargs(
+                image, gen.patch_height, gen.patch_width
             )
 
-            patches_stacked = patches  # [P, 3, H, W]
-            tv_val = self.tv_weight * total_variation_loss(patches_stacked, vis_mask)
-            spec_val = self.spectrum_weight * compute_spectrum_loss(patches_stacked, vis_mask)
+            # --- 3. Control activation (no_grad, no patch) ---
+            with self.ensemble.on_device(entry) as model:
+                neutral_inp = entry.preprocess_fn(
+                    entry.strategy.apply_neutral(image, **strategy_kwargs)
+                )
+                sample_shape = (3, *entry.input_shape)
+                sampled_neurons = self.neuron_sampler.sample_neurons(
+                    model, self.k_neurons, sample_shape
+                )
+                ctrl_acts = self.neuron_sampler.capture_sampled_activations(
+                    model, neutral_inp, sampled_neurons, no_grad=True
+                ).to(device)   # [k], detached
 
-            loss = total_act_loss + tv_val + spec_val
-            loss.backward()
+            # --- 4. Generate P patches conditioned on task metadata ---
+            z = torch.randn(P, gen.latent_dim, device=device)
 
-            # Release the grad graph immediately
-            del deltas, adv_acts_list
+            model_idx    = torch.full((P,), entry.model_id,    device=device, dtype=torch.long)
+            strategy_idx = torch.full((P,), entry.strategy_id, device=device, dtype=torch.long)
+            dataset_idx  = torch.full((P,), item.dataset_id,   device=device, dtype=torch.long)
 
-            return {
-                'loss':         loss.item(),
-                'diversity':    log_det.item(),
-                'quality':      quality.item(),
-                'tv':           tv_val.item(),
-                'spectrum':     spec_val.item(),
-                'model':        entry.name,
-            }
+            model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
+            strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
+            dataset_idx  = dataset_idx.clamp(0, self.task_encoder.num_datasets - 1)
+
+            z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)
+            patches = gen(z, z_enriched)   # [P, 3, H, W]
+
+            # --- 5. Adversarial activations + losses + backward ---
+            # loss.backward() runs inside on_device so model stays on GPU during backward.
+            adv_acts_list: List[Tensor] = []
+            vis_mask = None
+            with self.ensemble.on_device(entry) as model:
+                for p_idx in range(P):
+                    patch = patches[p_idx]
+                    composited, mask = entry.strategy.apply(image, patch, **strategy_kwargs)
+                    if vis_mask is None:
+                        vis_mask = mask
+                    adv_inp = entry.preprocess_fn(composited)
+                    adv_acts = self.neuron_sampler.capture_sampled_activations(
+                        model, adv_inp, sampled_neurons, no_grad=False
+                    )
+                    adv_acts_list.append(adv_acts)
+
+                # --- 6. Compute losses ---
+                deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)  # [P, k]
+
+                eps = max(1e-6, 1e-2 / P)
+                normalized = F.normalize(deltas, p=2, dim=1)
+                gram = normalized @ normalized.T
+                gram = gram + eps * torch.eye(P, device=device)
+                sign, log_det = torch.slogdet(gram)
+                if torch.isnan(log_det) or sign <= 0:
+                    log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
+
+                ctrl_std = ctrl_acts.std() + 1e-8
+                norm_deltas_sq = (deltas / ctrl_std) ** 2
+                per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
+                quality = per_patch_rms.mean() + 1e-8
+
+                total_act_loss = -(
+                    self.diversity_weight * log_det
+                    + self.quality_weight * torch.log(quality)
+                )
+
+                tv_val   = self.tv_weight      * total_variation_loss(patches, vis_mask)
+                spec_val = self.spectrum_weight * compute_spectrum_loss(patches, vis_mask)
+
+                # Divide by N so gradients accumulate to the mean over the batch
+                loss = (total_act_loss + tv_val + spec_val) / N
+                loss.backward()
+
+                del deltas, adv_acts_list
+
+            acc['loss']      += (total_act_loss + tv_val + spec_val).item()
+            acc['diversity'] += log_det.item()
+            acc['quality']   += quality.item()
+            acc['tv']        += tv_val.item()
+            acc['spectrum']  += spec_val.item()
+            acc['model']      = entry.name
+
+        return {
+            'loss':      acc['loss']      / N,
+            'diversity': acc['diversity'] / N,
+            'quality':   acc['quality']   / N,
+            'tv':        acc['tv']        / N,
+            'spectrum':  acc['spectrum']  / N,
+            'model':     acc['model'],
+        }
 
     # ------------------------------------------------------------------
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def _save_checkpoint(self, epoch: int, subdir: str = 'checkpoint') -> None:
+    def _save_checkpoint(self, epoch: int, global_step: int, subdir: str = 'checkpoint') -> None:
         ckpt_dir = self.output_dir / subdir
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -448,9 +455,11 @@ class EnsembleTrainer:
             'transformer_enc_layers':  gen.transformer_enc_layers,
             'transformer_dec_layers':  gen.transformer_dec_layers,
             'training_info': {
-                'epoch':             epoch,
-                'k_neurons':         self.k_neurons,
-                'patches_per_batch': self.patches_per_batch,
+                'epoch':            epoch,
+                'global_step':      global_step,
+                'k_neurons':        self.k_neurons,
+                'patches_per_image': self.patches_per_image,
+                'images_per_batch': self.images_per_batch,
             },
         }
 
@@ -473,22 +482,33 @@ class EnsembleTrainer:
 
     def train(
         self,
-        steps_per_epoch: int = 100,
         resume_from: Optional[str] = None,
         max_steps: Optional[int] = None,
     ) -> None:
         """
-        Train the generator for max_epochs, steps_per_epoch steps each.
+        Train the generator for max_epochs epochs.
+
+        One epoch = one full pass over the dataset pool (dataset_pool.total_images()
+        images, grouped into steps of images_per_batch each).
+
+        The LR scheduler steps every optimizer update (not every epoch), so the
+        cosine schedule stays correct even when training is stopped mid-epoch.
+        Checkpoints are saved every save_every_epochs completed epochs, and also
+        whenever max_steps is hit mid-epoch.
 
         Args:
-            steps_per_epoch: number of gradient updates per epoch
-            resume_from:     optional checkpoint path to resume from
-            max_steps:       if set, stop after this many total steps (for smoke tests)
+            resume_from: optional checkpoint directory to resume from
+            max_steps:   stop after this many total optimizer steps (partial epoch ok)
         """
+        # One epoch = ceil(total_images / images_per_batch) optimizer steps
+        total_images = self.dataset_pool.total_images()
+        steps_per_epoch = max(1, math.ceil(total_images / self.images_per_batch))
         total_steps = steps_per_epoch * self.max_epochs + 1
+
         optimizer, scheduler = self._build_optimizer(total_steps)
 
         start_epoch = 1
+        start_step  = 0
         if resume_from is not None:
             ckpt_files = sorted(Path(resume_from).glob("ensemble_epoch_*.pt"))
             if ckpt_files:
@@ -496,15 +516,21 @@ class EnsembleTrainer:
                 self.generator.load_state_dict(ckpt['generator_state_dict'])
                 self.task_encoder.load_state_dict(ckpt['task_encoder_state_dict'])
                 start_epoch = ckpt.get('epoch', 0) + 1
-                print(f"Resumed from {ckpt_files[-1]} at epoch {start_epoch}")
+                start_step  = ckpt.get('global_step', 0)
+                # Fast-forward scheduler to match resumed position
+                for _ in range(start_step):
+                    scheduler.step()
+                print(f"Resumed from {ckpt_files[-1]} — epoch {start_epoch}, step {start_step}")
 
         print(f"\n{'='*70}")
         print(f"EnsembleTrainer — {self.ensemble.num_models()} models, "
               f"{self.dataset_pool.num_datasets()} datasets, "
-              f"k={self.k_neurons} neurons, P={self.patches_per_batch} patches/step")
+              f"k={self.k_neurons} neurons, "
+              f"{self.patches_per_image} patches/image × {self.images_per_batch} images/batch")
+        print(f"  {total_images:,} dataset images → {steps_per_epoch:,} steps/epoch")
         print(f"{'='*70}\n")
 
-        global_step = 0
+        global_step = start_step
 
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()
@@ -514,6 +540,7 @@ class EnsembleTrainer:
                 'loss': 0.0, 'diversity': 0.0, 'quality': 0.0,
                 'tv': 0.0, 'spectrum': 0.0,
             }
+            epoch_steps = 0
 
             with tqdm(total=steps_per_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
                 for step in range(steps_per_epoch):
@@ -526,10 +553,11 @@ class EnsembleTrainer:
                         + list(self.task_encoder.parameters()), 1.0
                     )
                     optimizer.step()
-                    scheduler.step()
+                    scheduler.step()   # per optimizer step, not per epoch
 
                     for k in epoch_losses:
                         epoch_losses[k] += info.get(k, 0.0)
+                    epoch_steps += 1
 
                     pbar.set_postfix({
                         'loss':  f"{info['loss']:.4f}",
@@ -540,12 +568,16 @@ class EnsembleTrainer:
 
                     global_step += 1
                     if max_steps is not None and global_step >= max_steps:
-                        print(f"\n  max_steps={max_steps} reached; stopping.")
-                        break
+                        print(f"\n  max_steps={max_steps} reached mid-epoch; saving checkpoint.")
+                        self._save_checkpoint(
+                            epoch, global_step,
+                            subdir=f'checkpoint_step_{global_step:07d}'
+                        )
+                        return
 
-            n = steps_per_epoch
+            n = max(epoch_steps, 1)
             print(
-                f"[Epoch {epoch}] "
+                f"[Epoch {epoch}/{self.max_epochs}] "
                 f"loss={epoch_losses['loss']/n:.4f}  "
                 f"div={epoch_losses['diversity']/n:.3f}  "
                 f"qual={epoch_losses['quality']/n:.3f}  "
@@ -554,11 +586,9 @@ class EnsembleTrainer:
             )
 
             if epoch % self.save_every_epochs == 0 or epoch == self.max_epochs:
-                self._save_checkpoint(epoch, subdir=f'checkpoint_epoch_{epoch:04d}')
-
-            if max_steps is not None and global_step >= max_steps:
-                break
+                self._save_checkpoint(epoch, global_step,
+                                      subdir=f'checkpoint_epoch_{epoch:04d}')
 
         # Final checkpoint
-        self._save_checkpoint(self.max_epochs, subdir='ensemble_final')
+        self._save_checkpoint(self.max_epochs, global_step, subdir='ensemble_final')
         print(f"\n✓ Ensemble training complete. Output: {self.output_dir}")
