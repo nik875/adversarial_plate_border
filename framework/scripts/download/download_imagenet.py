@@ -26,7 +26,7 @@ from PIL import Image as PILImage
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir',    default='/data/imagenet')
+    ap.add_argument('--output-dir',    default=os.path.expanduser('~/.cache/imagenet'))
     ap.add_argument('--train-samples', type=int, default=1_000_000,
                     help='Number of training images to download (default: 1M of 1.28M, ~75 GB at 640px)')
     ap.add_argument('--val-only',      action='store_true',

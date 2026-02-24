@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import urllib.request
 import zipfile
@@ -67,7 +68,7 @@ def download_split(name: str, url: str, out_dir: Path) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir', default='/data/coco')
+    ap.add_argument('--output-dir', default=os.path.expanduser('~/.cache/coco'))
     ap.add_argument('--val-only',   action='store_true',
                     help='Download validation set only (5k images, ~1 GB)')
     args = ap.parse_args()

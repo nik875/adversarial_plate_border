@@ -84,32 +84,32 @@ models:
 # ---------------------------------------------------------------------------
 datasets:
   - name: imagenet_val
-    root: /data/imagenet/val           # download_imagenet.py (needs HF_TOKEN)
+    root: ~/.cache/imagenet/val           # download_imagenet.py (needs HF_TOKEN)
     domain_type: natural
 
   - name: imagenet_train
-    root: /data/imagenet/train         # download_imagenet.py  ~1M images at 640px
+    root: ~/.cache/imagenet/train         # download_imagenet.py  ~1M images at 640px
     max_samples: 1000000
     domain_type: natural
 
   - name: coco_train
-    root: /data/coco/train2017         # download_coco.py  ~118k images
+    root: ~/.cache/coco/train2017         # download_coco.py  ~118k images
     domain_type: natural
 
   - name: coco_val
-    root: /data/coco/val2017           # download_coco.py  ~5k images
+    root: ~/.cache/coco/val2017           # download_coco.py  ~5k images
     domain_type: natural
 
   - name: textvqa
-    root: /data/textvqa/train_val_images  # download_textvqa.py  ~34k images
+    root: ~/.cache/textvqa/train_val_images  # download_textvqa.py  ~34k images
     domain_type: text_in_scene
 
   - name: cc3m
-    root: /data/cc3m/images            # download_cc3m.py  ~1.2M images at 640px
+    root: ~/.cache/cc3m/images            # download_cc3m.py  ~1.2M images at 640px
     domain_type: web_natural
 
   - name: openimages
-    root: /data/openimages             # download_openimages.py  ~1M images at 640px
+    root: ~/.cache/openimages             # download_openimages.py  ~1M images at 640px
     domain_type: detection
 
   - name: synthetic

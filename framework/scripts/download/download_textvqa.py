@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import urllib.request
 import zipfile
@@ -38,7 +39,7 @@ def _progress(count, block_size, total_size):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir', default='/data/textvqa')
+    ap.add_argument('--output-dir', default=os.path.expanduser('~/.cache/textvqa'))
     args = ap.parse_args()
 
     out = Path(args.output_dir)

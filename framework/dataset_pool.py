@@ -95,7 +95,7 @@ class LazyDatasetPool:
         self._next_id += 1
         self._entries[dataset_id] = {
             'name': name,
-            'root': Path(root),
+            'root': Path(root).expanduser(),
             'domain_type': domain_type,
             'max_samples': max_samples,
             'paths': None,   # populated lazily

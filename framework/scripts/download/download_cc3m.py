@@ -106,7 +106,7 @@ def count_images(output_dir: Path) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir', default='/data/cc3m')
+    ap.add_argument('--output-dir', default=os.path.expanduser('~/.cache/cc3m'))
     ap.add_argument('--url-count',  type=int, default=2_500_000,
                     help='URLs to fetch (~50%% success rate; 2.5M → ~1.2M images, ~90 GB at 640px)')
     ap.add_argument('--processes',  type=int, default=16,

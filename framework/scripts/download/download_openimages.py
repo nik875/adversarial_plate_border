@@ -19,13 +19,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--output-dir',  default='/data/openimages')
+    ap.add_argument('--output-dir',  default=os.path.expanduser('~/.cache/openimages'))
     ap.add_argument('--num-samples', type=int, default=1_000_000,
                     help='Number of images to download (default: 1M, ~75 GB after 640px resize)')
     ap.add_argument('--split',       default='train',
