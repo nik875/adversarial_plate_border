@@ -42,6 +42,9 @@ _OI_TRAIN_CSV_URL = (
     'train-images-boxable-with-rotation.csv'
 )
 
+# Stable AWS S3 mirror — same source fiftyone uses, public, no dead links
+_S3_URL_TEMPLATE = 'https://s3.amazonaws.com/open-images-dataset/train/{image_id}.jpg'
+
 
 def _progress(count, block_size, total_size):
     if total_size <= 0:
@@ -59,15 +62,15 @@ def download_image_list(csv_path: Path) -> None:
 
 
 def prepare_url_list(full_csv: Path, url_list: Path, num_samples: int, seed: int) -> None:
-    """Read OriginalURL column, shuffle, truncate, write a plain URL-per-line file."""
-    print(f'\n==> Sampling {num_samples:,} URLs...')
+    """Build stable S3 URLs from ImageID column, shuffle, truncate, write CSV."""
+    print(f'\n==> Sampling {num_samples:,} URLs from AWS S3 mirror...')
     urls = []
     with full_csv.open(newline='') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            url = row.get('OriginalURL', '')
-            if url:
-                urls.append(url)
+            image_id = row.get('ImageID', '')
+            if image_id:
+                urls.append(_S3_URL_TEMPLATE.format(image_id=image_id))
 
     random.seed(seed)
     random.shuffle(urls)
@@ -141,10 +144,10 @@ def main():
 
     n = sum(1 for _ in images_dir.rglob('*.jpg'))
     print(f'\nDone. Open Images subset: {n:,} images → {images_dir}')
-    if n < args.num_samples * 0.5:
+    if n < args.num_samples * 0.8:
         print(f'WARNING: low yield ({n:,}/{args.num_samples:,}). '
-              f'Open Images original URLs (Flickr etc.) may have liveness issues. '
-              f'Consider increasing --num-samples.')
+              f'S3 URLs should be stable — check network connectivity or '
+              f'increase --processes/--thread-count.')
 
 
 if __name__ == '__main__':
