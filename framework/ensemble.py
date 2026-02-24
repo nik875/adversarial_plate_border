@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import os
+import signal
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -554,6 +555,13 @@ class EnsembleTrainer:
         samples_dir = run_dir / 'samples'
         samples_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save checkpoint on Ctrl+C so progress is never lost
+        interrupted = False
+        def _sigint_handler(sig, frame):
+            nonlocal interrupted
+            interrupted = True
+        signal.signal(signal.SIGINT, _sigint_handler)
+
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()
             self.task_encoder.train()
@@ -582,9 +590,8 @@ class EnsembleTrainer:
                     epoch_steps += 1
 
                     pbar.set_postfix({
-                        'loss':  f"{info['loss']:.4f}",
-                        'div':   f"{info['diversity']:.2f}",
-                        'model': info['model'],
+                        'loss': f"{info['loss']:.4f}",
+                        'div':  f"{info['diversity']:.2f}",
                     })
                     pbar.update(1)
 
@@ -602,8 +609,16 @@ class EnsembleTrainer:
                                 )
                         self.generator.train()
 
+                    if interrupted:
+                        print(f"\n  Interrupted at step {global_step}; saving checkpoint.")
+                        self._save_checkpoint(
+                            epoch, global_step, run_dir,
+                            subdir=f'checkpoint_step_{global_step:07d}'
+                        )
+                        return
+
                     if max_steps is not None and global_step >= max_steps:
-                        print(f"\n  max_steps={max_steps} reached mid-epoch; saving checkpoint.")
+                        print(f"\n  max_steps={max_steps} reached; saving checkpoint.")
                         self._save_checkpoint(
                             epoch, global_step, run_dir,
                             subdir=f'checkpoint_step_{global_step:07d}'
