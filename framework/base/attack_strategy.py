@@ -323,13 +323,8 @@ class StickerStrategy(AttackStrategy):
         bbox: Optional[Tuple[int, int, int, int]] = None,
         **kwargs,
     ) -> Tensor:
-        """Fill bbox with neutral grey, rest of image unchanged."""
-        x0, y0, x1, y1 = self._resolve_bbox(image, bbox)
-        x1 = min(x1, image.shape[3])
-        y1 = min(y1, image.shape[2])
-        result = image.clone()
-        result[:, :, y0:y1, x0:x1] = self.neutral_color
-        return torch.clamp(result, 0.0, 1.0)
+        """No-op: return image unchanged. Delta should measure the sticker's effect."""
+        return image
 
 
 # ---------------------------------------------------------------------------
