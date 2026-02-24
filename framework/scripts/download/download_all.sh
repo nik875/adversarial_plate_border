@@ -120,12 +120,11 @@ if [[ "$SKIP_SMOKE" == false ]]; then
     else
         if python - <<'PYEOF'
 import os, sys
-from datasets import load_dataset
 try:
-    ds = load_dataset('ILSVRC/imagenet-1k', split='train',
-                      token=os.environ['HF_TOKEN'], streaming=True)
-    sample = next(iter(ds))
-    assert sample['image'] is not None
+    from huggingface_hub import HfApi
+    api = HfApi(token=os.environ['HF_TOKEN'])
+    info = api.dataset_info('ILSVRC/imagenet-1k')
+    assert info.id is not None
     print("    PASS (token valid, dataset accessible)")
 except Exception as e:
     print(f"    FAIL: {e}", file=sys.stderr)

@@ -92,7 +92,7 @@ def run_img2dataset(url_list: Path, output_dir: Path, processes: int) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable, '-m', 'img2dataset',
+        'img2dataset',
         '--url_list',                str(url_list),
         '--input_format',            'csv',
         '--url_col',                 'url',

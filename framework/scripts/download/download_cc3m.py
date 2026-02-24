@@ -47,7 +47,6 @@ def export_url_list(out_tsv: Path, n_urls: int) -> None:
         'unlabeled',
         split='train',
         streaming=True,
-        trust_remote_code=True,
     )
 
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
@@ -77,7 +76,7 @@ def run_img2dataset(url_tsv: Path, output_dir: Path, processes: int) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        sys.executable, '-m', 'img2dataset',
+        'img2dataset',
         '--url_list',         str(url_tsv),
         '--input_format',     'tsv',
         '--url_col',          'url',
