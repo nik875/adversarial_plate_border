@@ -88,8 +88,7 @@ datasets:
     domain_type: natural
 
   - name: imagenet_train
-    root: ~/.cache/imagenet/train         # download_imagenet.py  ~1M images at 640px
-    max_samples: 1000000
+    root: ~/.cache/imagenet/train         # download_imagenet.py  full 1.28M images at 640px
     domain_type: natural
 
   - name: coco_train

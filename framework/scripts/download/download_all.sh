@@ -167,7 +167,7 @@ echo "============================================================"
 echo ""
 
 # ---- 1. ImageNet-1K (requires HF_TOKEN) ------------------------------------
-echo ">>> [1/5] ImageNet-1K val (50k) + train (1M images)"
+echo ">>> [1/5] ImageNet-1K val (50k) + train (full 1.28M images)"
 if [[ -z "${HF_TOKEN:-}" ]]; then
     echo "    SKIP: HF_TOKEN not set."
     echo "    To download ImageNet:"
@@ -177,7 +177,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 else
     python "$SCRIPT_DIR/download_imagenet.py" \
         --output-dir "$DATA_ROOT/imagenet" \
-        --train-samples 1000000 \
+        --train-samples 1300000 \
         --max-size 640
 fi
 echo ""
