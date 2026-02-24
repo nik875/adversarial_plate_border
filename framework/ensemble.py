@@ -519,12 +519,7 @@ class EnsembleTrainer:
                 for step in range(steps_per_epoch):
                     optimizer.zero_grad()
 
-                    try:
-                        info = self._train_step(optimizer)
-                    except Exception as e:
-                        print(f"\n  Warning: step {step} failed ({e}); skipping.")
-                        optimizer.zero_grad()
-                        continue
+                    info = self._train_step(optimizer)
 
                     torch.nn.utils.clip_grad_norm_(
                         list(self.generator.parameters())
