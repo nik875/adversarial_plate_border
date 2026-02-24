@@ -162,7 +162,7 @@ def main() -> None:
         ('COCO val',       lambda: _scan_coco_split(data_root / 'coco', 'val')),
         ('COCO train',     lambda: _scan_coco_split(data_root / 'coco', 'train')),
         ('TextVQA',        lambda: _scan_flat(
-                               data_root / 'textvqa' / 'train_val_images',
+                               data_root / 'textvqa',
                                'textvqa', '**/*.jpg')),
         ('CC3M',           lambda: _scan_flat(
                                data_root / 'cc3m' / 'images',
