@@ -595,7 +595,7 @@ class EnsembleTrainer:
                             epoch_losses[k] += info.get(k, 0.0)
                         epoch_steps += 1
 
-                        current_lr = optimizer.param_groups[0]['lr']
+                        current_lr = optimizer.param_groups[1]['lr']  # Task encoder & generator LR (fastest)
                         pbar.set_postfix({
                             'loss': f"{info['loss']:.4f}",
                             'div':  f"{info['diversity']:.2f}",
