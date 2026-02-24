@@ -555,12 +555,8 @@ class EnsembleTrainer:
         samples_dir = run_dir / 'samples'
         samples_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save checkpoint on Ctrl+C so progress is never lost
-        interrupted = False
-        def _sigint_handler(sig, frame):
-            nonlocal interrupted
-            interrupted = True
-        signal.signal(signal.SIGINT, _sigint_handler)
+        # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()
@@ -576,61 +572,62 @@ class EnsembleTrainer:
             if max_steps is not None:
                 steps_this_epoch = min(steps_per_epoch, max_steps - global_step)
 
-            with tqdm(total=steps_this_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
-                for step in range(steps_this_epoch):
-                    optimizer.zero_grad()
+            try:
+                with tqdm(total=steps_this_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
+                    for step in range(steps_this_epoch):
+                        optimizer.zero_grad()
 
-                    info = self._train_step(optimizer)
+                        info = self._train_step(optimizer)
 
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.generator.parameters())
-                        + list(self.task_encoder.parameters()), 1.0
-                    )
-                    optimizer.step()
-                    scheduler.step()   # per optimizer step, not per epoch
-
-                    for k in epoch_losses:
-                        epoch_losses[k] += info.get(k, 0.0)
-                    epoch_steps += 1
-
-                    pbar.set_postfix({
-                        'loss': f"{info['loss']:.4f}",
-                        'div':  f"{info['diversity']:.2f}",
-                        'qual': f"{info['quality']:.4f}",
-                        'tv':   f"{info['tv']:.4f}",
-                        'ssim': f"{info['spectrum']:.4f}",
-                    })
-                    pbar.update(1)
-
-                    global_step += 1
-
-                    # Save sample patches every 10 optimizer steps
-                    if global_step % 10 == 0:
-                        self.generator.eval()
-                        with torch.no_grad():
-                            z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                            sample_patches = self.generator(z)
-                            for i, patch in enumerate(sample_patches):
-                                T.ToPILImage()(patch.cpu()).save(
-                                    samples_dir / f'step_{global_step:07d}_patch_{i}.png'
-                                )
-                        self.generator.train()
-
-                    if interrupted:
-                        print(f"\n  Interrupted at step {global_step}; saving checkpoint.")
-                        self._save_checkpoint(
-                            epoch, global_step, run_dir,
-                            subdir=f'checkpoint_step_{global_step:07d}'
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self.generator.parameters())
+                            + list(self.task_encoder.parameters()), 1.0
                         )
-                        return
+                        optimizer.step()
+                        scheduler.step()   # per optimizer step, not per epoch
 
-                    if max_steps is not None and global_step >= max_steps:
-                        print(f"\n  max_steps={max_steps} reached; saving checkpoint.")
-                        self._save_checkpoint(
-                            epoch, global_step, run_dir,
-                            subdir=f'checkpoint_step_{global_step:07d}'
-                        )
-                        return
+                        for k in epoch_losses:
+                            epoch_losses[k] += info.get(k, 0.0)
+                        epoch_steps += 1
+
+                        pbar.set_postfix({
+                            'loss': f"{info['loss']:.4f}",
+                            'div':  f"{info['diversity']:.2f}",
+                            'qual': f"{info['quality']:.4f}",
+                            'tv':   f"{info['tv']:.4f}",
+                            'ssim': f"{info['spectrum']:.4f}",
+                        })
+                        pbar.update(1)
+
+                        global_step += 1
+
+                        # Save sample patches every 10 optimizer steps
+                        if global_step % 10 == 0:
+                            self.generator.eval()
+                            with torch.no_grad():
+                                z = torch.randn(10, self.generator.latent_dim, device=self._device)
+                                sample_patches = self.generator(z)
+                                for i, patch in enumerate(sample_patches):
+                                    T.ToPILImage()(patch.cpu()).save(
+                                        samples_dir / f'step_{global_step:07d}_patch_{i}.png'
+                                    )
+                            self.generator.train()
+
+                        if max_steps is not None and global_step >= max_steps:
+                            print(f"\n  max_steps={max_steps} reached; saving checkpoint.")
+                            self._save_checkpoint(
+                                epoch, global_step, run_dir,
+                                subdir=f'checkpoint_step_{global_step:07d}'
+                            )
+                            return
+
+            except KeyboardInterrupt:
+                print(f"\n  Interrupted at step {global_step}; saving checkpoint.")
+                self._save_checkpoint(
+                    epoch, global_step, run_dir,
+                    subdir=f'checkpoint_step_{global_step:07d}'
+                )
+                return
 
             n = max(epoch_steps, 1)
             print(
