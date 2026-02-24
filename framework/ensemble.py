@@ -572,8 +572,12 @@ class EnsembleTrainer:
             }
             epoch_steps = 0
 
-            with tqdm(total=steps_per_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
-                for step in range(steps_per_epoch):
+            steps_this_epoch = steps_per_epoch
+            if max_steps is not None:
+                steps_this_epoch = min(steps_per_epoch, max_steps - global_step)
+
+            with tqdm(total=steps_this_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
+                for step in range(steps_this_epoch):
                     optimizer.zero_grad()
 
                     info = self._train_step(optimizer)
