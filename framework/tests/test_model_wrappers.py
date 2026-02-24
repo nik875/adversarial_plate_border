@@ -1,15 +1,17 @@
 """
 test_model_wrappers.py — Forward-pass smoke tests for all 8 model wrappers.
 
-Run with pytest (skips heavyweight models unless --run-heavy is passed):
+Run lightweight tests (torchvision only, no large downloads):
     pytest framework/tests/test_model_wrappers.py -v
+
+Run all tests including models that download large weights:
     pytest framework/tests/test_model_wrappers.py -v --run-heavy
 
 Each test:
-  1. Imports the wrapper from framework.models.REGISTRY
+  1. Gets the wrapper class from framework.models.REGISTRY (lazy import)
   2. Calls wrapper.get_preprocess_fn() to build the preprocessing function
   3. Creates a random [2, 3, H, W] input in [0, 1]
-  4. Runs forward() and asserts the output is a Tensor with the expected batch dim
+  4. Runs forward() and asserts the output is a Tensor with batch dim == 2
 """
 from __future__ import annotations
 
@@ -17,19 +19,24 @@ import pytest
 import torch
 
 
-def _pytest_addoption_safe(parser):
-    """Add --run-heavy option if not already added by another plugin."""
+# ---------------------------------------------------------------------------
+# --run-heavy CLI option
+# ---------------------------------------------------------------------------
+
+def pytest_addoption(parser):
     try:
         parser.addoption(
             '--run-heavy', action='store_true', default=False,
             help='Include tests that download large pretrained models'
         )
     except ValueError:
-        pass
+        pass  # option already registered by another conftest
 
 
-def pytest_addoption(parser):
-    _pytest_addoption_safe(parser)
+def pytest_configure(config):
+    config.addinivalue_line(
+        'markers', 'heavy: mark test as requiring large model downloads'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +47,12 @@ def _make_input(H: int, W: int, B: int = 2) -> torch.Tensor:
     return torch.rand(B, 3, H, W)
 
 
-def _run_wrapper(wrapper_cls, raw_input_size=(64, 64), B=2):
-    """Instantiate wrapper, preprocess input, run forward, return output tensor."""
+def _run_wrapper(wrapper_cls, B: int = 2) -> torch.Tensor:
+    """Instantiate wrapper, preprocess a random input, run forward."""
     wrapper = wrapper_cls()
+    H, W = wrapper_cls.input_size()
     preprocess = wrapper_cls.get_preprocess_fn()
-    x_raw = _make_input(*raw_input_size, B=B)
+    x_raw = _make_input(H, W, B=B)
     x = preprocess(x_raw)
     with torch.no_grad():
         out = wrapper(x)
@@ -54,7 +62,7 @@ def _run_wrapper(wrapper_cls, raw_input_size=(64, 64), B=2):
 
 
 # ---------------------------------------------------------------------------
-# Lightweight tests (torchvision only — no large downloads)
+# Lightweight tests — torchvision only, no large downloads
 # ---------------------------------------------------------------------------
 
 class TestClassificationWrappers:
@@ -75,15 +83,17 @@ class TestClassificationWrappers:
 
 
 # ---------------------------------------------------------------------------
-# Heavy tests (require internet / large model downloads)
+# Heavy tests — require internet access and large model downloads
+# Skipped unless --run-heavy is passed.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not pytest.config.getoption('--run-heavy', default=False)
-    if hasattr(pytest, 'config') else True,
-    reason='Pass --run-heavy to run large model download tests'
-)
+@pytest.mark.heavy
 class TestHeavyWrappers:
+    @pytest.fixture(autouse=True)
+    def skip_unless_heavy(self, request):
+        if not request.config.getoption('--run-heavy', default=False):
+            pytest.skip('Pass --run-heavy to run large model download tests')
+
     def test_dinov2_output_shape(self):
         from framework.models.dinov2 import DINOv2Wrapper
         out = _run_wrapper(DINOv2Wrapper)
@@ -97,26 +107,23 @@ class TestHeavyWrappers:
     def test_yolo_output_shape(self):
         from framework.models.yolo_wrapper import YOLOv8Wrapper
         out = _run_wrapper(YOLOv8Wrapper)
-        # [B, 84, 8400]
-        assert out.shape[0] == 2, f"Unexpected batch dim: {out.shape}"
-        assert out.ndim == 3, f"Expected 3D output, got {out.ndim}D"
+        assert out.ndim == 3, f"Expected 3D output [B,84,8400], got {out.shape}"
+        assert out.shape[0] == 2
 
     def test_trocr_output_shape(self):
         from framework.models.trocr import TrOCREncoderWrapper
         out = _run_wrapper(TrOCREncoderWrapper)
-        # [B, 577, 768]
         assert out.shape == (2, 577, 768), f"Unexpected shape: {out.shape}"
 
     def test_smolvlm_output_shape(self):
         from framework.models.vlm import SmolVLMWrapper
         out = _run_wrapper(SmolVLMWrapper)
-        # [B, seq_len, vocab_size]
-        assert out.shape[0] == 2, f"Unexpected batch dim: {out.shape}"
-        assert out.ndim == 3, f"Expected 3D output, got {out.ndim}D"
+        assert out.ndim == 3, f"Expected 3D output [B,seq,vocab], got {out.shape}"
+        assert out.shape[0] == 2
 
 
 # ---------------------------------------------------------------------------
-# Registry smoke test
+# Registry tests — no model instantiation for the keys/raises tests
 # ---------------------------------------------------------------------------
 
 class TestRegistry:
@@ -127,10 +134,15 @@ class TestRegistry:
             'dinov2_vitb14', 'clip_vit_l14', 'yolov8s',
             'trocr_base', 'smolvlm_500m',
         }
-        assert expected == set(REGISTRY.keys()), (
-            f"Registry mismatch. Missing: {expected - set(REGISTRY)}, "
-            f"Extra: {set(REGISTRY) - expected}"
+        actual = set(REGISTRY.keys())
+        assert expected == actual, (
+            f"Missing: {expected - actual}, Extra: {actual - expected}"
         )
+
+    def test_registry_contains(self):
+        from framework.models import REGISTRY
+        assert 'resnet50' in REGISTRY
+        assert 'unknown_arch' not in REGISTRY
 
     def test_build_model_raises_on_unknown(self):
         from framework.models import build_model
@@ -138,7 +150,7 @@ class TestRegistry:
             build_model('this_does_not_exist')
 
     def test_classification_wrappers_via_registry(self):
-        """Light end-to-end test using the registry for torchvision models."""
+        """End-to-end test using REGISTRY for the three torchvision models."""
         from framework.models import REGISTRY
         for key in ('resnet50', 'convnext_small', 'swin_t'):
             cls = REGISTRY[key]
