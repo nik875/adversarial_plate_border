@@ -26,6 +26,7 @@ import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
@@ -438,8 +439,8 @@ class EnsembleTrainer:
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def _save_checkpoint(self, epoch: int, global_step: int, subdir: str = 'checkpoint') -> None:
-        ckpt_dir = self.output_dir / subdir
+    def _save_checkpoint(self, epoch: int, global_step: int, run_dir: Path, subdir: str = 'checkpoint') -> None:
+        ckpt_dir = run_dir / subdir
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         gen = self.generator
@@ -454,12 +455,13 @@ class EnsembleTrainer:
             'transformer_d_ff':        gen.transformer_d_ff,
             'transformer_enc_layers':  gen.transformer_enc_layers,
             'transformer_dec_layers':  gen.transformer_dec_layers,
+            'run_dir': str(run_dir),
             'training_info': {
-                'epoch':            epoch,
-                'global_step':      global_step,
-                'k_neurons':        self.k_neurons,
+                'epoch':             epoch,
+                'global_step':       global_step,
+                'k_neurons':         self.k_neurons,
                 'patches_per_image': self.patches_per_image,
-                'images_per_batch': self.images_per_batch,
+                'images_per_batch':  self.images_per_batch,
             },
         }
 
@@ -509,6 +511,8 @@ class EnsembleTrainer:
 
         start_epoch = 1
         start_step  = 0
+        run_dir: Optional[Path] = None
+
         if resume_from is not None:
             ckpt_files = sorted(Path(resume_from).glob("ensemble_epoch_*.pt"))
             if ckpt_files:
@@ -517,10 +521,24 @@ class EnsembleTrainer:
                 self.task_encoder.load_state_dict(ckpt['task_encoder_state_dict'])
                 start_epoch = ckpt.get('epoch', 0) + 1
                 start_step  = ckpt.get('global_step', 0)
+                # Restore the original run directory so outputs stay together
+                saved_run_dir = ckpt.get('run_dir')
+                if saved_run_dir and Path(saved_run_dir).exists():
+                    run_dir = Path(saved_run_dir)
+                else:
+                    run_dir = Path(resume_from).parent
                 # Fast-forward scheduler to match resumed position
                 for _ in range(start_step):
                     scheduler.step()
                 print(f"Resumed from {ckpt_files[-1]} — epoch {start_epoch}, step {start_step}")
+                print(f"  Run directory: {run_dir}")
+
+        if run_dir is None:
+            # Fresh run: create a timestamped subdirectory
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_dir = self.output_dir / f'run_{timestamp}'
+            run_dir.mkdir(parents=True, exist_ok=True)
+            print(f"New run directory: {run_dir}")
 
         print(f"\n{'='*70}")
         print(f"EnsembleTrainer — {self.ensemble.num_models()} models, "
@@ -531,7 +549,7 @@ class EnsembleTrainer:
         print(f"{'='*70}\n")
 
         global_step = start_step
-        samples_dir = self.output_dir / 'samples'
+        samples_dir = run_dir / 'samples'
         samples_dir.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(start_epoch, self.max_epochs + 1):
@@ -585,7 +603,7 @@ class EnsembleTrainer:
                     if max_steps is not None and global_step >= max_steps:
                         print(f"\n  max_steps={max_steps} reached mid-epoch; saving checkpoint.")
                         self._save_checkpoint(
-                            epoch, global_step,
+                            epoch, global_step, run_dir,
                             subdir=f'checkpoint_step_{global_step:07d}'
                         )
                         return
@@ -601,9 +619,9 @@ class EnsembleTrainer:
             )
 
             if epoch % self.save_every_epochs == 0 or epoch == self.max_epochs:
-                self._save_checkpoint(epoch, global_step,
+                self._save_checkpoint(epoch, global_step, run_dir,
                                       subdir=f'checkpoint_epoch_{epoch:04d}')
 
         # Final checkpoint
-        self._save_checkpoint(self.max_epochs, global_step, subdir='ensemble_final')
-        print(f"\n✓ Ensemble training complete. Output: {self.output_dir}")
+        self._save_checkpoint(self.max_epochs, global_step, run_dir, subdir='ensemble_final')
+        print(f"\n✓ Ensemble training complete. Output: {run_dir}")
