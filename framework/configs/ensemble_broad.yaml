@@ -80,16 +80,37 @@ models:
 
 # ---------------------------------------------------------------------------
 # Dataset pool
+# Run framework/scripts/download/download_all.sh to populate these paths.
 # ---------------------------------------------------------------------------
 datasets:
-  - name: coco_val
-    root: /data/coco/val2017
+  - name: imagenet_val
+    root: /data/imagenet/val           # download_imagenet.py (needs HF_TOKEN)
     domain_type: natural
 
-  - name: imagenet_val
-    root: /data/imagenet/val
-    max_samples: 5000
+  - name: imagenet_train
+    root: /data/imagenet/train         # download_imagenet.py  ~150k images
+    max_samples: 150000
     domain_type: natural
+
+  - name: coco_train
+    root: /data/coco/train2017         # download_coco.py  ~118k images
+    domain_type: natural
+
+  - name: coco_val
+    root: /data/coco/val2017           # download_coco.py  ~5k images
+    domain_type: natural
+
+  - name: textvqa
+    root: /data/textvqa/train_val_images  # download_textvqa.py  ~34k images
+    domain_type: text_in_scene
+
+  - name: cc3m
+    root: /data/cc3m/images            # download_cc3m.py  ~200-300k images
+    domain_type: web_natural
+
+  - name: openimages
+    root: /data/openimages             # download_openimages.py  ~150k images
+    domain_type: detection
 
   - name: synthetic
     root: /tmp/synthetic_images
