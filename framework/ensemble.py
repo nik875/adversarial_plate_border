@@ -374,65 +374,68 @@ class EnsembleTrainer:
         z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)  # [P, D]
         patches = gen(z, z_enriched)   # [P, 3, H, W]
 
-        # --- 5. Adversarial activations (with grad) for each patch ---
+        # --- 5. Adversarial activations (with grad) + losses + backward ---
+        # NOTE: loss.backward() must run *inside* on_device so model weights
+        # remain on the compute device during the backward pass.
         adv_acts_list: List[Tensor] = []
+        vis_mask = None
         with self.ensemble.on_device(entry) as model:
             model = model.to(device)
             for p_idx in range(P):
                 patch = patches[p_idx]   # [3, pH, pW]
-                composited, _ = entry.strategy.apply(image, patch, **strategy_kwargs)
+                composited, mask = entry.strategy.apply(image, patch, **strategy_kwargs)
+                if vis_mask is None:
+                    # Capture mask from first apply call using the real image,
+                    # not a dummy — avoids OOB bbox if image is larger than patch.
+                    vis_mask = mask  # [1, 1, pH, pW]
                 adv_inp = entry.preprocess_fn(composited)
                 adv_acts = self.neuron_sampler.capture_sampled_activations(
                     model, adv_inp, sampled_neurons, no_grad=False
                 )   # [k], has grad_fn
                 adv_acts_list.append(adv_acts)
 
-        # --- 6. Compute losses ---
-        # Deltas: [P, k]
-        deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)
+            # --- 6. Compute losses and backward (model still on device) ---
+            # Deltas: [P, k]
+            deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)
 
-        # Diversity: log-det of Gram matrix of unit-normalised deltas
-        eps = max(1e-6, 1e-2 / P)
-        normalized = F.normalize(deltas, p=2, dim=1)   # [P, k]
-        gram = normalized @ normalized.T               # [P, P]
-        gram = gram + eps * torch.eye(P, device=device)
-        sign, log_det = torch.slogdet(gram)
-        if torch.isnan(log_det) or sign <= 0:
-            log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
+            # Diversity: log-det of Gram matrix of unit-normalised deltas
+            eps = max(1e-6, 1e-2 / P)
+            normalized = F.normalize(deltas, p=2, dim=1)   # [P, k]
+            gram = normalized @ normalized.T               # [P, P]
+            gram = gram + eps * torch.eye(P, device=device)
+            sign, log_det = torch.slogdet(gram)
+            if torch.isnan(log_det) or sign <= 0:
+                log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
 
-        # Quality: mean RMS of normalized deltas across patches
-        ctrl_std = ctrl_acts.std() + 1e-8
-        norm_deltas_sq = (deltas / ctrl_std) ** 2      # [P, k]
-        per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()  # [P]
-        quality = per_patch_rms.mean() + 1e-8           # scalar
+            # Quality: mean RMS of normalized deltas across patches
+            ctrl_std = ctrl_acts.std() + 1e-8
+            norm_deltas_sq = (deltas / ctrl_std) ** 2      # [P, k]
+            per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()  # [P]
+            quality = per_patch_rms.mean() + 1e-8           # scalar
 
-        total_act_loss = -(
-            self.diversity_weight * log_det
-            + self.quality_weight * torch.log(quality)
-        )
+            total_act_loss = -(
+                self.diversity_weight * log_det
+                + self.quality_weight * torch.log(quality)
+            )
 
-        # Visibility mask for TV/spectrum (use first patch; geometry is per-image)
-        dummy = torch.zeros(1, 3, gen.patch_height, gen.patch_width, device=device)
-        _, vis_mask = entry.strategy.apply(dummy, patches[0].detach(), **strategy_kwargs)
+            patches_stacked = patches  # [P, 3, H, W]
+            tv_val = self.tv_weight * total_variation_loss(patches_stacked, vis_mask)
+            spec_val = self.spectrum_weight * compute_spectrum_loss(patches_stacked, vis_mask)
 
-        patches_stacked = patches  # [P, 3, H, W]
-        tv_val = self.tv_weight * total_variation_loss(patches_stacked, vis_mask)
-        spec_val = self.spectrum_weight * compute_spectrum_loss(patches_stacked, vis_mask)
+            loss = total_act_loss + tv_val + spec_val
+            loss.backward()
 
-        loss = total_act_loss + tv_val + spec_val
-        loss.backward()
+            # Release the grad graph immediately
+            del deltas, adv_acts_list
 
-        # Release the grad graph immediately
-        del deltas, adv_acts_list
-
-        return {
-            'loss':         loss.item(),
-            'diversity':    log_det.item(),
-            'quality':      quality.item(),
-            'tv':           tv_val.item(),
-            'spectrum':     spec_val.item(),
-            'model':        entry.name,
-        }
+            return {
+                'loss':         loss.item(),
+                'diversity':    log_det.item(),
+                'quality':      quality.item(),
+                'tv':           tv_val.item(),
+                'spectrum':     spec_val.item(),
+                'model':        entry.name,
+            }
 
     # ------------------------------------------------------------------
     # Checkpoint
