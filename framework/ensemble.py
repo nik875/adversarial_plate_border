@@ -531,6 +531,8 @@ class EnsembleTrainer:
         print(f"{'='*70}\n")
 
         global_step = start_step
+        samples_dir = self.output_dir / 'samples'
+        samples_dir.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()
@@ -567,6 +569,19 @@ class EnsembleTrainer:
                     pbar.update(1)
 
                     global_step += 1
+
+                    # Save sample patches every 10 optimizer steps
+                    if global_step % 10 == 0:
+                        self.generator.eval()
+                        with torch.no_grad():
+                            z = torch.randn(4, self.generator.latent_dim, device=self._device)
+                            sample_patches = self.generator(z)
+                            for i, patch in enumerate(sample_patches):
+                                T.ToPILImage()(patch.cpu()).save(
+                                    samples_dir / f'step_{global_step:07d}_patch_{i}.png'
+                                )
+                        self.generator.train()
+
                     if max_steps is not None and global_step >= max_steps:
                         print(f"\n  max_steps={max_steps} reached mid-epoch; saving checkpoint.")
                         self._save_checkpoint(
