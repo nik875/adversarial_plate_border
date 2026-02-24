@@ -21,15 +21,18 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from PIL import Image as PILImage
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output-dir',    default='/data/imagenet')
-    ap.add_argument('--train-samples', type=int, default=150_000,
-                    help='Number of training images to download (default: 150k)')
+    ap.add_argument('--train-samples', type=int, default=1_000_000,
+                    help='Number of training images to download (default: 1M of 1.28M, ~75 GB at 640px)')
     ap.add_argument('--val-only',      action='store_true',
                     help='Skip training subset, download validation only')
+    ap.add_argument('--max-size',      type=int, default=640,
+                    help='Downscale long edge to this size preserving aspect ratio (default: 640)')
     args = ap.parse_args()
 
     token = os.environ.get('HF_TOKEN')
@@ -44,6 +47,17 @@ def main():
     from datasets import load_dataset  # noqa: PLC0415
 
     out = Path(args.output_dir)
+    max_size = args.max_size
+
+    def save_image(img: PILImage.Image, path: Path) -> None:
+        """Convert to RGB, downscale long edge to max_size, save as JPEG."""
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        w, h = img.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+        img.save(path, format='JPEG', quality=90)
 
     # ------------------------------------------------------------------
     # Validation set (~50k images)
@@ -60,10 +74,7 @@ def main():
         for i, sample in enumerate(ds):
             cls_dir = val_dir / f'{sample["label"]:04d}'
             cls_dir.mkdir(exist_ok=True)
-            img = sample['image']
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img.save(cls_dir / f'{i:08d}.JPEG')
+            save_image(sample['image'], cls_dir / f'{i:08d}.JPEG')
             if (i + 1) % 5_000 == 0:
                 print(f'   val {i+1}/{len(ds)}')
         val_done.touch()
@@ -91,10 +102,7 @@ def main():
             break
         cls_dir = train_dir / f'{sample["label"]:04d}'
         cls_dir.mkdir(exist_ok=True)
-        img = sample['image']
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        img.save(cls_dir / f'{saved:08d}.JPEG')
+        save_image(sample['image'], cls_dir / f'{saved:08d}.JPEG')
         saved += 1
         if saved % 10_000 == 0:
             print(f'   train {saved:,}/{args.train_samples:,}')

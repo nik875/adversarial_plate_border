@@ -88,8 +88,8 @@ datasets:
     domain_type: natural
 
   - name: imagenet_train
-    root: /data/imagenet/train         # download_imagenet.py  ~150k images
-    max_samples: 150000
+    root: /data/imagenet/train         # download_imagenet.py  ~1M images at 640px
+    max_samples: 1000000
     domain_type: natural
 
   - name: coco_train
@@ -105,11 +105,11 @@ datasets:
     domain_type: text_in_scene
 
   - name: cc3m
-    root: /data/cc3m/images            # download_cc3m.py  ~200-300k images
+    root: /data/cc3m/images            # download_cc3m.py  ~1.2M images at 640px
     domain_type: web_natural
 
   - name: openimages
-    root: /data/openimages             # download_openimages.py  ~150k images
+    root: /data/openimages             # download_openimages.py  ~1M images at 640px
     domain_type: detection
 
   - name: synthetic

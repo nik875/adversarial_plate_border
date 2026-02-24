@@ -43,7 +43,8 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 else
     python "$SCRIPT_DIR/download_imagenet.py" \
         --output-dir "$DATA_ROOT/imagenet" \
-        --train-samples 150000
+        --train-samples 1000000 \
+        --max-size 640
 fi
 echo ""
 
@@ -63,7 +64,7 @@ echo ""
 echo ">>> [4/5] CC3M subset (~200-300k web images via img2dataset)"
 python "$SCRIPT_DIR/download_cc3m.py" \
     --output-dir "$DATA_ROOT/cc3m" \
-    --url-count 400000 \
+    --url-count 2500000 \
     --processes "$JOBS"
 echo ""
 
@@ -71,7 +72,8 @@ echo ""
 echo ">>> [5/5] Open Images V7 subset (150k detection-style images)"
 python "$SCRIPT_DIR/download_openimages.py" \
     --output-dir "$DATA_ROOT/openimages" \
-    --num-samples 150000
+    --num-samples 1000000 \
+    --max-size 640
 echo ""
 
 # ---- Summary ----------------------------------------------------------------

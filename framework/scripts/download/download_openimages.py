@@ -26,17 +26,20 @@ from pathlib import Path
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output-dir',  default='/data/openimages')
-    ap.add_argument('--num-samples', type=int, default=150_000,
-                    help='Number of images to download (default: 150k)')
+    ap.add_argument('--num-samples', type=int, default=1_000_000,
+                    help='Number of images to download (default: 1M, ~75 GB after 640px resize)')
     ap.add_argument('--split',       default='train',
                     choices=['train', 'validation', 'test'],
                     help='Dataset split (default: train)')
     ap.add_argument('--seed',        type=int, default=42)
+    ap.add_argument('--max-size',    type=int, default=640,
+                    help='Downscale long edge to this size after download (default: 640)')
     args = ap.parse_args()
 
     try:
         import fiftyone.zoo as foz          # noqa: PLC0415
         import fiftyone as fo               # noqa: PLC0415
+        from PIL import Image as PILImage   # noqa: PLC0415
     except ImportError:
         sys.exit(
             'ERROR: fiftyone not installed.\n'
@@ -73,9 +76,28 @@ def main():
         overwrite=True,
     )
 
-    n = len(list(out.rglob('*.jpg'))) + len(list(out.rglob('*.png')))
+    # Resize exported images so long edge <= max_size (in-place)
+    max_size = args.max_size
+    print(f'\n==> Resizing images to max {max_size}px long edge...')
+    all_imgs = list(out.rglob('*.jpg')) + list(out.rglob('*.png')) + list(out.rglob('*.jpeg'))
+    resized = 0
+    for p in all_imgs:
+        try:
+            with PILImage.open(p) as img:
+                w, h = img.size
+                if max(w, h) > max_size:
+                    scale = max_size / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+                    img.save(p, format='JPEG', quality=90)
+                    resized += 1
+        except Exception:
+            pass  # skip corrupt files
+        if (resized + 1) % 50_000 == 0:
+            print(f'   resized {resized:,}/{len(all_imgs):,}')
+
+    n = len(all_imgs)
     done_flag.touch()
-    print(f'   Saved {n:,} images → {out}')
+    print(f'   Saved {n:,} images ({resized:,} resized) → {out}')
 
     # Clean up fiftyone internal dataset to free cache
     dataset.delete()

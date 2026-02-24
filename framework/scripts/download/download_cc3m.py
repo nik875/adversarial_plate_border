@@ -83,7 +83,7 @@ def run_img2dataset(url_tsv: Path, output_dir: Path, processes: int) -> None:
         '--caption_col',      'caption',
         '--output_dir',       str(output_dir),
         '--output_format',    'files',         # plain JPEG files, no WebDataset
-        '--image_size',       '512',
+        '--image_size',       '640',
         '--resize_mode',      'keep_ratio',
         '--min_image_size',   '64',
         '--number_sample_per_shard', '10000',
@@ -107,8 +107,8 @@ def count_images(output_dir: Path) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output-dir', default='/data/cc3m')
-    ap.add_argument('--url-count',  type=int, default=400_000,
-                    help='URLs to fetch (~50%% success rate; 400k → ~200k images)')
+    ap.add_argument('--url-count',  type=int, default=2_500_000,
+                    help='URLs to fetch (~50%% success rate; 2.5M → ~1.2M images, ~90 GB at 640px)')
     ap.add_argument('--processes',  type=int, default=16,
                     help='Parallel download processes for img2dataset')
     ap.add_argument('--skip-url-export', action='store_true',
@@ -128,7 +128,7 @@ def main():
 
     n = count_images(images_dir)
     print(f'\nDone. CC3M subset: {n:,} images → {images_dir}')
-    if n < 150_000:
+    if n < 800_000:
         print(f'WARNING: only {n:,} images downloaded (many CC3M URLs are dead).')
         print('         Consider increasing --url-count or using a mirror.')
 
