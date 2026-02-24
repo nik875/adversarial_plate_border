@@ -293,14 +293,19 @@ class EnsembleTrainer:
             {'params': other_gen_params, 'lr': self.learning_rate,   'name': 'generator_custom'},
         ])
 
+        warmup_steps = 5
         lrs = [taesd_lr, self.learning_rate, self.learning_rate]
         scheduler = optim.lr_scheduler.LambdaLR(
             optimizer,
             lr_lambda=[
                 (lambda base: lambda step: (
-                    self.lr_min / base
-                    + (1 - self.lr_min / base)
-                    * (1 + math.cos(math.pi * step / total_steps)) / 2
+                    (step + 1) / warmup_steps  # linear warmup: 0.2, 0.4, 0.6, 0.8, 1.0
+                    if step < warmup_steps
+                    else (
+                        self.lr_min / base
+                        + (1 - self.lr_min / base)
+                        * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))) / 2
+                    )
                 ))(lr) for lr in lrs
             ],
         )
