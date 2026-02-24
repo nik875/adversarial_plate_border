@@ -611,14 +611,31 @@ class EnsembleTrainer:
 
                         # Save sample patches every 10 optimizer steps
                         if global_step % 10 == 0:
+                            step_samples_dir = samples_dir / f'step_{global_step:07d}'
+                            step_samples_dir.mkdir(parents=True, exist_ok=True)
+
                             self.generator.eval()
                             with torch.no_grad():
-                                z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                sample_patches = self.generator(z)
-                                for i, patch in enumerate(sample_patches):
-                                    T.ToPILImage()(patch.cpu()).save(
-                                        samples_dir / f'step_{global_step:07d}_patch_{i}.png'
-                                    )
+                                # Generate 10 patches for each of 3 strategy types
+                                from framework.base.attack_strategy import (
+                                    BorderStrategy, StickerStrategy, PerturbationStrategy
+                                )
+                                strategy_types = [
+                                    ('border', BorderStrategy),
+                                    ('sticker', StickerStrategy),
+                                    ('perturbation', PerturbationStrategy),
+                                ]
+
+                                for strategy_name, strategy_class in strategy_types:
+                                    strategy_dir = step_samples_dir / strategy_name
+                                    strategy_dir.mkdir(parents=True, exist_ok=True)
+
+                                    z = torch.randn(10, self.generator.latent_dim, device=self._device)
+                                    sample_patches = self.generator(z)
+                                    for i, patch in enumerate(sample_patches):
+                                        T.ToPILImage()(patch.cpu()).save(
+                                            strategy_dir / f'{i}.png'
+                                        )
                             self.generator.train()
 
                         if max_steps is not None and global_step >= max_steps:
