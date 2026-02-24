@@ -574,7 +574,7 @@ class EnsembleTrainer:
                     if global_step % 10 == 0:
                         self.generator.eval()
                         with torch.no_grad():
-                            z = torch.randn(4, self.generator.latent_dim, device=self._device)
+                            z = torch.randn(10, self.generator.latent_dim, device=self._device)
                             sample_patches = self.generator(z)
                             for i, patch in enumerate(sample_patches):
                                 T.ToPILImage()(patch.cpu()).save(
