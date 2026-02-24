@@ -1,0 +1,142 @@
+# ===========================================================================
+# Ensemble Adversarial Training — Broad 8-Model Production Config
+# ===========================================================================
+#
+# Covers 5 architecture families × 4 vision tasks:
+#   CNNs:          ResNet-50, ConvNeXt-Small, YOLOv8s
+#   Hierarchical:  Swin-T
+#   Self-supervised ViT: DINOv2-ViT-B/14
+#   Vision-Language: CLIP ViT-L/14, SmolVLM-500M
+#   OCR encoder:   TrOCR-base-printed
+#
+# Usage:
+#   python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml
+#
+# Smoke test (CPU, no real data, 2 steps):
+#   python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml \
+#       --epochs 1 --max-steps 2 --device cpu
+# ===========================================================================
+
+compute_device: cuda
+
+# Number of distinct strategies (must be >= max strategy_id + 1)
+num_strategies: 3    # 0=border, 1=sticker, 2=perturbation
+
+# ---------------------------------------------------------------------------
+# Model pool — 8 models spanning 4 vision tasks
+# ---------------------------------------------------------------------------
+models:
+  - name: resnet50_border
+    architecture: resnet50
+    domain_type: classification
+    strategy: border
+    strategy_id: 0
+
+  - name: convnext_small_sticker
+    architecture: convnext_small
+    domain_type: classification
+    strategy: sticker
+    strategy_id: 1
+    sticker_h: 64
+    sticker_w: 128
+
+  - name: swin_t_border
+    architecture: swin_t
+    domain_type: classification
+    strategy: border
+    strategy_id: 0
+
+  - name: dinov2_vitb14_border
+    architecture: dinov2_vitb14
+    domain_type: features
+    strategy: border
+    strategy_id: 0
+
+  - name: clip_vit_l14_border
+    architecture: clip_vit_l14
+    domain_type: features
+    strategy: border
+    strategy_id: 0
+
+  - name: yolov8s_sticker
+    architecture: yolov8s
+    domain_type: detection
+    strategy: sticker
+    strategy_id: 1
+    sticker_h: 128
+    sticker_w: 256
+
+  - name: trocr_base_border
+    architecture: trocr_base
+    domain_type: ocr
+    strategy: border
+    strategy_id: 0
+
+  - name: smolvlm_border
+    architecture: smolvlm_500m
+    domain_type: vlm
+    strategy: border
+    strategy_id: 0
+
+# ---------------------------------------------------------------------------
+# Dataset pool
+# ---------------------------------------------------------------------------
+datasets:
+  - name: coco_val
+    root: /data/coco/val2017
+    domain_type: natural
+
+  - name: imagenet_val
+    root: /data/imagenet/val
+    max_samples: 5000
+    domain_type: natural
+
+  - name: synthetic
+    root: /tmp/synthetic_images
+    synthetic: true
+    max_samples: 50
+    domain_type: generic
+
+# ---------------------------------------------------------------------------
+# Priors (character-texture decoders) — empty for broad generic training
+# ---------------------------------------------------------------------------
+priors: []
+
+# ---------------------------------------------------------------------------
+# TaskEncoder
+# ---------------------------------------------------------------------------
+task_encoder:
+  hidden_dim: 64
+  num_layers: 2
+  alpha: 0.5
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+generator:
+  latent_dim: 16
+  patch_height: 128
+  patch_width: 256
+  use_vae_lora: true
+  lora_rank: 8
+  lora_alpha: 16
+  bottleneck_dim: 64
+  char_embed_dim: 32
+
+# ---------------------------------------------------------------------------
+# EnsembleTrainer
+# ---------------------------------------------------------------------------
+trainer:
+  max_epochs: 100
+  steps_per_epoch: 200
+  k_neurons: 10000
+  patches_per_batch: 4
+  learning_rate: 1.0e-4
+  vae_lr_ratio: 0.1
+  lr_min: 1.0e-6
+  diversity_weight: 1.0
+  quality_weight: 1.0
+  tv_weight: 2.5
+  spectrum_weight: 1.0
+  output_dir: runs/broad_ensemble
+  save_every_epochs: 10

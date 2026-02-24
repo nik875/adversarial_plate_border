@@ -40,6 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 from framework.config_loader import load_ensemble_config
 from framework.ensemble import EnsembleModelPool, EnsembleTrainer
 from framework.neuron_sampler import NeuronSampler
+from framework.models import build_model as _registry_build, REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -97,22 +98,15 @@ def _build_model(model_cfg: Dict[str, Any]) -> nn.Module:
     """
     Instantiate a model from a config dict.
 
-    Supported architectures (for smoke tests):
-        - simple_cnn: tiny 2-conv CNN
-
-    For real models, extend this function or subclass train_ensemble.py.
+    Dispatches to ``framework.models.REGISTRY`` for all real pretrained models.
+    Falls back to the tiny ``_SyntheticCNN`` for ``architecture: simple_cnn``.
     """
     arch = model_cfg.get('architecture', 'simple_cnn').lower()
-    num_classes = model_cfg.get('num_classes', 10)
 
     if arch == 'simple_cnn':
-        return _SyntheticCNN(num_classes=num_classes)
-    else:
-        raise ValueError(
-            f"Unknown architecture '{arch}'. "
-            f"Supported in this script: simple_cnn. "
-            f"Add a custom branch in _build_model() for real models."
-        )
+        return _SyntheticCNN(num_classes=model_cfg.get('num_classes', 10))
+
+    return _registry_build(arch)
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +168,25 @@ def _build_generator(gen_cfg: Dict[str, Any], prior_registry=None) -> Any:
 # Preprocessing factory
 # ---------------------------------------------------------------------------
 
-def _build_preprocess(input_shape):
-    """Return a simple resize+clamp preprocessing function."""
+def _build_preprocess(model_cfg: Dict[str, Any], input_shape) -> Any:
+    """Return a preprocessing function for the given model config.
+
+    For architectures in the registry, delegates to the wrapper's
+    ``get_preprocess_fn()`` class method (which applies the correct
+    normalization statistics and resize).  Falls back to a simple
+    resize+clamp for ``simple_cnn`` and unknown architectures.
+    """
+    arch = model_cfg.get('architecture', '').lower()
+
+    if arch in REGISTRY:
+        cls = REGISTRY[arch]
+        if hasattr(cls, 'get_preprocess_fn'):
+            return cls.get_preprocess_fn()
+
+    # Fallback for simple_cnn and unknown architectures
     H, W = input_shape
 
     def preprocess(x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 3, any_H, any_W] in [0, 1]
         if x.shape[2] != H or x.shape[3] != W:
             x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
         return x.clamp(0.0, 1.0)
@@ -242,7 +249,7 @@ def main():
         model = _build_model(mc)
         strategy = _build_strategy(mc)
         input_shape = tuple(mc.get('input_shape', [64, 64]))
-        preprocess_fn = _build_preprocess(input_shape)
+        preprocess_fn = _build_preprocess(mc, input_shape)
 
         ensemble_pool.register(
             name=mc['name'],
