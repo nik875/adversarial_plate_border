@@ -299,6 +299,9 @@ class StickerStrategy(AttackStrategy):
             visibility_mask: [1, 1, pH, pW]  (all ones — full patch is 'visible')
         """
         x0, y0, x1, y1 = self._resolve_bbox(image, bbox)
+        # Clamp to image bounds so patch_resized always matches the slice
+        x1 = min(x1, image.shape[3])
+        y1 = min(y1, image.shape[2])
         region_h, region_w = y1 - y0, x1 - x0
 
         patch_resized = F.interpolate(patch.unsqueeze(0), size=(region_h, region_w),
@@ -321,6 +324,8 @@ class StickerStrategy(AttackStrategy):
     ) -> Tensor:
         """Fill bbox with neutral grey, rest of image unchanged."""
         x0, y0, x1, y1 = self._resolve_bbox(image, bbox)
+        x1 = min(x1, image.shape[3])
+        y1 = min(y1, image.shape[2])
         result = image.clone()
         result[:, :, y0:y1, x0:x1] = self.neutral_color
         return torch.clamp(result, 0.0, 1.0)
