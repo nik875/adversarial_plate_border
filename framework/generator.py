@@ -347,10 +347,6 @@ class FoundationPatchGenerator(nn.Module):
             nn.Linear(latent_dim, self.vae_latent_dim)
             for _ in range(num_taesd)
         ])
-        for adapter in self.adapters:
-            nn.init.kaiming_normal_(adapter.weight, mode='fan_out', nonlinearity='relu')
-            if adapter.bias is not None:
-                nn.init.constant_(adapter.bias, 0)
 
         # 6 TAESD decoder copies (encoder deleted, fully trainable)
         print(f"Loading {num_taesd} TAESD decoder copies from madebyollin/taesd ...")
