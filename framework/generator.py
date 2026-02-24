@@ -230,7 +230,7 @@ class BottleneckDenseRefiner(nn.Module):
         if prior_registry is not None:
             prior_channels = prior_registry.num_output_channels
 
-        spatial_in_channels = 3 + prior_channels  # refined + prior feats (no vae_output input)
+        spatial_in_channels = 3 + 3 + prior_channels  # vae_output + refined + prior feats
         if prior_channels > 0:
             print(f"PriorRegistry active: {prior_channels} extra channels "
                   f"({prior_channels // 4} prior(s) × 4 scales)")
@@ -280,8 +280,15 @@ class BottleneckDenseRefiner(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"BottleneckDenseRefiner initialized: ~{total_params:,} parameters")
 
-    def forward(self, z: Tensor) -> Tensor:
-        """Generate patch features purely from the latent code z (no vae_output input)."""
+    def forward(self, z: Tensor, vae_output: Optional[Tensor] = None) -> Tensor:
+        """
+        Generate patch features from the latent code z.
+
+        Args:
+            z:          [B, latent_dim]  latent code driving the dense path
+            vae_output: [B, 3, H, W]    VAE decoder output; concatenated with the
+                        dense-refined output before spatial attention.
+        """
         batch_size = z.shape[0]
 
         seed_embed = self.seed_projection(z)
@@ -293,12 +300,15 @@ class BottleneckDenseRefiner(nn.Module):
             refined = F.interpolate(refined, size=(self.patch_height, self.patch_width),
                                     mode='bilinear', align_corners=True)
 
+        if vae_output is not None and vae_output.shape[2:] != refined.shape[2:]:
+            vae_output = F.interpolate(vae_output, size=refined.shape[2:],
+                                       mode='bilinear', align_corners=True)
+
         if self.prior_registry is not None:
-            # Change B: use PriorRegistry instead of hardcoded omniglot
             prior_feats = self.prior_registry(z)   # List[[B, 1, H, W]]
-            combined = torch.cat([refined] + prior_feats, dim=1)
+            combined = torch.cat([vae_output, refined] + prior_feats, dim=1)
         else:
-            combined = refined
+            combined = torch.cat([vae_output, refined], dim=1)
 
         spatial_features = self.spatial_layers(combined)
         mode_outputs = torch.stack([m(spatial_features) for m in self.proj_modes], dim=1)
@@ -512,8 +522,8 @@ class FoundationPatchGenerator(nn.Module):
                 vae_output, size=(self.patch_height, self.patch_width),
                 mode='bilinear', align_corners=True)
 
-        # 2. Bottleneck refiner: generated purely from z (no vae_output input)
-        btl_out = self.bottleneck_refiner(z_enriched)   # [B, 3, H, W]
+        # 2. Bottleneck refiner: dense path from z; spatial attention sees vae_output too
+        btl_out = self.bottleneck_refiner(z_enriched, vae_output=vae_output)   # [B, 3, H, W]
 
         # 3. CNN: 6-channel input (vae_output | btl_out)
         cnn_input = torch.cat([vae_output, btl_out], dim=1)   # [B, 6, H, W]
