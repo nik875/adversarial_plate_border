@@ -17,7 +17,8 @@ pillow_heif
 seaborn
 python-Levenshtein
 diffusers
-transformers
+transformers>=4.45.0
+ultralytics
 accelerate
 b2
 datasets
