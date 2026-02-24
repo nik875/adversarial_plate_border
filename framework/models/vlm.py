@@ -2,6 +2,8 @@
 vlm.py — SmolVLM-500M-Instruct wrapper (Vision-Language Model).
 
   - HuggingFaceTB/SmolVLM-500M-Instruct via HuggingFace transformers
+  - Uses AutoModelForImageTextToText (transformers 5.x) with fallback to
+    AutoModelForVision2Seq (transformers 4.x)
   - SigLIP backbone: mean=0.5, std=0.5 normalization → maps [0,1] to [-1,1]
   - 512×512 inputs → [B, seq_len, vocab_size] logits
   - A fixed prompt ("Describe what you see.") is pre-tokenized once and
@@ -21,7 +23,12 @@ from typing import Callable, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoProcessor, AutoModelForVision2Seq
+# transformers 5.x renamed AutoModelForVision2Seq → AutoModelForImageTextToText
+try:
+    from transformers import AutoModelForImageTextToText as _AutoVLMCls
+except ImportError:
+    from transformers import AutoModelForVision2Seq as _AutoVLMCls  # type: ignore[assignment]
+from transformers import AutoProcessor
 
 
 class SmolVLMWrapper(nn.Module):
@@ -32,7 +39,7 @@ class SmolVLMWrapper(nn.Module):
         model_id = 'HuggingFaceTB/SmolVLM-500M-Instruct'
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForVision2Seq.from_pretrained(
+        self.model = _AutoVLMCls.from_pretrained(
             model_id,
             torch_dtype=torch.float32,  # bfloat16 for GPU, float32 for CPU compat
         )
