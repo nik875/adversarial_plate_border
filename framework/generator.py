@@ -196,25 +196,14 @@ class BottleneckDenseRefiner(nn.Module):
         # Store for attribute lookup (e.g. by checkpoint savers)
         self.prior_registry: Optional[object] = prior_registry
 
-        self.compress = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=4, padding=1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.SiLU(inplace=True),
-        )
-
-        self.bottleneck = nn.Sequential(
-            nn.AdaptiveAvgPool2d((4, 8)),
-        )
-
-        self.seed_embed_dim = 64
+        self.seed_embed_dim = 512
         self.seed_projection = nn.Sequential(
-            nn.Linear(latent_dim, 128),
+            nn.Linear(latent_dim, 256),
             nn.SiLU(inplace=True),
-            nn.Linear(128, self.seed_embed_dim),
+            nn.Linear(256, self.seed_embed_dim),
         )
 
-        bottleneck_with_seed_dim = 4096 + self.seed_embed_dim
+        bottleneck_with_seed_dim = self.seed_embed_dim
         self.dense = nn.Sequential(
             nn.Linear(bottleneck_with_seed_dim, 512),
             nn.SiLU(inplace=True),
@@ -241,7 +230,7 @@ class BottleneckDenseRefiner(nn.Module):
         if prior_registry is not None:
             prior_channels = prior_registry.num_output_channels
 
-        spatial_in_channels = 3 + 3 + prior_channels  # patches + refined + prior feats
+        spatial_in_channels = 3 + prior_channels  # refined + prior feats (no vae_output input)
         if prior_channels > 0:
             print(f"PriorRegistry active: {prior_channels} extra channels "
                   f"({prior_channels // 4} prior(s) × 4 scales)")
@@ -291,22 +280,12 @@ class BottleneckDenseRefiner(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"BottleneckDenseRefiner initialized: ~{total_params:,} parameters")
 
-    def forward(self, patches: Tensor, z: Optional[Tensor] = None) -> Tensor:
-        batch_size = patches.shape[0]
+    def forward(self, z: Tensor) -> Tensor:
+        """Generate patch features purely from the latent code z (no vae_output input)."""
+        batch_size = z.shape[0]
 
-        patches_logit = torch.logit(patches.clamp(1e-6, 1 - 1e-6))
-
-        compressed = self.compress(patches)
-        pooled = self.bottleneck(compressed)
-        bottleneck_flat = pooled.view(batch_size, -1)
-
-        if z is not None:
-            seed_embed = self.seed_projection(z)
-            bottleneck_with_seed = torch.cat([bottleneck_flat, seed_embed], dim=1)
-        else:
-            bottleneck_with_seed = bottleneck_flat
-
-        refined_features = self.dense(bottleneck_with_seed)
+        seed_embed = self.seed_projection(z)
+        refined_features = self.dense(seed_embed)
         refined_features = refined_features.view(batch_size, 128, 4, 8)
         refined = self.expand(refined_features)
 
@@ -317,9 +296,9 @@ class BottleneckDenseRefiner(nn.Module):
         if self.prior_registry is not None:
             # Change B: use PriorRegistry instead of hardcoded omniglot
             prior_feats = self.prior_registry(z)   # List[[B, 1, H, W]]
-            combined = torch.cat([patches, refined] + prior_feats, dim=1)
+            combined = torch.cat([refined] + prior_feats, dim=1)
         else:
-            combined = torch.cat([patches, refined], dim=1)
+            combined = refined
 
         spatial_features = self.spatial_layers(combined)
         mode_outputs = torch.stack([m(spatial_features) for m in self.proj_modes], dim=1)
@@ -332,7 +311,6 @@ class BottleneckDenseRefiner(nn.Module):
         refined_patches = (mode_outputs * blend_weights).sum(dim=1)
         refined_patches = F.silu(refined_patches)
         refined_patches = self.post_expansion_smooth(refined_patches)
-        refined_patches = refined_patches + patches_logit
         refined_patches = self.final_activation(refined_patches)
 
         return refined_patches
@@ -542,8 +520,8 @@ class FoundationPatchGenerator(nn.Module):
                 vae_output, size=(self.patch_height, self.patch_width),
                 mode='bilinear', align_corners=True)
 
-        # 2. Bottleneck refiner (now BEFORE CNN)
-        btl_out = self.bottleneck_refiner(vae_output, z_enriched)   # [B, 3, H, W]
+        # 2. Bottleneck refiner: generated purely from z (no vae_output input)
+        btl_out = self.bottleneck_refiner(z_enriched)   # [B, 3, H, W]
 
         # 3. Skip scalar
         skip_scale = self.skip_projection(z_enriched).view(batch_size, 1, 1, 1)
