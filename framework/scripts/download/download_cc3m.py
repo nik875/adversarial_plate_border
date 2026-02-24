@@ -91,7 +91,6 @@ def run_img2dataset(url_tsv: Path, output_dir: Path, processes: int) -> None:
         '--thread_count',     '64',
         '--retries',          '2',
         '--enable_wandb',     'False',
-        '--save_additional_columns', '[]',
     ]
     print(f'\n==> Running img2dataset  ({processes} processes, 64 threads each)...')
     print('    This will take a while. Progress is logged by img2dataset.')

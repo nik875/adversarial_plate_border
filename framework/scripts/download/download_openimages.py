@@ -106,7 +106,6 @@ def run_img2dataset(url_list: Path, output_dir: Path, processes: int) -> None:
         '--thread_count',            '64',
         '--retries',                 '2',
         '--enable_wandb',            'False',
-        '--save_additional_columns', '[]',
     ]
     print(f'\n==> Running img2dataset  ({processes} processes, 64 threads each)...')
     print('    Images are resized to 640px long-edge on-the-fly — no full-res intermediates.')
