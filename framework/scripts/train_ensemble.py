@@ -241,7 +241,13 @@ def main():
     for mc in ensemble_cfg.models_cfg:
         model = _build_model(mc)
         strategy = _build_strategy(mc)
-        input_shape = tuple(mc.get('input_shape', [64, 64]))
+        arch = mc.get('architecture', 'simple_cnn').lower()
+        if 'input_shape' in mc:
+            input_shape = tuple(mc['input_shape'])
+        elif arch in REGISTRY and hasattr(REGISTRY[arch], 'input_size'):
+            input_shape = REGISTRY[arch].input_size()
+        else:
+            input_shape = (64, 64)
         preprocess_fn = _build_preprocess(mc, input_shape)
 
         ensemble_pool.register(
