@@ -20,26 +20,6 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# --run-heavy CLI option
-# ---------------------------------------------------------------------------
-
-def pytest_addoption(parser):
-    try:
-        parser.addoption(
-            '--run-heavy', action='store_true', default=False,
-            help='Include tests that download large pretrained models'
-        )
-    except ValueError:
-        pass  # option already registered by another conftest
-
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        'markers', 'heavy: mark test as requiring large model downloads'
-    )
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
