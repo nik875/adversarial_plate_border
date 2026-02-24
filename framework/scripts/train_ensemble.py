@@ -303,9 +303,14 @@ def main():
     # ------------------------------------------------------------------
     # Train
     # ------------------------------------------------------------------
+    # CLI --max-steps overrides YAML; YAML overrides None
+    max_steps = args.max_steps if args.max_steps is not None else trainer_cfg.get('max_steps')
+    if max_steps is not None:
+        max_steps = int(max_steps)
+
     trainer.train(
         resume_from=args.resume,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
     )
 
 
