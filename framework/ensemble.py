@@ -632,7 +632,8 @@ class EnsembleTrainer:
 
                         # Save sample patches every 10 optimizer steps
                         if global_step % 10 == 0:
-                            tar_path = samples_dir / f'step_{global_step:07d}.tar'
+                            step_name = f'step_{global_step:07d}'
+                            tar_path = samples_dir / f'{step_name}.tar'
 
                             self.generator.eval()
                             self.task_encoder.eval()
@@ -658,7 +659,7 @@ class EnsembleTrainer:
                                                     buf.seek(0)
 
                                                     tar_info = tarfile.TarInfo(
-                                                        name=f'{strat_entry.name}/{model_entry.name}/{i}.png'
+                                                        name=f'{step_name}/{strat_entry.name}/{model_entry.name}/{i}.png'
                                                     )
                                                     tar_info.size = len(buf.getvalue())
                                                     tar.addfile(tar_info, buf)
