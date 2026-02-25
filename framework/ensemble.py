@@ -372,11 +372,8 @@ class EnsembleTrainer:
                 balanced_entries.extend(all_entries[:remainder])
             random.shuffle(balanced_entries)
 
-        # Accumulate loss components per-image; discard activations immediately after use
-        accumulated_log_det = 0.0
-        accumulated_final_quality = torch.tensor(0.0, device=device, dtype=torch.float32)
-        accumulated_tv_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        accumulated_spec_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        # Gradient accumulation: backward() is called per-image so only one image's
+        # activation stack lives at a time. Generator .grad buffers accumulate.
         sticker_count = 0
 
         for entry in balanced_entries:
@@ -490,50 +487,31 @@ class EnsembleTrainer:
                 else:
                     final_quality = torch.tensor(1e-8, device=device)
 
-                total_act_loss = -(
-                    self.diversity_weight * log_det
-                    + self.quality_weight * torch.log(final_quality)
-                )
-
                 # TV loss only for sticker attacks (penalises jagged edges within patch region)
                 if isinstance(strat_entry.strategy, StickerStrategy):
-                    tv_raw  = total_variation_loss(patches, vis_mask)
-                    accumulated_tv_loss = accumulated_tv_loss + self.tv_weight * tv_raw
+                    tv_raw = total_variation_loss(patches, vis_mask)
                     sticker_count += 1
                 else:
-                    tv_raw  = torch.tensor(0.0, device=device)
+                    tv_raw = torch.tensor(0.0, device=device)
 
                 spec_raw = compute_spectrum_loss(patches, vis_mask)
 
-                # Keep gradient-tracked loss components; discard activation buffers
-                accumulated_log_det = log_det
-                accumulated_final_quality = accumulated_final_quality + torch.log(final_quality)
-                accumulated_spec_loss = accumulated_spec_loss + self.spectrum_weight * spec_raw
+                # Per-image loss: backward immediately so this image's activation stack
+                # is freed before the next forward pass (true gradient accumulation).
+                per_image_loss = -(
+                    self.diversity_weight * log_det
+                    + self.quality_weight * torch.log(final_quality)
+                ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
 
-                # **Discard all activation tensors immediately** — no longer needed for gradients
-                del deltas, adv_acts_list, norm_deltas, ctrl_acts, ctrl_final
-                if final_neurons:
-                    del final_deltas
+                self.scaler.scale(per_image_loss / N).backward()
 
-            acc['loss']          += total_act_loss.item()
+            acc['loss']          += per_image_loss.item()
             acc['diversity']     += log_det.item()
             acc['quality']       += torch.log(quality).item()
             acc['final_quality'] += torch.log(final_quality).item()
             acc['tv']            += tv_raw.item()
             acc['spectrum']      += spec_raw.item()
             acc['model']      = entry.name
-
-        # Batch-averaged loss from gradient-tracked components
-        # Activations already freed per-image, but loss has full gradient path
-        total_loss = -(
-            self.diversity_weight * accumulated_log_det / N
-            + self.quality_weight * accumulated_final_quality / N
-        ) + accumulated_spec_loss / N
-
-        if sticker_count > 0:
-            total_loss = total_loss + accumulated_tv_loss / sticker_count
-
-        self.scaler.scale(total_loss).backward()
 
         return {
             'loss':          acc['loss']          / N,
