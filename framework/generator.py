@@ -72,8 +72,8 @@ class LightPatchTransformer(nn.Module):
 
     Architecture:
         - patch_embed: Conv2d(3, d_model, 16, 16) → [B, 256, d_model]
-        - 1-layer transformer encoder with gradient checkpointing
-        - 1-layer transformer decoder with gradient checkpointing
+        - 1-layer transformer encoder
+        - 1-layer transformer decoder
         - output_proj: Linear(d_model, 768) → reshape → [B, 3, 256, 256]
         - upsample: ConvTranspose2d(3, 3, 4, 2, 1) → [B, 3, 512, 512]
 
@@ -157,15 +157,15 @@ class LightPatchTransformer(nn.Module):
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
         tokens = tokens + self.encoder_pos_embed
 
-        # Encoder (with gradient checkpointing to save memory)
+        # Encoder
         for layer in self.encoder_layers:
-            tokens = torch.utils.checkpoint.checkpoint(layer, tokens, use_reentrant=False)
+            tokens = layer(tokens)
         encoder_out = tokens
 
-        # Decoder (with gradient checkpointing to save memory)
+        # Decoder
         queries = self.decoder_queries.expand(B, -1, -1) + self.decoder_pos_embed
         for layer in self.decoder_layers:
-            queries = torch.utils.checkpoint.checkpoint(layer, queries, encoder_out, use_reentrant=False)
+            queries = layer(queries, encoder_out)
 
         # Project to pixel space: [B, 256, d_model] → [B, 256, 768]
         out = self.output_proj(self.output_norm(queries))
@@ -316,7 +316,6 @@ class FoundationPatchGenerator(nn.Module):
         → concatenate [B, 18, H, W] → ChannelMixer → patch [B, 3, H, W]
 
     All TAESD decoders are fully trainable (no frozen weights).
-    Gradient checkpointing is applied inside each LightPatchTransformer.
     """
 
     def __init__(
@@ -419,12 +418,8 @@ class FoundationPatchGenerator(nn.Module):
         for adapter, taesd, transformer in zip(
             self.adapters, self.taesd_decoders, self.transformers
         ):
-            out = torch.utils.checkpoint.checkpoint(
-                _run_stream, adapter, taesd, transformer, z_enriched,
-                self.vae_latent_h, self.vae_latent_w,
-                use_reentrant=False,
-            )
-            stream_outputs.append(out)
+            stream_outputs.append(_run_stream(adapter, taesd, transformer, z_enriched,
+                                              self.vae_latent_h, self.vae_latent_w))
 
         # Concatenate all stream outputs: [B, 18, H, W]
         combined = torch.cat(stream_outputs, dim=1)
