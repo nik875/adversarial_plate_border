@@ -47,6 +47,8 @@ class NeuronSampler:
         self._neuron_stds: Dict[int, Dict[str, Tensor]] = {}
         # Per-model β floor: 10% of median live-neuron std (CPU scalar)
         self._neuron_betas: Dict[int, float] = {}
+        # Final (last forward-executing) layer name per model_id
+        self._final_layer_names: Dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Layer discovery
@@ -331,6 +333,11 @@ class NeuronSampler:
 
         self._neuron_stds[model_id] = stds
 
+        # Store the last layer to fire in the forward pass as the "final layer"
+        layer_names = list(shapes.keys())
+        if layer_names:
+            self._final_layer_names[model_id] = layer_names[-1]
+
         # β = 10% of median live-neuron std.
         # Using the median (not a low percentile) ensures β stays well above the
         # dead-neuron tail even when ReLU networks have 20-40% near-zero neurons.
@@ -380,6 +387,28 @@ class NeuronSampler:
         """
         return self._neuron_betas.get(model_id, 1e-3)
 
+    def get_final_layer_neurons(
+        self,
+        model_id: int,
+        max_k: int = 1000,
+    ) -> List[Tuple[str, int]]:
+        """
+        Return up to max_k (layer_name, flat_idx) tuples from the final layer.
+
+        The final layer is the last leaf module to fire during the profiling
+        forward pass.  Capped at max_k to handle large vocabulary projections
+        (e.g. TrOCR, SmolVLM).  Returns [] if the model hasn't been profiled.
+        """
+        layer_name = self._final_layer_names.get(model_id, '')
+        if not layer_name:
+            return []
+        stds = self._neuron_stds.get(model_id, {})
+        if layer_name not in stds:
+            return []
+        n = stds[layer_name].numel()
+        k = min(n, max_k)
+        return [(layer_name, i) for i in range(k)]
+
     # ------------------------------------------------------------------
     # Profile persistence
     # ------------------------------------------------------------------
@@ -393,8 +422,9 @@ class NeuronSampler:
         from pathlib import Path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            'neuron_stds': self._neuron_stds[model_id],
-            'beta':        self._neuron_betas[model_id],
+            'neuron_stds':      self._neuron_stds[model_id],
+            'beta':             self._neuron_betas[model_id],
+            'final_layer_name': self._final_layer_names.get(model_id, ''),
         }, path)
 
     def load_profile(self, model_id: int, path) -> bool:
@@ -411,6 +441,9 @@ class NeuronSampler:
             data = torch.load(p, map_location='cpu', weights_only=True)
             self._neuron_stds[model_id]  = data['neuron_stds']
             self._neuron_betas[model_id] = float(data['beta'])
+            final = data.get('final_layer_name', '')
+            if final:
+                self._final_layer_names[model_id] = final
             return True
         except Exception:
             return False

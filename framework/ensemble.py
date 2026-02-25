@@ -355,7 +355,7 @@ class EnsembleTrainer:
         N = self.images_per_batch
 
         acc: Dict[str, float] = {
-            'loss': 0.0, 'diversity': 0.0, 'quality': 0.0,
+            'loss': 0.0, 'diversity': 0.0, 'quality': 0.0, 'final_quality': 0.0,
             'tv': 0.0, 'spectrum': 0.0, 'model': '',
         }
 
@@ -383,9 +383,16 @@ class EnsembleTrainer:
                 sampled_neurons = self.neuron_sampler.sample_neurons(
                     model, self.k_neurons, sample_shape
                 )
-                ctrl_acts = self.neuron_sampler.capture_sampled_activations(
-                    model, neutral_inp, sampled_neurons, no_grad=True
-                ).to(device)   # [k], detached
+                # Append final-layer neurons so both sets are captured in one pass
+                final_neurons  = self.neuron_sampler.get_final_layer_neurons(entry.model_id)
+                k_rand         = len(sampled_neurons)
+                combined_neurons = sampled_neurons + final_neurons
+
+                combined_ctrl = self.neuron_sampler.capture_sampled_activations(
+                    model, neutral_inp, combined_neurons, no_grad=True
+                ).to(device)                              # [k_rand + k_final], detached
+                ctrl_acts  = combined_ctrl[:k_rand]       # [k_rand]
+                ctrl_final = combined_ctrl[k_rand:]       # [k_final]
 
             # --- 4. Generate P patches conditioned on task metadata ---
             z = torch.randn(P, gen.latent_dim, device=device)
@@ -413,12 +420,13 @@ class EnsembleTrainer:
                         vis_mask = mask
                     adv_inp = entry.preprocess_fn(composited)
                     adv_acts = self.neuron_sampler.capture_sampled_activations(
-                        model, adv_inp, sampled_neurons, no_grad=False
+                        model, adv_inp, combined_neurons, no_grad=False
                     )
                     adv_acts_list.append(adv_acts)
 
                 # --- 6. Compute losses ---
-                deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)  # [P, k]
+                # Split combined captures back into random-neuron and final-layer sets
+                deltas = torch.stack([a[:k_rand] - ctrl_acts  for a in adv_acts_list], dim=0)  # [P, k_rand]
 
                 # Per-neuron std from precomputed CPU profile → transfer only 10k values.
                 # Clamp to β (10% of median live-neuron std) so dead neurons get
@@ -442,9 +450,25 @@ class EnsembleTrainer:
                     log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
 
                 # Quality: RMS of std-normalised deltas across neurons and patches
-                norm_deltas_sq = norm_deltas ** 2                             # [P, k]
+                norm_deltas_sq = norm_deltas ** 2                             # [P, k_rand]
                 per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
                 quality = per_patch_rms.mean() + 1e-8
+
+                # Final-layer quality: same metric but restricted to final layer neurons.
+                # Detached — monitoring only, does not contribute to the loss.
+                if final_neurons:
+                    final_deltas = torch.stack(
+                        [a[k_rand:].detach() - ctrl_final for a in adv_acts_list], dim=0
+                    )                                                              # [P, k_final]
+                    final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
+                        entry.model_id, final_neurons
+                    ).to(device)
+                    final_eff_stds = final_neuron_stds.clamp(min=beta)
+                    final_quality = (
+                        (final_deltas / final_eff_stds) ** 2
+                    ).mean(dim=1).sqrt().mean() + 1e-8
+                else:
+                    final_quality = torch.tensor(1e-8, device=device)
 
                 total_act_loss = -(
                     self.diversity_weight * log_det
@@ -467,20 +491,22 @@ class EnsembleTrainer:
 
                 del deltas, adv_acts_list
 
-            acc['loss']      += (total_act_loss + tv_val + spec_val).item()
-            acc['diversity'] += log_det.item()
-            acc['quality']   += torch.log(quality).item()
-            acc['tv']        += tv_raw.item()
-            acc['spectrum']  += spec_raw.item()
+            acc['loss']          += (total_act_loss + tv_val + spec_val).item()
+            acc['diversity']     += log_det.item()
+            acc['quality']       += torch.log(quality).item()
+            acc['final_quality'] += torch.log(final_quality).item()
+            acc['tv']            += tv_raw.item()
+            acc['spectrum']      += spec_raw.item()
             acc['model']      = entry.name
 
         return {
-            'loss':      acc['loss']      / N,
-            'diversity': acc['diversity'] / N,
-            'quality':   acc['quality']   / N,
-            'tv':        acc['tv']        / N,
-            'spectrum':  acc['spectrum']  / N,
-            'model':     acc['model'],
+            'loss':          acc['loss']          / N,
+            'diversity':     acc['diversity']     / N,
+            'quality':       acc['quality']       / N,
+            'final_quality': acc['final_quality'] / N,
+            'tv':            acc['tv']            / N,
+            'spectrum':      acc['spectrum']      / N,
+            'model':         acc['model'],
         }
 
     # ------------------------------------------------------------------
@@ -689,7 +715,7 @@ class EnsembleTrainer:
             self.task_encoder.train()
 
             epoch_losses: Dict[str, float] = {
-                'loss': 0.0, 'diversity': 0.0, 'quality': 0.0,
+                'loss': 0.0, 'diversity': 0.0, 'quality': 0.0, 'final_quality': 0.0,
                 'tv': 0.0, 'spectrum': 0.0,
             }
             epoch_steps = 0
@@ -721,6 +747,7 @@ class EnsembleTrainer:
                             'loss': f"{info['loss']:.4f}",
                             'div':  f"{info['diversity']:.2f}",
                             'qual': f"{info['quality']:.4f}",
+                            'fql':  f"{info['final_quality']:.4f}",
                             'tv':   f"{info['tv']:.4f}",
                             'ssim': f"{info['spectrum']:.4f}",
                             'lr':   f"{current_lr:.2e}",
