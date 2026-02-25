@@ -635,27 +635,29 @@ class EnsembleTrainer:
 
                             self.generator.eval()
                             with torch.no_grad():
-                                # Generate 10 patches for each registered strategy
+                                # Generate 10 patches per strategy per target model
                                 for strat_entry in self.ensemble._strategies:
                                     strategy_dir = step_samples_dir / strat_entry.name
                                     strategy_dir.mkdir(parents=True, exist_ok=True)
 
-                                    # Pick a random model and dataset
-                                    sample_model = random.choice(self.ensemble._entries)
-                                    dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
+                                    for model_entry in self.ensemble._entries:
+                                        model_dir = strategy_dir / model_entry.name
+                                        model_dir.mkdir(parents=True, exist_ok=True)
 
-                                    z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                    model_idx    = torch.full((10,), sample_model.model_id,    dtype=torch.long, device=self._device)
-                                    strategy_idx = torch.full((10,), strat_entry.strategy_id,  dtype=torch.long, device=self._device)
-                                    dataset_idx_t = torch.full((10,), dataset_idx,             dtype=torch.long, device=self._device)
+                                        dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
 
-                                    z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
-                                    sample_patches = self.generator(z, z_enriched)
+                                        z = torch.randn(10, self.generator.latent_dim, device=self._device)
+                                        model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
+                                        strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
+                                        dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
 
-                                    for i, patch in enumerate(sample_patches):
-                                        T.ToPILImage()(patch.cpu()).save(
-                                            strategy_dir / f'{i}.png'
-                                        )
+                                        z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
+                                        sample_patches = self.generator(z, z_enriched)
+
+                                        for i, patch in enumerate(sample_patches):
+                                            T.ToPILImage()(patch.cpu()).save(
+                                                model_dir / f'{i}.png'
+                                            )
                             self.generator.train()
 
                         if max_steps is not None and global_step >= max_steps:
