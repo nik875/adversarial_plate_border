@@ -387,17 +387,15 @@ class NeuronSampler:
         """
         return self._neuron_betas.get(model_id, 1e-3)
 
-    def get_final_layer_neurons(
-        self,
-        model_id: int,
-        max_k: int = 1000,
-    ) -> List[Tuple[str, int]]:
+    def get_final_layer_neurons(self, model_id: int) -> List[Tuple[str, int]]:
         """
-        Return up to max_k (layer_name, flat_idx) tuples from the final layer.
+        Return ALL (layer_name, flat_idx) tuples from the final layer.
 
         The final layer is the last leaf module to fire during the profiling
-        forward pass.  Capped at max_k to handle large vocabulary projections
-        (e.g. TrOCR, SmolVLM).  Returns [] if the model hasn't been profiled.
+        forward pass.  All neurons are returned because fql is computed as a
+        simple average over neurons (no gram matrix), so using every neuron
+        gives a more accurate estimate with no added cost.
+        Returns [] if the model hasn't been profiled.
         """
         layer_name = self._final_layer_names.get(model_id, '')
         if not layer_name:
@@ -406,8 +404,7 @@ class NeuronSampler:
         if layer_name not in stds:
             return []
         n = stds[layer_name].numel()
-        k = min(n, max_k)
-        return [(layer_name, i) for i in range(k)]
+        return [(layer_name, i) for i in range(n)]
 
     # ------------------------------------------------------------------
     # Profile persistence
