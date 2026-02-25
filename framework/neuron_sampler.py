@@ -244,20 +244,21 @@ class NeuronSampler:
                     # Output is divisible by per-sample size and first dim accounts for batch.
                     # Check if we got exactly B sample units.
                     num_sample_units = act.numel() // per_sample_size
-                    if num_sample_units == B:
-                        # Exact match: reshape [B, per_sample] and extract
-                        flat = act.reshape(B, per_sample_size)
-                        L = per_sample_size
-
-                        idx_t = torch.tensor(
-                            [idx % L   for _, idx   in neuron_list],
-                            dtype=torch.long, device=flat.device,
+                    if num_sample_units != B:
+                        raise RuntimeError(
+                            f"Layer {layer_name}: expected {B} sample units but got {num_sample_units}. "
+                            f"act.shape={act.shape}, per_sample_size={per_sample_size}, "
+                            f"act.numel()={act.numel()}"
                         )
-                        vals = flat[:, idx_t]  # [B, n_layer] — retains grad_fn
-                    else:
-                        # Unexpected number of sample units, skip layer
-                        del captured[layer_name]
-                        continue
+                    # Reshape [B, per_sample] and extract
+                    flat = act.reshape(B, per_sample_size)
+                    L = per_sample_size
+
+                    idx_t = torch.tensor(
+                        [idx % L   for _, idx   in neuron_list],
+                        dtype=torch.long, device=flat.device,
+                    )
+                    vals = flat[:, idx_t]  # [B, n_layer] — retains grad_fn
 
                 elif act.shape[0] == B:
                     # First dim is batch: extract per-sample independently
@@ -274,9 +275,13 @@ class NeuronSampler:
                     vals = torch.stack(vals_per_sample, dim=0)  # [B, n_layer]
 
                 else:
-                    # Can't reliably extract: skip this layer
-                    del captured[layer_name]
-                    continue
+                    # Can't decompose this layer
+                    raise RuntimeError(
+                        f"Layer {layer_name}: unable to extract activations for B={B} samples. "
+                        f"act.shape={act.shape}, act.numel()={act.numel()}, "
+                        f"per_sample_size={per_sample_size}, "
+                        f"shape[0]={act.shape[0]}, shape[0]%B={act.shape[0] % B if B > 0 else 'N/A'}"
+                    )
 
                 pos_t = torch.tensor(
                     [pos for pos, _ in neuron_list],
