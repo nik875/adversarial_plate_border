@@ -280,6 +280,9 @@ class EnsembleTrainer:
         self.generator = self.generator.to(self._device)
         self.task_encoder = self.task_encoder.to(self._device)
 
+        # Mixed precision: GradScaler only used on CUDA; disabled on CPU/MPS
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self._device.type == 'cuda')
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -410,35 +413,35 @@ class EnsembleTrainer:
                 ctrl_acts  = combined_ctrl[:k_rand]       # [k_rand]
                 ctrl_final = combined_ctrl[k_rand:]       # [k_final]
 
-            # --- 4. Generate P patches conditioned on task metadata ---
-            z = torch.randn(P, gen.latent_dim, device=device)
+            with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+                # --- 4. Generate P patches conditioned on task metadata ---
+                z = torch.randn(P, gen.latent_dim, device=device)
 
-            model_idx    = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
-            strategy_idx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
-            dataset_idx  = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
+                model_idx    = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
+                strategy_idx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
+                dataset_idx  = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
 
-            model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
-            strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
-            dataset_idx  = dataset_idx.clamp(0, self.task_encoder.num_datasets - 1)
+                model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
+                strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
+                dataset_idx  = dataset_idx.clamp(0, self.task_encoder.num_datasets - 1)
 
-            z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)
-            patches = gen(z, z_enriched)   # [P, 3, H, W]
+                z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)
+                patches = gen(z, z_enriched)   # [P, 3, H, W]
 
-            # --- 5. Adversarial activations + losses + backward ---
-            # loss.backward() runs inside on_device so model stays on GPU during backward.
-            adv_acts_list: List[Tensor] = []
-            vis_mask = None
-            with self.ensemble.on_device(entry) as model:
-                for p_idx in range(P):
-                    patch = patches[p_idx]
-                    composited, mask = strat_entry.strategy.apply(image, patch, **strategy_kwargs)
-                    if vis_mask is None:
-                        vis_mask = mask
-                    adv_inp = entry.preprocess_fn(composited)
-                    adv_acts = self.neuron_sampler.capture_sampled_activations(
-                        model, adv_inp, combined_neurons, no_grad=False
-                    )
-                    adv_acts_list.append(adv_acts)
+                # --- 5. Adversarial activations ---
+                adv_acts_list: List[Tensor] = []
+                vis_mask = None
+                with self.ensemble.on_device(entry) as model:
+                    for p_idx in range(P):
+                        patch = patches[p_idx]
+                        composited, mask = strat_entry.strategy.apply(image, patch, **strategy_kwargs)
+                        if vis_mask is None:
+                            vis_mask = mask
+                        adv_inp = entry.preprocess_fn(composited)
+                        adv_acts = self.neuron_sampler.capture_sampled_activations(
+                            model, adv_inp, combined_neurons, no_grad=False
+                        )
+                        adv_acts_list.append(adv_acts)
 
                 # --- 6. Compute losses ---
                 # Split combined captures back into random-neuron and final-layer sets
@@ -518,11 +521,11 @@ class EnsembleTrainer:
             acc['spectrum']      += spec_raw.item()
             acc['model']      = entry.name
 
-        # Combine all accumulated losses and call backward once
+        # Combine all accumulated losses and call backward once via scaler
         total_loss = accumulated_act_loss / N + accumulated_spec_loss / N
         if sticker_count > 0:
             total_loss = total_loss + accumulated_tv_loss / sticker_count
-        total_loss.backward()
+        self.scaler.scale(total_loss).backward()
 
         return {
             'loss':          acc['loss']          / N,
@@ -756,11 +759,13 @@ class EnsembleTrainer:
 
                         info = self._train_step(optimizer)
 
+                        self.scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             list(self.generator.parameters())
                             + list(self.task_encoder.parameters()), 1.0
                         )
-                        optimizer.step()
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
                         scheduler.step()   # per optimizer step, not per epoch
 
                         for k in epoch_losses:

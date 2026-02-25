@@ -400,29 +400,25 @@ class FoundationPatchGenerator(nn.Module):
 
         B = z_enriched.shape[0]
 
+        def _run_stream(adapter, taesd, transformer, z_enc, vae_h, vae_w, ph, pw):
+            latent = adapter(z_enc).view(z_enc.shape[0], 4, vae_h, vae_w)
+            taesd_out = torch.clamp(taesd.decode(latent).sample, 0.0, 1.0)
+            if taesd_out.shape[2:] != (ph, pw):
+                taesd_out = F.interpolate(taesd_out, size=(ph, pw),
+                                          mode='bilinear', align_corners=True)
+            return transformer(taesd_out)
+
         stream_outputs = []
         for adapter, taesd, transformer in zip(
             self.adapters, self.taesd_decoders, self.transformers
         ):
-            # Adapt latent code to TAESD latent space
-            latent = adapter(z_enriched).view(
-                B, 4, self.vae_latent_h, self.vae_latent_w
+            out = torch.utils.checkpoint.checkpoint(
+                _run_stream, adapter, taesd, transformer, z_enriched,
+                self.vae_latent_h, self.vae_latent_w,
+                self.patch_height, self.patch_width,
+                use_reentrant=False,
             )
-
-            # TAESD decode
-            taesd_out = torch.clamp(taesd.decode(latent).sample, 0.0, 1.0)
-
-            # Resize to target patch size if needed
-            if taesd_out.shape[2:] != (self.patch_height, self.patch_width):
-                taesd_out = F.interpolate(
-                    taesd_out,
-                    size=(self.patch_height, self.patch_width),
-                    mode='bilinear',
-                    align_corners=True,
-                )
-
-            # Spatial transformer refinement
-            stream_outputs.append(transformer(taesd_out))
+            stream_outputs.append(out)
 
         # Concatenate all stream outputs: [B, 18, H, W]
         combined = torch.cat(stream_outputs, dim=1)
