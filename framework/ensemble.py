@@ -359,9 +359,18 @@ class EnsembleTrainer:
             'tv': 0.0, 'spectrum': 0.0, 'model': '',
         }
 
-        for _ in range(N):
-            # --- 1. Sample a random model, strategy, and image independently ---
-            entry = self.ensemble.sample_entry()
+        # Pre-build balanced model distribution: 2 images per model (N=16, 8 models)
+        all_entries = list(self.ensemble._entries)
+        if all_entries:
+            images_per_model = N // len(all_entries)
+            remainder = N % len(all_entries)
+            balanced_entries = all_entries * images_per_model
+            if remainder > 0:
+                balanced_entries.extend(all_entries[:remainder])
+            random.shuffle(balanced_entries)
+
+        for entry in balanced_entries:
+            # --- 1. Sample strategy and image (model is balanced) ---
             strat_entry = self.ensemble.sample_strategy()
             item = self.dataset_pool.sample()
 
@@ -384,11 +393,8 @@ class EnsembleTrainer:
                     model, self.k_neurons, sample_shape
                 )
                 # Append final-layer neurons so both sets are captured in one pass.
-                # Randomly subsample to 1024 — fql is an average so this is unbiased,
-                # and avoids O(k_final) Python loops for large vocab heads.
+                # Use all final-layer neurons (vectorized extraction is efficient).
                 final_neurons  = self.neuron_sampler.get_final_layer_neurons(entry.model_id)
-                if len(final_neurons) > 1024:
-                    final_neurons = random.sample(final_neurons, 1024)
                 k_rand         = len(sampled_neurons)
                 combined_neurons = sampled_neurons + final_neurons
 
