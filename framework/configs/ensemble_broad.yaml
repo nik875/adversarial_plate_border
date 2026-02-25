@@ -158,7 +158,7 @@ trainer:
   patches_per_image: 8
   images_per_batch: 16
   k_neurons: 10000
-  learning_rate: 1.0e-4
+  learning_rate: 7.0e-5
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
   diversity_weight: 1.0
