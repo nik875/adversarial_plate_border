@@ -372,10 +372,11 @@ class EnsembleTrainer:
                 balanced_entries.extend(all_entries[:remainder])
             random.shuffle(balanced_entries)
 
-        # Accumulate losses over the batch (call backward once at the end)
-        accumulated_act_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
-        accumulated_spec_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        # Accumulate loss components per-image; discard activations immediately after use
+        accumulated_log_det = 0.0
+        accumulated_final_quality = torch.tensor(0.0, device=device, dtype=torch.float32)
         accumulated_tv_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        accumulated_spec_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         sticker_count = 0
 
         for entry in balanced_entries:
@@ -495,7 +496,6 @@ class EnsembleTrainer:
                 )
 
                 # TV loss only for sticker attacks (penalises jagged edges within patch region)
-                # Accumulate separately so we don't dilute it with non-sticker attacks
                 if isinstance(strat_entry.strategy, StickerStrategy):
                     tv_raw  = total_variation_loss(patches, vis_mask)
                     accumulated_tv_loss = accumulated_tv_loss + self.tv_weight * tv_raw
@@ -505,11 +505,13 @@ class EnsembleTrainer:
 
                 spec_raw = compute_spectrum_loss(patches, vis_mask)
 
-                # Accumulate losses (don't call backward yet)
-                accumulated_act_loss = accumulated_act_loss + total_act_loss
+                # Keep gradient-tracked loss components; discard activation buffers
+                accumulated_log_det = log_det
+                accumulated_final_quality = accumulated_final_quality + torch.log(final_quality)
                 accumulated_spec_loss = accumulated_spec_loss + self.spectrum_weight * spec_raw
 
-                del deltas, adv_acts_list
+                # **Discard all activation tensors immediately** — no longer needed for gradients
+                del deltas, adv_acts_list, norm_deltas, ctrl_acts, ctrl_final
                 if final_neurons:
                     del final_deltas
 
@@ -521,10 +523,16 @@ class EnsembleTrainer:
             acc['spectrum']      += spec_raw.item()
             acc['model']      = entry.name
 
-        # Combine all accumulated losses and call backward once via scaler
-        total_loss = accumulated_act_loss / N + accumulated_spec_loss / N
+        # Batch-averaged loss from gradient-tracked components
+        # Activations already freed per-image, but loss has full gradient path
+        total_loss = -(
+            self.diversity_weight * accumulated_log_det / N
+            + self.quality_weight * accumulated_final_quality / N
+        ) + accumulated_spec_loss / N
+
         if sticker_count > 0:
             total_loss = total_loss + accumulated_tv_loss / sticker_count
+
         self.scaler.scale(total_loss).backward()
 
         return {
