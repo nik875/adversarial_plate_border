@@ -112,28 +112,29 @@ def _build_model(model_cfg: Dict[str, Any]) -> nn.Module:
 # Strategy factory
 # ---------------------------------------------------------------------------
 
-def _build_strategy(model_cfg: Dict[str, Any]):
+def _build_strategy(strategy_cfg: Dict[str, Any]):
     from framework.base.attack_strategy import BorderStrategy, StickerStrategy, PerturbationStrategy
 
-    strat = model_cfg.get('strategy', 'border').lower()
+    strat = strategy_cfg.get('type', 'border').lower()
     if strat == 'border':
         return BorderStrategy(
-            center_ratio=model_cfg.get('center_ratio', 0.6),
-            neutral_color=model_cfg.get('neutral_color', 0.5),
+            center_ratio=strategy_cfg.get('center_ratio', 0.91),
+            neutral_color=strategy_cfg.get('neutral_color', 0.5),
         )
     elif strat == 'sticker':
         return StickerStrategy(
-            sticker_h=model_cfg.get('sticker_h', None),
-            sticker_w=model_cfg.get('sticker_w', None),
-            neutral_color=model_cfg.get('neutral_color', 0.5),
+            sticker_h=strategy_cfg.get('sticker_h', None),
+            sticker_w=strategy_cfg.get('sticker_w', None),
+            neutral_color=strategy_cfg.get('neutral_color', 0.5),
+            area_fraction=strategy_cfg.get('area_fraction', 0.05),
         )
     elif strat in ('perturbation', 'additive'):
         return PerturbationStrategy(
-            budget=model_cfg.get('budget', 0.05),
-            norm=model_cfg.get('norm', 'linf'),
+            budget=strategy_cfg.get('budget', 0.05),
+            norm=strategy_cfg.get('norm', 'linf'),
         )
     else:
-        raise ValueError(f"Unknown strategy '{strat}'.")
+        raise ValueError(f"Unknown strategy type '{strat}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +241,6 @@ def main():
     ensemble_pool = ensemble_cfg.ensemble_pool
     for mc in ensemble_cfg.models_cfg:
         model = _build_model(mc)
-        strategy = _build_strategy(mc)
         arch = mc.get('architecture', 'simple_cnn').lower()
         if 'input_shape' in mc:
             input_shape = tuple(mc['input_shape'])
@@ -254,13 +254,22 @@ def main():
             name=mc['name'],
             model=model,
             domain_type=mc.get('domain_type', 'generic'),
-            strategy=strategy,
-            strategy_id=int(mc.get('strategy_id', 0)),
             input_shape=input_shape,
             preprocess_fn=preprocess_fn,
         )
-        print(f"  Registered model: {mc['name']}  "
-              f"(strategy={mc.get('strategy','border')}, id={mc.get('strategy_id',0)})")
+        print(f"  Registered model: {mc['name']}")
+
+    # ------------------------------------------------------------------
+    # Register strategies into the ensemble pool
+    # ------------------------------------------------------------------
+    for sc in ensemble_cfg.strategies_cfg:
+        strategy = _build_strategy(sc)
+        ensemble_pool.register_strategy(
+            name=sc['name'],
+            strategy=strategy,
+            strategy_id=int(sc['strategy_id']),
+        )
+        print(f"  Registered strategy: {sc['name']} (id={sc['strategy_id']})")
 
     if ensemble_pool.num_models() == 0:
         print("WARNING: no models registered — check 'models' section in YAML.")

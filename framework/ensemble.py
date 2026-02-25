@@ -57,28 +57,34 @@ class ModelEntry:
     model_id: int
     name: str
     domain_type: str
-    _model: nn.Module           # always on CPU
+    _model: nn.Module
     input_shape: Tuple[int, int]   # (H, W)
     preprocess_fn: Callable[[Tensor], Tensor]
-    strategy: AttackStrategy
+
+
+@dataclass
+class StrategyEntry:
+    """One registered attack strategy."""
     strategy_id: int
+    name: str
+    strategy: AttackStrategy
 
 
 class EnsembleModelPool:
     """
-    Pool of frozen target models, each paired with an attack strategy.
+    Pool of frozen target models and a separate pool of attack strategies.
 
-    All models are moved to compute_device at registration time and kept
-    there permanently.  on_device() is retained as a no-op context manager
-    for API compatibility but no longer moves anything.
+    Any strategy can be applied to any model — they are sampled independently.
+    Models are permanently on compute_device after registration.
 
     Usage::
 
         pool = EnsembleModelPool(compute_device=torch.device('cuda'))
         pool.register('resnet50', model, 'classification',
-                      strategy=BorderStrategy(), strategy_id=0,
                       input_shape=(224, 224), preprocess_fn=fn)
+        pool.register_strategy('border', BorderStrategy(), strategy_id=0)
         entry = pool.sample_entry()
+        strat = pool.sample_strategy()
         with pool.on_device(entry) as model:
             out = model(inp)
     """
@@ -88,6 +94,7 @@ class EnsembleModelPool:
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
         self._entries: List[ModelEntry] = []
+        self._strategies: List[StrategyEntry] = []
         self._next_id: int = 0
 
     # ------------------------------------------------------------------
@@ -99,24 +106,19 @@ class EnsembleModelPool:
         name: str,
         model: nn.Module,
         domain_type: str,
-        strategy: AttackStrategy,
-        strategy_id: int,
         input_shape: Tuple[int, int],
         preprocess_fn: Callable[[Tensor], Tensor],
     ) -> int:
         """
         Register a model in the ensemble pool.
 
-        The model is moved to CPU, set to eval mode, and all parameters are
-        frozen (requires_grad=False).  Gradients flow through composited
-        inputs (from the generator) but NOT into model weights.
+        The model is set to eval mode, all parameters frozen, and moved
+        to compute_device permanently.
 
         Args:
             name:          human-readable identifier
-            model:         nn.Module to register (will be frozen and CPU-resident)
+            model:         nn.Module to register
             domain_type:   arbitrary tag (e.g. 'classification', 'detection')
-            strategy:      AttackStrategy to use when attacking via this model
-            strategy_id:   integer strategy identifier (for TaskEncoder one-hot)
             input_shape:   (H, W) expected by this model (after preprocessing)
             preprocess_fn: callable (Tensor [B,3,H,W]) → Tensor [B,3,H',W']
 
@@ -137,10 +139,21 @@ class EnsembleModelPool:
             _model=model,
             input_shape=input_shape,
             preprocess_fn=preprocess_fn,
-            strategy=strategy,
-            strategy_id=strategy_id,
         ))
         return model_id
+
+    def register_strategy(
+        self,
+        name: str,
+        strategy: AttackStrategy,
+        strategy_id: int,
+    ) -> None:
+        """Register an attack strategy. Any strategy can be used with any model."""
+        self._strategies.append(StrategyEntry(
+            strategy_id=strategy_id,
+            name=name,
+            strategy=strategy,
+        ))
 
     # ------------------------------------------------------------------
     # Sampling
@@ -150,8 +163,13 @@ class EnsembleModelPool:
         """Sample a uniformly random model entry."""
         if not self._entries:
             raise RuntimeError("No models registered. Call register() first.")
-        import random
         return random.choice(self._entries)
+
+    def sample_strategy(self) -> StrategyEntry:
+        """Sample a uniformly random strategy entry."""
+        if not self._strategies:
+            raise RuntimeError("No strategies registered. Call register_strategy() first.")
+        return random.choice(self._strategies)
 
     def get_entry(self, model_id: int) -> ModelEntry:
         for e in self._entries:
@@ -165,10 +183,7 @@ class EnsembleModelPool:
 
     @contextmanager
     def on_device(self, entry: ModelEntry) -> Generator[nn.Module, None, None]:
-        """
-        No-op context manager — all models are permanently on compute_device.
-        Retained for API compatibility.
-        """
+        """No-op context manager — all models are permanently on compute_device."""
         yield entry._model
 
     # ------------------------------------------------------------------
@@ -179,11 +194,13 @@ class EnsembleModelPool:
         return len(self._entries)
 
     def num_strategies(self) -> int:
-        return len(set(e.strategy_id for e in self._entries))
+        return len(self._strategies)
 
     def __repr__(self) -> str:
-        names = [e.name for e in self._entries]
-        return f"EnsembleModelPool(models={names}, device={self.compute_device})"
+        model_names = [e.name for e in self._entries]
+        strat_names = [s.name for s in self._strategies]
+        return (f"EnsembleModelPool(models={model_names}, "
+                f"strategies={strat_names}, device={self.compute_device})")
 
 
 # ---------------------------------------------------------------------------
@@ -341,15 +358,16 @@ class EnsembleTrainer:
         }
 
         for _ in range(N):
-            # --- 1. Sample a random model entry and image ---
+            # --- 1. Sample a random model, strategy, and image independently ---
             entry = self.ensemble.sample_entry()
+            strat_entry = self.ensemble.sample_strategy()
             item = self.dataset_pool.sample()
 
             # image: [3, H, W] → [1, 3, H, W] on device
             image = item.image.unsqueeze(0).to(device)
 
             # --- 2. Sample strategy placement kwargs ---
-            strategy_kwargs = entry.strategy.sample_kwargs(
+            strategy_kwargs = strat_entry.strategy.sample_kwargs(
                 image, gen.patch_height, gen.patch_width,
                 model_input_shape=entry.input_shape
             )
@@ -357,7 +375,7 @@ class EnsembleTrainer:
             # --- 3. Control activation (no_grad, no patch) ---
             with self.ensemble.on_device(entry) as model:
                 neutral_inp = entry.preprocess_fn(
-                    entry.strategy.apply_neutral(image, **strategy_kwargs)
+                    strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
                 )
                 sample_shape = (3, *entry.input_shape)
                 sampled_neurons = self.neuron_sampler.sample_neurons(
@@ -370,9 +388,9 @@ class EnsembleTrainer:
             # --- 4. Generate P patches conditioned on task metadata ---
             z = torch.randn(P, gen.latent_dim, device=device)
 
-            model_idx    = torch.full((P,), entry.model_id,    device=device, dtype=torch.long)
-            strategy_idx = torch.full((P,), entry.strategy_id, device=device, dtype=torch.long)
-            dataset_idx  = torch.full((P,), item.dataset_id,   device=device, dtype=torch.long)
+            model_idx    = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
+            strategy_idx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
+            dataset_idx  = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
 
             model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
             strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
@@ -388,7 +406,7 @@ class EnsembleTrainer:
             with self.ensemble.on_device(entry) as model:
                 for p_idx in range(P):
                     patch = patches[p_idx]
-                    composited, mask = entry.strategy.apply(image, patch, **strategy_kwargs)
+                    composited, mask = strat_entry.strategy.apply(image, patch, **strategy_kwargs)
                     if vis_mask is None:
                         vis_mask = mask
                     adv_inp = entry.preprocess_fn(composited)
@@ -617,38 +635,21 @@ class EnsembleTrainer:
 
                             self.generator.eval()
                             with torch.no_grad():
-                                # Generate 10 patches for each of 3 strategy types
-                                from framework.base.attack_strategy import (
-                                    BorderStrategy, StickerStrategy, PerturbationStrategy
-                                )
-                                strategy_types = [
-                                    ('border', BorderStrategy),
-                                    ('sticker', StickerStrategy),
-                                    ('perturbation', PerturbationStrategy),
-                                ]
-
-                                for strategy_name, strategy_class in strategy_types:
-                                    strategy_dir = step_samples_dir / strategy_name
+                                # Generate 10 patches for each registered strategy
+                                for strat_entry in self.ensemble._strategies:
+                                    strategy_dir = step_samples_dir / strat_entry.name
                                     strategy_dir.mkdir(parents=True, exist_ok=True)
 
-                                    # Find a random model entry with this strategy type
-                                    matching_entries = [
-                                        e for e in self.ensemble._entries
-                                        if isinstance(e.strategy, strategy_class)
-                                    ]
-                                    if not matching_entries:
-                                        continue  # Skip if no models use this strategy
+                                    # Pick a random model and dataset
+                                    sample_model = random.choice(self.ensemble._entries)
+                                    dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
 
-                                    entry = random.choice(matching_entries)
-                                    dataset_idx = torch.randint(0, self.task_encoder.num_datasets, (1,)).item()
-
-                                    # Generate 10 patches conditioned on this strategy + random model
                                     z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                    model_idx = torch.full((10,), entry.model_id, dtype=torch.long, device=self._device)
-                                    strategy_idx = torch.full((10,), entry.strategy_id, dtype=torch.long, device=self._device)
-                                    dataset_idx_tensor = torch.full((10,), dataset_idx, dtype=torch.long, device=self._device)
+                                    model_idx    = torch.full((10,), sample_model.model_id,    dtype=torch.long, device=self._device)
+                                    strategy_idx = torch.full((10,), strat_entry.strategy_id,  dtype=torch.long, device=self._device)
+                                    dataset_idx_t = torch.full((10,), dataset_idx,             dtype=torch.long, device=self._device)
 
-                                    z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_tensor)
+                                    z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
                                     sample_patches = self.generator(z, z_enriched)
 
                                     for i, patch in enumerate(sample_patches):

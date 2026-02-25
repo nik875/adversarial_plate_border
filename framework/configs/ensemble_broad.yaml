@@ -24,60 +24,57 @@ compute_device: cuda
 # If the file is missing, config_loader falls back to root-based glob loading.
 manifest: ~/.cache/adversarial_plate_manifest.csv
 
-# Number of distinct strategies (must be >= max strategy_id + 1)
-num_strategies: 3    # 0=border, 1=sticker, 2=perturbation
+# ---------------------------------------------------------------------------
+# Attack strategies — any strategy can be used against any model
+# ---------------------------------------------------------------------------
+strategies:
+  - name: border
+    type: border
+    strategy_id: 0
+
+  - name: sticker
+    type: sticker
+    strategy_id: 1
+
+  - name: perturbation
+    type: perturbation
+    strategy_id: 2
 
 # ---------------------------------------------------------------------------
 # Model pool — 8 models spanning 4 vision tasks
 # ---------------------------------------------------------------------------
 models:
-  - name: resnet50_border
+  - name: resnet50
     architecture: resnet50
     domain_type: classification
-    strategy: border
-    strategy_id: 0
 
-  - name: convnext_small_sticker
+  - name: convnext_small
     architecture: convnext_small
     domain_type: classification
-    strategy: sticker
-    strategy_id: 1
 
-  - name: swin_t_border
+  - name: swin_t
     architecture: swin_t
     domain_type: classification
-    strategy: border
-    strategy_id: 0
 
-  - name: dinov2_vitb14_border
+  - name: dinov2_vitb14
     architecture: dinov2_vitb14
     domain_type: features
-    strategy: border
-    strategy_id: 0
 
-  - name: clip_vit_l14_border
+  - name: clip_vit_l14
     architecture: clip_vit_l14
     domain_type: features
-    strategy: border
-    strategy_id: 0
 
-  - name: yolov8s_sticker
+  - name: yolov8s
     architecture: yolov8s
     domain_type: detection
-    strategy: sticker
-    strategy_id: 1
 
-  - name: trocr_base_border
+  - name: trocr_base
     architecture: trocr_base
     domain_type: ocr
-    strategy: border
-    strategy_id: 0
 
-  - name: smolvlm_border
+  - name: smolvlm_500m
     architecture: smolvlm_500m
     domain_type: vlm
-    strategy: border
-    strategy_id: 0
 
 # ---------------------------------------------------------------------------
 # Dataset pool

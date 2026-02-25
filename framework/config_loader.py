@@ -64,6 +64,7 @@ class EnsembleConfig:
     generator_cfg: Dict           # dict of generator hyperparameters
     trainer_cfg: Dict             # dict of EnsembleTrainer hyperparameters
     models_cfg: List[Dict]        # raw list of model configs from YAML
+    strategies_cfg: List[Dict]    # raw list of strategy configs from YAML
     raw: Dict                     # full original YAML dict
 
 
@@ -152,8 +153,9 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
 
     # Dimensions for TaskEncoder
     models_cfg: List[Dict] = cfg.get('models', [])
+    strategies_cfg: List[Dict] = cfg.get('strategies', [])
     num_models = max(len(models_cfg), 1)
-    num_strategies = cfg.get('num_strategies', 3)
+    num_strategies = max(len(strategies_cfg), 1)
     datasets_cfg: List[Dict] = cfg.get('datasets', [])
     num_datasets = max(len(datasets_cfg), 1)
 
@@ -223,6 +225,7 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
         generator_cfg=gen_cfg,
         trainer_cfg=cfg.get('trainer', {}),
         models_cfg=models_cfg,
+        strategies_cfg=strategies_cfg,
         raw=cfg,
     )
 
