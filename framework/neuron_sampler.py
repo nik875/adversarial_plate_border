@@ -228,24 +228,30 @@ class NeuronSampler:
                     continue  # hook didn't fire — stays zero in result
 
                 act = captured[layer_name]     # [B, *layer_shape]
-                if act.numel() % B != 0:
-                    # Some models fold batch with spatial/head dims internally;
-                    # skip layers whose total size isn't divisible by B.
-                    del captured[layer_name]
-                    continue
-                flat = act.reshape(B, -1)      # [B, neurons_in_layer]
-                L = flat.shape[1]
+
+                # Extract per-sample: flatten each sample independently,
+                # then index to get the same neurons from each sample.
+                # This handles any output shape, even if total size isn't
+                # divisible by B (e.g., models with folded batch/head dims).
+                vals_per_sample = []
+                for b in range(B):
+                    act_b = act[b]  # [*layer_shape_per_sample]
+                    flat_b = act_b.reshape(-1)  # [total_per_sample]
+                    L = flat_b.shape[0]
+
+                    idx_t = torch.tensor(
+                        [idx % L   for _, idx   in neuron_list],
+                        dtype=torch.long, device=flat_b.device,
+                    )
+                    vals_b = flat_b[idx_t]  # [n_layer] — retains grad_fn
+                    vals_per_sample.append(vals_b)
+
+                vals = torch.stack(vals_per_sample, dim=0)  # [B, n_layer]
 
                 pos_t = torch.tensor(
-                    [pos       for pos, _   in neuron_list],
-                    dtype=torch.long, device=flat.device,
+                    [pos for pos, _ in neuron_list],
+                    dtype=torch.long, device=vals.device,
                 )
-                idx_t = torch.tensor(
-                    [idx % L   for _, idx   in neuron_list],
-                    dtype=torch.long, device=flat.device,
-                )
-                vals = flat[:, idx_t]          # [B, n_layer] — retains grad_fn
-
                 all_positions.append(pos_t)
                 all_vals.append(vals)
 
