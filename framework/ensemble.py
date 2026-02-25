@@ -409,7 +409,7 @@ class EnsembleTrainer:
                         z_enriched = self.task_encoder(z, midx, sidx, didx)
                         patches    = gen(z, z_enriched)   # [P, 3, H, W]
 
-                        # --- 3. Build [P+1, 3, H', W'] batch: ctrl first, then P adv ---
+                        # --- 3. Build ctrl input and P adv inputs separately ---
                         ctrl_inp = entry.preprocess_fn(
                             strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
                         )                                                           # [1, 3, H', W']
@@ -424,17 +424,20 @@ class EnsembleTrainer:
                                 vis_mask = mask
                             adv_inps.append(entry.preprocess_fn(composited))       # [1, 3, H', W']
 
-                        batch_inp = torch.cat([ctrl_inp] + adv_inps, dim=0)        # [P+1, 3, H', W']
+                        # --- 4. Two batched forwards: ctrl B=1 (no_grad), adv B=P (grad) ---
+                        # Keeping ctrl and adv separate avoids B=P+1 which can be a
+                        # prime or otherwise non-divisible batch size for models that
+                        # fold batch with head/spatial dims in intermediate layers.
+                        ctrl_combined = self.neuron_sampler.capture_sampled_activations(
+                            model, ctrl_inp, combined_neurons, no_grad=True,
+                        ).to(device)                                                # [1, k_rand+k_final]
+                        ctrl_acts  = ctrl_combined[0, :k_rand]                     # [k_rand]
+                        ctrl_final = ctrl_combined[0, k_rand:]                     # [k_final]
 
-                        # --- 4. One batched forward through the frozen target model ---
-                        combined = self.neuron_sampler.capture_sampled_activations(
-                            model, batch_inp, combined_neurons, no_grad=False,
-                        ).to(device)                                                # [P+1, k_rand+k_final]
-
-                        # Detach control row — it's a reference baseline, not part of the gradient path
-                        ctrl_acts  = combined[0, :k_rand].detach()                 # [k_rand]
-                        ctrl_final = combined[0, k_rand:].detach()                 # [k_final]
-                        adv_acts   = combined[1:]                                  # [P, k_rand+k_final]
+                        adv_batch = torch.cat(adv_inps, dim=0)                     # [P, 3, H', W']
+                        adv_acts  = self.neuron_sampler.capture_sampled_activations(
+                            model, adv_batch, combined_neurons, no_grad=False,
+                        ).to(device)                                                # [P, k_rand+k_final]
 
                         # --- 5. Compute losses ---
                         deltas = adv_acts[:, :k_rand] - ctrl_acts                  # [P, k_rand]

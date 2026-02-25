@@ -228,6 +228,11 @@ class NeuronSampler:
                     continue  # hook didn't fire — stays zero in result
 
                 act = captured[layer_name]     # [B, *layer_shape]
+                if act.numel() % B != 0:
+                    # Some models fold batch with spatial/head dims internally;
+                    # skip layers whose total size isn't divisible by B.
+                    del captured[layer_name]
+                    continue
                 flat = act.reshape(B, -1)      # [B, neurons_in_layer]
                 L = flat.shape[1]
 
