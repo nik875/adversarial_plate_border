@@ -212,38 +212,49 @@ class NeuronSampler:
             else:
                 model(model_input)
 
-            # Extract scalar values
-            results: List[Tensor | None] = [None] * len(sampled_neurons)
+            # Extract values — vectorised per layer (one index op per layer,
+            # not one per neuron) so PyTorch dispatch overhead is O(layers)
+            # rather than O(neurons).
+            # Collect positions + values across all layers, then assemble in
+            # one index_put (non-inplace, differentiable through values).
+            k = len(sampled_neurons)
+            all_positions: List[Tensor] = []
+            all_vals:      List[Tensor] = []
 
             for layer_name, neuron_list in layer_to_neurons.items():
                 if layer_name not in captured:
-                    # Hook didn't fire (layer not reached); fill with zeros
-                    for pos, _ in neuron_list:
-                        results[pos] = torch.tensor(
-                            0.0, device=self.device, dtype=torch.float32
-                        )
-                    continue
+                    continue  # hook didn't fire — stays zero in result
 
                 act = captured[layer_name]     # [1, *shape] (batch size = 1)
-                flat = act.reshape(1, -1)      # [1, N]
-                N = flat.shape[1]
+                flat = act.reshape(-1)         # [N]
+                N = flat.shape[0]
 
-                for pos, flat_idx in neuron_list:
-                    idx = flat_idx % N          # guard against shape mismatch
-                    val = flat[0, idx]          # scalar (retains grad_fn if no_grad=False)
-                    results[pos] = val
+                pos_t = torch.tensor(
+                    [pos       for pos, _   in neuron_list],
+                    dtype=torch.long, device=flat.device,
+                )
+                idx_t = torch.tensor(
+                    [idx % N   for _, idx   in neuron_list],
+                    dtype=torch.long, device=flat.device,
+                )
+                vals = flat[idx_t]             # [n_layer] — one op, retains grad_fn
 
-                # Release the large activation buffer immediately after all
-                # neurons for this layer have been extracted.
+                all_positions.append(pos_t)
+                all_vals.append(vals)
+
+                # Release the large activation buffer immediately.
                 del captured[layer_name]
 
-            # Stack into [k] — each element is a scalar (possibly with grad_fn)
-            result_tensor = torch.stack([
-                r if r is not None
-                else torch.tensor(0.0, device=self.device, dtype=torch.float32)
-                for r in results
-            ])
-            return result_tensor.float()
+            if all_positions:
+                all_pos_t  = torch.cat(all_positions)                     # [k]
+                all_vals_t = torch.cat(all_vals).float()                   # [k]
+                result_tensor = torch.zeros(
+                    k, device=self.device, dtype=torch.float32,
+                ).index_put((all_pos_t,), all_vals_t)
+            else:
+                result_tensor = torch.zeros(k, device=self.device, dtype=torch.float32)
+
+            return result_tensor
 
         finally:
             for h in hooks:
