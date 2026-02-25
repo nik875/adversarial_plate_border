@@ -483,15 +483,31 @@ class EnsembleTrainer:
         """
         Precompute per-neuron activation std for every registered model.
 
-        Samples n_images from the dataset pool, runs them through each model,
-        and stores per-neuron std on CPU via NeuronSampler.profile_model().
-        Called once at the start of training.
+        For each model, checks ~/.cache/adversarial_plate_profiles/ for a saved
+        profile matching {model_name}_n{n_images}.pt.  If found, loads it
+        instantly.  Otherwise runs Welford profiling and saves the result for
+        future runs.
+
+        Args:
+            n_images: number of images to profile with (cache key includes this)
         """
+        import os
+        cache_dir = Path(os.path.expanduser('~/.cache/adversarial_plate_profiles'))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
         print(f"\nProfiling {self.ensemble.num_models()} models "
               f"({n_images} images each) for per-neuron std ...")
 
         for entry in self.ensemble._entries:
-            print(f"  {entry.name} ...", end=' ', flush=True)
+            cache_path = cache_dir / f'{entry.name}_n{n_images}.pt'
+
+            # --- Try loading from cache ---
+            if self.neuron_sampler.load_profile(entry.model_id, cache_path):
+                print(f"  {entry.name} ... loaded from cache ({cache_path.name})")
+                continue
+
+            # --- Cache miss: run Welford profiling ---
+            print(f"  {entry.name} ... profiling", end=' ', flush=True)
             images = []
             for _ in range(n_images):
                 item = self.dataset_pool.sample()
@@ -506,7 +522,9 @@ class EnsembleTrainer:
                     images=images,
                     sample_input_shape=sample_shape,
                 )
-            print("done")
+
+            self.neuron_sampler.save_profile(entry.model_id, cache_path)
+            print(f"done (saved to {cache_path.name})")
 
         print("Profiling complete.\n")
 

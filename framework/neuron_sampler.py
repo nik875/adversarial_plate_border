@@ -381,6 +381,41 @@ class NeuronSampler:
         return self._neuron_betas.get(model_id, 1e-3)
 
     # ------------------------------------------------------------------
+    # Profile persistence
+    # ------------------------------------------------------------------
+
+    def save_profile(self, model_id: int, path) -> None:
+        """
+        Persist the profiling data for model_id to a .pt file.
+
+        Saves neuron_stds dict and the computed β scalar.
+        """
+        from pathlib import Path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'neuron_stds': self._neuron_stds[model_id],
+            'beta':        self._neuron_betas[model_id],
+        }, path)
+
+    def load_profile(self, model_id: int, path) -> bool:
+        """
+        Load profiling data from a .pt file into model_id's slot.
+
+        Returns True on success, False if the file doesn't exist or is corrupt.
+        """
+        from pathlib import Path
+        p = Path(path)
+        if not p.exists():
+            return False
+        try:
+            data = torch.load(p, map_location='cpu', weights_only=True)
+            self._neuron_stds[model_id]  = data['neuron_stds']
+            self._neuron_betas[model_id] = float(data['beta'])
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
     # Cache management
     # ------------------------------------------------------------------
 
