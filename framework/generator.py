@@ -67,18 +67,18 @@ class DilatedResidualSmoother(nn.Module):
 
 class LightPatchTransformer(nn.Module):
     """
-    Lightweight spatial transformer that refines a 256×256 TAESD output,
-    then upsamples to 512×512 via a learned transposed convolution.
+    Lightweight refinement transformer for TAESD outputs.
+    Keeps conceptual elegance of transformer refinement while minimizing compute.
 
     Architecture:
         - patch_embed: Conv2d(3, d_model, 16, 16) → [B, 256, d_model]
-        - 2-layer transformer encoder with gradient checkpointing
-        - 2-layer transformer decoder with gradient checkpointing
+        - 1-layer transformer encoder with gradient checkpointing
+        - 1-layer transformer decoder with gradient checkpointing
         - output_proj: Linear(d_model, 768) → reshape → [B, 3, 256, 256]
         - upsample: ConvTranspose2d(3, 3, 4, 2, 1) → [B, 3, 512, 512]
 
-    Operating at 256×256 (256 tokens) rather than 512×512 (1024 tokens) makes
-    attention maps 16× smaller: [B, nhead, 256, 256] vs [B, nhead, 1024, 1024].
+    Reduced from 2 layers to 1 per phase. d_model=128 instead of 256 for 4× smaller
+    attention maps: [B, nhead, 256, 128] vs [B, nhead, 256, 256].
     """
 
     def __init__(
