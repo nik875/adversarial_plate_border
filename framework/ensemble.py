@@ -41,7 +41,7 @@ from torch import Tensor, optim
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from framework.base.attack_strategy import AttackStrategy
+from framework.base.attack_strategy import AttackStrategy, StickerStrategy
 from framework.dataset_pool import LazyDatasetPool
 from framework.generator import FoundationPatchGenerator
 from framework.losses import total_variation_loss, compute_spectrum_loss
@@ -441,7 +441,11 @@ class EnsembleTrainer:
                     + self.quality_weight * torch.log(quality)
                 )
 
-                tv_val   = self.tv_weight      * total_variation_loss(patches, vis_mask)
+                # TV loss only for sticker attacks (penalises jagged edges within patch region)
+                if isinstance(strat_entry.strategy, StickerStrategy):
+                    tv_val = self.tv_weight * total_variation_loss(patches, vis_mask)
+                else:
+                    tv_val = torch.tensor(0.0, device=device)
                 spec_val = self.spectrum_weight * compute_spectrum_loss(patches, vis_mask)
 
                 # Divide by N so gradients accumulate to the mean over the batch
