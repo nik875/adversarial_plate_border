@@ -764,9 +764,13 @@ class EnsembleTrainer:
                             list(self.generator.parameters())
                             + list(self.task_encoder.parameters()), 1.0
                         )
+                        scale_before = self.scaler.get_scale()
                         self.scaler.step(optimizer)
                         self.scaler.update()
-                        scheduler.step()   # per optimizer step, not per epoch
+                        # Only advance scheduler when optimizer actually stepped
+                        # (scaler skips step on gradient overflow, reducing scale)
+                        if self.scaler.get_scale() >= scale_before:
+                            scheduler.step()
 
                         for k in epoch_losses:
                             epoch_losses[k] += info.get(k, 0.0)
