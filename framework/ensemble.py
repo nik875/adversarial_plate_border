@@ -454,11 +454,11 @@ class EnsembleTrainer:
                 per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
                 quality = per_patch_rms.mean() + 1e-8
 
-                # Final-layer quality: same metric but restricted to final layer neurons.
-                # Detached — monitoring only, does not contribute to the loss.
+                # Final-layer quality: optimization target (replaces random-neuron quality).
+                # Gradients flow through this into the generator.
                 if final_neurons:
                     final_deltas = torch.stack(
-                        [a[k_rand:].detach() - ctrl_final for a in adv_acts_list], dim=0
+                        [a[k_rand:] - ctrl_final for a in adv_acts_list], dim=0
                     )                                                              # [P, k_final]
                     final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
                         entry.model_id, final_neurons
@@ -472,7 +472,7 @@ class EnsembleTrainer:
 
                 total_act_loss = -(
                     self.diversity_weight * log_det
-                    + self.quality_weight * torch.log(quality)
+                    + self.quality_weight * torch.log(final_quality)
                 )
 
                 # TV loss only for sticker attacks (penalises jagged edges within patch region)
@@ -489,7 +489,7 @@ class EnsembleTrainer:
                 loss = (total_act_loss + tv_val + spec_val) / N
                 loss.backward()
 
-                del deltas, adv_acts_list
+                del deltas, final_deltas, adv_acts_list
 
             acc['loss']          += (total_act_loss + tv_val + spec_val).item()
             acc['diversity']     += log_det.item()
@@ -746,7 +746,6 @@ class EnsembleTrainer:
                         pbar.set_postfix({
                             'loss': f"{info['loss']:.4f}",
                             'div':  f"{info['diversity']:.2f}",
-                            'qual': f"{info['quality']:.4f}",
                             'fql':  f"{info['final_quality']:.4f}",
                             'tv':   f"{info['tv']:.4f}",
                             'ssim': f"{info['spectrum']:.4f}",
