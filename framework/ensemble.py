@@ -540,14 +540,30 @@ class EnsembleTrainer:
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def _save_checkpoint(self, epoch: int, global_step: int, run_dir: Path, subdir: str = 'checkpoint') -> None:
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        global_step: int,
+        run_dir: Path,
+        optimizer: optim.Optimizer,
+        scheduler,
+        subdir: str = 'checkpoint',
+    ) -> None:
         ckpt_dir = run_dir / subdir
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         gen = self.generator
         ckpt = {
+            # Top-level keys read directly by resume logic
+            'epoch':                   epoch,
+            'global_step':             global_step,
+            # Model weights
             'generator_state_dict':    gen.state_dict(),
             'task_encoder_state_dict': self.task_encoder.state_dict(),
+            # Optimizer + scheduler state — needed for correct resume
+            'optimizer_state_dict':    optimizer.state_dict(),
+            'scheduler_state_dict':    scheduler.state_dict(),
+            # Architecture metadata
             'basis_dim':               gen.latent_dim,
             'patch_size':              [gen.patch_height, gen.patch_width],
             'num_taesd':               gen.num_taesd,
@@ -622,17 +638,24 @@ class EnsembleTrainer:
                 ckpt = torch.load(ckpt_files[-1], map_location='cpu')
                 self.generator.load_state_dict(ckpt['generator_state_dict'])
                 self.task_encoder.load_state_dict(ckpt['task_encoder_state_dict'])
-                start_epoch = ckpt.get('epoch', 0) + 1
-                start_step  = ckpt.get('global_step', 0)
+                # epoch and global_step are at top level (training_info was a bug)
+                start_epoch = ckpt.get('epoch', ckpt.get('training_info', {}).get('epoch', 0)) + 1
+                start_step  = ckpt.get('global_step', ckpt.get('training_info', {}).get('global_step', 0))
+                # Restore optimizer moments + scheduler position (no fast-forward needed)
+                if 'optimizer_state_dict' in ckpt:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if 'scheduler_state_dict' in ckpt:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                else:
+                    # Legacy checkpoint: fast-forward scheduler
+                    for _ in range(start_step):
+                        scheduler.step()
                 # Restore the original run directory so outputs stay together
                 saved_run_dir = ckpt.get('run_dir')
                 if saved_run_dir and Path(saved_run_dir).exists():
                     run_dir = Path(saved_run_dir)
                 else:
                     run_dir = Path(resume_from).parent
-                # Fast-forward scheduler to match resumed position
-                for _ in range(start_step):
-                    scheduler.step()
                 print(f"Resumed from {ckpt_files[-1]} — epoch {start_epoch}, step {start_step}")
                 print(f"  Run directory: {run_dir}")
 
@@ -746,7 +769,7 @@ class EnsembleTrainer:
                         if max_steps is not None and global_step >= max_steps:
                             print(f"\n  max_steps={max_steps} reached; saving checkpoint.")
                             self._save_checkpoint(
-                                epoch, global_step, run_dir,
+                                epoch, global_step, run_dir, optimizer, scheduler,
                                 subdir=f'checkpoint_step_{global_step:07d}'
                             )
                             return
@@ -754,7 +777,7 @@ class EnsembleTrainer:
             except KeyboardInterrupt:
                 print(f"\n  Interrupted at step {global_step}; saving checkpoint.")
                 self._save_checkpoint(
-                    epoch, global_step, run_dir,
+                    epoch, global_step, run_dir, optimizer, scheduler,
                     subdir=f'checkpoint_step_{global_step:07d}'
                 )
                 return
@@ -770,9 +793,10 @@ class EnsembleTrainer:
             )
 
             if epoch % self.save_every_epochs == 0 or epoch == self.max_epochs:
-                self._save_checkpoint(epoch, global_step, run_dir,
+                self._save_checkpoint(epoch, global_step, run_dir, optimizer, scheduler,
                                       subdir=f'checkpoint_epoch_{epoch:04d}')
 
         # Final checkpoint
-        self._save_checkpoint(self.max_epochs, global_step, run_dir, subdir='ensemble_final')
+        self._save_checkpoint(self.max_epochs, global_step, run_dir, optimizer, scheduler,
+                              subdir='ensemble_final')
         print(f"\n✓ Ensemble training complete. Output: {run_dir}")
