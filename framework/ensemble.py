@@ -22,10 +22,12 @@ Gradient flow:
 """
 from __future__ import annotations
 
+import io
 import math
 import os
 import random
 import signal
+import tarfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -630,34 +632,36 @@ class EnsembleTrainer:
 
                         # Save sample patches every 10 optimizer steps
                         if global_step % 10 == 0:
-                            step_samples_dir = samples_dir / f'step_{global_step:07d}'
-                            step_samples_dir.mkdir(parents=True, exist_ok=True)
+                            tar_path = samples_dir / f'step_{global_step:07d}.tar'
 
                             self.generator.eval()
                             with torch.no_grad():
-                                # Generate 10 patches per strategy per target model
-                                for strat_entry in self.ensemble._strategies:
-                                    strategy_dir = step_samples_dir / strat_entry.name
-                                    strategy_dir.mkdir(parents=True, exist_ok=True)
+                                with tarfile.open(tar_path, 'w') as tar:
+                                    # Generate 10 patches per strategy per target model
+                                    for strat_entry in self.ensemble._strategies:
+                                        for model_entry in self.ensemble._entries:
+                                            dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
 
-                                    for model_entry in self.ensemble._entries:
-                                        model_dir = strategy_dir / model_entry.name
-                                        model_dir.mkdir(parents=True, exist_ok=True)
+                                            z = torch.randn(10, self.generator.latent_dim, device=self._device)
+                                            model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
+                                            strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
+                                            dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
 
-                                        dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
+                                            z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
+                                            sample_patches = self.generator(z, z_enriched)
 
-                                        z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                        model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
-                                        strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
-                                        dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
+                                            for i, patch in enumerate(sample_patches):
+                                                # Save patch to bytes buffer
+                                                buf = io.BytesIO()
+                                                T.ToPILImage()(patch.cpu()).save(buf, format='PNG')
+                                                buf.seek(0)
 
-                                        z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
-                                        sample_patches = self.generator(z, z_enriched)
-
-                                        for i, patch in enumerate(sample_patches):
-                                            T.ToPILImage()(patch.cpu()).save(
-                                                model_dir / f'{i}.png'
-                                            )
+                                                # Add to tar with hierarchical path
+                                                tar_info = tarfile.TarInfo(
+                                                    name=f'{strat_entry.name}/{model_entry.name}/{i}.png'
+                                                )
+                                                tar_info.size = len(buf.getvalue())
+                                                tar.addfile(tar_info, buf)
                             self.generator.train()
 
                         if max_steps is not None and global_step >= max_steps:
