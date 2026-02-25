@@ -153,8 +153,7 @@ generator:
 # EnsembleTrainer
 # ---------------------------------------------------------------------------
 trainer:
-  max_epochs: 100
-  max_steps: 3280
+  max_steps: 1640
   patches_per_image: 8
   images_per_batch: 32
   k_neurons: 10000
