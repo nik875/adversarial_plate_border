@@ -275,7 +275,12 @@ class NeuronSampler:
                     vals = torch.stack(vals_per_sample, dim=0)  # [B, n_layer]
 
                 else:
-                    # Can't decompose this layer
+                    # Skip non-batching layers (e.g., position embeddings)
+                    if act.shape[0] == 1 and B > 1:
+                        del captured[layer_name]
+                        continue
+
+                    # Unexpected shape: raise error
                     raise RuntimeError(
                         f"Layer {layer_name}: unable to extract activations for B={B} samples. "
                         f"act.shape={act.shape}, act.numel()={act.numel()}, "
