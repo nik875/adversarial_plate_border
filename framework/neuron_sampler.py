@@ -168,15 +168,17 @@ class NeuronSampler:
         have been extracted.
 
         Args:
-            model:          target model (all params should have requires_grad=False)
-            model_input:    [1, C, H, W] preprocessed input tensor
+            model:           target model (all params should have requires_grad=False)
+            model_input:     [B, C, H, W] preprocessed batch of inputs
             sampled_neurons: list of (layer_name, flat_idx) from sample_neurons()
-            no_grad:        if True, run under torch.no_grad() and detach activations;
-                            if False, activations retain grad_fn for backprop
+            no_grad:         if True, run under torch.no_grad() and detach activations;
+                             if False, activations retain grad_fn for backprop
 
         Returns:
-            Tensor [k] float32 — one scalar per sampled neuron, in input order
+            Tensor [B, k] float32 — one row per batch item, one scalar per sampled neuron
         """
+        B = model_input.shape[0]
+
         # Group: {layer_name → [(position_in_output, flat_idx), ...]}
         layer_to_neurons: Dict[str, List[Tuple[int, int]]] = {}
         for pos, (name, flat_idx) in enumerate(sampled_neurons):
@@ -216,28 +218,28 @@ class NeuronSampler:
             # not one per neuron) so PyTorch dispatch overhead is O(layers)
             # rather than O(neurons).
             # Collect positions + values across all layers, then assemble in
-            # one index_put (non-inplace, differentiable through values).
+            # one differentiable scatter into a [B, k] result tensor.
             k = len(sampled_neurons)
             all_positions: List[Tensor] = []
-            all_vals:      List[Tensor] = []
+            all_vals:      List[Tensor] = []  # each [B, n_layer]
 
             for layer_name, neuron_list in layer_to_neurons.items():
                 if layer_name not in captured:
                     continue  # hook didn't fire — stays zero in result
 
-                act = captured[layer_name]     # [1, *shape] (batch size = 1)
-                flat = act.reshape(-1)         # [N]
-                N = flat.shape[0]
+                act = captured[layer_name]     # [B, *layer_shape]
+                flat = act.reshape(B, -1)      # [B, neurons_in_layer]
+                L = flat.shape[1]
 
                 pos_t = torch.tensor(
                     [pos       for pos, _   in neuron_list],
                     dtype=torch.long, device=flat.device,
                 )
                 idx_t = torch.tensor(
-                    [idx % N   for _, idx   in neuron_list],
+                    [idx % L   for _, idx   in neuron_list],
                     dtype=torch.long, device=flat.device,
                 )
-                vals = flat[idx_t]             # [n_layer] — one op, retains grad_fn
+                vals = flat[:, idx_t]          # [B, n_layer] — retains grad_fn
 
                 all_positions.append(pos_t)
                 all_vals.append(vals)
@@ -246,13 +248,17 @@ class NeuronSampler:
                 del captured[layer_name]
 
             if all_positions:
-                all_pos_t  = torch.cat(all_positions)                     # [k]
-                all_vals_t = torch.cat(all_vals).float()                   # [k]
+                all_pos_t  = torch.cat(all_positions)              # [total_fired]
+                all_vals_t = torch.cat(all_vals, dim=1).float()    # [B, total_fired]
+                n_fired    = all_pos_t.shape[0]
+                # Differentiable scatter into [B, k]: expand indices across batch dim
+                batch_idx  = torch.arange(B, device=self.device).unsqueeze(1).expand(B, n_fired).reshape(-1)
+                pos_exp    = all_pos_t.unsqueeze(0).expand(B, -1).reshape(-1)
                 result_tensor = torch.zeros(
-                    k, device=self.device, dtype=torch.float32,
-                ).index_put((all_pos_t,), all_vals_t)
+                    B, k, device=self.device, dtype=torch.float32,
+                ).index_put((batch_idx, pos_exp), all_vals_t.reshape(-1))
             else:
-                result_tensor = torch.zeros(k, device=self.device, dtype=torch.float32)
+                result_tensor = torch.zeros(B, k, device=self.device, dtype=torch.float32)
 
             return result_tensor
 

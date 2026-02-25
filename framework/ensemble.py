@@ -346,11 +346,10 @@ class EnsembleTrainer:
         """
         One optimizer update accumulating gradients over images_per_batch images.
 
-        For each image:
-            - Sample a random model + image
-            - Generate patches_per_image patches
-            - Compute loss / images_per_batch and call backward()
-        Then return averaged loss stats for logging (optimizer.step() is in the caller).
+        Loop structure: outer = models, inner = images per model.
+        Per image: ctrl + P patches are batched into one target-model forward pass
+        (P+1 inputs, same neuron sample), then backward() is called immediately
+        so only one image's activation stack lives at a time.
         """
         gen = self.generator
         device = self._device
@@ -362,156 +361,134 @@ class EnsembleTrainer:
             'tv': 0.0, 'spectrum': 0.0, 'model': '',
         }
 
-        # Pre-build balanced model distribution: 2 images per model (N=16, 8 models)
+        # Balanced distribution: N images split evenly across all models
         all_entries = list(self.ensemble._entries)
-        if all_entries:
-            images_per_model = N // len(all_entries)
-            remainder = N % len(all_entries)
-            balanced_entries = all_entries * images_per_model
-            if remainder > 0:
-                balanced_entries.extend(all_entries[:remainder])
-            random.shuffle(balanced_entries)
+        n_models = len(all_entries)
+        images_per_model = N // n_models
+        remainder = N % n_models
 
-        # Gradient accumulation: backward() is called per-image so only one image's
-        # activation stack lives at a time. Generator .grad buffers accumulate.
-        sticker_count = 0
+        # Outer loop: models. Inner loop: images per model.
+        # Per-image forward pass batches ctrl + P patches together (P+1 inputs,
+        # same neuron sample) so the target model is called once per image
+        # instead of P+1 times. Gradient accumulation: backward after each image.
+        for model_idx_outer, entry in enumerate(all_entries):
+            n_images = images_per_model + (1 if model_idx_outer < remainder else 0)
 
-        for entry in balanced_entries:
-            # --- 1. Sample strategy and image (model is balanced) ---
-            strat_entry = self.ensemble.sample_strategy()
-            item = self.dataset_pool.sample()
-
-            # image: [3, H, W] → [1, 3, H, W] on device
-            image = item.image.unsqueeze(0).to(device)
-
-            # --- 2. Sample strategy placement kwargs ---
-            strategy_kwargs = strat_entry.strategy.sample_kwargs(
-                image, gen.patch_height, gen.patch_width,
-                model_input_shape=entry.input_shape
-            )
-
-            # --- 3. Control activation (no_grad, no patch) ---
             with self.ensemble.on_device(entry) as model:
-                neutral_inp = entry.preprocess_fn(
-                    strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
-                )
                 sample_shape = (3, *entry.input_shape)
                 sampled_neurons = self.neuron_sampler.sample_neurons(
                     model, self.k_neurons, sample_shape
                 )
-                # Append final-layer neurons so both sets are captured in one pass.
-                # Use all final-layer neurons (vectorized extraction is efficient).
-                final_neurons  = self.neuron_sampler.get_final_layer_neurons(entry.model_id)
-                k_rand         = len(sampled_neurons)
+                final_neurons    = self.neuron_sampler.get_final_layer_neurons(entry.model_id)
+                k_rand           = len(sampled_neurons)
                 combined_neurons = sampled_neurons + final_neurons
 
-                combined_ctrl = self.neuron_sampler.capture_sampled_activations(
-                    model, neutral_inp, combined_neurons, no_grad=True
-                ).to(device)                              # [k_rand + k_final], detached
-                ctrl_acts  = combined_ctrl[:k_rand]       # [k_rand]
-                ctrl_final = combined_ctrl[k_rand:]       # [k_final]
+                for _ in range(n_images):
+                    # --- 1. Sample strategy and image ---
+                    strat_entry = self.ensemble.sample_strategy()
+                    item        = self.dataset_pool.sample()
+                    image       = item.image.unsqueeze(0).to(device)
 
-            with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-                # --- 4. Generate P patches conditioned on task metadata ---
-                z = torch.randn(P, gen.latent_dim, device=device)
+                    strategy_kwargs = strat_entry.strategy.sample_kwargs(
+                        image, gen.patch_height, gen.patch_width,
+                        model_input_shape=entry.input_shape,
+                    )
 
-                model_idx    = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
-                strategy_idx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
-                dataset_idx  = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
+                    with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+                        # --- 2. Generate P patches ---
+                        z = torch.randn(P, gen.latent_dim, device=device)
 
-                model_idx    = model_idx.clamp(0, self.task_encoder.num_models - 1)
-                strategy_idx = strategy_idx.clamp(0, self.task_encoder.num_strategies - 1)
-                dataset_idx  = dataset_idx.clamp(0, self.task_encoder.num_datasets - 1)
+                        midx = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
+                        sidx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
+                        didx = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
 
-                z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx)
-                patches = gen(z, z_enriched)   # [P, 3, H, W]
+                        midx = midx.clamp(0, self.task_encoder.num_models    - 1)
+                        sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
+                        didx = didx.clamp(0, self.task_encoder.num_datasets  - 1)
 
-                # --- 5. Adversarial activations ---
-                adv_acts_list: List[Tensor] = []
-                vis_mask = None
-                with self.ensemble.on_device(entry) as model:
-                    for p_idx in range(P):
-                        patch = patches[p_idx]
-                        composited, mask = strat_entry.strategy.apply(image, patch, **strategy_kwargs)
-                        if vis_mask is None:
-                            vis_mask = mask
-                        adv_inp = entry.preprocess_fn(composited)
-                        adv_acts = self.neuron_sampler.capture_sampled_activations(
-                            model, adv_inp, combined_neurons, no_grad=False
-                        )
-                        adv_acts_list.append(adv_acts)
+                        z_enriched = self.task_encoder(z, midx, sidx, didx)
+                        patches    = gen(z, z_enriched)   # [P, 3, H, W]
 
-                # --- 6. Compute losses ---
-                # Split combined captures back into random-neuron and final-layer sets
-                deltas = torch.stack([a[:k_rand] - ctrl_acts  for a in adv_acts_list], dim=0)  # [P, k_rand]
+                        # --- 3. Build [P+1, 3, H', W'] batch: ctrl first, then P adv ---
+                        ctrl_inp = entry.preprocess_fn(
+                            strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
+                        )                                                           # [1, 3, H', W']
 
-                # Per-neuron std from precomputed CPU profile → transfer only 10k values.
-                # Clamp to β (10% of median live-neuron std) so dead neurons get
-                # credit at the scale of the quietest live neurons rather than
-                # being silenced (Tikhonov) or exploding (hard 1e-8 floor).
-                neuron_stds = self.neuron_sampler.lookup_neuron_stds(
-                    entry.model_id, sampled_neurons
-                ).to(device)                                                  # [k]
-                beta = self.neuron_sampler.lookup_beta(entry.model_id)
-                effective_stds = neuron_stds.clamp(min=beta)                 # [k]
-                norm_deltas = deltas / effective_stds                         # [P, k]
+                        vis_mask  = None
+                        adv_inps  = []
+                        for p_idx in range(P):
+                            composited, mask = strat_entry.strategy.apply(
+                                image, patches[p_idx], **strategy_kwargs
+                            )
+                            if vis_mask is None:
+                                vis_mask = mask
+                            adv_inps.append(entry.preprocess_fn(composited))       # [1, 3, H', W']
 
-                # Diversity: cosine similarities in std-normalised delta space so
-                # quiet neurons contribute equally to loud ones in direction.
-                eps = max(1e-6, 1e-2 / P)
-                normalized = F.normalize(norm_deltas, p=2, dim=1)
-                gram = normalized @ normalized.T
-                gram = gram + eps * torch.eye(P, device=device)
-                sign, log_det = torch.slogdet(gram)
-                if torch.isnan(log_det) or sign <= 0:
-                    log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
+                        batch_inp = torch.cat([ctrl_inp] + adv_inps, dim=0)        # [P+1, 3, H', W']
 
-                # Quality: RMS of std-normalised deltas across neurons and patches
-                norm_deltas_sq = norm_deltas ** 2                             # [P, k_rand]
-                per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
-                quality = per_patch_rms.mean() + 1e-8
+                        # --- 4. One batched forward through the frozen target model ---
+                        combined = self.neuron_sampler.capture_sampled_activations(
+                            model, batch_inp, combined_neurons, no_grad=False,
+                        ).to(device)                                                # [P+1, k_rand+k_final]
 
-                # Final-layer quality: optimization target (replaces random-neuron quality).
-                # Gradients flow through this into the generator.
-                if final_neurons:
-                    final_deltas = torch.stack(
-                        [a[k_rand:] - ctrl_final for a in adv_acts_list], dim=0
-                    )                                                              # [P, k_final]
-                    final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
-                        entry.model_id, final_neurons
-                    ).to(device)
-                    final_eff_stds = final_neuron_stds.clamp(min=beta)
-                    final_quality = (
-                        (final_deltas / final_eff_stds) ** 2
-                    ).mean(dim=1).sqrt().mean() + 1e-8
-                else:
-                    final_quality = torch.tensor(1e-8, device=device)
+                        # Detach control row — it's a reference baseline, not part of the gradient path
+                        ctrl_acts  = combined[0, :k_rand].detach()                 # [k_rand]
+                        ctrl_final = combined[0, k_rand:].detach()                 # [k_final]
+                        adv_acts   = combined[1:]                                  # [P, k_rand+k_final]
 
-                # TV loss only for sticker attacks (penalises jagged edges within patch region)
-                if isinstance(strat_entry.strategy, StickerStrategy):
-                    tv_raw = total_variation_loss(patches, vis_mask)
-                    sticker_count += 1
-                else:
-                    tv_raw = torch.tensor(0.0, device=device)
+                        # --- 5. Compute losses ---
+                        deltas = adv_acts[:, :k_rand] - ctrl_acts                  # [P, k_rand]
 
-                spec_raw = compute_spectrum_loss(patches, vis_mask)
+                        neuron_stds    = self.neuron_sampler.lookup_neuron_stds(
+                            entry.model_id, sampled_neurons
+                        ).to(device)
+                        beta           = self.neuron_sampler.lookup_beta(entry.model_id)
+                        effective_stds = neuron_stds.clamp(min=beta)
+                        norm_deltas    = deltas / effective_stds                    # [P, k_rand]
 
-                # Per-image loss: backward immediately so this image's activation stack
-                # is freed before the next forward pass (true gradient accumulation).
-                per_image_loss = -(
-                    self.diversity_weight * log_det
-                    + self.quality_weight * torch.log(final_quality)
-                ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
+                        eps        = max(1e-6, 1e-2 / P)
+                        normalized = F.normalize(norm_deltas, p=2, dim=1)
+                        gram       = normalized @ normalized.T + eps * torch.eye(P, device=device)
+                        sign, log_det = torch.slogdet(gram)
+                        if torch.isnan(log_det) or sign <= 0:
+                            log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
 
-                self.scaler.scale(per_image_loss / N).backward()
+                        norm_deltas_sq = norm_deltas ** 2
+                        quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
 
-            acc['loss']          += per_image_loss.item()
-            acc['diversity']     += log_det.item()
-            acc['quality']       += torch.log(quality).item()
-            acc['final_quality'] += torch.log(final_quality).item()
-            acc['tv']            += tv_raw.item()
-            acc['spectrum']      += spec_raw.item()
-            acc['model']      = entry.name
+                        if final_neurons:
+                            final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
+                            final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
+                                entry.model_id, final_neurons
+                            ).to(device)
+                            final_eff_stds = final_neuron_stds.clamp(min=beta)
+                            final_quality  = (
+                                (final_deltas / final_eff_stds) ** 2
+                            ).mean(dim=1).sqrt().mean() + 1e-8
+                        else:
+                            final_quality = torch.tensor(1e-8, device=device)
+
+                        if isinstance(strat_entry.strategy, StickerStrategy):
+                            tv_raw = total_variation_loss(patches, vis_mask)
+                        else:
+                            tv_raw = torch.tensor(0.0, device=device)
+
+                        spec_raw = compute_spectrum_loss(patches, vis_mask)
+
+                        per_image_loss = -(
+                            self.diversity_weight * log_det
+                            + self.quality_weight * torch.log(final_quality)
+                        ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
+
+                        self.scaler.scale(per_image_loss / N).backward()
+
+                    acc['loss']          += per_image_loss.item()
+                    acc['diversity']     += log_det.item()
+                    acc['quality']       += torch.log(quality).item()
+                    acc['final_quality'] += torch.log(final_quality).item()
+                    acc['tv']            += tv_raw.item()
+                    acc['spectrum']      += spec_raw.item()
+                    acc['model']          = entry.name
 
         return {
             'loss':          acc['loss']          / N,
