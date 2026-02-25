@@ -227,26 +227,46 @@ class NeuronSampler:
                 if layer_name not in captured:
                     continue  # hook didn't fire — stays zero in result
 
-                act = captured[layer_name]     # [B, *layer_shape]
+                act = captured[layer_name]     # [B, *layer_shape] or folded
 
-                # Extract per-sample: flatten each sample independently,
-                # then index to get the same neurons from each sample.
-                # This handles any output shape, even if total size isn't
-                # divisible by B (e.g., models with folded batch/head dims).
-                vals_per_sample = []
-                for b in range(B):
-                    act_b = act[b]  # [*layer_shape_per_sample]
-                    flat_b = act_b.reshape(-1)  # [total_per_sample]
-                    L = flat_b.shape[0]
+                # Use the cached per-sample shape to decompose output,
+                # even if batch dim is folded with spatial/head dims.
+                model_id = id(model)
+                per_sample_size = None
+                if model_id in self._shape_cache and layer_name in self._shape_cache[model_id]:
+                    # Compute expected per-sample size from B=1 shape cache
+                    for d in self._shape_cache[model_id][layer_name]:
+                        per_sample_size = d if per_sample_size is None else per_sample_size * d
+
+                if per_sample_size is not None and act.numel() == B * per_sample_size:
+                    # Output size matches B samples: reshape [B, per_sample]
+                    flat = act.reshape(B, per_sample_size)
+                    L = per_sample_size
 
                     idx_t = torch.tensor(
                         [idx % L   for _, idx   in neuron_list],
-                        dtype=torch.long, device=flat_b.device,
+                        dtype=torch.long, device=flat.device,
                     )
-                    vals_b = flat_b[idx_t]  # [n_layer] — retains grad_fn
-                    vals_per_sample.append(vals_b)
+                    vals = flat[:, idx_t]  # [B, n_layer] — retains grad_fn
 
-                vals = torch.stack(vals_per_sample, dim=0)  # [B, n_layer]
+                elif act.shape[0] == B:
+                    # First dim is batch: extract per-sample independently
+                    vals_per_sample = []
+                    for b in range(B):
+                        act_b = act[b].reshape(-1)
+                        L = act_b.shape[0]
+                        idx_t = torch.tensor(
+                            [idx % L   for _, idx   in neuron_list],
+                            dtype=torch.long, device=act_b.device,
+                        )
+                        vals_b = act_b[idx_t]  # [n_layer]
+                        vals_per_sample.append(vals_b)
+                    vals = torch.stack(vals_per_sample, dim=0)  # [B, n_layer]
+
+                else:
+                    # Can't reliably extract: skip this layer
+                    del captured[layer_name]
+                    continue
 
                 pos_t = torch.tensor(
                     [pos for pos, _ in neuron_list],
