@@ -43,6 +43,8 @@ class NeuronSampler:
         self.device = device
         # Cache: id(model) → {layer_name: output_shape_no_batch}
         self._shape_cache: Dict[int, Dict[str, Tuple[int, ...]]] = {}
+        # Precomputed per-neuron std profiles: model_id → {layer_name → std Tensor (CPU)}
+        self._neuron_stds: Dict[int, Dict[str, Tensor]] = {}
 
     # ------------------------------------------------------------------
     # Layer discovery
@@ -242,6 +244,119 @@ class NeuronSampler:
         finally:
             for h in hooks:
                 h.remove()
+
+    # ------------------------------------------------------------------
+    # Neuron profiling (precomputed per-neuron std)
+    # ------------------------------------------------------------------
+
+    def profile_model(
+        self,
+        model: nn.Module,
+        model_id: int,
+        images: List[Tensor],
+        sample_input_shape: Tuple[int, int, int],
+    ) -> None:
+        """
+        Profile per-neuron activation statistics using Welford's online algorithm.
+
+        Runs each image through the model with hooks on all leaf layers,
+        accumulating a running mean and variance per neuron. Stores the
+        resulting per-neuron std tensors on CPU keyed by model_id.
+
+        Args:
+            model:              frozen model (already on compute device)
+            model_id:           integer id to key the stored statistics
+            images:             list of preprocessed [1, C, H, W] tensors
+            sample_input_shape: (C, H, W) for layer discovery
+        """
+        shapes = self.discover_layers(model, sample_input_shape)
+
+        # Welford running state on CPU
+        counts: Dict[str, int] = {n: 0 for n in shapes}
+        means:  Dict[str, Tensor] = {
+            n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()
+        }
+        M2s:    Dict[str, Tensor] = {
+            n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()
+        }
+
+        for image in images:
+            captured: Dict[str, Tensor] = {}
+            hooks = []
+
+            def make_hook(name: str):
+                def hook(module, inp, out):
+                    if isinstance(out, Tensor):
+                        captured[name] = out.detach().cpu().float()
+                return hook
+
+            for name, module in model.named_modules():
+                if len(list(module.children())) == 0:
+                    hooks.append(module.register_forward_hook(make_hook(name)))
+
+            try:
+                with torch.no_grad():
+                    model(image)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            # Welford update per layer
+            for layer_name, act in captured.items():
+                if layer_name not in counts:
+                    continue
+                x = act.squeeze(0)  # remove batch dim → shape matches stored shape
+                if x.shape != means[layer_name].shape:
+                    continue        # shape mismatch (e.g. dynamic layers) — skip
+                counts[layer_name] += 1
+                n = counts[layer_name]
+                delta  = x - means[layer_name]
+                means[layer_name] += delta / n
+                delta2 = x - means[layer_name]
+                M2s[layer_name]   += delta * delta2
+
+        # Finalise: compute std from M2
+        stds: Dict[str, Tensor] = {}
+        for layer_name in shapes:
+            n = counts[layer_name]
+            if n > 1:
+                variance = M2s[layer_name] / (n - 1)
+                stds[layer_name] = variance.sqrt_().clamp_(min=1e-8)
+            else:
+                stds[layer_name] = torch.full(
+                    shapes[layer_name], 1e-8, dtype=torch.float32
+                )
+
+        self._neuron_stds[model_id] = stds
+
+    def lookup_neuron_stds(
+        self,
+        model_id: int,
+        sampled_neurons: List[Tuple[str, int]],
+    ) -> Tensor:
+        """
+        Return per-neuron std values for the given sampled neurons (CPU tensor).
+
+        Args:
+            model_id:        model whose stats to look up
+            sampled_neurons: list of (layer_name, flat_idx) from sample_neurons()
+
+        Returns:
+            [k] float32 CPU tensor — one std value per neuron, clamped to ≥ 1e-8.
+            Falls back to 1e-8 for any neuron whose layer wasn't profiled.
+        """
+        if model_id not in self._neuron_stds:
+            return torch.full((len(sampled_neurons),), 1e-8, dtype=torch.float32)
+
+        stds = self._neuron_stds[model_id]
+        result: List[Tensor] = []
+        for layer_name, flat_idx in sampled_neurons:
+            if layer_name not in stds:
+                result.append(torch.tensor(1e-8, dtype=torch.float32))
+            else:
+                flat = stds[layer_name].flatten()
+                result.append(flat[flat_idx % flat.numel()])
+        return torch.stack(result)   # [k] on CPU
 
     # ------------------------------------------------------------------
     # Cache management

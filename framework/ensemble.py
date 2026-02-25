@@ -428,8 +428,11 @@ class EnsembleTrainer:
                 if torch.isnan(log_det) or sign <= 0:
                     log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
 
-                ctrl_std = ctrl_acts.std() + 1e-8
-                norm_deltas_sq = (deltas / ctrl_std) ** 2
+                # Per-neuron std from precomputed CPU profile → transfer only 10k values
+                neuron_stds = self.neuron_sampler.lookup_neuron_stds(
+                    entry.model_id, sampled_neurons
+                ).to(device)                                     # [k]
+                norm_deltas_sq = (deltas / neuron_stds) ** 2    # [P, k]
                 per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
                 quality = per_patch_rms.mean() + 1e-8
 
@@ -462,6 +465,41 @@ class EnsembleTrainer:
             'spectrum':  acc['spectrum']  / N,
             'model':     acc['model'],
         }
+
+    # ------------------------------------------------------------------
+    # Neuron profiling
+    # ------------------------------------------------------------------
+
+    def _profile_all_models(self, n_images: int = 30) -> None:
+        """
+        Precompute per-neuron activation std for every registered model.
+
+        Samples n_images from the dataset pool, runs them through each model,
+        and stores per-neuron std on CPU via NeuronSampler.profile_model().
+        Called once at the start of training.
+        """
+        print(f"\nProfiling {self.ensemble.num_models()} models "
+              f"({n_images} images each) for per-neuron std ...")
+
+        for entry in self.ensemble._entries:
+            print(f"  {entry.name} ...", end=' ', flush=True)
+            images = []
+            for _ in range(n_images):
+                item = self.dataset_pool.sample()
+                image = item.image.unsqueeze(0).to(self._device)
+                images.append(entry.preprocess_fn(image))
+
+            sample_shape = (3, *entry.input_shape)
+            with self.ensemble.on_device(entry) as model:
+                self.neuron_sampler.profile_model(
+                    model=model,
+                    model_id=entry.model_id,
+                    images=images,
+                    sample_input_shape=sample_shape,
+                )
+            print("done")
+
+        print("Profiling complete.\n")
 
     # ------------------------------------------------------------------
     # Checkpoint
@@ -581,6 +619,9 @@ class EnsembleTrainer:
         global_step = start_step
         samples_dir = run_dir / 'samples'
         samples_dir.mkdir(parents=True, exist_ok=True)
+
+        # Precompute per-neuron activation statistics for all models (once per run)
+        self._profile_all_models(n_images=30)
 
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)
