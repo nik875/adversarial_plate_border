@@ -331,9 +331,8 @@ class GenericPatchTrainer:
                         else:
                             quality_score = torch.tensor(1.0, device=self._device)
 
-                        log_quality = torch.log(quality_score + 1e-8)
                         combined = (self.diversity_weight * div_score
-                                    + self.quality_weight * log_quality)
+                                    + self.quality_weight * quality_score)
                         total_loss = -(self.performance_weight * combined)
 
                         # ---- TV + spectrum losses ----

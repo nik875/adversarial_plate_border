@@ -2126,8 +2126,7 @@ class ProgressivePatchTrainer:
 
                         quality_score = torch.stack(quality_scores).mean() if quality_scores else torch.tensor(1.0, device=self.device)
 
-                        log_quality_score = torch.log(quality_score + 1e-8)
-                        combined = self.diversity_weight * diversity_score + self.quality_weight * log_quality_score
+                        combined = self.diversity_weight * diversity_score + self.quality_weight * quality_score
                         total_loss = -(self.performance_weight * combined)
 
                         # Stack patches for batch operations
@@ -2153,7 +2152,7 @@ class ProgressivePatchTrainer:
                         batch_spectrum_loss += spectrum_loss_weighted.item()
                         # Accumulate raw diversity and quality scores
                         batch_raw_diversity_score += diversity_score.item() if isinstance(diversity_score, torch.Tensor) else diversity_score
-                        batch_raw_quality_score += log_quality_score.item() if isinstance(log_quality_score, torch.Tensor) else log_quality_score
+                        batch_raw_quality_score += quality_score.item() if isinstance(quality_score, torch.Tensor) else quality_score
 
                         batch_count += 1
 
@@ -2206,10 +2205,10 @@ class ProgressivePatchTrainer:
                 avg_tv_loss = total_tv_loss / num_updates if num_updates > 0 else 0
                 avg_spectrum_loss = total_spectrum_loss / num_updates if num_updates > 0 else 0
                 avg_raw_diversity = total_raw_diversity_score / num_updates if num_updates > 0 else 0
-                avg_log_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
+                avg_quality = total_raw_quality_score / num_updates if num_updates > 0 else 0
                 pbar.set_postfix({
                     'DivScore': f"{avg_raw_diversity:.4f}",
-                    'LogQual': f"{avg_log_quality:.4f}",
+                    'QualScore': f"{avg_quality:.4f}",
                     'DivLoss': f"{avg_diversity_loss:.4f}",
                     'TVLoss': f"{avg_tv_loss:.4f}",
                     'SSIMLoss': f"{avg_spectrum_loss:.4f}",
@@ -2232,7 +2231,7 @@ class ProgressivePatchTrainer:
                         'tv_loss': f'{avg_tv_loss:.6f}',
                         'ssim_loss': f'{avg_spectrum_loss:.6f}',
                         'div_score': f'{avg_raw_diversity:.6f}',
-                        'quality_score': f'{avg_log_quality:.6f}',
+                        'quality_score': f'{avg_quality:.6f}',
                         'lr': scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else 0,
                     })
 
