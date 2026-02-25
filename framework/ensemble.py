@@ -428,11 +428,16 @@ class EnsembleTrainer:
                 if torch.isnan(log_det) or sign <= 0:
                     log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
 
-                # Per-neuron std from precomputed CPU profile → transfer only 10k values
+                # Per-neuron std from precomputed CPU profile → transfer only 10k values.
+                # Clamp to β (10% of median live-neuron std) so dead neurons get
+                # credit at the scale of the quietest live neurons rather than
+                # being silenced (Tikhonov) or exploding (hard 1e-8 floor).
                 neuron_stds = self.neuron_sampler.lookup_neuron_stds(
                     entry.model_id, sampled_neurons
-                ).to(device)                                     # [k]
-                norm_deltas_sq = (deltas / neuron_stds) ** 2    # [P, k]
+                ).to(device)                                                  # [k]
+                beta = self.neuron_sampler.lookup_beta(entry.model_id)
+                effective_stds = neuron_stds.clamp(min=beta)                 # [k]
+                norm_deltas_sq = (deltas / effective_stds) ** 2              # [P, k]
                 per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
                 quality = per_patch_rms.mean() + 1e-8
 
@@ -625,7 +630,7 @@ class EnsembleTrainer:
         samples_dir.mkdir(parents=True, exist_ok=True)
 
         # Precompute per-neuron activation statistics for all models (once per run)
-        self._profile_all_models(n_images=30)
+        self._profile_all_models(n_images=1024)
 
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)

@@ -45,6 +45,8 @@ class NeuronSampler:
         self._shape_cache: Dict[int, Dict[str, Tuple[int, ...]]] = {}
         # Precomputed per-neuron std profiles: model_id → {layer_name → std Tensor (CPU)}
         self._neuron_stds: Dict[int, Dict[str, Tensor]] = {}
+        # Per-model β floor: 10% of median live-neuron std (CPU scalar)
+        self._neuron_betas: Dict[int, float] = {}
 
     # ------------------------------------------------------------------
     # Layer discovery
@@ -329,6 +331,17 @@ class NeuronSampler:
 
         self._neuron_stds[model_id] = stds
 
+        # β = 10% of median live-neuron std.
+        # Using the median (not a low percentile) ensures β stays well above the
+        # dead-neuron tail even when ReLU networks have 20-40% near-zero neurons.
+        all_stds = torch.cat([s.flatten() for s in stds.values()])
+        live_stds = all_stds[all_stds > 1e-7]
+        if live_stds.numel() > 0:
+            beta = torch.median(live_stds).item() * 0.1
+        else:
+            beta = 1e-3  # fallback for pathological models
+        self._neuron_betas[model_id] = beta
+
     def lookup_neuron_stds(
         self,
         model_id: int,
@@ -357,6 +370,15 @@ class NeuronSampler:
                 flat = stds[layer_name].flatten()
                 result.append(flat[flat_idx % flat.numel()])
         return torch.stack(result)   # [k] on CPU
+
+    def lookup_beta(self, model_id: int) -> float:
+        """
+        Return the per-model β floor (10% of median live-neuron std).
+
+        Falls back to 1e-3 if the model hasn't been profiled.
+        Used as clamp(min=β) on neuron_stds before quality normalization.
+        """
+        return self._neuron_betas.get(model_id, 1e-3)
 
     # ------------------------------------------------------------------
     # Cache management
