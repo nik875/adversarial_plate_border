@@ -162,7 +162,7 @@ trainer:
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
   diversity_weight: 1.0
-  quality_weight: 1.0
+  quality_weight: 4.0
   tv_weight: 2.5
   spectrum_weight: 2.5
   output_dir: runs/broad_ensemble
