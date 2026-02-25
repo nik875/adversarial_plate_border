@@ -155,7 +155,7 @@ generator:
 trainer:
   max_steps: 1400
   patches_per_image: 8
-  images_per_batch: 32
+  images_per_batch: 24
   k_neurons: 10000
   learning_rate: 5.0e-5
   taesd_lr_ratio: 0.1
