@@ -420,14 +420,6 @@ class EnsembleTrainer:
                 # --- 6. Compute losses ---
                 deltas = torch.stack([a - ctrl_acts for a in adv_acts_list], dim=0)  # [P, k]
 
-                eps = max(1e-6, 1e-2 / P)
-                normalized = F.normalize(deltas, p=2, dim=1)
-                gram = normalized @ normalized.T
-                gram = gram + eps * torch.eye(P, device=device)
-                sign, log_det = torch.slogdet(gram)
-                if torch.isnan(log_det) or sign <= 0:
-                    log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
-
                 # Per-neuron std from precomputed CPU profile → transfer only 10k values.
                 # Clamp to β (10% of median live-neuron std) so dead neurons get
                 # credit at the scale of the quietest live neurons rather than
@@ -437,7 +429,20 @@ class EnsembleTrainer:
                 ).to(device)                                                  # [k]
                 beta = self.neuron_sampler.lookup_beta(entry.model_id)
                 effective_stds = neuron_stds.clamp(min=beta)                 # [k]
-                norm_deltas_sq = (deltas / effective_stds) ** 2              # [P, k]
+                norm_deltas = deltas / effective_stds                         # [P, k]
+
+                # Diversity: cosine similarities in std-normalised delta space so
+                # quiet neurons contribute equally to loud ones in direction.
+                eps = max(1e-6, 1e-2 / P)
+                normalized = F.normalize(norm_deltas, p=2, dim=1)
+                gram = normalized @ normalized.T
+                gram = gram + eps * torch.eye(P, device=device)
+                sign, log_det = torch.slogdet(gram)
+                if torch.isnan(log_det) or sign <= 0:
+                    log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
+
+                # Quality: RMS of std-normalised deltas across neurons and patches
+                norm_deltas_sq = norm_deltas ** 2                             # [P, k]
                 per_patch_rms = norm_deltas_sq.mean(dim=1).sqrt()
                 quality = per_patch_rms.mean() + 1e-8
 
