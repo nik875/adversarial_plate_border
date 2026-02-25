@@ -448,10 +448,13 @@ class EnsembleTrainer:
 
                 # TV loss only for sticker attacks (penalises jagged edges within patch region)
                 if isinstance(strat_entry.strategy, StickerStrategy):
-                    tv_val = self.tv_weight * total_variation_loss(patches, vis_mask)
+                    tv_raw  = total_variation_loss(patches, vis_mask)
+                    tv_val  = self.tv_weight * tv_raw
                 else:
-                    tv_val = torch.tensor(0.0, device=device)
-                spec_val = self.spectrum_weight * compute_spectrum_loss(patches, vis_mask)
+                    tv_raw  = torch.tensor(0.0, device=device)
+                    tv_val  = torch.tensor(0.0, device=device)
+                spec_raw = compute_spectrum_loss(patches, vis_mask)
+                spec_val = self.spectrum_weight * spec_raw
 
                 # Divide by N so gradients accumulate to the mean over the batch
                 loss = (total_act_loss + tv_val + spec_val) / N
@@ -462,8 +465,8 @@ class EnsembleTrainer:
             acc['loss']      += (total_act_loss + tv_val + spec_val).item()
             acc['diversity'] += log_det.item()
             acc['quality']   += torch.log(quality).item()
-            acc['tv']        += tv_val.item()
-            acc['spectrum']  += spec_val.item()
+            acc['tv']        += tv_raw.item()
+            acc['spectrum']  += spec_raw.item()
             acc['model']      = entry.name
 
         return {
