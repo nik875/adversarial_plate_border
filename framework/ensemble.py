@@ -369,8 +369,10 @@ class EnsembleTrainer:
                 balanced_entries.extend(all_entries[:remainder])
             random.shuffle(balanced_entries)
 
-        # Accumulate TV loss separately for sticker attacks only
-        sticker_tv_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        # Accumulate losses over the batch (call backward once at the end)
+        accumulated_act_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        accumulated_spec_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+        accumulated_tv_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
         sticker_count = 0
 
         for entry in balanced_entries:
@@ -493,24 +495,22 @@ class EnsembleTrainer:
                 # Accumulate separately so we don't dilute it with non-sticker attacks
                 if isinstance(strat_entry.strategy, StickerStrategy):
                     tv_raw  = total_variation_loss(patches, vis_mask)
-                    sticker_tv_loss = sticker_tv_loss + self.tv_weight * tv_raw
+                    accumulated_tv_loss = accumulated_tv_loss + self.tv_weight * tv_raw
                     sticker_count += 1
                 else:
                     tv_raw  = torch.tensor(0.0, device=device)
 
                 spec_raw = compute_spectrum_loss(patches, vis_mask)
-                spec_val = self.spectrum_weight * spec_raw
 
-                # Activation + spectrum losses divided by N (batch size)
-                # TV loss will be added and divided by sticker count after the loop
-                loss = (total_act_loss + spec_val) / N
-                loss.backward()
+                # Accumulate losses (don't call backward yet)
+                accumulated_act_loss = accumulated_act_loss + total_act_loss
+                accumulated_spec_loss = accumulated_spec_loss + self.spectrum_weight * spec_raw
 
                 del deltas, adv_acts_list
                 if final_neurons:
                     del final_deltas
 
-            acc['loss']          += (total_act_loss + spec_val).item()
+            acc['loss']          += total_act_loss.item()
             acc['diversity']     += log_det.item()
             acc['quality']       += torch.log(quality).item()
             acc['final_quality'] += torch.log(final_quality).item()
@@ -518,10 +518,11 @@ class EnsembleTrainer:
             acc['spectrum']      += spec_raw.item()
             acc['model']      = entry.name
 
-        # Apply TV loss (divided by sticker count only) via backward pass
+        # Combine all accumulated losses and call backward once
+        total_loss = accumulated_act_loss / N + accumulated_spec_loss / N
         if sticker_count > 0:
-            tv_loss_scaled = sticker_tv_loss / sticker_count
-            tv_loss_scaled.backward()
+            total_loss = total_loss + accumulated_tv_loss / sticker_count
+        total_loss.backward()
 
         return {
             'loss':          acc['loss']          / N,
