@@ -383,8 +383,12 @@ class EnsembleTrainer:
                 sampled_neurons = self.neuron_sampler.sample_neurons(
                     model, self.k_neurons, sample_shape
                 )
-                # Append final-layer neurons so both sets are captured in one pass
+                # Append final-layer neurons so both sets are captured in one pass.
+                # Randomly subsample to 1024 — fql is an average so this is unbiased,
+                # and avoids O(k_final) Python loops for large vocab heads.
                 final_neurons  = self.neuron_sampler.get_final_layer_neurons(entry.model_id)
+                if len(final_neurons) > 1024:
+                    final_neurons = random.sample(final_neurons, 1024)
                 k_rand         = len(sampled_neurons)
                 combined_neurons = sampled_neurons + final_neurons
 
