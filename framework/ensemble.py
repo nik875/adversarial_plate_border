@@ -479,15 +479,15 @@ class EnsembleTrainer:
 
                         per_image_loss = -(
                             self.diversity_weight * log_det
-                            + self.quality_weight * torch.log(final_quality)
+                            + self.quality_weight * final_quality
                         ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
 
                         self.scaler.scale(per_image_loss / N).backward()
 
                     acc['loss']          += per_image_loss.item()
                     acc['diversity']     += log_det.item()
-                    acc['quality']       += torch.log(quality).item()
-                    acc['final_quality'] += torch.log(final_quality).item()
+                    acc['quality']       += quality.item()
+                    acc['final_quality'] += final_quality.item()
                     acc['tv']            += tv_raw.item()
                     acc['spectrum']      += spec_raw.item()
                     acc['model']          = entry.name
