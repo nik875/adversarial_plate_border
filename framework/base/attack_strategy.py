@@ -35,12 +35,19 @@ class AttackStrategy(ABC):
         image: Tensor,
         patch_h: int,
         patch_w: int,
+        model_input_shape: Optional[Tuple[int, int]] = None,
     ) -> Dict:
         """
         Sample per-image kwargs to pass into apply() / apply_neutral().
 
         Called once per image before the patches_per_image loop, so all
         patches for that image see the same transform (e.g. same random bbox).
+
+        Args:
+            image: [B, 3, H, W] input image
+            patch_h: generator patch height
+            patch_w: generator patch width
+            model_input_shape: (H, W) target model input dimensions (optional, used by some strategies)
 
         Default: returns {}, meaning apply() uses its own defaults.
         """
