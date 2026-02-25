@@ -67,17 +67,18 @@ class DilatedResidualSmoother(nn.Module):
 
 class LightPatchTransformer(nn.Module):
     """
-    Lightweight spatial transformer that learns to spatially transform a
-    512×512 TAESD output into an improved 512×512 patch.
+    Lightweight spatial transformer that refines a 256×256 TAESD output,
+    then upsamples to 512×512 via a learned transposed convolution.
 
     Architecture:
-        - patch_embed: Conv2d(3, d_model, 16, 16) → [B, 1024, d_model]
+        - patch_embed: Conv2d(3, d_model, 16, 16) → [B, 256, d_model]
         - 2-layer transformer encoder with gradient checkpointing
         - 2-layer transformer decoder with gradient checkpointing
-        - output_proj: Linear(d_model, 768) → reshape → [B, 3, 512, 512]
+        - output_proj: Linear(d_model, 768) → reshape → [B, 3, 256, 256]
+        - upsample: ConvTranspose2d(3, 3, 4, 2, 1) → [B, 3, 512, 512]
 
-    Gradient checkpointing is applied per-layer, trading ~33% extra compute
-    for significant peak-memory savings on large [B, 1024, 1024] attention maps.
+    Operating at 256×256 (256 tokens) rather than 512×512 (1024 tokens) makes
+    attention maps 16× smaller: [B, nhead, 256, 256] vs [B, nhead, 1024, 1024].
     """
 
     def __init__(
@@ -87,14 +88,18 @@ class LightPatchTransformer(nn.Module):
         d_ff: int = 1024,
         num_enc_layers: int = 2,
         num_dec_layers: int = 2,
+        input_size: int = 256,
     ):
         super().__init__()
 
-        # Patch embedding: Conv2d produces [B, d_model, 32, 32] for 512×512 input
+        self.input_size = input_size
+        num_tokens = (input_size // 16) ** 2  # 256 for 256×256 input
+
+        # Patch embedding: Conv2d produces [B, d_model, 16, 16] for 256×256 input
         self.patch_embed = nn.Conv2d(3, d_model, kernel_size=16, stride=16)
 
-        # Learnable positional embeddings: 32×32 = 1024 tokens
-        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, 1024, d_model))
+        # Learnable positional embeddings: 16×16 = 256 tokens
+        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, d_model))
         nn.init.trunc_normal_(self.encoder_pos_embed, std=0.02)
 
         # Encoder
@@ -111,10 +116,10 @@ class LightPatchTransformer(nn.Module):
         ])
 
         # Decoder queries and positional embeddings
-        self.decoder_queries = nn.Parameter(torch.zeros(1, 1024, d_model))
+        self.decoder_queries = nn.Parameter(torch.zeros(1, num_tokens, d_model))
         nn.init.trunc_normal_(self.decoder_queries, std=0.02)
 
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1024, d_model))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, d_model))
         nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
 
         # Decoder
@@ -134,18 +139,21 @@ class LightPatchTransformer(nn.Module):
         self.output_norm = nn.LayerNorm(d_model)
         self.output_proj = nn.Linear(d_model, 768)  # 768 = 16*16*3
 
+        # 2× upsample: 256×256 → 512×512
+        self.upsample = nn.ConvTranspose2d(3, 3, kernel_size=4, stride=2, padding=1)
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: [B, 3, 512, 512] TAESD output in [0, 1]
+            x: [B, 3, 256, 256] TAESD output in [0, 1]
 
         Returns:
-            [B, 3, 512, 512] spatially transformed patch in [0, 1]
+            [B, 3, 512, 512] upsampled refined patch
         """
         B = x.shape[0]
         x_orig = x  # Save original input for residual connection
 
-        # Embed patches: [B, 3, 512, 512] → [B, d_model, 32, 32] → [B, 1024, d_model]
+        # Embed patches: [B, 3, 256, 256] → [B, d_model, 16, 16] → [B, 256, d_model]
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
         tokens = tokens + self.encoder_pos_embed
 
@@ -159,19 +167,19 @@ class LightPatchTransformer(nn.Module):
         for layer in self.decoder_layers:
             queries = torch.utils.checkpoint.checkpoint(layer, queries, encoder_out, use_reentrant=False)
 
-        # Project to pixel space: [B, 1024, d_model] → [B, 1024, 768]
+        # Project to pixel space: [B, 256, d_model] → [B, 256, 768]
         out = self.output_proj(self.output_norm(queries))
 
-        # Reshape to image: [B, 1024, 768] → [B, 3, 512, 512]
-        # 1024 = 32×32 patch grid, 768 = 3×16×16 pixels per patch
-        out = out.view(B, 32, 32, 3, 16, 16)
-        out = out.permute(0, 3, 1, 4, 2, 5).contiguous()  # [B, 3, 32, 16, 32, 16]
-        out = out.view(B, 3, 512, 512)
+        # Reshape to image: [B, 256, 768] → [B, 3, 256, 256]
+        # 256 = 16×16 patch grid, 768 = 3×16×16 pixels per patch
+        grid = self.input_size // 16
+        out = out.view(B, grid, grid, 3, 16, 16)
+        out = out.permute(0, 3, 1, 4, 2, 5).contiguous()
+        out = out.view(B, 3, self.input_size, self.input_size)
 
-        # Residual connection: ensure transformer refines input rather than replacing it
-        out = out + x_orig
-
-        return torch.sigmoid(out)
+        # Residual + sigmoid, then upsample to 512×512
+        out = torch.sigmoid(out + x_orig)
+        return self.upsample(out)
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +345,10 @@ class FoundationPatchGenerator(nn.Module):
         self.transformer_enc_layers = transformer_enc_layers
         self.transformer_dec_layers = transformer_dec_layers
 
-        # TAESD latent space: 4 channels, H/8 × W/8
-        self.vae_latent_h = patch_height // 8
-        self.vae_latent_w = patch_width  // 8
-        self.vae_latent_dim = 4 * self.vae_latent_h * self.vae_latent_w
+        # TAESD targets 256×256 internally; transformer upsamples 2× to patch_height×patch_width
+        self.vae_latent_h = 256 // 8   # = 32
+        self.vae_latent_w = 256 // 8   # = 32
+        self.vae_latent_dim = 4 * self.vae_latent_h * self.vae_latent_w  # = 4096
 
         # 6 adapters: Linear(latent_dim → vae_latent_dim) each
         self.adapters = nn.ModuleList([
@@ -361,7 +369,7 @@ class FoundationPatchGenerator(nn.Module):
             self.taesd_decoders.append(vae)
             print(f"  TAESD decoder {i + 1}/{num_taesd} loaded")
 
-        # 6 spatial transformers
+        # 6 spatial transformers (operate at 256×256, upsample to 512×512)
         self.transformers = nn.ModuleList([
             LightPatchTransformer(
                 d_model=transformer_d_model,
@@ -369,6 +377,7 @@ class FoundationPatchGenerator(nn.Module):
                 d_ff=transformer_d_ff,
                 num_enc_layers=transformer_enc_layers,
                 num_dec_layers=transformer_dec_layers,
+                input_size=256,
             )
             for _ in range(num_taesd)
         ])
@@ -400,12 +409,10 @@ class FoundationPatchGenerator(nn.Module):
 
         B = z_enriched.shape[0]
 
-        def _run_stream(adapter, taesd, transformer, z_enc, vae_h, vae_w, ph, pw):
+        def _run_stream(adapter, taesd, transformer, z_enc, vae_h, vae_w):
             latent = adapter(z_enc).view(z_enc.shape[0], 4, vae_h, vae_w)
             taesd_out = torch.clamp(taesd.decode(latent).sample, 0.0, 1.0)
-            if taesd_out.shape[2:] != (ph, pw):
-                taesd_out = F.interpolate(taesd_out, size=(ph, pw),
-                                          mode='bilinear', align_corners=True)
+            # transformer refines at 256×256, upsamples to 512×512 internally
             return transformer(taesd_out)
 
         stream_outputs = []
@@ -415,7 +422,6 @@ class FoundationPatchGenerator(nn.Module):
             out = torch.utils.checkpoint.checkpoint(
                 _run_stream, adapter, taesd, transformer, z_enriched,
                 self.vae_latent_h, self.vae_latent_w,
-                self.patch_height, self.patch_width,
                 use_reentrant=False,
             )
             stream_outputs.append(out)
