@@ -238,16 +238,23 @@ class NeuronSampler:
                     for d in self._shape_cache[model_id][layer_name]:
                         per_sample_size = d if per_sample_size is None else per_sample_size * d
 
-                if per_sample_size is not None and act.numel() == B * per_sample_size:
-                    # Output size matches B samples: reshape [B, per_sample]
-                    flat = act.reshape(B, per_sample_size)
-                    L = per_sample_size
+                if per_sample_size is not None and act.numel() % per_sample_size == 0:
+                    # Output is divisible by per-sample size; check if we got B units
+                    num_sample_units = act.numel() // per_sample_size
+                    if num_sample_units == B:
+                        # Exact match: reshape [B, per_sample] and extract
+                        flat = act.reshape(B, per_sample_size)
+                        L = per_sample_size
 
-                    idx_t = torch.tensor(
-                        [idx % L   for _, idx   in neuron_list],
-                        dtype=torch.long, device=flat.device,
-                    )
-                    vals = flat[:, idx_t]  # [B, n_layer] — retains grad_fn
+                        idx_t = torch.tensor(
+                            [idx % L   for _, idx   in neuron_list],
+                            dtype=torch.long, device=flat.device,
+                        )
+                        vals = flat[:, idx_t]  # [B, n_layer] — retains grad_fn
+                    else:
+                        # Unexpected number of sample units, skip layer
+                        del captured[layer_name]
+                        continue
 
                 elif act.shape[0] == B:
                     # First dim is batch: extract per-sample independently
