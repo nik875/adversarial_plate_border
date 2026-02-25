@@ -149,15 +149,15 @@ class LightPatchTransformer(nn.Module):
         tokens = self.patch_embed(x).flatten(2).transpose(1, 2)
         tokens = tokens + self.encoder_pos_embed
 
-        # Encoder
+        # Encoder (with gradient checkpointing to save memory)
         for layer in self.encoder_layers:
-            tokens = layer(tokens)
+            tokens = torch.utils.checkpoint.checkpoint(layer, tokens, use_reentrant=False)
         encoder_out = tokens
 
-        # Decoder
+        # Decoder (with gradient checkpointing to save memory)
         queries = self.decoder_queries.expand(B, -1, -1) + self.decoder_pos_embed
         for layer in self.decoder_layers:
-            queries = layer(queries, encoder_out)
+            queries = torch.utils.checkpoint.checkpoint(layer, queries, encoder_out, use_reentrant=False)
 
         # Project to pixel space: [B, 1024, d_model] → [B, 1024, 768]
         out = self.output_proj(self.output_norm(queries))
