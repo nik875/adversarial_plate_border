@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import signal
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -630,8 +631,26 @@ class EnsembleTrainer:
                                     strategy_dir = step_samples_dir / strategy_name
                                     strategy_dir.mkdir(parents=True, exist_ok=True)
 
+                                    # Find a random model entry with this strategy type
+                                    matching_entries = [
+                                        e for e in self.ensemble._entries
+                                        if isinstance(e.strategy, strategy_class)
+                                    ]
+                                    if not matching_entries:
+                                        continue  # Skip if no models use this strategy
+
+                                    entry = random.choice(matching_entries)
+                                    dataset_idx = torch.randint(0, self.task_encoder.num_datasets, (1,)).item()
+
+                                    # Generate 10 patches conditioned on this strategy + random model
                                     z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                    sample_patches = self.generator(z)
+                                    model_idx = torch.full((10,), entry.model_id, dtype=torch.long, device=self._device)
+                                    strategy_idx = torch.full((10,), entry.strategy_id, dtype=torch.long, device=self._device)
+                                    dataset_idx_tensor = torch.full((10,), dataset_idx, dtype=torch.long, device=self._device)
+
+                                    z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_tensor)
+                                    sample_patches = self.generator(z, z_enriched)
+
                                     for i, patch in enumerate(sample_patches):
                                         T.ToPILImage()(patch.cpu()).save(
                                             strategy_dir / f'{i}.png'
