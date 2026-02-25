@@ -489,7 +489,9 @@ class EnsembleTrainer:
                 loss = (total_act_loss + tv_val + spec_val) / N
                 loss.backward()
 
-                del deltas, final_deltas, adv_acts_list
+                del deltas, adv_acts_list
+                if final_neurons:
+                    del final_deltas
 
             acc['loss']          += (total_act_loss + tv_val + spec_val).item()
             acc['diversity']     += log_det.item()
