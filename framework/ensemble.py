@@ -456,7 +456,7 @@ class EnsembleTrainer:
 
             acc['loss']      += (total_act_loss + tv_val + spec_val).item()
             acc['diversity'] += log_det.item()
-            acc['quality']   += quality.item()
+            acc['quality']   += torch.log(quality).item()
             acc['tv']        += tv_val.item()
             acc['spectrum']  += spec_val.item()
             acc['model']      = entry.name
