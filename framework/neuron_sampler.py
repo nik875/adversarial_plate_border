@@ -238,8 +238,11 @@ class NeuronSampler:
                     for d in self._shape_cache[model_id][layer_name]:
                         per_sample_size = d if per_sample_size is None else per_sample_size * d
 
-                if per_sample_size is not None and act.numel() % per_sample_size == 0:
-                    # Output is divisible by per-sample size; check if we got B units
+                if (per_sample_size is not None
+                    and act.numel() % per_sample_size == 0
+                    and act.shape[0] % B == 0):  # First dim accounts for batch
+                    # Output is divisible by per-sample size and first dim accounts for batch.
+                    # Check if we got exactly B sample units.
                     num_sample_units = act.numel() // per_sample_size
                     if num_sample_units == B:
                         # Exact match: reshape [B, per_sample] and extract
