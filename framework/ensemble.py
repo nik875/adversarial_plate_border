@@ -680,6 +680,46 @@ class EnsembleTrainer:
                 )
 
     # ------------------------------------------------------------------
+    # Sample saving
+    # ------------------------------------------------------------------
+
+    def _save_samples(self, global_step: int, samples_dir: Path) -> None:
+        """Save 10 patches per strategy × model into a tar at samples_dir/step_NNNNNNN.tar."""
+        step_name = f'step_{global_step:07d}'
+        tar_path  = samples_dir / f'{step_name}.tar'
+
+        self.generator.eval()
+        self.task_encoder.eval()
+        try:
+            with torch.no_grad():
+                with tarfile.open(tar_path, 'w') as tar:
+                    for strat_entry in self.ensemble._strategies:
+                        for model_entry in self.ensemble._entries:
+                            dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
+
+                            z            = torch.randn(10, self.generator.latent_dim, device=self._device)
+                            model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
+                            strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
+                            dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
+
+                            z_enriched     = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
+                            sample_patches = self.generator(z, z_enriched)
+
+                            for i, patch in enumerate(sample_patches):
+                                buf = io.BytesIO()
+                                T.ToPILImage()(patch.cpu()).save(buf, format='PNG')
+                                buf.seek(0)
+
+                                tar_info = tarfile.TarInfo(
+                                    name=f'{step_name}/{strat_entry.name}/{model_entry.name}/{i}.png'
+                                )
+                                tar_info.size = len(buf.getvalue())
+                                tar.addfile(tar_info, buf)
+        finally:
+            self.generator.train()
+            self.task_encoder.train()
+
+    # ------------------------------------------------------------------
     # Full training loop
     # ------------------------------------------------------------------
 
@@ -807,6 +847,8 @@ class EnsembleTrainer:
                         if self.scaler.get_scale() >= scale_before:
                             scheduler.step()
                         global_step += 1
+                        if global_step % 10 == 0:
+                            self._save_samples(global_step, samples_dir)
                         wpbar.set_postfix({
                             'loss': f"{info['loss']:.4f}",
                             'div':  f"{info['diversity']:.2f}",
@@ -871,40 +913,7 @@ class EnsembleTrainer:
 
                         # Save sample patches every 10 optimizer steps
                         if global_step % 10 == 0:
-                            step_name = f'step_{global_step:07d}'
-                            tar_path = samples_dir / f'{step_name}.tar'
-
-                            self.generator.eval()
-                            self.task_encoder.eval()
-                            try:
-                                with torch.no_grad():
-                                    with tarfile.open(tar_path, 'w') as tar:
-                                        # Generate 10 patches per strategy per target model
-                                        for strat_entry in self.ensemble._strategies:
-                                            for model_entry in self.ensemble._entries:
-                                                dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
-
-                                                z = torch.randn(10, self.generator.latent_dim, device=self._device)
-                                                model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
-                                                strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
-                                                dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
-
-                                                z_enriched = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
-                                                sample_patches = self.generator(z, z_enriched)
-
-                                                for i, patch in enumerate(sample_patches):
-                                                    buf = io.BytesIO()
-                                                    T.ToPILImage()(patch.cpu()).save(buf, format='PNG')
-                                                    buf.seek(0)
-
-                                                    tar_info = tarfile.TarInfo(
-                                                        name=f'{step_name}/{strat_entry.name}/{model_entry.name}/{i}.png'
-                                                    )
-                                                    tar_info.size = len(buf.getvalue())
-                                                    tar.addfile(tar_info, buf)
-                            finally:
-                                self.generator.train()
-                                self.task_encoder.train()
+                            self._save_samples(global_step, samples_dir)
 
                         if max_steps is not None and global_step >= max_steps:
                             print(f"\n  max_steps={max_steps} reached; saving checkpoint.")
