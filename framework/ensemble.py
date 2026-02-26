@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Generator, List, Optional, Tuple
 
+import PIL.Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -700,6 +701,69 @@ class EnsembleTrainer:
                 )
 
     # ------------------------------------------------------------------
+    # Debug visualizations
+    # ------------------------------------------------------------------
+
+    def _save_debug_visualizations(self, debug_dir: Path) -> None:
+        """Generate debug images showing clean and attacked image pairs."""
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        num_samples = 4
+        patch_h = self.generator.patch_height
+        patch_w = self.generator.patch_width
+
+        # Only use border strategy for visualization
+        border_strategy = None
+        for strat_entry in self.ensemble._strategies:
+            if isinstance(strat_entry.strategy, BorderStrategy):
+                border_strategy = strat_entry.strategy
+                break
+
+        if border_strategy is None:
+            print("  No BorderStrategy found; skipping debug visualizations")
+            return
+
+        print(f"\nGenerating debug visualizations ({num_samples} pairs)...")
+
+        for sample_idx in range(num_samples):
+            # Sample a raw image
+            item = self.dataset_pool.sample()
+            raw_image = item.image.to(self._device)  # [3, H, W]
+
+            # Get strategy kwargs (same for both clean and attacked)
+            strategy_kwargs = border_strategy.sample_kwargs(
+                raw_image.unsqueeze(0), patch_h, patch_w,
+                model_input_shape=None,
+            )
+
+            # Clean: apply neutral border
+            clean_composited = border_strategy.apply_neutral(
+                raw_image.unsqueeze(0), **strategy_kwargs
+            )  # [1, 3, H, W]
+
+            # Attacked: apply random patch
+            rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
+            attacked_composited, _ = border_strategy.apply(
+                raw_image.unsqueeze(0), rand_patch, **strategy_kwargs
+            )  # [1, 3, H, W]
+
+            # Convert to PIL and save side-by-side
+            clean_pil = T.ToPILImage()(clean_composited[0].cpu().clamp(0, 1))
+            attacked_pil = T.ToPILImage()(attacked_composited[0].cpu().clamp(0, 1))
+
+            # Combine horizontally
+            combined_width = clean_pil.width + attacked_pil.width
+            combined_height = clean_pil.height
+            combined = PIL.Image.new('RGB', (combined_width, combined_height))
+            combined.paste(clean_pil, (0, 0))
+            combined.paste(attacked_pil, (clean_pil.width, 0))
+
+            # Save
+            combined.save(debug_dir / f'debug_pair_{sample_idx:02d}_clean_vs_attacked.png')
+
+        print(f"  Saved {num_samples} debug image pairs to {debug_dir}\n")
+
+    # ------------------------------------------------------------------
     # Sample saving
     # ------------------------------------------------------------------
 
@@ -824,6 +888,10 @@ class EnsembleTrainer:
 
         # Precompute per-neuron activation statistics for all models (once per run)
         self._profile_all_models(n_images=1000)
+
+        # Save debug visualizations (clean vs attacked image pairs)
+        debug_dir = run_dir / 'debug_visualizations'
+        self._save_debug_visualizations(debug_dir)
 
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)
