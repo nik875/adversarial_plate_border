@@ -342,21 +342,18 @@ class NeuronSampler:
     def update_profile(
         self,
         model: nn.Module,
-        batch_images: List[Tensor],
+        batch: Tensor,
         state: Dict,
     ) -> None:
         """
         Run one batch of images through the model and update Welford accumulators.
 
         Args:
-            model:        frozen model (already on compute device)
-            batch_images: list of preprocessed [1, C, H, W] tensors (one batch)
-            state:        accumulator dict returned by init_profile()
+            model:  frozen model (already on compute device)
+            batch:  preprocessed [B, C, H, W] tensor (already on compute device)
+            state:  accumulator dict returned by init_profile()
         """
         counts, means, M2s, shapes = state['counts'], state['means'], state['M2s'], state['shapes']
-
-        # Stack batch: list of [1, C, H, W] → [B, C, H, W]
-        batch = torch.cat(batch_images, dim=0)
 
         captured: Dict[str, Tensor] = {}
         hooks = []
@@ -446,7 +443,8 @@ class NeuronSampler:
         state = self.init_profile(model, sample_input_shape)
         batch_size = 10
         for batch_start in range(0, len(images), batch_size):
-            self.update_profile(model, images[batch_start:batch_start + batch_size], state)
+            batch = torch.cat(images[batch_start:batch_start + batch_size], dim=0)
+            self.update_profile(model, batch, state)
         self.finish_profile(model_id, state)
 
     def lookup_neuron_stds(
