@@ -514,7 +514,8 @@ class EnsembleTrainer:
                         if torch.isnan(log_det) or sign <= 0:
                             log_det = torch.tensor(-20.0, device=device, dtype=div_vecs.dtype)
 
-                        if isinstance(strat_entry.strategy, StickerStrategy):
+                        # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
+                        if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
                             tv_raw = total_variation_loss(patches, vis_mask)
                         else:
                             tv_raw = torch.tensor(0.0, device=device)
