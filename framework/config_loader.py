@@ -175,6 +175,11 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
                 "Falling back to glob-based dataset loading."
             )
 
+    # PriorRegistry is no longer used — always None
+    prior_registry = None
+    gen_cfg = cfg.get('generator', {})
+    latent_dim = gen_cfg.get('latent_dim', 16)
+
     # Build LazyDatasetPool — resize raw images to generator patch dimensions so
     # compositing happens at the right resolution; each model's preprocess_fn
     # then scales down to its own input size.
@@ -208,11 +213,6 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
                 domain_type=domain_type,
                 max_samples=ds.get('max_samples', None),
             )
-
-    # PriorRegistry is no longer used — always None
-    prior_registry = None
-    gen_cfg = cfg.get('generator', {})
-    latent_dim = gen_cfg.get('latent_dim', 16)
 
     # Build TaskEncoder
     te_cfg = cfg.get('task_encoder', {})
