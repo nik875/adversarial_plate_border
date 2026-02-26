@@ -853,30 +853,38 @@ class EnsembleTrainer:
                 print(f"{'='*60}")
                 self.generator.train(); self.task_encoder.train()
                 all_params = list(self.generator.parameters()) + list(self.task_encoder.parameters())
-                with tqdm(total=self.warmup_steps, desc="Warmup") as wpbar:
-                    for _ in range(self.warmup_steps):
-                        optimizer.zero_grad()
-                        prefetched = next(prefetch_iter)
-                        info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
-                        self.scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(optimizer)
-                        self.scaler.update()
-                        if self.scaler.get_scale() >= scale_before:
-                            scheduler.step()
-                        global_step += 1
-                        if global_step % 10 == 0:
-                            self._save_samples(global_step, samples_dir)
-                        wpbar.set_postfix({
-                            'loss': f"{info['loss']:.4f}",
-                            'div':  f"{info['diversity']:.2f}",
-                            'qual': f"{info['final_quality']:.4f}",
-                            'tv':   f"{info['tv']:.4f}",
-                            'ssim': f"{info['spectrum']:.4f}",
-                            'lr':   f"{optimizer.param_groups[1]['lr']:.2e}",
-                        })
-                        wpbar.update(1)
+                try:
+                    with tqdm(total=self.warmup_steps, desc="Warmup") as wpbar:
+                        for _ in range(self.warmup_steps):
+                            optimizer.zero_grad()
+                            prefetched = next(prefetch_iter)
+                            info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
+                            self.scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                            scale_before = self.scaler.get_scale()
+                            self.scaler.step(optimizer)
+                            self.scaler.update()
+                            if self.scaler.get_scale() >= scale_before:
+                                scheduler.step()
+                            global_step += 1
+                            if global_step % 10 == 0:
+                                self._save_samples(global_step, samples_dir)
+                            wpbar.set_postfix({
+                                'loss': f"{info['loss']:.4f}",
+                                'div':  f"{info['diversity']:.2f}",
+                                'qual': f"{info['final_quality']:.4f}",
+                                'tv':   f"{info['tv']:.4f}",
+                                'ssim': f"{info['spectrum']:.4f}",
+                                'lr':   f"{optimizer.param_groups[1]['lr']:.2e}",
+                            })
+                            wpbar.update(1)
+                except KeyboardInterrupt:
+                    print(f"\n  Interrupted during warmup at step {global_step}; saving checkpoint.")
+                    self._save_checkpoint(
+                        0, global_step, run_dir, optimizer, scheduler,
+                        subdir=f'checkpoint_step_{global_step:07d}'
+                    )
+                    return
                 print(f"Warmup complete. global_step={global_step}\n")
 
         for epoch in range(start_epoch, self.max_epochs + 1):
