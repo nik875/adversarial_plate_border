@@ -152,7 +152,7 @@ def _build_generator(gen_cfg: Dict[str, Any]) -> Any:
         latent_dim=gen_cfg.get('latent_dim', 16),
         patch_height=gen_cfg.get('patch_height', 512),
         patch_width=gen_cfg.get('patch_width', 512),
-        num_taesd=gen_cfg.get('num_taesd', 6),
+        num_taesd=gen_cfg.get('num_taesd', 1),
         transformer_d_model=gen_cfg.get('transformer_d_model', 256),
         transformer_nhead=gen_cfg.get('transformer_nhead', 4),
         transformer_d_ff=gen_cfg.get('transformer_d_ff', 1024),

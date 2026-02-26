@@ -203,7 +203,7 @@ class ChannelMixer(nn.Module):
         patch_height: int = 512,
         patch_width: int = 512,
         latent_dim: int = 16,
-        num_taesd: int = 6,
+        num_taesd: int = 1,
         num_modes: int = 6,
     ):
         super().__init__()
@@ -323,7 +323,7 @@ class FoundationPatchGenerator(nn.Module):
         latent_dim: int = 16,
         patch_height: int = 512,
         patch_width: int = 512,
-        num_taesd: int = 6,
+        num_taesd: int = 1,
         transformer_d_model: int = 256,
         transformer_nhead: int = 4,
         transformer_d_ff: int = 1024,
