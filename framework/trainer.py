@@ -55,7 +55,7 @@ class GenericPatchTrainer:
         diversity_weight: float = 1.0,
         quality_weight: float = 1.0,
         performance_weight: float = 1.0,
-        tv_weight: float = 2.5,
+        tv_weight: float = 200.0,
         spectrum_weight: float = 1.0,
         num_taesd: int = 1,
         transformer_d_model: int = 256,

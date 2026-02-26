@@ -268,7 +268,7 @@ class EnsembleTrainer:
         images_per_batch: int = 32,
         diversity_weight: float = 1.0,
         quality_weight: float = 1.0,
-        tv_weight: float = 2.5,
+        tv_weight: float = 200.0,
         spectrum_weight: float = 1.0,
         learning_rate: float = 1e-4,
         vae_lr_ratio: float = 0.1,

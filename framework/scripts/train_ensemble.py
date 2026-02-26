@@ -301,7 +301,7 @@ def main():
         images_per_batch=int(trainer_cfg.get('images_per_batch', 32)),
         diversity_weight=float(trainer_cfg.get('diversity_weight', 1.0)),
         quality_weight=float(trainer_cfg.get('quality_weight', 1.0)),
-        tv_weight=float(trainer_cfg.get('tv_weight', 2.5)),
+        tv_weight=float(trainer_cfg.get('tv_weight', 200.0)),
         spectrum_weight=float(trainer_cfg.get('spectrum_weight', 1.0)),
         learning_rate=float(trainer_cfg.get('learning_rate', 1e-4)),
         vae_lr_ratio=float(trainer_cfg.get('taesd_lr_ratio', trainer_cfg.get('vae_lr_ratio', 0.1))),

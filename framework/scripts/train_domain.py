@@ -59,7 +59,7 @@ def main():
         diversity_weight=trainer_cfg.get('diversity_weight', 1.0),
         quality_weight=trainer_cfg.get('quality_weight', 1.0),
         performance_weight=trainer_cfg.get('performance_weight', 1.0),
-        tv_weight=trainer_cfg.get('tv_weight', 2.5),
+        tv_weight=trainer_cfg.get('tv_weight', 200.0),
         spectrum_weight=trainer_cfg.get('spectrum_weight', 1.0),
         use_vae_lora=trainer_cfg.get('use_vae_lora', True),
         lora_rank=trainer_cfg.get('lora_rank', 8),
