@@ -488,29 +488,31 @@ class EnsembleTrainer:
                         ).to(device)
                         beta           = self.neuron_sampler.lookup_beta(entry.model_id)
                         effective_stds = neuron_stds.clamp(min=beta)
-                        norm_deltas    = deltas / effective_stds                    # [P, k_rand]
-
-                        eps        = max(1e-6, 1e-2 / P)
-                        normalized = F.normalize(norm_deltas, p=2, dim=1)
-                        gram       = normalized @ normalized.T + eps * torch.eye(P, device=device)
-                        sign, log_det = torch.slogdet(gram)
-                        if torch.isnan(log_det) or sign <= 0:
-                            log_det = torch.tensor(-20.0, device=device, dtype=deltas.dtype)
+                        norm_deltas    = deltas / effective_stds                    # [P, k_rand] — kept for quality logging
 
                         norm_deltas_sq = norm_deltas ** 2
                         quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
 
+                        # Final-layer activations — used for both quality and diversity
                         if final_neurons:
                             final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
                             final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
                                 entry.model_id, final_neurons
                             ).to(device)
-                            final_eff_stds = final_neuron_stds.clamp(min=beta)
-                            final_quality  = (
-                                (final_deltas / final_eff_stds) ** 2
-                            ).mean(dim=1).sqrt().mean() + 1e-8
+                            final_eff_stds    = final_neuron_stds.clamp(min=beta)
+                            final_norm_deltas = final_deltas / final_eff_stds       # [P, k_final]
+                            final_quality     = final_norm_deltas.pow(2).mean(dim=1).sqrt().mean() + 1e-8
+                            div_vecs          = final_norm_deltas  # diversity uses final layer
                         else:
                             final_quality = torch.tensor(1e-8, device=device)
+                            div_vecs      = norm_deltas            # fallback: random neurons
+
+                        eps        = max(1e-6, 1e-2 / P)
+                        normalized = F.normalize(div_vecs, p=2, dim=1)
+                        gram       = normalized @ normalized.T + eps * torch.eye(P, device=device)
+                        sign, log_det = torch.slogdet(gram)
+                        if torch.isnan(log_det) or sign <= 0:
+                            log_det = torch.tensor(-20.0, device=device, dtype=div_vecs.dtype)
 
                         if isinstance(strat_entry.strategy, StickerStrategy):
                             tv_raw = total_variation_loss(patches, vis_mask)
