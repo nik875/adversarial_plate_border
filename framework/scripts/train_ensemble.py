@@ -117,8 +117,11 @@ def _build_strategy(strategy_cfg: Dict[str, Any]):
 
     strat = strategy_cfg.get('type', 'border').lower()
     if strat == 'border':
+        center_ratio = strategy_cfg.get('center_ratio', 0.91)
+        border_scale = 1.0 / center_ratio if center_ratio > 0 else 1.0
+        print(f"  Building BorderStrategy: center_ratio={center_ratio:.3f} (border_scale={border_scale:.2f})")
         return BorderStrategy(
-            center_ratio=strategy_cfg.get('center_ratio', 0.91),
+            center_ratio=center_ratio,
             neutral_color=strategy_cfg.get('neutral_color', 0.5),
         )
     elif strat == 'sticker':
