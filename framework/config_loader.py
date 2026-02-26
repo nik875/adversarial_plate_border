@@ -175,8 +175,17 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
                 "Falling back to glob-based dataset loading."
             )
 
-    # Build LazyDatasetPool
-    dataset_pool = LazyDatasetPool()
+    # Build LazyDatasetPool — resize raw images to generator patch dimensions so
+    # compositing happens at the right resolution; each model's preprocess_fn
+    # then scales down to its own input size.
+    import torchvision.transforms as _T
+    gen_h = gen_cfg.get('patch_height', 512)
+    gen_w = gen_cfg.get('patch_width', 512)
+    raw_transform = _T.Compose([
+        _T.Resize((gen_h, gen_w)),
+        _T.ToTensor(),
+    ])
+    dataset_pool = LazyDatasetPool(transform=raw_transform)
     for ds in datasets_cfg:
         name = ds.get('name', 'unnamed')
         domain_type = ds.get('domain_type', 'generic')
