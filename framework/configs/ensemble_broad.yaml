@@ -123,10 +123,10 @@ trainer:
   learning_rate: 3.5e-5
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
-  diversity_weight: 1.0
-  quality_weight: 8.0
+  diversity_weight: 0.0
+  quality_weight: 0.0
   tv_weight: 1000.0
-  spectrum_weight: 2.0
+  spectrum_weight: 0.0
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
   warmup_steps: 100
