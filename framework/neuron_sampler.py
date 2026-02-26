@@ -325,18 +325,25 @@ class NeuronSampler:
         self,
         model: nn.Module,
         sample_input_shape: Tuple[int, int, int],
+        device: Optional[torch.device] = None,
     ) -> Dict:
         """
         Initialise fresh Welford accumulators for profiling.
 
+        Args:
+            device: device to keep accumulators on (should match model device).
+                    Defaults to CPU.
+
         Returns a state dict to be passed to update_profile() and finish_profile().
         """
         shapes = self.discover_layers(model, sample_input_shape)
+        dev = device if device is not None else torch.device('cpu')
         return {
             'shapes': shapes,
+            'device': dev,
             'counts': {n: 0 for n in shapes},
-            'means':  {n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()},
-            'M2s':    {n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()},
+            'means':  {n: torch.zeros(s, dtype=torch.float32, device=dev) for n, s in shapes.items()},
+            'M2s':    {n: torch.zeros(s, dtype=torch.float32, device=dev) for n, s in shapes.items()},
         }
 
     def update_profile(
@@ -348,12 +355,17 @@ class NeuronSampler:
         """
         Run one batch of images through the model and update Welford accumulators.
 
+        Uses Chan's parallel Welford formula to update the entire batch at once
+        (no Python loop over images). Activations stay on the model's device
+        until finish_profile() moves the final stds to CPU.
+
         Args:
             model:  frozen model (already on compute device)
             batch:  preprocessed [B, C, H, W] tensor (already on compute device)
             state:  accumulator dict returned by init_profile()
         """
         counts, means, M2s, shapes = state['counts'], state['means'], state['M2s'], state['shapes']
+        B = batch.shape[0]
 
         captured: Dict[str, Tensor] = {}
         hooks = []
@@ -361,7 +373,8 @@ class NeuronSampler:
         def make_hook(name: str):
             def hook(module, inp, out):
                 if isinstance(out, Tensor):
-                    captured[name] = out.detach().cpu().float()
+                    # Keep on GPU — no .cpu() here (would serialize every layer)
+                    captured[name] = out.detach().float()
             return hook
 
         for name, module in model.named_modules():
@@ -375,20 +388,42 @@ class NeuronSampler:
             for h in hooks:
                 h.remove()
 
-        # Welford update per layer, per image in batch
+        # Chan's parallel Welford: combine running state with entire batch at once.
+        # This replaces the per-image Python loop and keeps all ops on the GPU.
         for layer_name, act in captured.items():
             if layer_name not in counts:
                 continue
-            for b in range(act.shape[0]):
-                x = act[b]
-                if x.shape != means[layer_name].shape:
-                    continue
-                counts[layer_name] += 1
-                n = counts[layer_name]
-                delta  = x - means[layer_name]
-                means[layer_name] += delta / n
-                delta2 = x - means[layer_name]
-                M2s[layer_name]   += delta * delta2
+
+            expected_shape = shapes[layer_name]
+            per_sample_size = 1
+            for s in expected_shape:
+                per_sample_size *= s
+
+            # Skip layers whose output shape doesn't match what was seen at discovery time
+            if act.numel() != B * per_sample_size:
+                continue
+
+            # Flatten activations to [B, per_sample_size] for vectorised ops
+            flat = act.reshape(B, per_sample_size)
+
+            # Batch statistics (fully on GPU)
+            batch_mean = flat.mean(dim=0)                                  # [per_sample_size]
+            batch_M2   = ((flat - batch_mean.unsqueeze(0)) ** 2).sum(dim=0)  # [per_sample_size]
+
+            # Chan's parallel combination with running accumulators
+            n_A = counts[layer_name]
+            n_C = n_A + B
+
+            cur_mean = means[layer_name].reshape(per_sample_size)
+            cur_M2   = M2s[layer_name].reshape(per_sample_size)
+
+            delta    = batch_mean - cur_mean
+            new_mean = cur_mean + delta * (B / n_C)
+            new_M2   = cur_M2 + batch_M2 + delta ** 2 * (n_A * B / n_C)
+
+            means[layer_name]  = new_mean.reshape(expected_shape)
+            M2s[layer_name]    = new_M2.reshape(expected_shape)
+            counts[layer_name] = n_C
 
     def finish_profile(
         self,
@@ -409,11 +444,11 @@ class NeuronSampler:
             n = counts[layer_name]
             if n > 1:
                 variance = M2s[layer_name] / (n - 1)
-                stds[layer_name] = variance.sqrt_().clamp_(min=1e-8)
+                stds[layer_name] = variance.sqrt_().clamp_(min=1e-8).cpu()
             else:
                 stds[layer_name] = torch.full(
                     shapes[layer_name], 1e-8, dtype=torch.float32
-                )
+                )  # already CPU
 
         self._neuron_stds[model_id] = stds
 

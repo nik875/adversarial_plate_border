@@ -568,7 +568,7 @@ class EnsembleTrainer:
             num_batches = len(loader)
             sample_shape = (3, *entry.input_shape)
             with self.ensemble.on_device(entry) as model:
-                state = self.neuron_sampler.init_profile(model, sample_shape)
+                state = self.neuron_sampler.init_profile(model, sample_shape, device=self._device)
                 with tqdm(total=num_batches, desc=f"    {entry.name}", leave=False) as pbar:
                     for batch in loader:
                         batch = batch.to(self._device)
