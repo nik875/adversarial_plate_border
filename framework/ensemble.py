@@ -712,15 +712,15 @@ class EnsembleTrainer:
         patch_h = self.generator.patch_height
         patch_w = self.generator.patch_width
 
-        # Only use border strategy for visualization
-        border_strategy = None
+        # Use sticker strategy for visualization
+        sticker_strategy = None
         for strat_entry in self.ensemble._strategies:
-            if isinstance(strat_entry.strategy, BorderStrategy):
-                border_strategy = strat_entry.strategy
+            if isinstance(strat_entry.strategy, StickerStrategy):
+                sticker_strategy = strat_entry.strategy
                 break
 
-        if border_strategy is None:
-            print("  No BorderStrategy found; skipping debug visualizations")
+        if sticker_strategy is None:
+            print("  No StickerStrategy found; skipping debug visualizations")
             return
 
         print(f"\nGenerating debug visualizations ({num_samples} pairs)...")
@@ -731,19 +731,19 @@ class EnsembleTrainer:
             raw_image = item.image.to(self._device)  # [3, H, W]
 
             # Get strategy kwargs (same for both clean and attacked)
-            strategy_kwargs = border_strategy.sample_kwargs(
+            strategy_kwargs = sticker_strategy.sample_kwargs(
                 raw_image.unsqueeze(0), patch_h, patch_w,
                 model_input_shape=None,
             )
 
-            # Clean: apply neutral border
-            clean_composited = border_strategy.apply_neutral(
+            # Clean: apply neutral sticker
+            clean_composited = sticker_strategy.apply_neutral(
                 raw_image.unsqueeze(0), **strategy_kwargs
             )  # [1, 3, H, W]
 
             # Attacked: apply random patch
             rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
-            attacked_composited, _ = border_strategy.apply(
+            attacked_composited, _ = sticker_strategy.apply(
                 raw_image.unsqueeze(0), rand_patch, **strategy_kwargs
             )  # [1, 3, H, W]
 
