@@ -30,15 +30,8 @@ manifest: ~/.cache/adversarial_plate_manifest.csv
 strategies:
   - name: border
     type: border
+    center_ratio: 0.625  # border_scale=1.6 (larger border, ~40% subject visible)
     strategy_id: 0
-
-  - name: sticker
-    type: sticker
-    strategy_id: 1
-
-  - name: perturbation
-    type: perturbation
-    strategy_id: 2
 
 # ---------------------------------------------------------------------------
 # Model pool — 8 models spanning 4 vision tasks
