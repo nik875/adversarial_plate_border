@@ -50,7 +50,7 @@ def total_variation_loss(patches: Tensor, visibility_mask: Tensor) -> Tensor:
         num_vis_v = mask_v.sum()
 
         denom = num_vis_h + num_vis_v
-        patch_tv = ((tv_h_masked + tv_v_masked) / denom * 2.5
+        patch_tv = ((tv_h_masked + tv_v_masked) / denom
                     if denom > 0
                     else torch.tensor(0.0, device=patches.device))
 
