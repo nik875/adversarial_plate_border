@@ -50,6 +50,27 @@ from framework.task_encoder import TaskEncoder
 
 
 # ---------------------------------------------------------------------------
+# Prefetch dataset for parallel training image loading
+# ---------------------------------------------------------------------------
+
+class _TrainingImageDataset(torch.utils.data.IterableDataset):
+    """
+    Infinite random-sampling dataset for parallel image prefetching during training.
+
+    Each DataLoader worker independently calls pool.sample() in a tight loop,
+    so N workers load N images in parallel. The DataLoader batches these into
+    [images_per_batch, 3, H, W] tensors that are handed to _train_step.
+    """
+    def __init__(self, pool: LazyDatasetPool):
+        self.pool = pool
+
+    def __iter__(self):
+        while True:
+            item = self.pool.sample()
+            yield item.image, item.dataset_id
+
+
+# ---------------------------------------------------------------------------
 # EnsembleModelPool
 # ---------------------------------------------------------------------------
 
@@ -256,6 +277,7 @@ class EnsembleTrainer:
         save_every_epochs: int = 5,
         warmup_steps: int = 0,
         warmup_model: Optional[str] = None,
+        num_prefetch_workers: int = 8,
         device: Optional[torch.device] = None,
     ):
         self.ensemble = ensemble
@@ -279,6 +301,7 @@ class EnsembleTrainer:
         self.save_every_epochs = save_every_epochs
         self.warmup_steps = warmup_steps
         self.warmup_model = warmup_model
+        self.num_prefetch_workers = num_prefetch_workers
 
         self._device = device or ensemble.compute_device
         self.generator = self.generator.to(self._device)
@@ -346,6 +369,7 @@ class EnsembleTrainer:
     def _train_step(
         self,
         optimizer: optim.Optimizer,
+        prefetched: Optional[Tuple[Tensor, Tensor]] = None,
         entries_override=None,
     ) -> Dict[str, float]:
         """
@@ -355,6 +379,11 @@ class EnsembleTrainer:
         Per image: ctrl + P patches are batched into one target-model forward pass
         (P+1 inputs, same neuron sample), then backward() is called immediately
         so only one image's activation stack lives at a time.
+
+        Args:
+            prefetched: (images [N,3,H,W], dataset_ids [N]) pre-loaded by the
+                        background DataLoader. If None, falls back to synchronous
+                        dataset_pool.sample() (used in smoke-test / CPU mode).
         """
         gen = self.generator
         device = self._device
@@ -371,6 +400,8 @@ class EnsembleTrainer:
         n_models = len(all_entries)
         images_per_model = N // n_models
         remainder = N % n_models
+
+        img_cursor = 0  # index into prefetched batch
 
         # Outer loop: models. Inner loop: images per model.
         # Per-image forward pass batches ctrl + P patches together (P+1 inputs,
@@ -389,10 +420,16 @@ class EnsembleTrainer:
                 combined_neurons = sampled_neurons + final_neurons
 
                 for _ in range(n_images):
-                    # --- 1. Sample strategy and image ---
+                    # --- 1. Get image (from prefetch queue or synchronous fallback) ---
                     strat_entry = self.ensemble.sample_strategy()
-                    item        = self.dataset_pool.sample()
-                    image       = item.image.unsqueeze(0).to(device)
+                    if prefetched is not None:
+                        image      = prefetched[0][img_cursor].unsqueeze(0).to(device)
+                        dataset_id = int(prefetched[1][img_cursor])
+                        img_cursor += 1
+                    else:
+                        item       = self.dataset_pool.sample()
+                        image      = item.image.unsqueeze(0).to(device)
+                        dataset_id = item.dataset_id
 
                     strategy_kwargs = strat_entry.strategy.sample_kwargs(
                         image, gen.patch_height, gen.patch_width,
@@ -405,7 +442,7 @@ class EnsembleTrainer:
 
                         midx = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
                         sidx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
-                        didx = torch.full((P,), item.dataset_id,         device=device, dtype=torch.long)
+                        didx = torch.full((P,), dataset_id,              device=device, dtype=torch.long)
 
                         midx = midx.clamp(0, self.task_encoder.num_models    - 1)
                         sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
@@ -729,6 +766,21 @@ class EnsembleTrainer:
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)
 
+        # Persistent background DataLoader: workers pre-load images while the GPU
+        # processes the previous batch, eliminating synchronous disk I/O from the
+        # hot path. pin_memory=True enables fast DMA transfers on CUDA.
+        prefetch_loader = torch.utils.data.DataLoader(
+            _TrainingImageDataset(self.dataset_pool),
+            batch_size=self.images_per_batch,
+            num_workers=self.num_prefetch_workers,
+            prefetch_factor=2,
+            persistent_workers=True,
+            pin_memory=(self._device.type == 'cuda'),
+        )
+        prefetch_iter = iter(prefetch_loader)
+        print(f"Prefetch DataLoader: {self.num_prefetch_workers} workers, "
+              f"batch_size={self.images_per_batch}, pin_memory={self._device.type == 'cuda'}\n")
+
         # --- Warmup phase ---
         if self.warmup_steps > 0 and self.warmup_model and global_step == 0:
             warmup_entries = [e for e in self.ensemble._entries if e.name == self.warmup_model]
@@ -743,7 +795,8 @@ class EnsembleTrainer:
                 with tqdm(total=self.warmup_steps, desc="Warmup") as wpbar:
                     for _ in range(self.warmup_steps):
                         optimizer.zero_grad()
-                        info = self._train_step(optimizer, entries_override=warmup_entries)
+                        prefetched = next(prefetch_iter)
+                        info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
                         self.scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(all_params, 1.0)
                         scale_before = self.scaler.get_scale()
@@ -781,8 +834,8 @@ class EnsembleTrainer:
                 with tqdm(total=steps_this_epoch, desc=f"Epoch {epoch}", leave=False) as pbar:
                     for step in range(steps_this_epoch):
                         optimizer.zero_grad()
-
-                        info = self._train_step(optimizer)
+                        prefetched = next(prefetch_iter)
+                        info = self._train_step(optimizer, prefetched=prefetched)
 
                         self.scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(

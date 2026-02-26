@@ -138,3 +138,4 @@ trainer:
   save_every_epochs: 1
   warmup_steps: 100
   warmup_model: clip_vit_l14
+  num_prefetch_workers: 12

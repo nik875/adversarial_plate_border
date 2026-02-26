@@ -308,6 +308,7 @@ def main():
         save_every_epochs=int(trainer_cfg.get('save_every_epochs', 5)),
         warmup_steps=int(trainer_cfg.get('warmup_steps', 0)),
         warmup_model=str(trainer_cfg.get('warmup_model', '')) or None,
+        num_prefetch_workers=int(trainer_cfg.get('num_prefetch_workers', 8)),
         device=compute_device,
     )
 
