@@ -754,7 +754,10 @@ class EnsembleTrainer:
                         global_step += 1
                         wpbar.set_postfix({
                             'loss': f"{info['loss']:.4f}",
+                            'div':  f"{info['diversity']:.2f}",
                             'qual': f"{info['final_quality']:.4f}",
+                            'tv':   f"{info['tv']:.4f}",
+                            'ssim': f"{info['spectrum']:.4f}",
                             'lr':   f"{optimizer.param_groups[1]['lr']:.2e}",
                         })
                         wpbar.update(1)
