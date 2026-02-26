@@ -331,9 +331,9 @@ class NeuronSampler:
         """
         Profile per-neuron activation statistics using Welford's online algorithm.
 
-        Runs each image through the model with hooks on all leaf layers,
-        accumulating a running mean and variance per neuron. Stores the
-        resulting per-neuron std tensors on CPU keyed by model_id.
+        Processes images in batches of 10 for efficiency (one forward pass per batch
+        instead of per image). Accumulates running mean and variance per neuron.
+        Stores the resulting per-neuron std tensors on CPU keyed by model_id.
 
         Args:
             model:              frozen model (already on compute device)
@@ -352,7 +352,15 @@ class NeuronSampler:
             n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()
         }
 
-        for image in images:
+        # Batch processing: 10 images at a time for GPU efficiency
+        batch_size = 10
+        for batch_start in range(0, len(images), batch_size):
+            batch_end = min(batch_start + batch_size, len(images))
+            batch_images = images[batch_start:batch_end]
+
+            # Stack batch: [B, 1, C, H, W] → [B, C, H, W]
+            batch = torch.cat(batch_images, dim=0)
+
             captured: Dict[str, Tensor] = {}
             hooks = []
 
@@ -368,24 +376,27 @@ class NeuronSampler:
 
             try:
                 with torch.no_grad():
-                    model(image)
+                    model(batch)
             finally:
                 for h in hooks:
                     h.remove()
 
-            # Welford update per layer
+            # Welford update per layer, per image in batch
             for layer_name, act in captured.items():
                 if layer_name not in counts:
                     continue
-                x = act.squeeze(0)  # remove batch dim → shape matches stored shape
-                if x.shape != means[layer_name].shape:
-                    continue        # shape mismatch (e.g. dynamic layers) — skip
-                counts[layer_name] += 1
-                n = counts[layer_name]
-                delta  = x - means[layer_name]
-                means[layer_name] += delta / n
-                delta2 = x - means[layer_name]
-                M2s[layer_name]   += delta * delta2
+                # act shape: [B, ...feature_dims...]
+                # Loop through batch to update per-image statistics
+                for b in range(act.shape[0]):
+                    x = act[b]  # extract single image: shape matches stored shape
+                    if x.shape != means[layer_name].shape:
+                        continue        # shape mismatch (e.g. dynamic layers) — skip
+                    counts[layer_name] += 1
+                    n = counts[layer_name]
+                    delta  = x - means[layer_name]
+                    means[layer_name] += delta / n
+                    delta2 = x - means[layer_name]
+                    M2s[layer_name]   += delta * delta2
 
         # Finalise: compute std from M2
         stds: Dict[str, Tensor] = {}
