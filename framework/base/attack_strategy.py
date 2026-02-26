@@ -285,14 +285,15 @@ class StickerStrategy(AttackStrategy):
         # Compute sticker size from area_fraction if not explicitly set
         if sh is None or sw is None:
             if model_input_shape is not None:
-                model_h, model_w = model_input_shape
-                target_area = self.area_fraction * model_h * model_w
-                # Aspect ratio 2:1 (width:height)
-                sh = int((target_area / 2) ** 0.5)
-                sw = int((target_area * 2) ** 0.5)
+                ref_h, ref_w = model_input_shape
             else:
-                sh = sh if sh is not None else patch_h
-                sw = sw if sw is not None else patch_w
+                # Fall back to actual image dimensions so the sticker never
+                # exceeds the image size (patch dims can be >> image dims).
+                ref_h, ref_w = image.shape[2], image.shape[3]
+            target_area = self.area_fraction * ref_h * ref_w
+            # Aspect ratio 2:1 (width:height)
+            sh = max(1, int((target_area / 2) ** 0.5))
+            sw = max(1, int((target_area * 2) ** 0.5))
 
         img_h, img_w = image.shape[2], image.shape[3]
         max_x = max(img_w - sw, 0)

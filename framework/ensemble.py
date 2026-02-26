@@ -730,10 +730,14 @@ class EnsembleTrainer:
             item = self.dataset_pool.sample()
             raw_image = item.image.to(self._device)  # [3, H, W]
 
-            # Get strategy kwargs (same for both clean and attacked)
+            # Get strategy kwargs — use first model's input_shape so sticker
+            # size is computed as area_fraction of the actual model input area.
+            model_input_shape = None
+            if self.ensemble._entries:
+                model_input_shape = self.ensemble._entries[0].input_shape
             strategy_kwargs = sticker_strategy.sample_kwargs(
                 raw_image.unsqueeze(0), patch_h, patch_w,
-                model_input_shape=None,
+                model_input_shape=model_input_shape,
             )
 
             # Clean: apply neutral sticker
