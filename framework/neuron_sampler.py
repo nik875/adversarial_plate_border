@@ -321,84 +321,92 @@ class NeuronSampler:
     # Neuron profiling (precomputed per-neuron std)
     # ------------------------------------------------------------------
 
-    def profile_model(
+    def init_profile(
         self,
         model: nn.Module,
-        model_id: int,
-        images: List[Tensor],
         sample_input_shape: Tuple[int, int, int],
-    ) -> None:
+    ) -> Dict:
         """
-        Profile per-neuron activation statistics using Welford's online algorithm.
+        Initialise fresh Welford accumulators for profiling.
 
-        Processes images in batches of 10 for efficiency (one forward pass per batch
-        instead of per image). Accumulates running mean and variance per neuron.
-        Stores the resulting per-neuron std tensors on CPU keyed by model_id.
-
-        Args:
-            model:              frozen model (already on compute device)
-            model_id:           integer id to key the stored statistics
-            images:             list of preprocessed [1, C, H, W] tensors
-            sample_input_shape: (C, H, W) for layer discovery
+        Returns a state dict to be passed to update_profile() and finish_profile().
         """
         shapes = self.discover_layers(model, sample_input_shape)
-
-        # Welford running state on CPU
-        counts: Dict[str, int] = {n: 0 for n in shapes}
-        means:  Dict[str, Tensor] = {
-            n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()
-        }
-        M2s:    Dict[str, Tensor] = {
-            n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()
+        return {
+            'shapes': shapes,
+            'counts': {n: 0 for n in shapes},
+            'means':  {n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()},
+            'M2s':    {n: torch.zeros(s, dtype=torch.float32) for n, s in shapes.items()},
         }
 
-        # Batch processing: 10 images at a time for GPU efficiency
-        batch_size = 10
-        for batch_start in range(0, len(images), batch_size):
-            batch_end = min(batch_start + batch_size, len(images))
-            batch_images = images[batch_start:batch_end]
+    def update_profile(
+        self,
+        model: nn.Module,
+        batch_images: List[Tensor],
+        state: Dict,
+    ) -> None:
+        """
+        Run one batch of images through the model and update Welford accumulators.
 
-            # Stack batch: [B, 1, C, H, W] → [B, C, H, W]
-            batch = torch.cat(batch_images, dim=0)
+        Args:
+            model:        frozen model (already on compute device)
+            batch_images: list of preprocessed [1, C, H, W] tensors (one batch)
+            state:        accumulator dict returned by init_profile()
+        """
+        counts, means, M2s, shapes = state['counts'], state['means'], state['M2s'], state['shapes']
 
-            captured: Dict[str, Tensor] = {}
-            hooks = []
+        # Stack batch: list of [1, C, H, W] → [B, C, H, W]
+        batch = torch.cat(batch_images, dim=0)
 
-            def make_hook(name: str):
-                def hook(module, inp, out):
-                    if isinstance(out, Tensor):
-                        captured[name] = out.detach().cpu().float()
-                return hook
+        captured: Dict[str, Tensor] = {}
+        hooks = []
 
-            for name, module in model.named_modules():
-                if len(list(module.children())) == 0:
-                    hooks.append(module.register_forward_hook(make_hook(name)))
+        def make_hook(name: str):
+            def hook(module, inp, out):
+                if isinstance(out, Tensor):
+                    captured[name] = out.detach().cpu().float()
+            return hook
 
-            try:
-                with torch.no_grad():
-                    model(batch)
-            finally:
-                for h in hooks:
-                    h.remove()
+        for name, module in model.named_modules():
+            if len(list(module.children())) == 0:
+                hooks.append(module.register_forward_hook(make_hook(name)))
 
-            # Welford update per layer, per image in batch
-            for layer_name, act in captured.items():
-                if layer_name not in counts:
+        try:
+            with torch.no_grad():
+                model(batch)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # Welford update per layer, per image in batch
+        for layer_name, act in captured.items():
+            if layer_name not in counts:
+                continue
+            for b in range(act.shape[0]):
+                x = act[b]
+                if x.shape != means[layer_name].shape:
                     continue
-                # act shape: [B, ...feature_dims...]
-                # Loop through batch to update per-image statistics
-                for b in range(act.shape[0]):
-                    x = act[b]  # extract single image: shape matches stored shape
-                    if x.shape != means[layer_name].shape:
-                        continue        # shape mismatch (e.g. dynamic layers) — skip
-                    counts[layer_name] += 1
-                    n = counts[layer_name]
-                    delta  = x - means[layer_name]
-                    means[layer_name] += delta / n
-                    delta2 = x - means[layer_name]
-                    M2s[layer_name]   += delta * delta2
+                counts[layer_name] += 1
+                n = counts[layer_name]
+                delta  = x - means[layer_name]
+                means[layer_name] += delta / n
+                delta2 = x - means[layer_name]
+                M2s[layer_name]   += delta * delta2
 
-        # Finalise: compute std from M2
+    def finish_profile(
+        self,
+        model_id: int,
+        state: Dict,
+    ) -> None:
+        """
+        Finalise accumulators: compute per-neuron std and beta, store results.
+
+        Args:
+            model_id: integer id to key the stored statistics
+            state:    accumulator dict returned by init_profile()
+        """
+        shapes, counts, M2s = state['shapes'], state['counts'], state['M2s']
+
         stds: Dict[str, Tensor] = {}
         for layer_name in shapes:
             n = counts[layer_name]
@@ -412,21 +420,34 @@ class NeuronSampler:
 
         self._neuron_stds[model_id] = stds
 
-        # Store the last layer to fire in the forward pass as the "final layer"
         layer_names = list(shapes.keys())
         if layer_names:
             self._final_layer_names[model_id] = layer_names[-1]
 
-        # β = 10% of median live-neuron std.
-        # Using the median (not a low percentile) ensures β stays well above the
-        # dead-neuron tail even when ReLU networks have 20-40% near-zero neurons.
+        # β = 10% of median live-neuron std
         all_stds = torch.cat([s.flatten() for s in stds.values()])
         live_stds = all_stds[all_stds > 1e-7]
-        if live_stds.numel() > 0:
-            beta = torch.median(live_stds).item() * 0.1
-        else:
-            beta = 1e-3  # fallback for pathological models
+        beta = torch.median(live_stds).item() * 0.1 if live_stds.numel() > 0 else 1e-3
         self._neuron_betas[model_id] = beta
+
+    def profile_model(
+        self,
+        model: nn.Module,
+        model_id: int,
+        images: List[Tensor],
+        sample_input_shape: Tuple[int, int, int],
+    ) -> None:
+        """
+        Convenience wrapper: profile a model from a pre-loaded list of images.
+
+        For incremental (memory-efficient) profiling, use init_profile() /
+        update_profile() / finish_profile() directly.
+        """
+        state = self.init_profile(model, sample_input_shape)
+        batch_size = 10
+        for batch_start in range(0, len(images), batch_size):
+            self.update_profile(model, images[batch_start:batch_start + batch_size], state)
+        self.finish_profile(model_id, state)
 
     def lookup_neuron_stds(
         self,

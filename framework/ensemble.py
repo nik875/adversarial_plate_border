@@ -28,6 +28,7 @@ import os
 import random
 import signal
 import tarfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -538,28 +539,40 @@ class EnsembleTrainer:
                 print(f"  {entry.name} ... loaded from cache ({cache_path.name})")
                 continue
 
-            # --- Cache miss: run Welford profiling with progress bar ---
-            print(f"  {entry.name} ... loading {n_images} images")
-            images = []
-            with tqdm(total=n_images, desc=f"    Load {entry.name}", leave=False) as pbar:
-                for _ in range(n_images):
-                    item = self.dataset_pool.sample()
-                    image = item.image.unsqueeze(0).to(self._device)
-                    images.append(entry.preprocess_fn(image))
-                    pbar.update(1)
+            # --- Cache miss: load and profile incrementally, batch by batch ---
+            # Each batch of images is loaded in parallel, profiled immediately,
+            # then discarded — only Welford accumulators (counts/means/M2s) stay in memory.
+            batch_size = 10
+            num_batches = (n_images + batch_size - 1) // batch_size
 
-            print(f"  {entry.name} ... profiling (batches of 10)")
             sample_shape = (3, *entry.input_shape)
             with self.ensemble.on_device(entry) as model:
-                self.neuron_sampler.profile_model(
-                    model=model,
-                    model_id=entry.model_id,
-                    images=images,
-                    sample_input_shape=sample_shape,
-                )
+                state = self.neuron_sampler.init_profile(model, sample_shape)
+
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    with tqdm(total=num_batches, desc=f"    {entry.name}", leave=False) as pbar:
+                        for batch_idx in range(num_batches):
+                            this_batch = min(batch_size, n_images - batch_idx * batch_size)
+
+                            # Load this batch's images in parallel (I/O-bound)
+                            futures = [
+                                executor.submit(
+                                    lambda: entry.preprocess_fn(
+                                        self.dataset_pool.sample().image.unsqueeze(0).to(self._device)
+                                    )
+                                )
+                                for _ in range(this_batch)
+                            ]
+                            batch_images = [f.result() for f in as_completed(futures)]
+
+                            # Update Welford accumulators, then images are discarded
+                            self.neuron_sampler.update_profile(model, batch_images, state)
+                            pbar.update(1)
+
+                self.neuron_sampler.finish_profile(entry.model_id, state)
 
             self.neuron_sampler.save_profile(entry.model_id, cache_path)
-            print(f"  {entry.name} ... done (saved to {cache_path.name})")
+            print(f"  {entry.name} done (saved to {cache_path.name})")
 
         print("Profiling complete.\n")
 
