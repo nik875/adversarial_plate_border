@@ -76,14 +76,18 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "==> Datasets available:"
-for ds in imagenet coco textvqa cc3m openimages; do
+total=0
+for ds in coco textvqa; do
     dir="$CACHE_DIR/$ds"
     if [[ -d "$dir" ]]; then
         n=$(find "$dir" -type f \( -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.JPEG" \) 2>/dev/null | wc -l)
         sz=$(du -sh "$dir" 2>/dev/null | cut -f1)
-        printf "  %-20s %8s images  %s\n" "$ds" "$n" "$sz"
+        printf "  %-20s %8d images  %s\n" "$ds" "$n" "$sz"
+        total=$((total + n))
     fi
 done
+echo "  ────────────────────────────────"
+printf "  %-20s %8d images\n" "TOTAL" "$total"
 echo ""
 echo "Done. Run training with:"
 echo "  python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml"

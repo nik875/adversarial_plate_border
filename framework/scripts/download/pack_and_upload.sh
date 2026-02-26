@@ -26,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-DATASETS=(imagenet coco textvqa cc3m openimages)
+DATASETS=(coco textvqa)
 
 # ---------------------------------------------------------------------------
 # 1. Build the tar archive
