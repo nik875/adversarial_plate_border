@@ -511,17 +511,17 @@ class EnsembleTrainer:
     # Neuron profiling
     # ------------------------------------------------------------------
 
-    def _profile_all_models(self, n_images: int = 30) -> None:
+    def _profile_all_models(self, n_images: int = 1000) -> None:
         """
         Precompute per-neuron activation std for every registered model.
 
         For each model, checks ~/.cache/adversarial_plate_profiles/ for a saved
         profile matching {model_name}_n{n_images}.pt.  If found, loads it
-        instantly.  Otherwise runs Welford profiling and saves the result for
-        future runs.
+        instantly.  Otherwise runs Welford profiling (batched, with progress bar)
+        and saves the result for future runs.
 
         Args:
-            n_images: number of images to profile with (cache key includes this)
+            n_images: number of images to profile with (default 1024, cache key includes this)
         """
         import os
         cache_dir = Path(os.path.expanduser('~/.cache/adversarial_plate_profiles'))
@@ -538,14 +538,17 @@ class EnsembleTrainer:
                 print(f"  {entry.name} ... loaded from cache ({cache_path.name})")
                 continue
 
-            # --- Cache miss: run Welford profiling ---
-            print(f"  {entry.name} ... profiling", end=' ', flush=True)
+            # --- Cache miss: run Welford profiling with progress bar ---
+            print(f"  {entry.name} ... loading {n_images} images")
             images = []
-            for _ in range(n_images):
-                item = self.dataset_pool.sample()
-                image = item.image.unsqueeze(0).to(self._device)
-                images.append(entry.preprocess_fn(image))
+            with tqdm(total=n_images, desc=f"    Load {entry.name}", leave=False) as pbar:
+                for _ in range(n_images):
+                    item = self.dataset_pool.sample()
+                    image = item.image.unsqueeze(0).to(self._device)
+                    images.append(entry.preprocess_fn(image))
+                    pbar.update(1)
 
+            print(f"  {entry.name} ... profiling (batches of 10)")
             sample_shape = (3, *entry.input_shape)
             with self.ensemble.on_device(entry) as model:
                 self.neuron_sampler.profile_model(
@@ -556,7 +559,7 @@ class EnsembleTrainer:
                 )
 
             self.neuron_sampler.save_profile(entry.model_id, cache_path)
-            print(f"done (saved to {cache_path.name})")
+            print(f"  {entry.name} ... done (saved to {cache_path.name})")
 
         print("Profiling complete.\n")
 
@@ -703,7 +706,7 @@ class EnsembleTrainer:
         samples_dir.mkdir(parents=True, exist_ok=True)
 
         # Precompute per-neuron activation statistics for all models (once per run)
-        self._profile_all_models(n_images=1024)
+        self._profile_all_models(n_images=1000)
 
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)
