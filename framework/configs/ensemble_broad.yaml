@@ -28,9 +28,9 @@ manifest: ~/.cache/adversarial_plate_manifest.csv
 # Attack strategies — any strategy can be used against any model
 # ---------------------------------------------------------------------------
 strategies:
-  - name: border
-    type: border
-    center_ratio: 0.625  # border_scale=1.6 (larger border, ~40% subject visible)
+  - name: sticker
+    type: sticker
+    area_fraction: 0.05  # sticker covers ~5% of image
     strategy_id: 0
 
 # ---------------------------------------------------------------------------
