@@ -40,6 +40,8 @@ def _progress(count, block_size, total_size):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output-dir', default=os.path.expanduser('~/.cache/textvqa'))
+    ap.add_argument('--max-samples', type=int, default=None,
+                    help='Randomly sample this many images')
     args = ap.parse_args()
 
     out = Path(args.output_dir)
@@ -66,6 +68,27 @@ def main():
     with zipfile.ZipFile(zip_path, 'r') as zf:
         zf.extractall(out)
     zip_path.unlink()
+
+    # --- Random sampling if --max-samples is set ---
+    if args.max_samples is not None:
+        print(f'\n==> Randomly sampling {args.max_samples:,} images...')
+        import random
+
+        all_images = list(out.rglob('*.jpg'))
+
+        if len(all_images) > args.max_samples:
+            sampled = random.sample(all_images, args.max_samples)
+            sampled_set = set(sampled)
+
+            deleted = 0
+            for img in all_images:
+                if img not in sampled_set:
+                    img.unlink()
+                    deleted += 1
+
+            print(f'   Kept {len(sampled):,} images, deleted {deleted:,} images')
+        else:
+            print(f'   Dataset has {len(all_images):,} images (≤ {args.max_samples:,}), keeping all')
 
     done_flag.touch()
     n = len(list(out.rglob('*.jpg')))

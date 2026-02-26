@@ -81,46 +81,21 @@ models:
 # Run framework/scripts/download/download_all.sh to populate these paths.
 # ---------------------------------------------------------------------------
 datasets:
-  # --- Labeled val splits (split: val) — never seen during training ----------
-  - name: imagenet_val
-    split: val
-    domain_type: natural                  # 50k images, class 0–999
-
-  - name: coco_val
-    split: val
-    domain_type: natural                  # 5k images, COCO category labels
-
-  # --- Train splits (split: train) -------------------------------------------
+  # --- Balanced 100k image subset for space-constrained training ---
   - name: imagenet_train
     split: train
-    domain_type: natural                  # 1.28M images at 640px
-
-  - name: imagenet_test
-    split: train
-    domain_type: natural                  # ~100k images, no labels
+    domain_type: natural                  # 34k images
+    max_samples: 34000
 
   - name: coco_train
     split: train
-    domain_type: natural                  # ~118k images
+    domain_type: natural                  # 33k images (sampled from train2017 + val2017)
+    max_samples: 33000
 
   - name: textvqa
     split: train
-    domain_type: text_in_scene            # ~34k text-in-scene images
-
-  - name: cc3m
-    split: train
-    domain_type: web_natural              # ~1.2M images at 640px
-
-  - name: openimages
-    split: train
-    domain_type: detection                # ~1M images at 640px
-
-  # --- Synthetic (no manifest entry — always uses root glob) ------------------
-  - name: synthetic
-    root: /tmp/synthetic_images
-    synthetic: true
-    max_samples: 50
-    domain_type: generic
+    domain_type: text_in_scene            # 33k images
+    max_samples: 33000
 
 # ---------------------------------------------------------------------------
 # Priors (character-texture decoders) — empty for broad generic training

@@ -111,7 +111,11 @@ def main():
                     help='Download validation set only (5k images, ~1 GB)')
     ap.add_argument('--skip-annotations', action='store_true',
                     help='Skip downloading annotation JSONs')
+    ap.add_argument('--max-samples',      type=int, default=None,
+                    help='Randomly sample this many images total (across train+val)')
     args = ap.parse_args()
+
+    import random
 
     out = Path(args.output_dir)
 
@@ -121,6 +125,32 @@ def main():
 
     if not args.skip_annotations:
         download_annotations(out)
+
+    # --- Random sampling if --max-samples is set ---
+    if args.max_samples is not None:
+        print(f'\n==> Randomly sampling {args.max_samples:,} images...')
+
+        # Collect all images across splits
+        all_images = []
+        for split_dir in [out / 'train2017', out / 'val2017']:
+            if split_dir.exists():
+                all_images.extend(split_dir.glob('*.jpg'))
+
+        if len(all_images) > args.max_samples:
+            # Sample randomly
+            sampled = random.sample(all_images, args.max_samples)
+            sampled_set = set(sampled)
+
+            # Delete non-sampled images
+            deleted = 0
+            for img in all_images:
+                if img not in sampled_set:
+                    img.unlink()
+                    deleted += 1
+
+            print(f'   Kept {len(sampled):,} images, deleted {deleted:,} images')
+        else:
+            print(f'   Dataset has {len(all_images):,} images (≤ {args.max_samples:,}), keeping all')
 
     print(f'\nDone. COCO saved to {out}')
 

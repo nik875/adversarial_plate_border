@@ -1,36 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
-# download_all.sh — Download all training datasets for broad ensemble training
+# download_all.sh — Download 100k balanced dataset subset for ensemble training
+#
+# Datasets: ImageNet-train (34k), COCO (33k sampled), TextVQA (33k sampled)
 #
 # Usage:
-#   export HF_TOKEN=hf_...    # required for ImageNet only
+#   export HF_TOKEN=hf_...    # required for ImageNet
 #   ./download_all.sh
-#   ./download_all.sh --data-root ~/.cache --jobs 16
-#   ./download_all.sh --skip-smoke   # skip smoke test, go straight to full download
+#   ./download_all.sh --data-root ~/.cache
 #
-# Runs a smoke-test phase first (small downloads to verify connectivity and
-# tooling), then proceeds with the full download only if all tests pass.
+# Requires: HF_TOKEN set for ImageNet, pip install datasets
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_ROOT="$HOME/.cache"
-JOBS=16
-SKIP_SMOKE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --data-root)   DATA_ROOT="$2"; shift 2 ;;
-        --jobs)        JOBS="$2";      shift 2 ;;
-        --skip-smoke)  SKIP_SMOKE=true; shift  ;;
+        --data-root) DATA_ROOT="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
 echo "============================================================"
-echo "  Ensemble training dataset downloader"
-echo "  Data root : $DATA_ROOT"
-echo "  Processes : $JOBS"
+echo "  Ensemble training dataset downloader (100k subset)"
+echo "  Data root: $DATA_ROOT"
 echo "============================================================"
 echo ""
 
@@ -42,191 +37,115 @@ count_images() {
 }
 
 # ---------------------------------------------------------------------------
-# PHASE 1: Smoke tests
+# Connectivity checks
 # ---------------------------------------------------------------------------
-if [[ "$SKIP_SMOKE" == false ]]; then
-    echo "============================================================"
-    echo "  PHASE 1: Smoke tests"
-    echo "  (small downloads to verify connectivity + tooling)"
-    echo "============================================================"
-    echo ""
-
-    SMOKE_DIR="$(mktemp -d)"
-    trap 'echo ""; echo "Cleaning up smoke test dir..."; rm -rf "$SMOKE_DIR"' EXIT
-    SMOKE_FAILED=0
-
-    # -- COCO: HEAD request only (ZIP download, can't do partial) -------------
-    echo ">>> Smoke [1/5]: COCO — checking URL reachability"
-    if curl -sf --head "http://images.cocodataset.org/zips/val2017.zip" > /dev/null; then
-        echo "    PASS"
-    else
-        echo "    FAIL: COCO server unreachable"
-        SMOKE_FAILED=1
-    fi
-    echo ""
-
-    # -- TextVQA: HEAD request only -------------------------------------------
-    echo ">>> Smoke [2/5]: TextVQA — checking URL reachability"
-    if curl -sf --head "https://dl.fbaipublicfiles.com/textvqa/images/train_val_images.zip" > /dev/null; then
-        echo "    PASS"
-    else
-        echo "    FAIL: TextVQA server unreachable"
-        SMOKE_FAILED=1
-    fi
-    echo ""
-
-    # -- CC3M: stream 200 metadata rows, fetch ~100 images --------------------
-    echo ">>> Smoke [3/5]: CC3M — streaming metadata + downloading ~100 images"
-    if python "$SCRIPT_DIR/download_cc3m.py" \
-        --output-dir "$SMOKE_DIR/cc3m" \
-        --url-count 200 \
-        --processes 2; then
-        n=$(count_images "$SMOKE_DIR/cc3m")
-        if [[ $n -gt 0 ]]; then
-            echo "    PASS ($n images downloaded)"
-        else
-            echo "    FAIL: 0 images downloaded — check img2dataset install or network"
-            SMOKE_FAILED=1
-        fi
-    else
-        echo "    FAIL: script exited with error"
-        SMOKE_FAILED=1
-    fi
-    echo ""
-
-    # -- OpenImages: download 50 images from S3 -------------------------------
-    echo ">>> Smoke [4/5]: OpenImages — downloading 50 images from S3"
-    if python "$SCRIPT_DIR/download_openimages.py" \
-        --output-dir "$SMOKE_DIR/openimages" \
-        --num-samples 50 \
-        --processes 2; then
-        n=$(count_images "$SMOKE_DIR/openimages")
-        if [[ $n -ge 40 ]]; then
-            echo "    PASS ($n/50 images downloaded)"
-        else
-            echo "    FAIL: only $n/50 images — S3 URLs should be stable, check network"
-            SMOKE_FAILED=1
-        fi
-    else
-        echo "    FAIL: script exited with error"
-        SMOKE_FAILED=1
-    fi
-    echo ""
-
-    # -- ImageNet: verify HF token + stream 1 sample --------------------------
-    echo ">>> Smoke [5/5]: ImageNet"
-    if [[ -z "${HF_TOKEN:-}" ]]; then
-        echo "    SKIP (HF_TOKEN not set — ImageNet will be skipped in full download too)"
-    else
-        if python - <<'PYEOF'
+echo ">>> Checking connectivity..."
+echo -n "  ImageNet (HuggingFace): "
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    echo "SKIP (HF_TOKEN not set)"
+    SKIP_IMAGENET=1
+else
+    if python - <<'PYEOF'
 import os, sys
 try:
     from huggingface_hub import HfApi
     api = HfApi(token=os.environ['HF_TOKEN'])
     info = api.dataset_info('ILSVRC/imagenet-1k')
     assert info.id is not None
-    print("    PASS (token valid, dataset accessible)")
+    print("OK")
 except Exception as e:
-    print(f"    FAIL: {e}", file=sys.stderr)
+    print(f"FAIL ({e})", file=sys.stderr)
     sys.exit(1)
 PYEOF
-        then
-            : # pass already printed inside python
-        else
-            echo "    FAIL: ImageNet token check failed"
-            SMOKE_FAILED=1
-        fi
-    fi
-    echo ""
-
-    # -- Result ----------------------------------------------------------------
-    # Disable the EXIT trap before the failure check so we control cleanup
-    trap - EXIT
-    rm -rf "$SMOKE_DIR"
-
-    if [[ $SMOKE_FAILED -ne 0 ]]; then
-        echo "============================================================"
-        echo "  SMOKE TEST FAILED — fix the issues above before re-running"
-        echo "  To skip smoke tests: ./download_all.sh --skip-smoke"
-        echo "============================================================"
+    then
+        SKIP_IMAGENET=0
+    else
+        echo "Token check failed"
         exit 1
     fi
+fi
 
-    echo "============================================================"
-    echo "  All smoke tests passed — proceeding with full download"
-    echo "============================================================"
+echo -n "  COCO (cocodataset.org): "
+if curl -sf --head "http://images.cocodataset.org/zips/val2017.zip" > /dev/null; then
+    echo "OK"
+else
+    echo "FAIL"
+    exit 1
+fi
+
+echo -n "  TextVQA (fbaipublicfiles.com): "
+if curl -sf --head "https://dl.fbaipublicfiles.com/textvqa/images/train_val_images.zip" > /dev/null; then
+    echo "OK"
+else
+    echo "FAIL"
+    exit 1
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# Download datasets
+# ---------------------------------------------------------------------------
+echo "============================================================"
+echo "  Downloading datasets..."
+echo "============================================================"
+echo ""
+
+# ---- 1. ImageNet-train (streaming, stops at 34k) ----
+if [[ $SKIP_IMAGENET -eq 0 ]]; then
+    echo ">>> [1/3] ImageNet-train (34,000 images, streaming download)"
+    python "$SCRIPT_DIR/download_imagenet.py" \
+        --output-dir "$DATA_ROOT/imagenet" \
+        --train-samples 34000 \
+        --skip-test \
+        --max-size 640
+    echo ""
+else
+    echo ">>> [1/3] ImageNet-train — SKIPPED (HF_TOKEN not set)"
     echo ""
 fi
 
-# ---------------------------------------------------------------------------
-# PHASE 2: Full download
-# ---------------------------------------------------------------------------
-echo "============================================================"
-echo "  PHASE 2: Full download"
-echo "============================================================"
-echo ""
-
-# ---- 1. ImageNet-1K (requires HF_TOKEN) ------------------------------------
-echo ">>> [1/5] ImageNet-1K val (50k) + train (1.28M) + test (~100k images)"
-if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "    SKIP: HF_TOKEN not set."
-    echo "    To download ImageNet:"
-    echo "      1. Accept license: https://huggingface.co/datasets/ILSVRC/imagenet-1k"
-    echo "      2. export HF_TOKEN=hf_..."
-    echo "      3. python $SCRIPT_DIR/download_imagenet.py --output-dir $DATA_ROOT/imagenet"
-else
-    python "$SCRIPT_DIR/download_imagenet.py" \
-        --output-dir "$DATA_ROOT/imagenet" \
-        --train-samples 1300000 \
-        --max-size 640
-fi
-echo ""
-
-# ---- 2. COCO 2017 -----------------------------------------------------------
-echo ">>> [2/5] COCO 2017 (train: 118k + val: 5k images)"
+# ---- 2. COCO (33k sampled from train+val) ----
+echo ">>> [2/3] COCO (33,000 images randomly sampled)"
 python "$SCRIPT_DIR/download_coco.py" \
-    --output-dir "$DATA_ROOT/coco"
+    --output-dir "$DATA_ROOT/coco" \
+    --max-samples 33000
 echo ""
 
-# ---- 3. TextVQA -------------------------------------------------------------
-echo ">>> [3/5] TextVQA train+val images (~34k text-in-scene images)"
+# ---- 3. TextVQA (33k sampled) ----
+echo ">>> [3/3] TextVQA (33,000 images randomly sampled)"
 python "$SCRIPT_DIR/download_textvqa.py" \
-    --output-dir "$DATA_ROOT/textvqa"
+    --output-dir "$DATA_ROOT/textvqa" \
+    --max-samples 33000
 echo ""
 
-# ---- 4. CC3M subset ---------------------------------------------------------
-echo ">>> [4/5] CC3M subset (~1.2M images via img2dataset)"
-python "$SCRIPT_DIR/download_cc3m.py" \
-    --output-dir "$DATA_ROOT/cc3m" \
-    --url-count 2500000 \
-    --processes "$JOBS"
-echo ""
-
-# ---- 5. Open Images V7 subset -----------------------------------------------
-echo ">>> [5/5] Open Images V7 (1M images from S3)"
-python "$SCRIPT_DIR/download_openimages.py" \
-    --output-dir "$DATA_ROOT/openimages" \
-    --num-samples 1000000 \
-    --processes "$JOBS"
-echo ""
-
-# ---- Manifest generation ---------------------------------------------------
-echo ">>> Generating dataset manifest CSV..."
-python "$SCRIPT_DIR/generate_manifest.py" --data-root "$DATA_ROOT"
-echo ""
-
-# ---- Summary ----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 echo "============================================================"
 echo "  Download complete. Final image counts:"
-for dir in imagenet/val imagenet/train imagenet/test \
-           coco/train2017 coco/val2017 \
-           textvqa/train_val_images cc3m/images openimages/images; do
-    full="$DATA_ROOT/$dir"
-    if [[ -d "$full" ]]; then
-        n=$(count_images "$full")
-        printf "  %-40s %s images\n" "$dir" "$n"
+echo "============================================================"
+
+total=0
+for name in imagenet coco textvqa; do
+    case "$name" in
+        imagenet) pattern="$DATA_ROOT/imagenet/train" ;;
+        coco) pattern="$DATA_ROOT/coco" ;;
+        textvqa) pattern="$DATA_ROOT/textvqa" ;;
+    esac
+
+    if [[ -d "$pattern" ]]; then
+        n=$(count_images "$pattern")
+        printf "  %-20s %8d images\n" "$name" "$n"
+        total=$((total + n))
     else
-        printf "  %-40s (not found)\n" "$dir"
+        printf "  %-20s (not found)\n" "$name"
     fi
 done
+
+echo "  ────────────────────────────────"
+printf "  %-20s %8d images\n" "TOTAL" "$total"
 echo "============================================================"
+echo ""
+echo "Ready to train with:"
+echo "  python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml"
