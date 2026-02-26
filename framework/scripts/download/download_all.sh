@@ -2,14 +2,13 @@
 # =============================================================================
 # download_all.sh — Download 100k balanced dataset subset for ensemble training
 #
-# Datasets: ImageNet-train (34k), COCO (33k sampled), TextVQA (33k sampled)
+# Datasets: COCO (66k sampled), TextVQA (34k sampled)
+# No ImageNet to avoid HuggingFace infrastructure bottlenecks
 #
 # Usage:
-#   export HF_TOKEN=hf_...    # required for ImageNet
 #   ./download_all.sh
 #   ./download_all.sh --data-root ~/.cache
 #
-# Requires: HF_TOKEN set for ImageNet, pip install datasets
 # =============================================================================
 set -euo pipefail
 
@@ -40,30 +39,6 @@ count_images() {
 # Connectivity checks
 # ---------------------------------------------------------------------------
 echo ">>> Checking connectivity..."
-echo -n "  ImageNet (HuggingFace): "
-if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "SKIP (HF_TOKEN not set)"
-    SKIP_IMAGENET=1
-else
-    if python - <<'PYEOF'
-import os, sys
-try:
-    from huggingface_hub import HfApi
-    api = HfApi(token=os.environ['HF_TOKEN'])
-    info = api.dataset_info('ILSVRC/imagenet-1k')
-    assert info.id is not None
-    print("OK")
-except Exception as e:
-    print(f"FAIL ({e})", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-    then
-        SKIP_IMAGENET=0
-    else
-        echo "Token check failed"
-        exit 1
-    fi
-fi
 
 echo -n "  COCO (cocodataset.org): "
 if curl -sf --head "http://images.cocodataset.org/zips/val2017.zip" > /dev/null; then
@@ -91,32 +66,18 @@ echo "  Downloading datasets..."
 echo "============================================================"
 echo ""
 
-# ---- 1. ImageNet-train (streaming, stops at 34k) ----
-if [[ $SKIP_IMAGENET -eq 0 ]]; then
-    echo ">>> [1/3] ImageNet-train (34,000 images, streaming download)"
-    python "$SCRIPT_DIR/download_imagenet.py" \
-        --output-dir "$DATA_ROOT/imagenet" \
-        --train-samples 34000 \
-        --skip-test \
-        --max-size 640
-    echo ""
-else
-    echo ">>> [1/3] ImageNet-train — SKIPPED (HF_TOKEN not set)"
-    echo ""
-fi
-
-# ---- 2. COCO (33k sampled from train+val) ----
-echo ">>> [2/3] COCO (33,000 images randomly sampled)"
+# ---- 1. COCO (66k sampled from train+val) ----
+echo ">>> [1/2] COCO (66,000 images randomly sampled)"
 python "$SCRIPT_DIR/download_coco.py" \
     --output-dir "$DATA_ROOT/coco" \
-    --max-samples 33000
+    --max-samples 66000
 echo ""
 
-# ---- 3. TextVQA (33k sampled) ----
-echo ">>> [3/3] TextVQA (33,000 images randomly sampled)"
+# ---- 2. TextVQA (34k sampled) ----
+echo ">>> [2/2] TextVQA (34,000 images randomly sampled)"
 python "$SCRIPT_DIR/download_textvqa.py" \
     --output-dir "$DATA_ROOT/textvqa" \
-    --max-samples 33000
+    --max-samples 34000
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -127,9 +88,8 @@ echo "  Download complete. Final image counts:"
 echo "============================================================"
 
 total=0
-for name in imagenet coco textvqa; do
+for name in coco textvqa; do
     case "$name" in
-        imagenet) pattern="$DATA_ROOT/imagenet/train" ;;
         coco) pattern="$DATA_ROOT/coco" ;;
         textvqa) pattern="$DATA_ROOT/textvqa" ;;
     esac

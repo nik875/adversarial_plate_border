@@ -81,21 +81,16 @@ models:
 # Run framework/scripts/download/download_all.sh to populate these paths.
 # ---------------------------------------------------------------------------
 datasets:
-  # --- Balanced 100k image subset for space-constrained training ---
-  - name: imagenet_train
-    split: train
-    domain_type: natural                  # 34k images
-    max_samples: 34000
-
+  # --- Balanced 100k image subset: COCO (66k) + TextVQA (34k) ---
   - name: coco_train
     split: train
-    domain_type: natural                  # 33k images (sampled from train2017 + val2017)
-    max_samples: 33000
+    domain_type: natural                  # 66k images (sampled from train2017 + val2017)
+    max_samples: 66000
 
   - name: textvqa
     split: train
-    domain_type: text_in_scene            # 33k images
-    max_samples: 33000
+    domain_type: text_in_scene            # 34k images
+    max_samples: 34000
 
 # ---------------------------------------------------------------------------
 # Priors (character-texture decoders) — empty for broad generic training
