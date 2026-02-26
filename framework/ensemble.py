@@ -41,7 +41,7 @@ from torch import Tensor, optim
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from framework.base.attack_strategy import AttackStrategy, StickerStrategy
+from framework.base.attack_strategy import AttackStrategy, BorderStrategy, StickerStrategy
 from framework.dataset_pool import LazyDatasetPool
 from framework.generator import FoundationPatchGenerator
 from framework.losses import total_variation_loss, compute_spectrum_loss
@@ -569,33 +569,35 @@ class EnsembleTrainer:
         print(f"\nProfiling {self.ensemble.num_models()} models "
               f"({n_images} images each) for per-neuron std ...")
 
+        patch_h = self.generator.patch_height
+        patch_w = self.generator.patch_width
+        all_strategies = [se.strategy for se in self.ensemble._strategies]
+
         for entry in self.ensemble._entries:
-            cache_path = cache_dir / f'{entry.name}_n{n_images}.pt'
+            # Cache key includes '_delta' to distinguish from old raw-activation profiles
+            cache_path = cache_dir / f'{entry.name}_n{n_images}_delta.pt'
 
             # --- Try loading from cache ---
             if self.neuron_sampler.load_profile(entry.model_id, cache_path):
                 print(f"  {entry.name} ... loaded from cache ({cache_path.name})")
                 continue
 
-            # --- Cache miss: DataLoader loads batches in parallel, profile incrementally ---
-            # Workers preprocess on CPU; main thread moves to GPU and updates accumulators.
-            # Only Welford state stays in memory between batches.
+            # --- Cache miss: profile std of activation DELTAS (patched - clean) ---
+            # Workers load raw images on CPU; main thread composites and preprocesses on GPU.
+            # Each batch: neutral-border images vs randomly-attacked images → one 2B forward pass.
             class _ProfilingDataset(torch.utils.data.Dataset):
-                def __init__(self, pool, n, preprocess_fn):
+                def __init__(self, pool, n):
                     self.pool = pool
                     self.n = n
-                    self.preprocess_fn = preprocess_fn
 
                 def __len__(self):
                     return self.n
 
                 def __getitem__(self, idx):
-                    item = self.pool.sample()
-                    # preprocess on CPU (workers can't use CUDA); squeeze so
-                    # DataLoader stacks into [B, C, H, W] not [B, 1, C, H, W]
-                    return self.preprocess_fn(item.image.unsqueeze(0)).squeeze(0)
+                    # Return raw image — compositing + preprocessing happens on GPU in main thread
+                    return self.pool.sample().image  # [3, H, W]
 
-            dataset = _ProfilingDataset(self.dataset_pool, n_images, entry.preprocess_fn)
+            dataset = _ProfilingDataset(self.dataset_pool, n_images)
             loader = torch.utils.data.DataLoader(
                 dataset,
                 batch_size=10,
@@ -609,9 +611,26 @@ class EnsembleTrainer:
             with self.ensemble.on_device(entry) as model:
                 state = self.neuron_sampler.init_profile(model, sample_shape, device=self._device)
                 with tqdm(total=num_batches, desc=f"    {entry.name}", leave=False) as pbar:
-                    for batch in loader:
-                        batch = batch.to(self._device)
-                        self.neuron_sampler.update_profile(model, batch, state)
+                    for raw_batch in loader:
+                        raw_batch = raw_batch.to(self._device)  # [B, 3, H, W]
+
+                        # Randomly pick an attack strategy for this batch
+                        strategy = random.choice(all_strategies) if all_strategies else BorderStrategy()
+                        strategy_kwargs = strategy.sample_kwargs(
+                            raw_batch, patch_h, patch_w,
+                            model_input_shape=entry.input_shape,
+                        )
+
+                        # Clean: neutral-border composite → preprocess
+                        clean_composited = strategy.apply_neutral(raw_batch, **strategy_kwargs)
+                        clean_batch = entry.preprocess_fn(clean_composited)
+
+                        # Attacked: uniform-random patch → preprocess
+                        rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
+                        patched_composited, _ = strategy.apply(raw_batch, rand_patch, **strategy_kwargs)
+                        patched_batch = entry.preprocess_fn(patched_composited)
+
+                        self.neuron_sampler.update_profile_delta(model, clean_batch, patched_batch, state)
                         pbar.update(1)
                 self.neuron_sampler.finish_profile(entry.model_id, state)
 

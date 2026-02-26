@@ -346,6 +346,64 @@ class NeuronSampler:
             'M2s':    {n: torch.zeros(s, dtype=torch.float32, device=dev) for n, s in shapes.items()},
         }
 
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+
+    def _run_and_capture(self, model: nn.Module, batch: Tensor) -> Dict[str, Tensor]:
+        """Single forward pass; returns {layer_name: activation} for all leaf modules."""
+        captured: Dict[str, Tensor] = {}
+        hooks = []
+
+        def make_hook(name: str):
+            def hook(module, inp, out):
+                if isinstance(out, Tensor):
+                    captured[name] = out.detach().float()
+            return hook
+
+        for name, module in model.named_modules():
+            if len(list(module.children())) == 0:
+                hooks.append(module.register_forward_hook(make_hook(name)))
+        try:
+            with torch.no_grad():
+                model(batch)
+        finally:
+            for h in hooks:
+                h.remove()
+        return captured
+
+    # ------------------------------------------------------------------
+
+    def _welford_update(
+        self,
+        flat: Tensor,          # [B, per_sample_size] — values to accumulate
+        layer_name: str,
+        B: int,
+        counts: Dict,
+        means: Dict,
+        M2s: Dict,
+        expected_shape: Tuple,
+    ) -> None:
+        """Apply Chan's parallel Welford update in-place for one layer."""
+        per_sample_size = flat.shape[1]
+
+        batch_mean = flat.mean(dim=0)
+        batch_M2   = ((flat - batch_mean.unsqueeze(0)) ** 2).sum(dim=0)
+
+        n_A = counts[layer_name]
+        n_C = n_A + B
+
+        cur_mean = means[layer_name].reshape(per_sample_size)
+        cur_M2   = M2s[layer_name].reshape(per_sample_size)
+
+        delta    = batch_mean - cur_mean
+        new_mean = cur_mean + delta * (B / n_C)
+        new_M2   = cur_M2 + batch_M2 + delta ** 2 * (n_A * B / n_C)
+
+        means[layer_name]  = new_mean.reshape(expected_shape)
+        M2s[layer_name]    = new_M2.reshape(expected_shape)
+        counts[layer_name] = n_C
+
     def update_profile(
         self,
         model: nn.Module,
@@ -353,11 +411,8 @@ class NeuronSampler:
         state: Dict,
     ) -> None:
         """
-        Run one batch of images through the model and update Welford accumulators.
-
-        Uses Chan's parallel Welford formula to update the entire batch at once
-        (no Python loop over images). Activations stay on the model's device
-        until finish_profile() moves the final stds to CPU.
+        Run one batch of images through the model and update Welford accumulators
+        with raw activations.
 
         Args:
             model:  frozen model (already on compute device)
@@ -366,30 +421,9 @@ class NeuronSampler:
         """
         counts, means, M2s, shapes = state['counts'], state['means'], state['M2s'], state['shapes']
         B = batch.shape[0]
-
-        captured: Dict[str, Tensor] = {}
-        hooks = []
-
-        def make_hook(name: str):
-            def hook(module, inp, out):
-                if isinstance(out, Tensor):
-                    # Keep on GPU — no .cpu() here (would serialize every layer)
-                    captured[name] = out.detach().float()
-            return hook
-
-        for name, module in model.named_modules():
-            if len(list(module.children())) == 0:
-                hooks.append(module.register_forward_hook(make_hook(name)))
-
-        try:
-            with torch.no_grad():
-                model(batch)
-        finally:
-            for h in hooks:
-                h.remove()
+        captured = self._run_and_capture(model, batch)
 
         # Chan's parallel Welford: combine running state with entire batch at once.
-        # This replaces the per-image Python loop and keeps all ops on the GPU.
         for layer_name, act in captured.items():
             if layer_name not in counts:
                 continue
@@ -399,31 +433,62 @@ class NeuronSampler:
             for s in expected_shape:
                 per_sample_size *= s
 
-            # Skip layers whose output shape doesn't match what was seen at discovery time
             if act.numel() != B * per_sample_size:
                 continue
 
-            # Flatten activations to [B, per_sample_size] for vectorised ops
-            flat = act.reshape(B, per_sample_size)
+            self._welford_update(
+                act.reshape(B, per_sample_size),
+                layer_name, B, counts, means, M2s, expected_shape,
+            )
 
-            # Batch statistics (fully on GPU)
-            batch_mean = flat.mean(dim=0)                                  # [per_sample_size]
-            batch_M2   = ((flat - batch_mean.unsqueeze(0)) ** 2).sum(dim=0)  # [per_sample_size]
+    def update_profile_delta(
+        self,
+        model: nn.Module,
+        clean_batch: Tensor,
+        patched_batch: Tensor,
+        state: Dict,
+    ) -> None:
+        """
+        Profile std of activation DELTAS (patched − clean) using a single
+        concatenated forward pass [clean | patched] → split → subtract.
 
-            # Chan's parallel combination with running accumulators
-            n_A = counts[layer_name]
-            n_C = n_A + B
+        This matches progressive_patch's calibration: quality=1.0 means the
+        adversarial patch moves activations by as much as a typical random patch,
+        rather than by as much as natural image variation.
 
-            cur_mean = means[layer_name].reshape(per_sample_size)
-            cur_M2   = M2s[layer_name].reshape(per_sample_size)
+        Args:
+            model:         frozen model on compute device
+            clean_batch:   [B, C, H, W] neutral-border images, preprocessed
+            patched_batch: [B, C, H, W] randomly-attacked images, preprocessed
+            state:         accumulator dict from init_profile()
+        """
+        counts, means, M2s, shapes = state['counts'], state['means'], state['M2s'], state['shapes']
+        B = clean_batch.shape[0]
 
-            delta    = batch_mean - cur_mean
-            new_mean = cur_mean + delta * (B / n_C)
-            new_M2   = cur_M2 + batch_M2 + delta ** 2 * (n_A * B / n_C)
+        # One forward pass handles both halves — halves kernel-launch overhead
+        combined  = torch.cat([clean_batch, patched_batch], dim=0)  # [2B, C, H, W]
+        captured  = self._run_and_capture(model, combined)
 
-            means[layer_name]  = new_mean.reshape(expected_shape)
-            M2s[layer_name]    = new_M2.reshape(expected_shape)
-            counts[layer_name] = n_C
+        for layer_name, act in captured.items():
+            if layer_name not in counts:
+                continue
+
+            expected_shape = shapes[layer_name]
+            per_sample_size = 1
+            for s in expected_shape:
+                per_sample_size *= s
+
+            # Need exactly 2B samples to split into clean / patched halves
+            if act.numel() != 2 * B * per_sample_size:
+                continue
+
+            act_flat = act.reshape(2 * B, per_sample_size)
+            delta    = act_flat[B:] - act_flat[:B]           # [B, per_sample_size]
+
+            self._welford_update(
+                delta,
+                layer_name, B, counts, means, M2s, expected_shape,
+            )
 
     def finish_profile(
         self,
