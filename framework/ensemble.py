@@ -533,7 +533,7 @@ class EnsembleTrainer:
                     acc['diversity']     += log_det.item()
                     acc['quality']       += quality.item()
                     acc['final_quality'] += final_quality.item()
-                    acc['tv']            += tv_raw.item()
+                    acc['tv']            += (self.tv_weight * tv_raw).item()
                     acc['spectrum']      += spec_raw.item()
                     acc['model']          = entry.name
 
