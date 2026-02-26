@@ -254,6 +254,8 @@ class EnsembleTrainer:
         max_epochs: int = 100,
         output_dir: str = 'ensemble_output',
         save_every_epochs: int = 5,
+        warmup_steps: int = 0,
+        warmup_model: Optional[str] = None,
         device: Optional[torch.device] = None,
     ):
         self.ensemble = ensemble
@@ -275,6 +277,8 @@ class EnsembleTrainer:
         self.max_epochs = max_epochs
         self.output_dir = Path(output_dir)
         self.save_every_epochs = save_every_epochs
+        self.warmup_steps = warmup_steps
+        self.warmup_model = warmup_model
 
         self._device = device or ensemble.compute_device
         self.generator = self.generator.to(self._device)
@@ -342,6 +346,7 @@ class EnsembleTrainer:
     def _train_step(
         self,
         optimizer: optim.Optimizer,
+        entries_override=None,
     ) -> Dict[str, float]:
         """
         One optimizer update accumulating gradients over images_per_batch images.
@@ -362,7 +367,7 @@ class EnsembleTrainer:
         }
 
         # Balanced distribution: N images split evenly across all models
-        all_entries = list(self.ensemble._entries)
+        all_entries = entries_override if entries_override is not None else list(self.ensemble._entries)
         n_models = len(all_entries)
         images_per_model = N // n_models
         remainder = N % n_models
@@ -702,6 +707,37 @@ class EnsembleTrainer:
 
         # Raise KeyboardInterrupt immediately on Ctrl+C so we can save and exit
         signal.signal(signal.SIGINT, signal.default_int_handler)
+
+        # --- Warmup phase ---
+        if self.warmup_steps > 0 and self.warmup_model and global_step == 0:
+            warmup_entries = [e for e in self.ensemble._entries if e.name == self.warmup_model]
+            if not warmup_entries:
+                print(f"WARNING: warmup_model '{self.warmup_model}' not found in ensemble — skipping warmup")
+            else:
+                print(f"\n{'='*60}")
+                print(f"Warmup phase: {self.warmup_steps} steps on '{self.warmup_model}'")
+                print(f"{'='*60}")
+                self.generator.train(); self.task_encoder.train()
+                all_params = list(self.generator.parameters()) + list(self.task_encoder.parameters())
+                with tqdm(total=self.warmup_steps, desc="Warmup") as wpbar:
+                    for _ in range(self.warmup_steps):
+                        optimizer.zero_grad()
+                        info = self._train_step(optimizer, entries_override=warmup_entries)
+                        self.scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+                        scale_before = self.scaler.get_scale()
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+                        if self.scaler.get_scale() >= scale_before:
+                            scheduler.step()
+                        global_step += 1
+                        wpbar.set_postfix({
+                            'loss': f"{info['loss']:.4f}",
+                            'qual': f"{info['final_quality']:.4f}",
+                            'lr':   f"{optimizer.param_groups[1]['lr']:.2e}",
+                        })
+                        wpbar.update(1)
+                print(f"Warmup complete. global_step={global_step}\n")
 
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()

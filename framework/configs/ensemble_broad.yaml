@@ -166,3 +166,5 @@ trainer:
   spectrum_weight: 2.0
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
+  warmup_steps: 100
+  warmup_model: clip_vit_l14
