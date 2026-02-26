@@ -88,7 +88,7 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # Training subset (streaming — avoids loading full 1.28M into RAM)
+    # Training subset (streaming + .take() — only downloads what's needed)
     # ------------------------------------------------------------------
     train_dir = out / 'train'
     train_done = train_dir / '.done'
@@ -99,10 +99,10 @@ def main():
         train_dir.mkdir(parents=True, exist_ok=True)
         ds_train = load_dataset('ILSVRC/imagenet-1k', split='train',
                                 token=token, streaming=True)
+        # Use .take() to only fetch the exact number of samples needed
+        ds_train = ds_train.take(args.train_samples)
         saved = 0
         for sample in ds_train:
-            if saved >= args.train_samples:
-                break
             cls_dir = train_dir / f'{sample["label"]:04d}'
             cls_dir.mkdir(exist_ok=True)
             save_image(sample['image'], cls_dir / f'{saved:08d}.JPEG')
@@ -129,6 +129,7 @@ def main():
     test_dir.mkdir(parents=True, exist_ok=True)
     ds_test = load_dataset('ILSVRC/imagenet-1k', split='test',
                            token=token, streaming=True)
+    # Stream and save all test images (no limit)
     saved = 0
     for sample in ds_test:
         save_image(sample['image'], test_dir / f'{saved:08d}.JPEG')
