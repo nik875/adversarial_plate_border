@@ -284,8 +284,7 @@ def apply_attacks(
                 print(f"Skipping {strategy_name}: no patches loaded")
                 continue
 
-            total_attacks = len(patches_list) * len(images)
-            print(f"\n{strategy_name}: {len(patches_list)} patches × {len(images)} images = {total_attacks} attacks")
+            print(f"\n{strategy_name}: {len(patches_list)} patches (1 image per patch)")
 
             # Count patches per model for progress tracking
             models = set(model for _, model, _ in patches_list)
@@ -294,34 +293,36 @@ def apply_attacks(
                 model_dir = output_dir / strategy_name / model_name
                 model_dir.mkdir(parents=True, exist_ok=True)
 
-                for img_idx, (image, img_filename) in enumerate(tqdm(
-                    images, desc=f"{strategy_name}/{model_name}", leave=False
+                for patch_idx, (patch, patch_id) in enumerate(tqdm(
+                    model_patches, desc=f"{strategy_name}/{model_name}", leave=False
                 )):
-                    for patch, patch_id in model_patches:
-                        # Prepare image as batch [1, 3, H, W]
-                        image_batch = image.unsqueeze(0)
+                    # Pick one random image for this patch
+                    image, img_filename = images[patch_idx % len(images)]
 
-                        # Apply strategy
-                        if strategy_name == 'border':
-                            # Resize image to patch size for border strategy
-                            patch_h, patch_w = patch.shape[1], patch.shape[2]
-                            image_resized = torch.nn.functional.interpolate(
-                                image_batch,
-                                size=(patch_h, patch_w),
-                                mode='bilinear',
-                                align_corners=False
-                            )
-                            composited, _ = strategy.apply(image_resized, patch)
-                        else:
-                            # Sticker and perturbation use original image size
-                            composited, _ = strategy.apply(image_batch, patch)
+                    # Prepare image as batch [1, 3, H, W]
+                    image_batch = image.unsqueeze(0)
 
-                        composited = composited.squeeze(0)
-
-                        # Save attacked image: {patch_id}_attacked.png
-                        tensor_to_pil(composited).save(
-                            model_dir / f"{patch_id}_attacked.png"
+                    # Apply strategy
+                    if strategy_name == 'border':
+                        # Resize image to patch size for border strategy
+                        patch_h, patch_w = patch.shape[1], patch.shape[2]
+                        image_resized = torch.nn.functional.interpolate(
+                            image_batch,
+                            size=(patch_h, patch_w),
+                            mode='bilinear',
+                            align_corners=False
                         )
+                        composited, _ = strategy.apply(image_resized, patch)
+                    else:
+                        # Sticker and perturbation use original image size
+                        composited, _ = strategy.apply(image_batch, patch)
+
+                    composited = composited.squeeze(0)
+
+                    # Save attacked image: {patch_id}_attacked.png
+                    tensor_to_pil(composited).save(
+                        model_dir / f"{patch_id}_attacked.png"
+                    )
 
     print(f"\n✓ Attack outputs saved to: {output_dir}")
     return output_dir
