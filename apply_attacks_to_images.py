@@ -67,38 +67,49 @@ def load_image_from_path(image_path: str) -> Tuple[torch.Tensor, str]:
         return None, None
 
 
-def find_latest_checkpoint_patches(run_dir: str) -> Path:
+def find_latest_patches(run_dir: str) -> Path:
     """
-    Find the latest checkpoint's example_samples in a run directory.
+    Find the latest sample patches in a run directory.
 
-    Looks for checkpoint_epoch_XXXX directories and returns example_samples
-    from the one with the highest epoch number.
+    Looks for step_XXXXXXX.tar files and extracts patches from the latest one.
 
     Args:
         run_dir: Path to run directory (e.g., runs/broad_ensemble/run_20260227_051206/)
 
     Returns:
-        Path to example_samples directory of latest checkpoint
+        Path to directory containing patch PNG files
     """
+    import tempfile
+
     run_dir = Path(run_dir)
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    checkpoint_dirs = sorted([
-        d for d in run_dir.rglob('checkpoint_epoch_*')
-        if d.is_dir()
-    ])
+    samples_dir = run_dir / 'samples'
+    if not samples_dir.exists():
+        raise FileNotFoundError(f"samples directory not found in {run_dir}")
 
-    if not checkpoint_dirs:
-        raise FileNotFoundError(f"No checkpoint directories found in {run_dir}")
+    # Find latest step tar file
+    step_tars = sorted(samples_dir.glob('step_*.tar'))
+    if not step_tars:
+        raise FileNotFoundError(f"No step_*.tar files found in {samples_dir}")
 
-    latest_ckpt = checkpoint_dirs[-1]
-    example_samples = latest_ckpt / 'example_samples'
-    if not example_samples.exists():
-        raise FileNotFoundError(f"example_samples not found in {latest_ckpt}")
+    latest_tar = step_tars[-1]
+    print(f"Using latest samples: {latest_tar.name}")
 
-    print(f"Using latest checkpoint: {latest_ckpt.name}")
-    return example_samples
+    # Extract tar to temp directory
+    extract_dir = Path(tempfile.mkdtemp(prefix='patches_'))
+    with tarfile.open(latest_tar, 'r') as tar:
+        tar.extractall(extract_dir)
+
+    # Find patch PNG files
+    patches_dir = extract_dir
+    patch_files = list(patches_dir.glob('*.png'))
+    if not patch_files:
+        raise FileNotFoundError(f"No patch PNG files found in extracted tar")
+
+    print(f"Extracted {len(patch_files)} patches from {latest_tar.name}")
+    return patches_dir
 
 
 def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
@@ -314,9 +325,9 @@ Examples:
 
     args = parser.parse_args()
 
-    # Find latest checkpoint's example_samples in the run directory
+    # Find and extract latest patches from run directory
     try:
-        patch_dir = find_latest_checkpoint_patches(args.patch_dir)
+        patch_dir = find_latest_patches(args.patch_dir)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return 1
