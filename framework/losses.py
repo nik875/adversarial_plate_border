@@ -40,8 +40,10 @@ def total_variation_loss(patches: Tensor, visibility_mask: Tensor) -> Tensor:
         tv_h = torch.pow(patch[:, :, :, 1:] - patch[:, :, :, :-1], 2)
         tv_v = torch.pow(patch[:, :, 1:, :] - patch[:, :, :-1, :], 2)
 
-        mask_h = visibility_mask[:, :, :, :-1]  # [1, 1, H, W-1]
-        mask_v = visibility_mask[:, :, :-1, :]  # [1, 1, H-1, W]
+        # AND of both adjacent pixels: only count a difference if both sides are visible.
+        # This prevents boundary TV pairs (border→center) from being included.
+        mask_h = visibility_mask[:, :, :, :-1] * visibility_mask[:, :, :, 1:]   # [1, 1, H, W-1]
+        mask_v = visibility_mask[:, :, :-1, :] * visibility_mask[:, :, 1:, :]   # [1, 1, H-1, W]
 
         tv_h_masked = (tv_h * mask_h).sum()
         tv_v_masked = (tv_v * mask_v).sum()

@@ -524,13 +524,17 @@ class EnsembleTrainer:
                         patches_scaled  = patches
                         vis_mask_scaled = vis_mask
 
+                    # Zero out invisible (center) pixels so SSIM sliding windows that
+                    # overlap the border/center boundary don't see arbitrary generator values.
+                    patches_for_loss = patches_scaled * vis_mask_scaled
+
                     # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
                     if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
-                        tv_raw = total_variation_loss(patches_scaled, vis_mask_scaled)
+                        tv_raw = total_variation_loss(patches_for_loss, vis_mask_scaled)
                     else:
                         tv_raw = torch.tensor(0.0, device=device)
 
-                    spec_raw = compute_spectrum_loss(patches_scaled, vis_mask_scaled)
+                    spec_raw = compute_spectrum_loss(patches_for_loss, vis_mask_scaled)
 
                     per_image_loss = -(
                         self.diversity_weight * log_det
