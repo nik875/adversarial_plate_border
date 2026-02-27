@@ -730,47 +730,44 @@ class EnsembleTrainer:
         patch_h = self.generator.patch_height
         patch_w = self.generator.patch_width
 
-        strat_entry = self.ensemble._strategies[0]
-        strategy = strat_entry.strategy
-
         model_input_shape = self.ensemble._entries[0].input_shape if self.ensemble._entries else None
 
-        print(f"\nGenerating debug visualizations ({num_samples} pairs, strategy={strat_entry.name})...")
+        print(f"\nGenerating debug visualizations ({num_samples} pairs × {len(self.ensemble._strategies)} strategies)...")
 
-        for sample_idx in range(num_samples):
-            # Sample a raw image
-            item = self.dataset_pool.sample()
-            raw_image = item.image.to(self._device)  # [3, H, W]
+        for strat_entry in self.ensemble._strategies:
+            strategy = strat_entry.strategy
+            for sample_idx in range(num_samples):
+                item = self.dataset_pool.sample()
+                raw_image = item.image.to(self._device)  # [3, H, W]
 
-            strategy_kwargs = strategy.sample_kwargs(
-                raw_image.unsqueeze(0), patch_h, patch_w,
-                model_input_shape=model_input_shape,
-            )
+                strategy_kwargs = strategy.sample_kwargs(
+                    raw_image.unsqueeze(0), patch_h, patch_w,
+                    model_input_shape=model_input_shape,
+                )
 
-            # Clean: apply neutral
-            clean_composited = strategy.apply_neutral(
-                raw_image.unsqueeze(0), **strategy_kwargs
-            )  # [1, 3, ?, ?]
+                # Clean: apply neutral
+                clean_composited = strategy.apply_neutral(
+                    raw_image.unsqueeze(0), **strategy_kwargs
+                )  # [1, 3, ?, ?]
 
-            # Attacked: apply random patch
-            rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
-            attacked_composited, _ = strategy.apply(
-                raw_image.unsqueeze(0), rand_patch, **strategy_kwargs
-            )  # [1, 3, ?, ?]
+                # Attacked: apply random patch
+                rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
+                attacked_composited, _ = strategy.apply(
+                    raw_image.unsqueeze(0), rand_patch, **strategy_kwargs
+                )  # [1, 3, ?, ?]
 
-            # Convert to PIL and save side-by-side
-            clean_pil = T.ToPILImage()(clean_composited[0].cpu().clamp(0, 1))
-            attacked_pil = T.ToPILImage()(attacked_composited[0].cpu().clamp(0, 1))
+                clean_pil = T.ToPILImage()(clean_composited[0].cpu().clamp(0, 1))
+                attacked_pil = T.ToPILImage()(attacked_composited[0].cpu().clamp(0, 1))
 
-            combined_width = clean_pil.width + attacked_pil.width
-            combined_height = max(clean_pil.height, attacked_pil.height)
-            combined = PIL.Image.new('RGB', (combined_width, combined_height))
-            combined.paste(clean_pil, (0, 0))
-            combined.paste(attacked_pil, (clean_pil.width, 0))
+                combined_width = clean_pil.width + attacked_pil.width
+                combined_height = max(clean_pil.height, attacked_pil.height)
+                combined = PIL.Image.new('RGB', (combined_width, combined_height))
+                combined.paste(clean_pil, (0, 0))
+                combined.paste(attacked_pil, (clean_pil.width, 0))
 
-            combined.save(debug_dir / f'debug_pair_{sample_idx:02d}_clean_vs_attacked.png')
+                combined.save(debug_dir / f'debug_pair_{strat_entry.name}_{sample_idx:02d}_clean_vs_attacked.png')
 
-        print(f"  Saved {num_samples} debug image pairs to {debug_dir}\n")
+        print(f"  Saved debug image pairs to {debug_dir}\n")
 
     # ------------------------------------------------------------------
     # Sample saving
