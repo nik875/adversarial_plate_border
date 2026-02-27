@@ -42,7 +42,7 @@ from torch import Tensor, optim
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from framework.base.attack_strategy import AttackStrategy, BorderStrategy, StickerStrategy
+from framework.base.attack_strategy import AttackStrategy, BorderStrategy, StickerStrategy, PerturbationStrategy
 from framework.dataset_pool import LazyDatasetPool
 from framework.generator import FoundationPatchGenerator
 from framework.losses import total_variation_loss, compute_spectrum_loss
@@ -504,7 +504,7 @@ class EnsembleTrainer:
                     norm_deltas_sq = norm_deltas ** 2
                     quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
 
-                    # Final-layer activations — used for quality only
+                    # Final-layer activations — used for quality and diversity
                     if final_neurons:
                         final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
                         final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
@@ -514,10 +514,11 @@ class EnsembleTrainer:
                         final_norm_deltas = final_deltas / final_eff_stds       # [P, k_final]
                         final_quality     = final_norm_deltas.pow(2).mean(dim=1).sqrt().mean() + 1e-8
                     else:
+                        final_norm_deltas = norm_deltas  # fallback: use random neurons
                         final_quality = torch.tensor(1e-8, device=device)
 
-                    # Diversity always uses randomly sampled neurons (broad coverage)
-                    div_vecs = norm_deltas
+                    # Diversity uses final-layer activations only
+                    div_vecs = final_norm_deltas
 
                     eps        = max(1e-6, 1e-2 / P)
                     normalized = F.normalize(div_vecs, p=2, dim=1)
@@ -542,18 +543,21 @@ class EnsembleTrainer:
                     # overlap the border/center boundary don't see arbitrary generator values.
                     patches_for_loss = patches_scaled * vis_mask_scaled
 
-                    # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
-                    if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
-                        tv_raw = total_variation_loss(patches_for_loss, vis_mask_scaled)
-                    else:
-                        tv_raw = torch.tensor(0.0, device=device)
+                    # TV loss: all strategies. Border/sticker minimize it (smooth patches);
+                    # perturbation maximizes it (encourage high-frequency noise).
+                    tv_raw = total_variation_loss(patches_for_loss, vis_mask_scaled)
 
                     spec_raw = compute_spectrum_loss(patches_for_loss, vis_mask_scaled)
+
+                    if isinstance(strat_entry.strategy, PerturbationStrategy):
+                        tv_contrib = -self.tv_weight * torch.sigmoid(tv_raw / 2)
+                    else:
+                        tv_contrib = self.tv_weight * tv_raw
 
                     per_image_loss = -(
                         self.diversity_weight * log_det
                         + self.quality_weight * final_quality
-                    ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
+                    ) + tv_contrib + self.spectrum_weight * spec_raw
 
                     (per_image_loss / N).backward()
 
@@ -561,7 +565,7 @@ class EnsembleTrainer:
                     acc['diversity']     += log_det.item()
                     acc['quality']       += quality.item()
                     acc['final_quality'] += final_quality.item()
-                    acc['tv']            += (self.tv_weight * tv_raw).item()
+                    acc['tv']            += tv_contrib.item()
                     acc['spectrum']      += spec_raw.item()
                     acc['model']          = entry.name
 
