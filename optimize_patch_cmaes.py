@@ -40,164 +40,54 @@ try:
 except ImportError:
     openai = None
 
+import torchvision.transforms as T
+from framework.generator_loader import load_generator, generate_patch_from_z
 
-def load_validation_samples_from_csv(csv_path, num_samples, max_val_samples=None):
-    """Load validation samples using combined dataset (matching training setup).
+
+def load_validation_from_manifest(manifest_path, max_val_samples=None):
+    """Load validation images from the framework manifest CSV.
+
+    Reads the manifest, filters for split='val', and loads images as
+    [3, H, W] float tensors in [0, 1].
 
     Args:
-        csv_path: Path to train_val_split CSV
-        num_samples: Number of samples to draw per iteration
-        max_val_samples: If set, cap the total pool loaded from disk (randomly sampled)
+        manifest_path: Path to manifest CSV with 'path' and 'split' columns
+        max_val_samples: If set, randomly sample this many from the val pool
 
     Returns:
-        Tuple of (list of images as tensors [3, H, W] in [0, 1], list of (width, height) tuples)
+        List of [3, H, W] float tensors in [0, 1]
     """
-    # Import OCRDataset and ConcatDataset
-    script_dir = Path(__file__).parent
-    from torch.utils.data import ConcatDataset
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    # Import OCRDataset from progressive_patch
-    sys.path.insert(0, str(script_dir))
-    try:
-        from progressive_patch import OCRDataset
-    except ImportError:
-        raise ImportError("Could not import OCRDataset from progressive_patch.py")
-
-    # Read CSV to get dataset names and validation indices
-    val_indices = []
-    dataset_names_in_csv = set()
-
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    print(f"Loading validation images from manifest: {manifest_path}")
+    with open(manifest_path, 'r') as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            if row['split'].lower() == 'val':
-                val_indices.append(int(row['index']))
-                dataset_names_in_csv.add(row['dataset'])
+        all_paths = [row['path'] for row in reader if row.get('split') == 'val']
 
-    if not val_indices:
-        raise ValueError(f"No validation samples found in {csv_path}")
+    print(f"Found {len(all_paths)} validation images in manifest")
 
-    print(f"Found {len(val_indices)} validation samples in CSV")
-    if max_val_samples is not None and max_val_samples < len(val_indices):
-        import random as _random
-        val_indices = _random.sample(val_indices, max_val_samples)
-        print(f"Limiting val pool to {max_val_samples} randomly sampled indices")
-    print(f"Datasets in CSV: {', '.join(sorted(dataset_names_in_csv))}")
-
-    # Load and combine datasets in order
-    datasets_to_combine = []
-    for dataset_name in sorted(dataset_names_in_csv):
-        print(f"  Loading {dataset_name}...")
-        try:
-            dataset = OCRDataset(
-                dataset_name=dataset_name,
-                split='train',
-                transform=None,
-                max_samples=None
-            )
-            datasets_to_combine.append(dataset)
-            print(f"    Loaded {len(dataset)} samples from {dataset_name}")
-        except Exception as e:
-            print(f"  Error loading {dataset_name}: {e}", file=sys.stderr)
-            raise
-
-    # Combine datasets (matching how progressive_patch.py does it)
-    if len(datasets_to_combine) > 1:
-        combined_dataset = ConcatDataset(datasets_to_combine)
-        print(f"Combined {len(datasets_to_combine)} datasets: {len(combined_dataset)} total samples")
-    else:
-        combined_dataset = datasets_to_combine[0]
-
-    # Load all validation samples upfront (no downsampling - we'll sample per iteration)
-    images = []
-    dimensions = []
-    failed_samples = []
-
-    print(f"\nLoading {len(val_indices)} validation samples from combined dataset...")
-    for combined_idx in tqdm(val_indices, desc="Loading samples"):
-        try:
-            item = combined_dataset[combined_idx]
-            img_tensor = item['prep_image']
-            # Track dimensions: tensor is [3, H, W], so width=W, height=H
-            height, width = img_tensor.shape[1], img_tensor.shape[2]
-
-            images.append(img_tensor)
-            dimensions.append((width, height))
-        except Exception as e:
-            error_msg = f"{type(e).__name__}: {e}"
-            failed_samples.append((combined_idx, error_msg))
-
-    print(f"Loaded {len(images)} validation samples (will sample {min(num_samples, len(images))} per iteration)")
-    if failed_samples:
-        print(f"Failed to load {len(failed_samples)} samples", file=sys.stderr)
-
-    return images, dimensions
-
-
-def load_validation_samples_from_preproc_csv(csv_path, num_samples, crop_size=(64, 128), max_val_samples=None):
-    """Load validation samples from a preproc_labels CSV using AdversarialPatchDataset.
-
-    Loads the original (unprocessed) image for each sample and crops exactly to
-    the plate region defined by orig_corners, resized to crop_size.
-
-    Args:
-        csv_path: Path to preproc_labels CSV (dataset.py format)
-        num_samples: Number of samples to draw per iteration
-        crop_size: (height, width) to resize plate crops to (default: (64, 128))
-        max_val_samples: If set, cap the total pool loaded from disk (randomly sampled)
-
-    Returns:
-        Tuple of (list of images as tensors [3, H, W] in [0, 1] RGB, list of (width, height) tuples)
-    """
-    import pandas as pd
-    import torchvision.transforms as T
-    import kornia
-
-    script_dir = Path(__file__).parent
-    sys.path.insert(0, str(script_dir))
-    try:
-        from dataset import AdversarialPatchDataset
-    except ImportError:
-        raise ImportError("Could not import AdversarialPatchDataset from dataset.py")
-
-    df = pd.read_csv(csv_path)
-    print(f"Loaded {len(df)} rows from {csv_path}")
-
-    if max_val_samples is not None and max_val_samples < len(df):
-        df = df.sample(n=max_val_samples, random_state=42).reset_index(drop=True)
-        print(f"Limiting val pool to {max_val_samples} randomly sampled rows")
-
-    # dataset.py loads images as BGR numpy arrays via cv2; convert to RGB for OCR models
-    transform = T.Compose([
-        T.Lambda(lambda x: cv2.cvtColor(x, cv2.COLOR_BGR2RGB)),
-        T.ToTensor(),
-    ])
-
-    dataset = AdversarialPatchDataset(df, transform=transform)
+    if max_val_samples is not None and max_val_samples < len(all_paths):
+        all_paths = random.sample(all_paths, max_val_samples)
+        print(f"Sampled {max_val_samples} from validation pool")
 
     images = []
-    dimensions = []
-    print(f"Loading {len(dataset)} samples from preproc dataset...")
-    for idx in tqdm(range(len(dataset)), desc="Loading samples"):
-        item = dataset[idx]
-        orig_img = item['orig_image']  # [3, H, W] float in [0, 1]
-        orig_corners = item['orig_corners']  # [4, 2] plate corners in original image
+    failed = 0
+    for img_path in tqdm(all_paths, desc="Loading validation images"):
+        try:
+            img = T.ToTensor()(
+                __import__('PIL').Image.open(img_path).convert('RGB')
+            )  # [3, H, W] in [0, 1]
+            images.append(img)
+        except Exception as e:
+            print(f"Warning: could not load {img_path}: {e}", file=sys.stderr)
+            failed += 1
 
-        # Crop plate region from original image and resize
-        cropped = kornia.geometry.crop_and_resize(
-            orig_img.unsqueeze(0),  # [1, 3, H, W]
-            orig_corners.unsqueeze(0),  # [1, 4, 2]
-            crop_size,
-            mode='bilinear',
-            align_corners=True
-        ).squeeze(0)  # [3, crop_h, crop_w]
-
-        height, width = cropped.shape[1], cropped.shape[2]
-        images.append(cropped)
-        dimensions.append((width, height))
-
-    print(f"Loaded {len(images)} plate crops at {crop_size[0]}x{crop_size[1]} (will sample {min(num_samples, len(images))} per iteration)")
-    return images, dimensions
+    if failed:
+        print(f"Warning: failed to load {failed} images")
+    print(f"Loaded {len(images)} validation images")
+    return images
 
 
 def apply_patch_ocr_mode(image, patch, center_ratio=0.6):
@@ -293,163 +183,7 @@ def apply_neutral_border_ocr_mode(image, center_ratio=0.6, border_color=0.5, out
     return result_image
 
 
-def load_generator(run_dir, device=None):
-    """Load the FoundationPatchGenerator from the run directory.
-
-    Args:
-        run_dir: Path to run directory
-        device: torch device (if None, auto-detect)
-
-    Returns:
-        Tuple of (generator model, latent_dim, device)
-    """
-    import sys
-    from pathlib import Path
-
-    # Import from progressive_patch.py (original architecture)
-    sys.path.insert(0, str(Path(__file__).parent))
-    try:
-        from progressive_patch import FoundationPatchGenerator
-    except ImportError:
-        raise ImportError("Could not import FoundationPatchGenerator from progressive_patch.py")
-
-    # Search for checkpoints in this priority order:
-    # 1. training_complete_final_model (final checkpoint at end of training)
-    # 2. best_progressive_patch (best model during training)
-    # 3. checkpoint_epoch_XXXX (periodic checkpoints)
-    # 4. Any other directories with generator_epoch_*.pt files
-
-    run_path = Path(run_dir)
-    latest_checkpoint = None
-    checkpoint_source = None
-
-    # Priority 1: Final training checkpoint
-    final_dir = run_path / "training_complete_final_model"
-    if final_dir.exists() and final_dir.is_dir():
-        checkpoint_files = sorted(final_dir.glob("generator_epoch_*.pt"))
-        if checkpoint_files:
-            latest_checkpoint = checkpoint_files[-1]
-            checkpoint_source = "final training checkpoint"
-
-    # Priority 2: Best model checkpoint
-    if latest_checkpoint is None:
-        best_dir = run_path / "best_progressive_patch"
-        if best_dir.exists() and best_dir.is_dir():
-            checkpoint_files = sorted(best_dir.glob("generator_epoch_*.pt"))
-            if checkpoint_files:
-                latest_checkpoint = checkpoint_files[-1]
-                checkpoint_source = "best model checkpoint"
-
-    # Priority 3: Latest periodic checkpoint
-    if latest_checkpoint is None:
-        checkpoint_dirs = sorted([d for d in run_path.iterdir()
-                                 if d.is_dir() and d.name.startswith("checkpoint_epoch_")])
-        if checkpoint_dirs:
-            latest_checkpoint_dir = checkpoint_dirs[-1]
-            checkpoint_files = sorted(latest_checkpoint_dir.glob("generator_epoch_*.pt"))
-            if checkpoint_files:
-                latest_checkpoint = checkpoint_files[-1]
-                checkpoint_source = f"periodic checkpoint ({latest_checkpoint_dir.name})"
-
-    # Priority 4: Any other checkpoint directory
-    if latest_checkpoint is None:
-        # Search all subdirectories for generator checkpoints
-        all_checkpoints = sorted(run_path.glob("**/generator_epoch_*.pt"))
-        if all_checkpoints:
-            latest_checkpoint = all_checkpoints[-1]
-            checkpoint_source = f"found in {latest_checkpoint.parent.name}"
-
-    if latest_checkpoint is None:
-        raise FileNotFoundError(
-            f"No generator checkpoint files found in {run_dir}\n"
-            f"Searched for:\n"
-            f"  - training_complete_final_model/generator_epoch_*.pt\n"
-            f"  - best_progressive_patch/generator_epoch_*.pt\n"
-            f"  - checkpoint_epoch_*/generator_epoch_*.pt\n"
-            f"  - **/generator_epoch_*.pt"
-        )
-
-    print(f"Loading checkpoint: {latest_checkpoint}")
-    print(f"  Source: {checkpoint_source}")
-
-    # Load checkpoint
-    checkpoint = torch.load(latest_checkpoint, map_location='cpu')
-
-    # Extract model parameters from checkpoint
-    latent_dim = checkpoint['basis_dim']
-    patch_height, patch_width = checkpoint['patch_size']
-    use_vae_lora = checkpoint.get('use_vae_lora', True)
-    lora_rank = checkpoint.get('lora_rank', 8)
-    lora_alpha = checkpoint.get('lora_alpha', 16)
-    use_omniglot = checkpoint.get('use_omniglot', False)
-
-    print(f"  Latent dim: {latent_dim}")
-    print(f"  Patch size: {patch_height}x{patch_width}")
-    print(f"  VAE LoRA: {use_vae_lora} (rank={lora_rank}, alpha={lora_alpha})")
-    print(f"  Omniglot conditioning: {use_omniglot}")
-
-    # Create generator with same architecture
-    generator = FoundationPatchGenerator(
-        latent_dim=latent_dim,
-        patch_height=patch_height,
-        patch_width=patch_width,
-        use_vae_lora=use_vae_lora,
-        lora_rank=lora_rank,
-        lora_alpha=lora_alpha,
-        use_omniglot=use_omniglot,
-    )
-
-    # Load state dict, falling back to the opposite use_omniglot value if there's a mismatch
-    try:
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-    except RuntimeError as e:
-        alt_omniglot = not use_omniglot
-        print(f"  Warning: state dict mismatch with use_omniglot={use_omniglot}, retrying with use_omniglot={alt_omniglot}")
-        print(f"  ({e})")
-        try:
-            generator = FoundationPatchGenerator(
-                latent_dim=latent_dim,
-                patch_height=patch_height,
-                patch_width=patch_width,
-                use_vae_lora=use_vae_lora,
-                lora_rank=lora_rank,
-                lora_alpha=lora_alpha,
-                use_omniglot=alt_omniglot,
-            )
-            generator.load_state_dict(checkpoint['generator_state_dict'])
-            use_omniglot = alt_omniglot
-        except RuntimeError:
-            raise e  # Re-raise original error if both attempts fail
-
-    # Use provided device or auto-detect
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    generator = generator.to(device)
-    generator.eval()
-
-    print(f"Loaded generator on device={device}")
-
-    return generator, latent_dim, device
-
-
-def generate_patch_from_z(generator, z, device):
-    """Generate a patch from latent code z using the generator.
-
-    Args:
-        generator: FoundationPatchGenerator model
-        z: Latent code as numpy array [latent_dim]
-        device: torch device
-
-    Returns:
-        patch: [3, H, W] tensor in [0, 1]
-    """
-    with torch.no_grad():
-        z_tensor = torch.from_numpy(z).float().unsqueeze(0).to(device)  # [1, latent_dim]
-        patch = generator(z_tensor)  # [1, 3, H, W]
-        # Generator output is already in [0, 1] range (uses tanh scaled to [0, 1])
-        patch = patch.squeeze(0).cpu()  # [3, H, W]
-
-    return patch
+# load_generator and generate_patch_from_z imported from framework.generator_loader above
 
 
 def create_ocr_model(ocr_model_type, white_box=False, device=None, api_key=None, max_parallel=4):
@@ -1282,11 +1016,10 @@ def main():
     parser = argparse.ArgumentParser(
         description='CMA-ES optimization of adversarial patches to maximize misreads.'
     )
-    parser.add_argument('run_dir', help='Path to run directory with trained VAE')
-    parser.add_argument('--csv', default=None,
-                        help='Path to train_val_split CSV (default: auto-detect from run_dir)')
-    parser.add_argument('--preproc-csv', default=None,
-                        help='Path to preproc_labels CSV (dataset.py format). If provided, uses AdversarialPatchDataset instead of OCRDataset')
+    parser.add_argument('run_dir', help='Path to run directory with trained generator checkpoint')
+    parser.add_argument('--manifest', default=None,
+                        help='Path to manifest CSV with path/split columns '
+                             '(default: ~/.cache/adversarial_plate_manifest.csv)')
     parser.add_argument('--n-eval-samples', type=int, default=50,
                         help='Number of validation samples to evaluate on per iteration (default: 50)')
     parser.add_argument('--max-val-samples', type=int, default=None,
@@ -1396,41 +1129,19 @@ def main():
         print(f"Error: Run directory not found: {run_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Find CSV file (only needed if not using --preproc-csv)
-    csv_path = None
-    if not args.preproc_csv:
-        if args.csv:
-            csv_path = Path(args.csv)
-        else:
-            csv_files = list(run_dir.glob("**/*.csv"))
-            for csv_file in csv_files:
-                if 'train_val_split' in csv_file.name or 'split' in csv_file.name:
-                    csv_path = csv_file
-                    break
+    # Resolve manifest path
+    manifest_path = args.manifest or Path.home() / '.cache' / 'adversarial_plate_manifest.csv'
+    manifest_path = Path(manifest_path)
 
-            if csv_path is None:
-                cwd_csv = list(Path('.').glob("train_val_split_*.csv"))
-                if cwd_csv:
-                    csv_path = cwd_csv[-1]
-
-            if csv_path is None:
-                print("Error: Could not find train_val_split CSV file. "
-                      "Pass --csv or use --preproc-csv for a preproc_labels CSV.", file=sys.stderr)
-                sys.exit(1)
-
-    # Load validation samples
-    if args.preproc_csv:
-        preproc_csv_path = Path(args.preproc_csv)
-        if not preproc_csv_path.exists():
-            print(f"Error: preproc CSV not found: {preproc_csv_path}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Using preproc dataset: {preproc_csv_path}")
-        print(f"\nLoading {args.n_eval_samples} samples from preproc CSV...")
-        val_images, dimensions = load_validation_samples_from_preproc_csv(preproc_csv_path, args.n_eval_samples, max_val_samples=args.max_val_samples)
-    else:
-        print(f"Using data split: {csv_path}")
-        print(f"\nLoading validation samples...")
-        val_images, dimensions = load_validation_samples_from_csv(csv_path, args.n_eval_samples, max_val_samples=args.max_val_samples)
+    # Load validation images from manifest
+    try:
+        val_images = load_validation_from_manifest(
+            manifest_path, max_val_samples=args.max_val_samples
+        )
+        dimensions = [(img.shape[2], img.shape[1]) for img in val_images]  # (W, H)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if not val_images:
         print("Error: No validation samples loaded", file=sys.stderr)
@@ -1943,7 +1654,7 @@ def main():
             f.write(f"{'=' * 80}\n")
             f.write(f"Timestamp: {datetime.now().isoformat()}\n\n")
             f.write(f"Run directory: {run_dir}\n")
-            f.write(f"CSV file: {csv_path}\n\n")
+            f.write(f"Manifest: {manifest_path}\n\n")
             f.write(f"CMA-ES Parameters:\n")
             f.write(f"  Population size: {args.popsize}\n")
             f.write(f"  Max iterations: {args.maxiter}\n")
