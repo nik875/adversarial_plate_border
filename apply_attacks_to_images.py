@@ -72,12 +72,13 @@ def find_latest_patches(run_dir: str) -> Path:
     Find the latest sample patches in a run directory.
 
     Looks for step_XXXXXXX.tar files and extracts patches from the latest one.
+    Tar structure is step_XXXXXXX/{strategy}/{model}/{i}.png
 
     Args:
         run_dir: Path to run directory (e.g., runs/broad_ensemble/run_20260227_051206/)
 
     Returns:
-        Path to directory containing patch PNG files
+        Path to directory containing all patch PNG files (flattened)
     """
     import tempfile
 
@@ -102,14 +103,13 @@ def find_latest_patches(run_dir: str) -> Path:
     with tarfile.open(latest_tar, 'r') as tar:
         tar.extractall(extract_dir)
 
-    # Find patch PNG files
-    patches_dir = extract_dir
-    patch_files = list(patches_dir.glob('*.png'))
+    # Find all patch PNG files (they're nested in step_XXXXX/strategy/model/i.png)
+    patch_files = list(extract_dir.rglob('*.png'))
     if not patch_files:
         raise FileNotFoundError(f"No patch PNG files found in extracted tar")
 
     print(f"Extracted {len(patch_files)} patches from {latest_tar.name}")
-    return patches_dir
+    return extract_dir
 
 
 def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
