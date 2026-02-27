@@ -33,6 +33,17 @@ strategies:
     center_ratio: 0.91
     strategy_id: 0
 
+  - name: sticker
+    type: sticker
+    area_fraction: 0.05
+    strategy_id: 1
+
+  - name: perturbation
+    type: perturbation
+    budget: 0.05
+    norm: linf
+    strategy_id: 2
+
 # ---------------------------------------------------------------------------
 # Model pool — 8 models spanning 4 vision tasks
 # ---------------------------------------------------------------------------
