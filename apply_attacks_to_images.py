@@ -67,6 +67,33 @@ def load_image_from_path(image_path: str) -> Tuple[torch.Tensor, str]:
         return None, None
 
 
+def find_latest_checkpoint(checkpoint_root: str = 'framework_output') -> Path:
+    """
+    Find the latest checkpoint directory by epoch number.
+
+    Looks for directories named checkpoint_epoch_XXXX and returns the one with highest epoch.
+    """
+    checkpoint_root = Path(checkpoint_root)
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Checkpoint root not found: {checkpoint_root}")
+
+    checkpoint_dirs = sorted([
+        d for d in checkpoint_root.iterdir()
+        if d.is_dir() and d.name.startswith('checkpoint_epoch_')
+    ])
+
+    if not checkpoint_dirs:
+        raise FileNotFoundError(f"No checkpoint directories found in {checkpoint_root}")
+
+    latest_ckpt = checkpoint_dirs[-1]
+    example_samples = latest_ckpt / 'example_samples'
+    if not example_samples.exists():
+        raise FileNotFoundError(f"example_samples not found in {latest_ckpt}")
+
+    print(f"Using latest checkpoint: {latest_ckpt.name}")
+    return example_samples
+
+
 def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
     """
     Load all patch images from a directory.
@@ -245,7 +272,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python apply_attacks_to_images.py --manifest data/manifest.csv --patch-dir checkpoint/example_samples
+  # Auto-finds latest checkpoint
+  python apply_attacks_to_images.py --manifest ~/.cache/adversarial_plate_manifest.csv
+
+  # Or specify patch directory explicitly
   python apply_attacks_to_images.py --image-dir /path/to/images --patch-dir /path/to/patches
         """
     )
@@ -267,8 +297,13 @@ Examples:
     parser.add_argument(
         '--patch-dir',
         type=str,
-        required=True,
-        help='Directory containing example patch PNG files (e.g., from checkpoint outputs)'
+        help='Directory containing example patch PNG files. If not specified, finds latest checkpoint'
+    )
+    parser.add_argument(
+        '--checkpoint-root',
+        type=str,
+        default='framework_output',
+        help='Root directory containing checkpoints (default: framework_output). Used to find latest checkpoint if --patch-dir not specified'
     )
 
     parser.add_argument(
@@ -280,14 +315,24 @@ Examples:
 
     args = parser.parse_args()
 
+    # Determine patch directory
+    if args.patch_dir:
+        patch_dir = args.patch_dir
+    else:
+        try:
+            patch_dir = str(find_latest_checkpoint(args.checkpoint_root))
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            return 1
+
     # Validate patch directory exists
-    if not Path(args.patch_dir).exists():
-        print(f"Error: patch directory not found: {args.patch_dir}")
+    if not Path(patch_dir).exists():
+        print(f"Error: patch directory not found: {patch_dir}")
         return 1
 
     # Load patches
     try:
-        patches, patch_filenames = load_patches(args.patch_dir, args.device)
+        patches, patch_filenames = load_patches(patch_dir, args.device)
     except Exception as e:
         print(f"Error loading patches: {e}")
         import traceback
