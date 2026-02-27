@@ -17,7 +17,7 @@ Contains:
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -391,14 +391,22 @@ class FoundationPatchGenerator(nn.Module):
         total_params = sum(p.numel() for p in self.parameters())
         print(f"FoundationPatchGenerator total parameters: {total_params:,}")
 
-    def forward(self, z: Tensor, z_enriched: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        z: Tensor,
+        z_enriched: Optional[Tensor] = None,
+        active_streams: Optional[List[int]] = None,
+    ) -> Tensor:
         """
         Generate an adversarial patch from latent codes.
 
         Args:
-            z:          [B, latent_dim]  base latent codes
-            z_enriched: [B, latent_dim]  task-conditioned codes (from TaskEncoder).
-                        If None, falls back to z.
+            z:              [B, latent_dim]  base latent codes
+            z_enriched:     [B, latent_dim]  task-conditioned codes (from TaskEncoder).
+                            If None, falls back to z.
+            active_streams: optional list of stream indices to compute. Inactive
+                            streams are replaced with zeros (no forward pass).
+                            If None, all streams are active (normal training).
 
         Returns:
             patches: [B, 3, patch_height, patch_width] in [0, 1]
@@ -415,11 +423,17 @@ class FoundationPatchGenerator(nn.Module):
             return transformer(taesd_out)
 
         stream_outputs = []
-        for adapter, taesd, transformer in zip(
-            self.adapters, self.taesd_decoders, self.transformers
+        for i, (adapter, taesd, transformer) in enumerate(
+            zip(self.adapters, self.taesd_decoders, self.transformers)
         ):
-            stream_outputs.append(_run_stream(adapter, taesd, transformer, z_enriched,
-                                              self.vae_latent_h, self.vae_latent_w))
+            if active_streams is not None and i not in active_streams:
+                stream_outputs.append(
+                    torch.zeros(B, 3, self.patch_height, self.patch_width,
+                                device=z.device, dtype=z.dtype)
+                )
+            else:
+                stream_outputs.append(_run_stream(adapter, taesd, transformer, z_enriched,
+                                                  self.vae_latent_h, self.vae_latent_w))
 
         # Concatenate all stream outputs: [B, 18, H, W]
         combined = torch.cat(stream_outputs, dim=1)
