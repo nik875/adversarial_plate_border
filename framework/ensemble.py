@@ -308,8 +308,6 @@ class EnsembleTrainer:
         self.generator = self.generator.to(self._device)
         self.task_encoder = self.task_encoder.to(self._device)
 
-        # Mixed precision: GradScaler only used on CUDA; disabled on CPU/MPS
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self._device.type == 'cuda')
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -437,98 +435,97 @@ class EnsembleTrainer:
                         model_input_shape=entry.input_shape,
                     )
 
-                    with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
-                        # --- 2. Generate P patches ---
-                        z = torch.randn(P, gen.latent_dim, device=device)
+                    # --- 2. Generate P patches ---
+                    z = torch.randn(P, gen.latent_dim, device=device)
 
-                        midx = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
-                        sidx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
-                        didx = torch.full((P,), dataset_id,              device=device, dtype=torch.long)
+                    midx = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
+                    sidx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
+                    didx = torch.full((P,), dataset_id,              device=device, dtype=torch.long)
 
-                        midx = midx.clamp(0, self.task_encoder.num_models    - 1)
-                        sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
-                        didx = didx.clamp(0, self.task_encoder.num_datasets  - 1)
+                    midx = midx.clamp(0, self.task_encoder.num_models    - 1)
+                    sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
+                    didx = didx.clamp(0, self.task_encoder.num_datasets  - 1)
 
-                        z_enriched = self.task_encoder(z, midx, sidx, didx)
-                        patches    = gen(z, z_enriched)   # [P, 3, H, W]
+                    z_enriched = self.task_encoder(z, midx, sidx, didx)
+                    patches    = gen(z, z_enriched)   # [P, 3, H, W]
 
-                        # --- 3. Build [P+1, 3, H', W'] batch: ctrl first, then P adv ---
-                        ctrl_inp = entry.preprocess_fn(
-                            strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
-                        )                                                           # [1, 3, H', W']
+                    # --- 3. Build [P+1, 3, H', W'] batch: ctrl first, then P adv ---
+                    ctrl_inp = entry.preprocess_fn(
+                        strat_entry.strategy.apply_neutral(image, **strategy_kwargs)
+                    )                                                           # [1, 3, H', W']
 
-                        vis_mask  = None
-                        adv_inps  = []
-                        for p_idx in range(P):
-                            composited, mask = strat_entry.strategy.apply(
-                                image, patches[p_idx], **strategy_kwargs
-                            )
-                            if vis_mask is None:
-                                vis_mask = mask
-                            adv_inps.append(entry.preprocess_fn(composited))       # [1, 3, H', W']
+                    vis_mask  = None
+                    adv_inps  = []
+                    for p_idx in range(P):
+                        composited, mask = strat_entry.strategy.apply(
+                            image, patches[p_idx], **strategy_kwargs
+                        )
+                        if vis_mask is None:
+                            vis_mask = mask
+                        adv_inps.append(entry.preprocess_fn(composited))       # [1, 3, H', W']
 
-                        batch_inp = torch.cat([ctrl_inp] + adv_inps, dim=0)        # [P+1, 3, H', W']
+                    batch_inp = torch.cat([ctrl_inp] + adv_inps, dim=0)        # [P+1, 3, H', W']
 
-                        # --- 4. One batched forward with robust neuron extraction ---
-                        # The neuron sampler now uses the shape cache to infer per-sample
-                        # size and correctly extract neurons even if batch dims are folded
-                        # with spatial or head dimensions in intermediate layers.
-                        combined = self.neuron_sampler.capture_sampled_activations(
-                            model, batch_inp, combined_neurons, no_grad=False,
-                        ).to(device)                                                # [P+1, k_rand+k_final]
+                    # --- 4. One batched forward with robust neuron extraction ---
+                    # The neuron sampler now uses the shape cache to infer per-sample
+                    # size and correctly extract neurons even if batch dims are folded
+                    # with spatial or head dimensions in intermediate layers.
+                    combined = self.neuron_sampler.capture_sampled_activations(
+                        model, batch_inp, combined_neurons, no_grad=False,
+                    ).to(device)                                                # [P+1, k_rand+k_final]
 
-                        ctrl_acts  = combined[0, :k_rand].detach()                 # [k_rand], detached
-                        ctrl_final = combined[0, k_rand:].detach()                 # [k_final], detached
-                        adv_acts   = combined[1:]                                  # [P, k_rand+k_final]
+                    ctrl_acts  = combined[0, :k_rand].detach()                 # [k_rand], detached
+                    ctrl_final = combined[0, k_rand:].detach()                 # [k_final], detached
+                    adv_acts   = combined[1:]                                  # [P, k_rand+k_final]
 
-                        # --- 5. Compute losses ---
-                        deltas = adv_acts[:, :k_rand] - ctrl_acts                  # [P, k_rand]
+                    # --- 5. Compute losses ---
+                    deltas = adv_acts[:, :k_rand] - ctrl_acts                  # [P, k_rand]
 
-                        neuron_stds    = self.neuron_sampler.lookup_neuron_stds(
-                            entry.model_id, sampled_neurons
+                    neuron_stds    = self.neuron_sampler.lookup_neuron_stds(
+                        entry.model_id, sampled_neurons
+                    ).to(device)
+                    beta           = self.neuron_sampler.lookup_beta(entry.model_id)
+                    effective_stds = neuron_stds.clamp(min=beta)
+                    norm_deltas    = deltas / effective_stds                    # [P, k_rand] — kept for quality logging
+
+                    norm_deltas_sq = norm_deltas ** 2
+                    quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
+
+                    # Final-layer activations — used for both quality and diversity
+                    if final_neurons:
+                        final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
+                        final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
+                            entry.model_id, final_neurons
                         ).to(device)
-                        beta           = self.neuron_sampler.lookup_beta(entry.model_id)
-                        effective_stds = neuron_stds.clamp(min=beta)
-                        norm_deltas    = deltas / effective_stds                    # [P, k_rand] — kept for quality logging
+                        final_eff_stds    = final_neuron_stds.clamp(min=beta)
+                        final_norm_deltas = final_deltas / final_eff_stds       # [P, k_final]
+                        final_quality     = final_norm_deltas.pow(2).mean(dim=1).sqrt().mean() + 1e-8
+                        div_vecs          = final_norm_deltas  # diversity uses final layer
+                    else:
+                        final_quality = torch.tensor(1e-8, device=device)
+                        div_vecs      = norm_deltas            # fallback: random neurons
 
-                        norm_deltas_sq = norm_deltas ** 2
-                        quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
+                    eps        = max(1e-6, 1e-2 / P)
+                    normalized = F.normalize(div_vecs, p=2, dim=1)
+                    gram       = normalized @ normalized.T + eps * torch.eye(P, device=device)
+                    sign, log_det = torch.slogdet(gram)
+                    if torch.isnan(log_det) or sign <= 0:
+                        log_det = torch.tensor(-20.0, device=device, dtype=div_vecs.dtype)
 
-                        # Final-layer activations — used for both quality and diversity
-                        if final_neurons:
-                            final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
-                            final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
-                                entry.model_id, final_neurons
-                            ).to(device)
-                            final_eff_stds    = final_neuron_stds.clamp(min=beta)
-                            final_norm_deltas = final_deltas / final_eff_stds       # [P, k_final]
-                            final_quality     = final_norm_deltas.pow(2).mean(dim=1).sqrt().mean() + 1e-8
-                            div_vecs          = final_norm_deltas  # diversity uses final layer
-                        else:
-                            final_quality = torch.tensor(1e-8, device=device)
-                            div_vecs      = norm_deltas            # fallback: random neurons
+                    # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
+                    if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
+                        tv_raw = total_variation_loss(patches, vis_mask)
+                    else:
+                        tv_raw = torch.tensor(0.0, device=device)
 
-                        eps        = max(1e-6, 1e-2 / P)
-                        normalized = F.normalize(div_vecs, p=2, dim=1)
-                        gram       = normalized @ normalized.T + eps * torch.eye(P, device=device)
-                        sign, log_det = torch.slogdet(gram)
-                        if torch.isnan(log_det) or sign <= 0:
-                            log_det = torch.tensor(-20.0, device=device, dtype=div_vecs.dtype)
+                    spec_raw = compute_spectrum_loss(patches, vis_mask)
 
-                        # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
-                        if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
-                            tv_raw = total_variation_loss(patches, vis_mask)
-                        else:
-                            tv_raw = torch.tensor(0.0, device=device)
+                    per_image_loss = -(
+                        self.diversity_weight * log_det
+                        + self.quality_weight * final_quality
+                    ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
 
-                        spec_raw = compute_spectrum_loss(patches, vis_mask)
-
-                        per_image_loss = -(
-                            self.diversity_weight * log_det
-                            + self.quality_weight * final_quality
-                        ) + self.tv_weight * tv_raw + self.spectrum_weight * spec_raw
-
-                        self.scaler.scale(per_image_loss / N).backward()
+                    (per_image_loss / N).backward()
 
                     acc['loss']          += per_image_loss.item()
                     acc['diversity']     += log_det.item()
@@ -834,7 +831,7 @@ class EnsembleTrainer:
         # One epoch = ceil(total_images / images_per_batch) optimizer steps
         total_images = self.dataset_pool.total_images()
         steps_per_epoch = max(1, math.ceil(total_images / self.images_per_batch))
-        total_steps = steps_per_epoch * self.max_epochs + 1
+        total_steps = self.warmup_steps + steps_per_epoch * self.max_epochs + 1
 
         # If max_steps is set, design the LR schedule for that budget
         schedule_steps = max_steps if max_steps is not None else total_steps
@@ -932,13 +929,9 @@ class EnsembleTrainer:
                             optimizer.zero_grad()
                             prefetched = next(prefetch_iter)
                             info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
-                            self.scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-                            scale_before = self.scaler.get_scale()
-                            self.scaler.step(optimizer)
-                            self.scaler.update()
-                            if self.scaler.get_scale() >= scale_before:
-                                scheduler.step()
+                            optimizer.step()
+                            scheduler.step()
                             global_step += 1
                             if global_step % 10 == 0:
                                 self._save_samples(global_step, samples_dir)
@@ -981,18 +974,12 @@ class EnsembleTrainer:
                         prefetched = next(prefetch_iter)
                         info = self._train_step(optimizer, prefetched=prefetched)
 
-                        self.scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             list(self.generator.parameters())
                             + list(self.task_encoder.parameters()), 1.0
                         )
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(optimizer)
-                        self.scaler.update()
-                        # Only advance scheduler when optimizer actually stepped
-                        # (scaler skips step on gradient overflow, reducing scale)
-                        if self.scaler.get_scale() >= scale_before:
-                            scheduler.step()
+                        optimizer.step()
+                        scheduler.step()
 
                         for k in epoch_losses:
                             epoch_losses[k] += info.get(k, 0.0)
