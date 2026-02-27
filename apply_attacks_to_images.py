@@ -164,38 +164,45 @@ def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, 
 def load_validation_images(
     manifest_path: Optional[str] = None,
     image_dir: Optional[str] = None,
+    num_samples: int = 50,
     device: str = 'cuda',
 ) -> List[Tuple[torch.Tensor, str]]:
     """
-    Load all validation images from either a manifest CSV or a directory.
+    Randomly sample and load validation images from manifest or directory.
 
     Args:
         manifest_path: Path to CSV manifest with 'path' column
         image_dir: Directory containing images
+        num_samples: Number of images to randomly sample (default: 50)
         device: Device to load images to
 
     Returns:
         List of (image_tensor, filename) tuples
     """
-    images = []
+    import random
 
     if manifest_path:
         print(f"Loading images from manifest: {manifest_path}")
         with open(manifest_path, 'r') as f:
             reader = csv.DictReader(f)
-            paths = [row['path'] for row in reader]
+            all_paths = [row['path'] for row in reader]
     elif image_dir:
         print(f"Loading images from directory: {image_dir}")
         image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'}
-        paths = sorted([
+        all_paths = sorted([
             str(p) for p in Path(image_dir).rglob('*')
             if p.suffix.lower() in image_exts
         ])
     else:
         raise ValueError("Must provide either --manifest or --image-dir")
 
-    print(f"Found {len(paths)} images")
+    print(f"Found {len(all_paths)} images total")
 
+    # Randomly sample
+    paths = random.sample(all_paths, min(num_samples, len(all_paths)))
+    print(f"Sampling {len(paths)} images")
+
+    images = []
     for img_path in tqdm(paths, desc="Loading images"):
         img_tensor, filename = load_image_from_path(img_path)
         if img_tensor is not None:
@@ -342,6 +349,13 @@ Examples:
     )
 
     parser.add_argument(
+        '--num-samples',
+        type=int,
+        default=50,
+        help='Number of validation images to randomly sample (default: 50)'
+    )
+
+    parser.add_argument(
         '--device',
         type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -376,6 +390,7 @@ Examples:
         images = load_validation_images(
             manifest_path=args.manifest,
             image_dir=args.image_dir,
+            num_samples=args.num_samples,
             device=args.device,
         )
     except Exception as e:
