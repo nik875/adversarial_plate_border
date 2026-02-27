@@ -717,61 +717,52 @@ class EnsembleTrainer:
         """Generate debug images showing clean and attacked image pairs."""
         debug_dir.mkdir(parents=True, exist_ok=True)
 
+        if not self.ensemble._strategies:
+            print("  No strategies registered; skipping debug visualizations")
+            return
+
         num_samples = 4
         patch_h = self.generator.patch_height
         patch_w = self.generator.patch_width
 
-        # Use sticker strategy for visualization
-        sticker_strategy = None
-        for strat_entry in self.ensemble._strategies:
-            if isinstance(strat_entry.strategy, StickerStrategy):
-                sticker_strategy = strat_entry.strategy
-                break
+        strat_entry = self.ensemble._strategies[0]
+        strategy = strat_entry.strategy
 
-        if sticker_strategy is None:
-            print("  No StickerStrategy found; skipping debug visualizations")
-            return
+        model_input_shape = self.ensemble._entries[0].input_shape if self.ensemble._entries else None
 
-        print(f"\nGenerating debug visualizations ({num_samples} pairs)...")
+        print(f"\nGenerating debug visualizations ({num_samples} pairs, strategy={strat_entry.name})...")
 
         for sample_idx in range(num_samples):
             # Sample a raw image
             item = self.dataset_pool.sample()
             raw_image = item.image.to(self._device)  # [3, H, W]
 
-            # Get strategy kwargs — use first model's input_shape so sticker
-            # size is computed as area_fraction of the actual model input area.
-            model_input_shape = None
-            if self.ensemble._entries:
-                model_input_shape = self.ensemble._entries[0].input_shape
-            strategy_kwargs = sticker_strategy.sample_kwargs(
+            strategy_kwargs = strategy.sample_kwargs(
                 raw_image.unsqueeze(0), patch_h, patch_w,
                 model_input_shape=model_input_shape,
             )
 
-            # Clean: apply neutral sticker
-            clean_composited = sticker_strategy.apply_neutral(
+            # Clean: apply neutral
+            clean_composited = strategy.apply_neutral(
                 raw_image.unsqueeze(0), **strategy_kwargs
-            )  # [1, 3, H, W]
+            )  # [1, 3, ?, ?]
 
             # Attacked: apply random patch
             rand_patch = torch.rand(3, patch_h, patch_w, device=self._device)
-            attacked_composited, _ = sticker_strategy.apply(
+            attacked_composited, _ = strategy.apply(
                 raw_image.unsqueeze(0), rand_patch, **strategy_kwargs
-            )  # [1, 3, H, W]
+            )  # [1, 3, ?, ?]
 
             # Convert to PIL and save side-by-side
             clean_pil = T.ToPILImage()(clean_composited[0].cpu().clamp(0, 1))
             attacked_pil = T.ToPILImage()(attacked_composited[0].cpu().clamp(0, 1))
 
-            # Combine horizontally
             combined_width = clean_pil.width + attacked_pil.width
-            combined_height = clean_pil.height
+            combined_height = max(clean_pil.height, attacked_pil.height)
             combined = PIL.Image.new('RGB', (combined_width, combined_height))
             combined.paste(clean_pil, (0, 0))
             combined.paste(attacked_pil, (clean_pil.width, 0))
 
-            # Save
             combined.save(debug_dir / f'debug_pair_{sample_idx:02d}_clean_vs_attacked.png')
 
         print(f"  Saved {num_samples} debug image pairs to {debug_dir}\n")
