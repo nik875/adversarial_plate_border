@@ -67,23 +67,30 @@ def load_image_from_path(image_path: str) -> Tuple[torch.Tensor, str]:
         return None, None
 
 
-def find_latest_checkpoint(checkpoint_root: str = 'framework_output') -> Path:
+def find_latest_checkpoint_patches(run_dir: str) -> Path:
     """
-    Find the latest checkpoint directory by epoch number.
+    Find the latest checkpoint's example_samples in a run directory.
 
-    Looks for directories named checkpoint_epoch_XXXX and returns the one with highest epoch.
+    Looks for checkpoint_epoch_XXXX directories and returns example_samples
+    from the one with the highest epoch number.
+
+    Args:
+        run_dir: Path to run directory (e.g., runs/broad_ensemble/run_20260227_051206/)
+
+    Returns:
+        Path to example_samples directory of latest checkpoint
     """
-    checkpoint_root = Path(checkpoint_root)
-    if not checkpoint_root.exists():
-        raise FileNotFoundError(f"Checkpoint root not found: {checkpoint_root}")
+    run_dir = Path(run_dir)
+    if not run_dir.exists():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
     checkpoint_dirs = sorted([
-        d for d in checkpoint_root.iterdir()
-        if d.is_dir() and d.name.startswith('checkpoint_epoch_')
+        d for d in run_dir.rglob('checkpoint_epoch_*')
+        if d.is_dir()
     ])
 
     if not checkpoint_dirs:
-        raise FileNotFoundError(f"No checkpoint directories found in {checkpoint_root}")
+        raise FileNotFoundError(f"No checkpoint directories found in {run_dir}")
 
     latest_ckpt = checkpoint_dirs[-1]
     example_samples = latest_ckpt / 'example_samples'
@@ -272,11 +279,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Auto-finds latest checkpoint
-  python apply_attacks_to_images.py --manifest ~/.cache/adversarial_plate_manifest.csv
-
-  # Or specify patch directory explicitly
-  python apply_attacks_to_images.py --image-dir /path/to/images --patch-dir /path/to/patches
+  python apply_attacks_to_images.py --manifest ~/.cache/adversarial_plate_manifest.csv --patch-dir runs/broad_ensemble/run_20260227_051206/
+  python apply_attacks_to_images.py --image-dir /path/to/images --patch-dir runs/my_run/
         """
     )
 
@@ -297,13 +301,8 @@ Examples:
     parser.add_argument(
         '--patch-dir',
         type=str,
-        help='Directory containing example patch PNG files. If not specified, finds latest checkpoint'
-    )
-    parser.add_argument(
-        '--checkpoint-root',
-        type=str,
-        default='framework_output',
-        help='Root directory containing checkpoints (default: framework_output). Used to find latest checkpoint if --patch-dir not specified'
+        required=True,
+        help='Run directory (e.g., runs/broad_ensemble/run_20260227_051206/). Script finds latest checkpoint within it'
     )
 
     parser.add_argument(
@@ -315,24 +314,16 @@ Examples:
 
     args = parser.parse_args()
 
-    # Determine patch directory
-    if args.patch_dir:
-        patch_dir = args.patch_dir
-    else:
-        try:
-            patch_dir = str(find_latest_checkpoint(args.checkpoint_root))
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-            return 1
-
-    # Validate patch directory exists
-    if not Path(patch_dir).exists():
-        print(f"Error: patch directory not found: {patch_dir}")
+    # Find latest checkpoint's example_samples in the run directory
+    try:
+        patch_dir = find_latest_checkpoint_patches(args.patch_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
         return 1
 
     # Load patches
     try:
-        patches, patch_filenames = load_patches(patch_dir, args.device)
+        patches, patch_filenames = load_patches(str(patch_dir), args.device)
     except Exception as e:
         print(f"Error loading patches: {e}")
         import traceback
