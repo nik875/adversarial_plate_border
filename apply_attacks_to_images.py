@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-Apply all attack strategies to validation images using a trained patch generator.
+Apply all attack strategies to validation images using example patches from checkpoint.
 
 For each attack strategy (border, sticker, perturbation):
+- Load example patches from checkpoint outputs
 - Iterate through validation images
-- Generate one patch per image
-- Apply that attack
-- Save result
+- Apply patches using that strategy
+- Save results
 
 Output structure:
   attack_outputs/
     border/
-      image_000_patch.png
-      image_000_attacked.png
+      image_000_patch_0_attacked.png
+      image_000_patch_1_attacked.png
       ...
     sticker/
-      image_000_patch.png
-      image_000_attacked.png
+      image_000_patch_0_attacked.png
+      image_000_patch_1_attacked.png
       ...
     perturbation/
-      image_000_patch.png
-      image_000_attacked.png
+      image_000_patch_0_attacked.png
+      image_000_patch_1_attacked.png
       ...
   attack_outputs.tar.gz  (archived at project root)
 
 Usage:
-    python apply_attacks_to_images.py --manifest /path/to/manifest.csv --checkpoint /path/to/generator.pt
-    python apply_attacks_to_images.py --image-dir /path/to/images --checkpoint /path/to/generator.pt
+    python apply_attacks_to_images.py --manifest /path/to/manifest.csv --patch-dir /path/to/patches
+    python apply_attacks_to_images.py --image-dir /path/to/images --patch-dir /path/to/patches
 """
 
 import argparse
@@ -40,7 +40,6 @@ from tqdm import tqdm
 from typing import Optional, List, Tuple
 
 # Framework imports
-from framework.generator import FoundationPatchGenerator
 from framework.base.attack_strategy import (
     BorderStrategy,
     StickerStrategy,
@@ -68,44 +67,34 @@ def load_image_from_path(image_path: str) -> Tuple[torch.Tensor, str]:
         return None, None
 
 
-def load_generator_checkpoint(checkpoint_path: str, device: str = 'cuda') -> FoundationPatchGenerator:
-    """Load a trained generator from checkpoint."""
-    print(f"Loading checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
+    """
+    Load all patch images from a directory.
 
-    basis_dim = checkpoint['basis_dim']
-    patch_size = checkpoint.get('patch_size', [224, 224])
-    patch_height, patch_width = patch_size
-    num_taesd = checkpoint.get('num_taesd', 1)
+    Args:
+        patch_dir: Directory containing patch PNG files
+        device: Device to load patches to
 
-    # Get transformer params
-    transformer_d_model = checkpoint.get('transformer_d_model', 256)
-    transformer_nhead = checkpoint.get('transformer_nhead', 4)
-    transformer_d_ff = checkpoint.get('transformer_d_ff', 1024)
-    transformer_enc_layers = checkpoint.get('transformer_enc_layers', 2)
-    transformer_dec_layers = checkpoint.get('transformer_dec_layers', 2)
+    Returns:
+        Tuple of (list of patch tensors, list of patch filenames)
+    """
+    print(f"Loading patches from: {patch_dir}")
+    patch_dir = Path(patch_dir)
 
-    print(f"  Basis dim: {basis_dim}")
-    print(f"  Patch size: {patch_height} × {patch_width}")
-    print(f"  Num TAESD: {num_taesd}")
+    patches = []
+    filenames = []
 
-    generator = FoundationPatchGenerator(
-        latent_dim=basis_dim,
-        patch_height=patch_height,
-        patch_width=patch_width,
-        num_taesd=num_taesd,
-        transformer_d_model=transformer_d_model,
-        transformer_nhead=transformer_nhead,
-        transformer_d_ff=transformer_d_ff,
-        transformer_enc_layers=transformer_enc_layers,
-        transformer_dec_layers=transformer_dec_layers,
-    ).to(device)
+    patch_files = sorted(patch_dir.glob('*.png'))
+    print(f"Found {len(patch_files)} patch images")
 
-    generator.load_state_dict(checkpoint['generator_state_dict'])
-    generator.eval()
-    print(f"✓ Generator loaded on {device}")
+    for patch_path in tqdm(patch_files, desc="Loading patches"):
+        img, filename = load_image_from_path(str(patch_path))
+        if img is not None:
+            patches.append(img.to(device))
+            filenames.append(filename)
 
-    return generator, patch_height, patch_width
+    print(f"✓ Loaded {len(patches)} patches")
+    return patches, filenames
 
 
 def load_validation_images(
@@ -161,20 +150,20 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 
 def apply_attacks(
-    generator: FoundationPatchGenerator,
+    patches: List[torch.Tensor],
+    patch_filenames: List[str],
     images: List[Tuple[torch.Tensor, str]],
-    patch_height: int,
-    patch_width: int,
     device: str = 'cuda',
 ) -> Path:
     """
-    Apply all attack strategies. For each strategy, generate one patch per image.
+    Apply all attack strategies using example patches.
+
+    For each strategy, apply all patches to all images.
 
     Args:
-        generator: Trained patch generator
+        patches: List of patch tensors [3, H, W]
+        patch_filenames: List of patch filenames (for naming)
         images: List of (image_tensor, filename) tuples
-        patch_height: Height of generated patches
-        patch_width: Width of generated patches
         device: Torch device
 
     Returns:
@@ -194,7 +183,8 @@ def apply_attacks(
         'perturbation': perturbation_strategy,
     }
 
-    print(f"\nApplying {len(strategies)} attack strategies to {len(images)} images...")
+    print(f"\nApplying {len(strategies)} attack strategies...")
+    print(f"  {len(patches)} patches × {len(images)} images = {len(patches) * len(images)} attacks per strategy")
     print(f"  Border: center_ratio=0.91")
     print(f"  Sticker: area_fraction=0.2")
     print(f"  Perturbation: budget=0.1, norm=linf")
@@ -204,42 +194,38 @@ def apply_attacks(
             strategy_dir = output_dir / strategy_name
             strategy_dir.mkdir(parents=True, exist_ok=True)
 
-            for img_idx, (image, filename) in enumerate(tqdm(
+            output_idx = 0
+            for img_idx, (image, img_filename) in enumerate(tqdm(
                 images, desc=f"Processing {strategy_name}", leave=False
             )):
-                # Generate one patch for this image
-                z = torch.rand(1, generator.latent_dim, device=device)
-                patch = generator(z)[0]  # [3, H, W]
+                img_base = Path(img_filename).stem
 
-                # Prepare image as batch [1, 3, H, W]
-                image_batch = image.unsqueeze(0)
+                for patch_idx, patch in enumerate(patches):
+                    # Prepare image as batch [1, 3, H, W]
+                    image_batch = image.unsqueeze(0)
 
-                # Apply strategy
-                if strategy_name == 'border':
-                    # Resize image to patch size for border strategy
-                    image_resized = torch.nn.functional.interpolate(
-                        image_batch,
-                        size=(patch_height, patch_width),
-                        mode='bilinear',
-                        align_corners=False
+                    # Apply strategy
+                    if strategy_name == 'border':
+                        # Resize image to patch size for border strategy
+                        patch_h, patch_w = patch.shape[1], patch.shape[2]
+                        image_resized = torch.nn.functional.interpolate(
+                            image_batch,
+                            size=(patch_h, patch_w),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        composited, _ = strategy.apply(image_resized, patch)
+                    else:
+                        # Sticker and perturbation use original image size
+                        composited, _ = strategy.apply(image_batch, patch)
+
+                    composited = composited.squeeze(0)
+
+                    # Save attacked image
+                    tensor_to_pil(composited).save(
+                        strategy_dir / f"{output_idx:06d}_{img_base}_patch{patch_idx}_attacked.png"
                     )
-                    composited, _ = strategy.apply(image_resized, patch)
-                else:
-                    # Sticker and perturbation use original image size
-                    composited, _ = strategy.apply(image_batch, patch)
-
-                composited = composited.squeeze(0)
-
-                # Save patch
-                base_name = Path(filename).stem
-                tensor_to_pil(patch).save(
-                    strategy_dir / f"{img_idx:04d}_{base_name}_patch.png"
-                )
-
-                # Save attacked image
-                tensor_to_pil(composited).save(
-                    strategy_dir / f"{img_idx:04d}_{base_name}_attacked.png"
-                )
+                    output_idx += 1
 
     print(f"✓ Attack outputs saved to: {output_dir}")
     return output_dir
@@ -255,12 +241,12 @@ def create_tar_archive(output_dir: Path, tar_path: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Apply all attack strategies to validation images",
+        description="Apply all attack strategies to validation images using example patches",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python apply_attacks_to_images.py --manifest data/manifest.csv --checkpoint checkpoint.pt
-  python apply_attacks_to_images.py --image-dir /path/to/images --checkpoint checkpoint.pt
+  python apply_attacks_to_images.py --manifest data/manifest.csv --patch-dir checkpoint/example_samples
+  python apply_attacks_to_images.py --image-dir /path/to/images --patch-dir /path/to/patches
         """
     )
 
@@ -277,12 +263,12 @@ Examples:
         help='Directory containing images'
     )
 
-    # Checkpoint
+    # Patches
     parser.add_argument(
-        '--checkpoint',
+        '--patch-dir',
         type=str,
         required=True,
-        help='Path to trained generator checkpoint'
+        help='Directory containing example patch PNG files (e.g., from checkpoint outputs)'
     )
 
     parser.add_argument(
@@ -294,18 +280,22 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate checkpoint exists
-    if not Path(args.checkpoint).exists():
-        print(f"Error: checkpoint not found: {args.checkpoint}")
+    # Validate patch directory exists
+    if not Path(args.patch_dir).exists():
+        print(f"Error: patch directory not found: {args.patch_dir}")
         return 1
 
-    # Load generator
+    # Load patches
     try:
-        generator, patch_h, patch_w = load_generator_checkpoint(args.checkpoint, args.device)
+        patches, patch_filenames = load_patches(args.patch_dir, args.device)
     except Exception as e:
-        print(f"Error loading generator: {e}")
+        print(f"Error loading patches: {e}")
         import traceback
         traceback.print_exc()
+        return 1
+
+    if not patches:
+        print("Error: no patches loaded")
         return 1
 
     # Load images
@@ -328,10 +318,9 @@ Examples:
     # Apply attacks
     try:
         output_dir = apply_attacks(
-            generator,
+            patches,
+            patch_filenames,
             images,
-            patch_h,
-            patch_w,
             device=args.device,
         )
     except Exception as e:
