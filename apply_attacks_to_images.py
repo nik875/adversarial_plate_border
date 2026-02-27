@@ -267,7 +267,7 @@ def apply_attacks(
     # Initialize strategies
     border_strategy = BorderStrategy(center_ratio=0.91)
     sticker_strategy = StickerStrategy(area_fraction=0.2)
-    perturbation_strategy = PerturbationStrategy(budget=0.1, norm='linf')
+    perturbation_strategy = PerturbationStrategy(budget=0.05, norm='linf')
 
     strategies = {
         'border': border_strategy,
@@ -278,7 +278,7 @@ def apply_attacks(
     print(f"\nApplying attack strategies with their respective patches...")
     print(f"  Border: center_ratio=0.91")
     print(f"  Sticker: area_fraction=0.2")
-    print(f"  Perturbation: budget=0.1, norm=linf")
+    print(f"  Perturbation: budget=0.05, norm=linf")
 
     with torch.no_grad():
         for strategy_name, strategy in strategies.items():
