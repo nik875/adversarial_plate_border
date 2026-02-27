@@ -37,7 +37,7 @@ import torchvision.transforms as T
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # Framework imports
 from framework.base.attack_strategy import (
@@ -112,34 +112,53 @@ def find_latest_patches(run_dir: str) -> Path:
     return extract_dir
 
 
-def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
+def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, Tuple[List[torch.Tensor], List[str]]]:
     """
-    Load all patch images from a directory (recursively).
+    Load patch images organized by strategy directory.
+
+    Tar structure: step_XXXXX/{strategy}/{model}/{i}.png
 
     Args:
-        patch_dir: Directory containing patch PNG files (may be nested)
+        patch_dir: Directory containing patch PNG files (extracted tar root)
         device: Device to load patches to
 
     Returns:
-        Tuple of (list of patch tensors, list of patch filenames)
+        Dict mapping strategy name → (list of patch tensors, list of filenames)
     """
     print(f"Loading patches from: {patch_dir}")
     patch_dir = Path(patch_dir)
 
-    patches = []
-    filenames = []
+    # Find strategy directories (border, sticker, perturbation)
+    strategy_dirs = {
+        d.name: d for d in patch_dir.rglob('*')
+        if d.is_dir() and d.name in {'border', 'sticker', 'perturbation'}
+    }
 
-    patch_files = sorted(patch_dir.rglob('*.png'))
-    print(f"Found {len(patch_files)} patch images")
+    patches_by_strategy = {}
 
-    for patch_path in tqdm(patch_files, desc="Loading patches"):
-        img, filename = load_image_from_path(str(patch_path))
-        if img is not None:
-            patches.append(img.to(device))
-            filenames.append(filename)
+    for strategy_name in ['border', 'sticker', 'perturbation']:
+        if strategy_name not in strategy_dirs:
+            print(f"Warning: no {strategy_name} patches found")
+            patches_by_strategy[strategy_name] = ([], [])
+            continue
 
-    print(f"✓ Loaded {len(patches)} patches")
-    return patches, filenames
+        strat_dir = strategy_dirs[strategy_name]
+        patches = []
+        filenames = []
+
+        patch_files = sorted(strat_dir.rglob('*.png'))
+        print(f"Found {len(patch_files)} {strategy_name} patches")
+
+        for patch_path in tqdm(patch_files, desc=f"Loading {strategy_name} patches", leave=False):
+            img, filename = load_image_from_path(str(patch_path))
+            if img is not None:
+                patches.append(img.to(device))
+                filenames.append(filename)
+
+        print(f"  ✓ Loaded {len(patches)} {strategy_name} patches")
+        patches_by_strategy[strategy_name] = (patches, filenames)
+
+    return patches_by_strategy
 
 
 def load_validation_images(
@@ -195,19 +214,17 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 
 def apply_attacks(
-    patches: List[torch.Tensor],
-    patch_filenames: List[str],
+    patches_by_strategy: Dict[str, Tuple[List[torch.Tensor], List[str]]],
     images: List[Tuple[torch.Tensor, str]],
     device: str = 'cuda',
 ) -> Path:
     """
-    Apply all attack strategies using example patches.
+    Apply attack strategies using strategy-specific patches.
 
-    For each strategy, apply all patches to all images.
+    For each strategy, only apply patches from that strategy to all images.
 
     Args:
-        patches: List of patch tensors [3, H, W]
-        patch_filenames: List of patch filenames (for naming)
+        patches_by_strategy: Dict mapping strategy name → (patch tensors, filenames)
         images: List of (image_tensor, filename) tuples
         device: Torch device
 
@@ -228,16 +245,24 @@ def apply_attacks(
         'perturbation': perturbation_strategy,
     }
 
-    print(f"\nApplying {len(strategies)} attack strategies...")
-    print(f"  {len(patches)} patches × {len(images)} images = {len(patches) * len(images)} attacks per strategy")
+    print(f"\nApplying attack strategies with their respective patches...")
     print(f"  Border: center_ratio=0.91")
     print(f"  Sticker: area_fraction=0.2")
     print(f"  Perturbation: budget=0.1, norm=linf")
 
     with torch.no_grad():
         for strategy_name, strategy in strategies.items():
+            patches, filenames = patches_by_strategy[strategy_name]
+
+            if not patches:
+                print(f"Skipping {strategy_name}: no patches loaded")
+                continue
+
             strategy_dir = output_dir / strategy_name
             strategy_dir.mkdir(parents=True, exist_ok=True)
+
+            total_attacks = len(patches) * len(images)
+            print(f"\n{strategy_name}: {len(patches)} patches × {len(images)} images = {total_attacks} attacks")
 
             output_idx = 0
             for img_idx, (image, img_filename) in enumerate(tqdm(
@@ -272,7 +297,7 @@ def apply_attacks(
                     )
                     output_idx += 1
 
-    print(f"✓ Attack outputs saved to: {output_dir}")
+    print(f"\n✓ Attack outputs saved to: {output_dir}")
     return output_dir
 
 
@@ -332,16 +357,17 @@ Examples:
         print(f"Error: {e}")
         return 1
 
-    # Load patches
+    # Load patches organized by strategy
     try:
-        patches, patch_filenames = load_patches(str(patch_dir), args.device)
+        patches_by_strategy = load_patches_by_strategy(str(patch_dir), args.device)
     except Exception as e:
         print(f"Error loading patches: {e}")
         import traceback
         traceback.print_exc()
         return 1
 
-    if not patches:
+    total_patches = sum(len(p[0]) for p in patches_by_strategy.values())
+    if total_patches == 0:
         print("Error: no patches loaded")
         return 1
 
@@ -365,8 +391,7 @@ Examples:
     # Apply attacks
     try:
         output_dir = apply_attacks(
-            patches,
-            patch_filenames,
+            patches_by_strategy,
             images,
             device=args.device,
         )
