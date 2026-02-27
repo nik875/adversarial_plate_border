@@ -512,13 +512,25 @@ class EnsembleTrainer:
                     if torch.isnan(log_det) or sign <= 0:
                         log_det = torch.tensor(-20.0, device=device, dtype=div_vecs.dtype)
 
+                    # Resize patches to actual display size before computing TV/SSIM.
+                    # For StickerStrategy the bbox gives the on-image sticker dimensions.
+                    bbox = strategy_kwargs.get('bbox')
+                    if bbox is not None and isinstance(strat_entry.strategy, StickerStrategy):
+                        x0, y0, x1, y1 = bbox
+                        sh, sw = max(1, y1 - y0), max(1, x1 - x0)
+                        patches_scaled = F.interpolate(patches, size=(sh, sw), mode='bilinear', align_corners=False)
+                        vis_mask_scaled = torch.ones(1, 1, sh, sw, device=device)
+                    else:
+                        patches_scaled  = patches
+                        vis_mask_scaled = vis_mask
+
                     # Apply TV loss to both BorderStrategy and StickerStrategy (penalize high-frequency noise)
                     if isinstance(strat_entry.strategy, (BorderStrategy, StickerStrategy)):
-                        tv_raw = total_variation_loss(patches, vis_mask)
+                        tv_raw = total_variation_loss(patches_scaled, vis_mask_scaled)
                     else:
                         tv_raw = torch.tensor(0.0, device=device)
 
-                    spec_raw = compute_spectrum_loss(patches, vis_mask)
+                    spec_raw = compute_spectrum_loss(patches_scaled, vis_mask_scaled)
 
                     per_image_loss = -(
                         self.diversity_weight * log_det
@@ -789,6 +801,15 @@ class EnsembleTrainer:
 
                             z_enriched     = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
                             sample_patches = self.generator(z, z_enriched)
+
+                            # Resize to actual on-image sticker size for display
+                            if isinstance(strat_entry.strategy, StickerStrategy):
+                                ref_h, ref_w = model_entry.input_shape
+                                target_area = strat_entry.strategy.area_fraction * ref_h * ref_w
+                                sh = sw = max(1, int(target_area ** 0.5))
+                                sample_patches = F.interpolate(
+                                    sample_patches, size=(sh, sw), mode='bilinear', align_corners=False
+                                )
 
                             for i, patch in enumerate(sample_patches):
                                 buf = io.BytesIO()

@@ -125,7 +125,7 @@ trainer:
   lr_min: 1.0e-6
   diversity_weight: 1.0
   quality_weight: 8.0
-  tv_weight: 25.0
+  tv_weight: 2.5
   spectrum_weight: 2.0
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
