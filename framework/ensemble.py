@@ -491,7 +491,7 @@ class EnsembleTrainer:
                     norm_deltas_sq = norm_deltas ** 2
                     quality        = norm_deltas_sq.mean(dim=1).sqrt().mean() + 1e-8
 
-                    # Final-layer activations — used for both quality and diversity
+                    # Final-layer activations — used for quality only
                     if final_neurons:
                         final_deltas      = adv_acts[:, k_rand:] - ctrl_final  # [P, k_final]
                         final_neuron_stds = self.neuron_sampler.lookup_neuron_stds(
@@ -500,10 +500,11 @@ class EnsembleTrainer:
                         final_eff_stds    = final_neuron_stds.clamp(min=beta)
                         final_norm_deltas = final_deltas / final_eff_stds       # [P, k_final]
                         final_quality     = final_norm_deltas.pow(2).mean(dim=1).sqrt().mean() + 1e-8
-                        div_vecs          = final_norm_deltas  # diversity uses final layer
                     else:
                         final_quality = torch.tensor(1e-8, device=device)
-                        div_vecs      = norm_deltas            # fallback: random neurons
+
+                    # Diversity always uses randomly sampled neurons (broad coverage)
+                    div_vecs = norm_deltas
 
                     eps        = max(1e-6, 1e-2 / P)
                     normalized = F.normalize(div_vecs, p=2, dim=1)
