@@ -369,13 +369,6 @@ Examples:
     )
 
     parser.add_argument(
-        '--num-samples',
-        type=int,
-        default=50,
-        help='Number of validation images to randomly sample (default: 50)'
-    )
-
-    parser.add_argument(
         '--device',
         type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -405,12 +398,15 @@ Examples:
         print("Error: no patches loaded")
         return 1
 
-    # Load images
+    # Load exactly enough images to match total patches
+    num_images_needed = total_patches
+    print(f"Total patches: {total_patches}, sampling {num_images_needed} images")
+
     try:
         images = load_validation_images(
             manifest_path=args.manifest,
             image_dir=args.image_dir,
-            num_samples=args.num_samples,
+            num_samples=num_images_needed,
             device=args.device,
         )
     except Exception as e:
