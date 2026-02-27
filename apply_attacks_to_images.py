@@ -114,10 +114,10 @@ def find_latest_patches(run_dir: str) -> Path:
 
 def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tensor], List[str]]:
     """
-    Load all patch images from a directory.
+    Load all patch images from a directory (recursively).
 
     Args:
-        patch_dir: Directory containing patch PNG files
+        patch_dir: Directory containing patch PNG files (may be nested)
         device: Device to load patches to
 
     Returns:
@@ -129,7 +129,7 @@ def load_patches(patch_dir: str, device: str = 'cuda') -> Tuple[List[torch.Tenso
     patches = []
     filenames = []
 
-    patch_files = sorted(patch_dir.glob('*.png'))
+    patch_files = sorted(patch_dir.rglob('*.png'))
     print(f"Found {len(patch_files)} patch images")
 
     for patch_path in tqdm(patch_files, desc="Loading patches"):
