@@ -112,9 +112,9 @@ def find_latest_patches(run_dir: str) -> Path:
     return extract_dir
 
 
-def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, Tuple[List[torch.Tensor], List[str]]]:
+def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, List[Tuple[torch.Tensor, str, str]]]:
     """
-    Load patch images organized by strategy directory.
+    Load patch images organized by strategy, preserving model hierarchy.
 
     Tar structure: step_XXXXX/{strategy}/{model}/{i}.png
 
@@ -123,7 +123,7 @@ def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, 
         device: Device to load patches to
 
     Returns:
-        Dict mapping strategy name → (list of patch tensors, list of filenames)
+        Dict mapping strategy name → list of (patch_tensor, model_name, patch_id)
     """
     print(f"Loading patches from: {patch_dir}")
     patch_dir = Path(patch_dir)
@@ -139,24 +139,29 @@ def load_patches_by_strategy(patch_dir: str, device: str = 'cuda') -> Dict[str, 
     for strategy_name in ['border', 'sticker', 'perturbation']:
         if strategy_name not in strategy_dirs:
             print(f"Warning: no {strategy_name} patches found")
-            patches_by_strategy[strategy_name] = ([], [])
+            patches_by_strategy[strategy_name] = []
             continue
 
         strat_dir = strategy_dirs[strategy_name]
-        patches = []
-        filenames = []
+        patches_list = []
 
-        patch_files = sorted(strat_dir.rglob('*.png'))
-        print(f"Found {len(patch_files)} {strategy_name} patches")
+        # Iterate through model subdirectories
+        for model_dir in sorted(strat_dir.iterdir()):
+            if not model_dir.is_dir():
+                continue
 
-        for patch_path in tqdm(patch_files, desc=f"Loading {strategy_name} patches", leave=False):
-            img, filename = load_image_from_path(str(patch_path))
-            if img is not None:
-                patches.append(img.to(device))
-                filenames.append(filename)
+            model_name = model_dir.name
+            patch_files = sorted(model_dir.glob('*.png'))
 
-        print(f"  ✓ Loaded {len(patches)} {strategy_name} patches")
-        patches_by_strategy[strategy_name] = (patches, filenames)
+            for patch_path in patch_files:
+                img, filename = load_image_from_path(str(patch_path))
+                if img is not None:
+                    patch_id = patch_path.stem
+                    patches_list.append((img.to(device), model_name, patch_id))
+
+        print(f"Found {len(patches_list)} {strategy_name} patches")
+        print(f"  ✓ Loaded {len(patches_list)} {strategy_name} patches")
+        patches_by_strategy[strategy_name] = patches_list
 
     return patches_by_strategy
 
@@ -221,17 +226,31 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 
 def apply_attacks(
-    patches_by_strategy: Dict[str, Tuple[List[torch.Tensor], List[str]]],
+    patches_by_strategy: Dict[str, List[Tuple[torch.Tensor, str, str]]],
     images: List[Tuple[torch.Tensor, str]],
     device: str = 'cuda',
 ) -> Path:
     """
     Apply attack strategies using strategy-specific patches.
 
-    For each strategy, only apply patches from that strategy to all images.
+    Output structure mirrors input:
+      attack_outputs/
+        border/
+          SmolVLM/
+            0_attacked.png
+            1_attacked.png
+            ...
+          CLIP/
+            0_attacked.png
+            ...
+        sticker/
+          SmolVLM/
+            ...
+        perturbation/
+          ...
 
     Args:
-        patches_by_strategy: Dict mapping strategy name → (patch tensors, filenames)
+        patches_by_strategy: Dict mapping strategy name → list of (patch_tensor, model_name, patch_id)
         images: List of (image_tensor, filename) tuples
         device: Torch device
 
@@ -259,50 +278,50 @@ def apply_attacks(
 
     with torch.no_grad():
         for strategy_name, strategy in strategies.items():
-            patches, filenames = patches_by_strategy[strategy_name]
+            patches_list = patches_by_strategy[strategy_name]
 
-            if not patches:
+            if not patches_list:
                 print(f"Skipping {strategy_name}: no patches loaded")
                 continue
 
-            strategy_dir = output_dir / strategy_name
-            strategy_dir.mkdir(parents=True, exist_ok=True)
+            total_attacks = len(patches_list) * len(images)
+            print(f"\n{strategy_name}: {len(patches_list)} patches × {len(images)} images = {total_attacks} attacks")
 
-            total_attacks = len(patches) * len(images)
-            print(f"\n{strategy_name}: {len(patches)} patches × {len(images)} images = {total_attacks} attacks")
+            # Count patches per model for progress tracking
+            models = set(model for _, model, _ in patches_list)
+            for model_name in sorted(models):
+                model_patches = [(p, pid) for p, m, pid in patches_list if m == model_name]
+                model_dir = output_dir / strategy_name / model_name
+                model_dir.mkdir(parents=True, exist_ok=True)
 
-            output_idx = 0
-            for img_idx, (image, img_filename) in enumerate(tqdm(
-                images, desc=f"Processing {strategy_name}", leave=False
-            )):
-                img_base = Path(img_filename).stem
+                for img_idx, (image, img_filename) in enumerate(tqdm(
+                    images, desc=f"{strategy_name}/{model_name}", leave=False
+                )):
+                    for patch, patch_id in model_patches:
+                        # Prepare image as batch [1, 3, H, W]
+                        image_batch = image.unsqueeze(0)
 
-                for patch_idx, patch in enumerate(patches):
-                    # Prepare image as batch [1, 3, H, W]
-                    image_batch = image.unsqueeze(0)
+                        # Apply strategy
+                        if strategy_name == 'border':
+                            # Resize image to patch size for border strategy
+                            patch_h, patch_w = patch.shape[1], patch.shape[2]
+                            image_resized = torch.nn.functional.interpolate(
+                                image_batch,
+                                size=(patch_h, patch_w),
+                                mode='bilinear',
+                                align_corners=False
+                            )
+                            composited, _ = strategy.apply(image_resized, patch)
+                        else:
+                            # Sticker and perturbation use original image size
+                            composited, _ = strategy.apply(image_batch, patch)
 
-                    # Apply strategy
-                    if strategy_name == 'border':
-                        # Resize image to patch size for border strategy
-                        patch_h, patch_w = patch.shape[1], patch.shape[2]
-                        image_resized = torch.nn.functional.interpolate(
-                            image_batch,
-                            size=(patch_h, patch_w),
-                            mode='bilinear',
-                            align_corners=False
+                        composited = composited.squeeze(0)
+
+                        # Save attacked image: {patch_id}_attacked.png
+                        tensor_to_pil(composited).save(
+                            model_dir / f"{patch_id}_attacked.png"
                         )
-                        composited, _ = strategy.apply(image_resized, patch)
-                    else:
-                        # Sticker and perturbation use original image size
-                        composited, _ = strategy.apply(image_batch, patch)
-
-                    composited = composited.squeeze(0)
-
-                    # Save attacked image
-                    tensor_to_pil(composited).save(
-                        strategy_dir / f"{output_idx:06d}_{img_base}_patch{patch_idx}_attacked.png"
-                    )
-                    output_idx += 1
 
     print(f"\n✓ Attack outputs saved to: {output_dir}")
     return output_dir
@@ -380,7 +399,7 @@ Examples:
         traceback.print_exc()
         return 1
 
-    total_patches = sum(len(p[0]) for p in patches_by_strategy.values())
+    total_patches = sum(len(p) for p in patches_by_strategy.values())
     if total_patches == 0:
         print("Error: no patches loaded")
         return 1
