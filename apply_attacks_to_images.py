@@ -175,8 +175,10 @@ def load_validation_images(
     """
     Randomly sample and load validation images from manifest or directory.
 
+    If manifest is used, filters for split='val' (ImageNet val, COCO val).
+
     Args:
-        manifest_path: Path to CSV manifest with 'path' column
+        manifest_path: Path to CSV manifest with 'path' and 'split' columns
         image_dir: Directory containing images
         num_samples: Number of images to randomly sample (default: 50)
         device: Device to load images to
@@ -187,10 +189,12 @@ def load_validation_images(
     import random
 
     if manifest_path:
-        print(f"Loading images from manifest: {manifest_path}")
+        print(f"Loading validation images from manifest: {manifest_path}")
         with open(manifest_path, 'r') as f:
             reader = csv.DictReader(f)
-            all_paths = [row['path'] for row in reader]
+            # Filter for validation split only
+            all_paths = [row['path'] for row in reader if row.get('split') == 'val']
+        print(f"Found {len(all_paths)} validation images")
     elif image_dir:
         print(f"Loading images from directory: {image_dir}")
         image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'}
