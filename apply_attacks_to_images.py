@@ -316,10 +316,12 @@ def apply_attacks(
                             mode='bilinear',
                             align_corners=False
                         )
-                        composited, _ = strategy.apply(image_resized, patch)
+                        kwargs = strategy.sample_kwargs(image_resized, patch.shape[1], patch.shape[2])
+                        composited, _ = strategy.apply(image_resized, patch, **kwargs)
                     else:
-                        # Sticker and perturbation use original image size
-                        composited, _ = strategy.apply(image_batch, patch)
+                        # Sticker and perturbation: sample kwargs (gives random bbox for sticker)
+                        kwargs = strategy.sample_kwargs(image_batch, patch.shape[1], patch.shape[2])
+                        composited, _ = strategy.apply(image_batch, patch, **kwargs)
 
                     composited = composited.squeeze(0)
 
