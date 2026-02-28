@@ -880,11 +880,11 @@ class ProgressivePatchTrainer:
                  device: str = None,
                  grad_accumulate: int = None,
                  basis_dim: int = 16,
-                 diversity_weight: float = 0.0,
+                 diversity_weight: float = 1.0,
                  quality_weight: float = 1.0,
                  performance_weight: float = 1.0,
-                 tv_weight: float = 0.0,
-                 spectrum_weight: float = 0.0,
+                 tv_weight: float = 2.5,
+                 spectrum_weight: float = 1.0,
                  layer_configs: Optional[List[LayerConfig]] = None,
                  ocr_dataset_split: str = 'train',
                  ocr_max_samples: Optional[int] = None,
@@ -2823,8 +2823,8 @@ def main():
     parser = argparse.ArgumentParser(description='Progressive Layer Diversity Training for Patch Generation')
     parser.add_argument('--basis-dim', type=int, default=16,
                         help='Dimensionality of latent basis (default: 16)')
-    parser.add_argument('--diversity-weight', type=float, default=0.0,
-                        help='Weight for diversity term in combined loss (default: 0.0). '
+    parser.add_argument('--diversity-weight', type=float, default=1.0,
+                        help='Weight for diversity term in combined loss (default: 1.0). '
                         'Multiplies diversity_score. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
     parser.add_argument('--quality-weight', type=float, default=1.0,
                         help='Weight for quality term in combined loss (default: 1.0). '
@@ -2832,10 +2832,10 @@ def main():
     parser.add_argument('--performance-weight', type=float, default=1.0,
                         help='Overall weight for diversity-quality combined loss (default: 1.0). '
                         'Multiplies the entire combined term. Loss = -(performance_weight * (diversity_weight * diversity_score + quality_weight * quality_score))')
-    parser.add_argument('--tv-weight', type=float, default=0.0,
-                        help='Weight for total variation loss to encourage spatial smoothness (default: 0.0)')
-    parser.add_argument('--ssim-weight', type=float, default=0.0, dest='spectrum_weight',
-                        help='Weight for SSIM structural diversity loss to discourage patch similarity (default: 0.0). '
+    parser.add_argument('--tv-weight', type=float, default=2.5,
+                        help='Weight for total variation loss to encourage spatial smoothness (default: 2.5)')
+    parser.add_argument('--ssim-weight', type=float, default=1.0, dest='spectrum_weight',
+                        help='Weight for SSIM structural diversity loss to discourage patch similarity (default: 1.0). '
                         'Penalizes high SSIM between patches - higher value = force more different structures.')
     parser.add_argument('--save-examples-every', type=int, default=None,
                         help='Save example patches every N batches during training (default: disabled). '
