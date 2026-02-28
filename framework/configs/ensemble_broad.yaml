@@ -9,8 +9,6 @@
 #   Vision-Language: CLIP ViT-L/14, SmolVLM-500M
 #   OCR encoder:   TrOCR-base-printed
 #
-# Warmup: MobileNetV3-Small (lightweight distilled model for initialization)
-#
 # Usage:
 #   python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml
 #
@@ -37,13 +35,9 @@ strategies:
     strategy_id: 0
 
 # ---------------------------------------------------------------------------
-# Model pool — 8 models spanning 4 vision tasks + warmup
+# Model pool — 8 models spanning 4 vision tasks
 # ---------------------------------------------------------------------------
 models:
-  - name: mobilenetv3_small
-    architecture: mobilenetv3_small
-    domain_type: classification
-
   - name: resnet50
     architecture: resnet50
     domain_type: classification
@@ -137,5 +131,5 @@ trainer:
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
   warmup_steps: 250
-  warmup_model: mobilenetv3_small
+  warmup_model: clip_vit_l14
   num_prefetch_workers: 12

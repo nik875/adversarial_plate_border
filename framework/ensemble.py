@@ -1001,11 +1001,6 @@ class EnsembleTrainer:
                     return
                 print(f"Warmup complete. global_step={global_step}\n")
 
-        # After warmup, exclude warmup_model from main training (if specified)
-        main_training_entries = None
-        if self.warmup_model:
-            main_training_entries = [e for e in self.ensemble._entries if e.name != self.warmup_model]
-
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()
             self.task_encoder.train()
@@ -1025,7 +1020,7 @@ class EnsembleTrainer:
                     for step in range(steps_this_epoch):
                         optimizer.zero_grad()
                         prefetched = next(prefetch_iter)
-                        info = self._train_step(optimizer, prefetched=prefetched, entries_override=main_training_entries)
+                        info = self._train_step(optimizer, prefetched=prefetched)
 
                         torch.nn.utils.clip_grad_norm_(
                             list(self.generator.parameters())
