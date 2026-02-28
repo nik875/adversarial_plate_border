@@ -128,6 +128,7 @@ generator:
 # ---------------------------------------------------------------------------
 trainer:
   max_epochs: 1
+  max_steps: 1381
   patches_per_image: 8
   images_per_batch: 32
   k_neurons: 10000
