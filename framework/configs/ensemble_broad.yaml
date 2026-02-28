@@ -37,9 +37,13 @@ strategies:
     strategy_id: 0
 
 # ---------------------------------------------------------------------------
-# Model pool — 8 models spanning 4 vision tasks
+# Model pool — 8 models spanning 4 vision tasks + warmup
 # ---------------------------------------------------------------------------
 models:
+  - name: mobilenetv3_small
+    architecture: mobilenetv3_small
+    domain_type: classification
+
   - name: resnet50
     architecture: resnet50
     domain_type: classification
