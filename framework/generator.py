@@ -418,7 +418,7 @@ class FoundationPatchGenerator(nn.Module):
 
         def _run_stream(adapter, taesd, transformer, z_enc, vae_h, vae_w):
             latent = adapter(z_enc).view(z_enc.shape[0], 4, vae_h, vae_w)
-            taesd_out = torch.sigmoid(taesd.decode(latent).sample)
+            taesd_out = F.leaky_relu(taesd.decode(latent).sample)
             # transformer refines at 256×256, upsamples to 512×512 internally
             return transformer(taesd_out)
 
