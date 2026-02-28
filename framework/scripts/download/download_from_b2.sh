@@ -11,6 +11,18 @@
 # =============================================================================
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Install system dependencies (X11/graphics libraries for OpenCV, etc.)
+# ---------------------------------------------------------------------------
+echo "==> Installing system dependencies..."
+sudo apt-get update
+sudo apt-get install -y \
+    libxcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 \
+    libsm6 libxext6 libxrender-dev \
+    libgl1-mesa-glx libglib2.0-0 libgomp1
+echo "    System dependencies installed."
+echo ""
+
 CACHE_DIR="$HOME/.cache"
 TAR_PATH="$(pwd)/general_image_data.tar"
 B2_URI="b2://licenseplate-dataset/general_image_data.tar"

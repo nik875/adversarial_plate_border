@@ -24,4 +24,5 @@ b2
 datasets
 sentencepiece
 h5py
+xformers
 git+https://github.com/nik875/doctr.git@main
