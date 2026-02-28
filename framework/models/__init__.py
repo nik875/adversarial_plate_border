@@ -34,6 +34,7 @@ import torch.nn as nn
 # Python module is loaded on first access via _LazyRegistry.__getitem__.
 # ---------------------------------------------------------------------------
 _MAP: dict[str, tuple[str, str]] = {
+    'mobilenetv3_small': ('framework.models.classification', 'MobileNetV3SmallWrapper'),
     'resnet50':       ('framework.models.classification', 'ResNet50Wrapper'),
     'convnext_small': ('framework.models.classification', 'ConvNeXtSmallWrapper'),
     'swin_t':         ('framework.models.swin',           'SwinTWrapper'),
