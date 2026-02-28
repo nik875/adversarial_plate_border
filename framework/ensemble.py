@@ -753,13 +753,13 @@ class EnsembleTrainer:
                     ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}_raw.png'
                 )
 
-            # Composite patch onto each val image
-            if self.ensemble._strategies:
-                strategy = self.ensemble._strategies[0].strategy
-                model_input_shape = (
-                    self.ensemble._entries[0].input_shape
-                    if self.ensemble._entries else None
-                )
+            # Composite patch onto each val image, once per strategy
+            model_input_shape = (
+                self.ensemble._entries[0].input_shape
+                if self.ensemble._entries else None
+            )
+            for strat_entry in self.ensemble._strategies:
+                strategy = strat_entry.strategy
                 for i in range(len(val_images)):
                     img = val_images[i:i + 1]   # [1, 3, H, W]
                     patch = patches[i]           # [3, H, W]
@@ -768,7 +768,7 @@ class EnsembleTrainer:
                     )
                     composited, _ = strategy.apply(img, patch, **kwargs)
                     T.ToPILImage()(composited[0].cpu().clamp(0, 1)).save(
-                        ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}_composited.png'
+                        ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}_{strat_entry.name}.png'
                     )
         self.generator.train()
         self.task_encoder.train()
