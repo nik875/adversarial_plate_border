@@ -95,7 +95,7 @@ priors: []
 # TaskEncoder
 # ---------------------------------------------------------------------------
 task_encoder:
-  hidden_dim: 64
+  hidden_dim: 256
   num_layers: 2
   alpha: 0.5
 
