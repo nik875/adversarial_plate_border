@@ -25,24 +25,14 @@ compute_device: cuda
 manifest: ~/.cache/adversarial_plate_manifest.csv
 
 # ---------------------------------------------------------------------------
-# Attack strategies — any strategy can be used against any model
+# Attack strategies — perturbation only
 # ---------------------------------------------------------------------------
 strategies:
-  - name: border
-    type: border
-    center_ratio: 0.91
-    strategy_id: 0
-
-  - name: sticker
-    type: sticker
-    area_fraction: 0.05
-    strategy_id: 1
-
   - name: perturbation
     type: perturbation
     budget: 0.05
     norm: linf
-    strategy_id: 2
+    strategy_id: 0
 
 # ---------------------------------------------------------------------------
 # Model pool — 8 models spanning 4 vision tasks
@@ -134,10 +124,10 @@ trainer:
   learning_rate: 3.5e-5
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
-  diversity_weight: 0.0
+  diversity_weight: 1.0
   quality_weight: 1.0
-  tv_weight: 0.0
-  spectrum_weight: 0.0
+  tv_weight: 2.5
+  spectrum_weight: 1.0
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
   warmup_steps: 100

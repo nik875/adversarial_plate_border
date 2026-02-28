@@ -740,7 +740,7 @@ class TestTaskEncoder(unittest.TestCase):
 
     def test_init(self):
         enc = self.TaskEncoder(
-            num_models=3, num_strategies=3, num_datasets=2,
+            num_models=3, num_strategies=3,
             latent_dim=8, hidden_dim=32, num_layers=2, alpha=0.5,
         )
         self.assertIsNotNone(enc)
@@ -748,33 +748,34 @@ class TestTaskEncoder(unittest.TestCase):
     def test_zero_delta_at_init(self):
         """Final Linear is zero-initialized → task_delta = 0 → z_enriched = z."""
         enc = self.TaskEncoder(
-            num_models=3, num_strategies=3, num_datasets=2,
+            num_models=3, num_strategies=3,
             latent_dim=8, hidden_dim=32, num_layers=2, alpha=0.5,
         )
-        z = torch.randn(2, 8)
-        mi = torch.zeros(2, dtype=torch.long)
-        si = torch.zeros(2, dtype=torch.long)
-        di = torch.zeros(2, dtype=torch.long)
-        z_enc = enc(z, mi, si, di)
+        B = 2
+        z = torch.randn(B, 8)
+        mi = torch.zeros(B, dtype=torch.long)
+        si = torch.zeros(B, dtype=torch.long)
+        clip_embed = torch.zeros(B, 1024)
+        z_enc = enc(z, mi, si, clip_embed)
         self.assertTrue(torch.allclose(z_enc, z),
                         msg="z_enriched should equal z at init (delta=0)")
 
     def test_forward_shape(self):
         enc = self.TaskEncoder(
-            num_models=4, num_strategies=3, num_datasets=5, latent_dim=16,
+            num_models=4, num_strategies=3, latent_dim=16,
         )
         B = 3
         z = torch.randn(B, 16)
         mi = torch.randint(0, 4, (B,))
         si = torch.randint(0, 3, (B,))
-        di = torch.randint(0, 5, (B,))
-        out = enc(z, mi, si, di)
+        clip_embed = torch.randn(B, 1024)
+        out = enc(z, mi, si, clip_embed)
         self.assertEqual(out.shape, (B, 16))
 
     def test_alpha_bounds_shift(self):
         """z_enriched should be within alpha=1.0 of z (since Tanh ∈ [-1,1])."""
         enc = self.TaskEncoder(
-            num_models=2, num_strategies=2, num_datasets=2,
+            num_models=2, num_strategies=2,
             latent_dim=8, hidden_dim=16, num_layers=2, alpha=1.0,
         )
         # Give the final layer non-zero weights so delta isn't trivially 0
@@ -783,8 +784,9 @@ class TestTaskEncoder(unittest.TestCase):
             enc.mlp[-2].bias.fill_(0.0)
 
         z = torch.zeros(1, 8)
-        mi = torch.tensor([0]); si = torch.tensor([0]); di = torch.tensor([0])
-        z_enc = enc(z, mi, si, di)
+        mi = torch.tensor([0]); si = torch.tensor([0])
+        clip_embed = torch.zeros(1, 1024)
+        z_enc = enc(z, mi, si, clip_embed)
         diff = (z_enc - z).abs().max().item()
         self.assertLessEqual(diff, 1.0 + 1e-5,
                              msg="shift must be ≤ alpha * 1 = 1.0")
@@ -1126,7 +1128,7 @@ class TestEnsembleTrainer(unittest.TestCase):
 
         # TaskEncoder
         task_enc = TaskEncoder(
-            num_models=1, num_strategies=3, num_datasets=1,
+            num_models=1, num_strategies=3,
             latent_dim=4, hidden_dim=16, num_layers=2,
         )
 
@@ -1153,6 +1155,11 @@ class TestEnsembleTrainer(unittest.TestCase):
 
         gen = MockGenerator()
 
+        # Mock CLIP encoder: returns zero embeddings without downloading weights
+        class MockCLIPEncoder(nn.Module):
+            def forward(self, x):
+                return torch.zeros(x.shape[0], 1024)
+
         sampler = NeuronSampler(device)
 
         trainer = EnsembleTrainer(
@@ -1162,7 +1169,7 @@ class TestEnsembleTrainer(unittest.TestCase):
             generator=gen,
             neuron_sampler=sampler,
             k_neurons=10,
-            patches_per_batch=2,
+            patches_per_image=2,
             diversity_weight=1.0,
             quality_weight=1.0,
             tv_weight=0.0,      # off to keep test fast
@@ -1172,6 +1179,7 @@ class TestEnsembleTrainer(unittest.TestCase):
             output_dir=tmpdir,
             save_every_epochs=1,
             device=device,
+            clip_encoder=MockCLIPEncoder(),
         )
         return trainer
 
@@ -1229,9 +1237,9 @@ class TestEnsembleConfigLoader(unittest.TestCase):
 
         cfg = load_ensemble_config(str(config_path))
         te = cfg.task_encoder
-        # ensemble_example.yaml has 2 models and 1 dataset
+        # ensemble_example.yaml has 2 models and 1 strategy
         self.assertEqual(te.num_models, len(cfg.models_cfg))
-        self.assertEqual(te.num_datasets, cfg.dataset_pool.num_datasets())
+        self.assertEqual(te.num_strategies, len(cfg.strategies_cfg))
 
 
 # =============================================================================

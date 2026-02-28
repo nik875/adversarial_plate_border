@@ -157,7 +157,6 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
     num_models = max(len(models_cfg), 1)
     num_strategies = max(len(strategies_cfg), 1)
     datasets_cfg: List[Dict] = cfg.get('datasets', [])
-    num_datasets = max(len(datasets_cfg), 1)
 
     # Load manifest if specified at top level of YAML
     manifest_path = cfg.get('manifest')
@@ -219,7 +218,7 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
     task_encoder = TaskEncoder(
         num_models=num_models,
         num_strategies=num_strategies,
-        num_datasets=num_datasets,
+        clip_embed_dim=te_cfg.get('clip_embed_dim', 1024),
         latent_dim=latent_dim,
         hidden_dim=te_cfg.get('hidden_dim', 128),
         num_layers=te_cfg.get('num_layers', 3),

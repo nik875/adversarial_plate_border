@@ -46,6 +46,7 @@ from framework.base.attack_strategy import AttackStrategy, BorderStrategy, Stick
 from framework.dataset_pool import LazyDatasetPool
 from framework.generator import FoundationPatchGenerator
 from framework.losses import total_variation_loss, compute_spectrum_loss
+from framework.models.clip_encoder import CLIPVisionWrapper
 from framework.neuron_sampler import NeuronSampler
 from framework.task_encoder import TaskEncoder
 
@@ -280,6 +281,7 @@ class EnsembleTrainer:
         warmup_model: Optional[str] = None,
         num_prefetch_workers: int = 8,
         device: Optional[torch.device] = None,
+        clip_encoder: Optional[nn.Module] = None,
     ):
         self.ensemble = ensemble
         self.dataset_pool = dataset_pool
@@ -308,6 +310,12 @@ class EnsembleTrainer:
         self.generator = self.generator.to(self._device)
         self.task_encoder = self.task_encoder.to(self._device)
 
+        # Frozen CLIP encoder for image-conditioned task encoding
+        if clip_encoder is not None:
+            self.clip_encoder = clip_encoder.to(self._device)
+        else:
+            self.clip_encoder = CLIPVisionWrapper().to(self._device)
+        self.clip_preprocess = CLIPVisionWrapper.get_preprocess_fn()
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -441,13 +449,17 @@ class EnsembleTrainer:
 
                     midx = torch.full((P,), entry.model_id,          device=device, dtype=torch.long)
                     sidx = torch.full((P,), strat_entry.strategy_id, device=device, dtype=torch.long)
-                    didx = torch.full((P,), dataset_id,              device=device, dtype=torch.long)
 
                     midx = midx.clamp(0, self.task_encoder.num_models    - 1)
                     sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
-                    didx = didx.clamp(0, self.task_encoder.num_datasets  - 1)
 
-                    z_enriched = self.task_encoder(z, midx, sidx, didx)
+                    # Compute frozen CLIP embedding of the input image for task conditioning
+                    with torch.no_grad():
+                        clip_inp   = self.clip_preprocess(image)          # [1, 3, 224, 224]
+                        clip_embed = self.clip_encoder(clip_inp)          # [1, 1024]
+                    clip_embed_P = clip_embed.expand(P, -1)               # [P, 1024]
+
+                    z_enriched = self.task_encoder(z, midx, sidx, clip_embed_P)
 
                     # Stream gating: during warmup, each strategy uses a dedicated
                     # subset of TAESD streams so each specialises early on.
@@ -543,14 +555,14 @@ class EnsembleTrainer:
                     # overlap the border/center boundary don't see arbitrary generator values.
                     patches_for_loss = patches_scaled * vis_mask_scaled
 
-                    # TV loss: all strategies. Border/sticker minimize it (smooth patches);
-                    # perturbation maximizes it (encourage high-frequency noise).
+                    # TV loss: applied to border/sticker (smooth patches);
+                    # skipped entirely for perturbation attacks.
                     tv_raw = total_variation_loss(patches_for_loss, vis_mask_scaled)
 
                     spec_raw = compute_spectrum_loss(patches_for_loss, vis_mask_scaled)
 
                     if isinstance(strat_entry.strategy, PerturbationStrategy):
-                        tv_contrib = -self.tv_weight * torch.sigmoid(tv_raw / 2)
+                        tv_contrib = torch.tensor(0.0, device=device)
                     else:
                         tv_contrib = self.tv_weight * tv_raw
 
@@ -802,14 +814,18 @@ class EnsembleTrainer:
                 with tarfile.open(tar_path, 'w') as tar:
                     for strat_entry in self.ensemble._strategies:
                         for model_entry in self.ensemble._entries:
-                            dataset_idx = random.randint(0, self.task_encoder.num_datasets - 1)
+                            # Sample a reference image for CLIP conditioning
+                            ref_item   = self.dataset_pool.sample()
+                            ref_image  = ref_item.image.unsqueeze(0).to(self._device)
+                            clip_inp   = self.clip_preprocess(ref_image)
+                            clip_embed = self.clip_encoder(clip_inp)          # [1, 1024]
+                            clip_embed_batch = clip_embed.expand(10, -1)      # [10, 1024]
 
                             z            = torch.randn(10, self.generator.latent_dim, device=self._device)
                             model_idx    = torch.full((10,), model_entry.model_id,    dtype=torch.long, device=self._device)
                             strategy_idx = torch.full((10,), strat_entry.strategy_id, dtype=torch.long, device=self._device)
-                            dataset_idx_t = torch.full((10,), dataset_idx,            dtype=torch.long, device=self._device)
 
-                            z_enriched     = self.task_encoder(z, model_idx, strategy_idx, dataset_idx_t)
+                            z_enriched     = self.task_encoder(z, model_idx, strategy_idx, clip_embed_batch)
                             sample_patches = self.generator(z, z_enriched)
 
                             # Resize to actual on-image sticker size for display
