@@ -581,7 +581,7 @@ class EnsembleTrainer:
 
                     per_image_loss = -(
                         self.diversity_weight * log_det
-                        + self.quality_weight * final_quality
+                        + self.quality_weight * torch.log(final_quality)
                     ) + tv_contrib + self.spectrum_weight * spec_raw
 
                     (per_image_loss / N).backward()
