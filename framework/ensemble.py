@@ -589,7 +589,7 @@ class EnsembleTrainer:
                     acc['loss']          += per_image_loss.item()
                     acc['diversity']     += log_det.item()
                     acc['quality']       += quality.item()
-                    acc['final_quality'] += final_quality.item()
+                    acc['final_quality'] += torch.log(final_quality).item()
                     acc['tv']            += tv_contrib.item()
                     acc['spectrum']      += spec_raw.item()
                     acc['model']          = entry.name
