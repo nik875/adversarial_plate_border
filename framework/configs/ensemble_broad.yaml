@@ -3,11 +3,13 @@
 # ===========================================================================
 #
 # Covers 5 architecture families × 4 vision tasks:
-#   CNNs:          ResNet-50, ConvNeXt-Small, YOLOv8s, MobileNetV3-Small (warmup only)
+#   CNNs:          ResNet-50, ConvNeXt-Small, YOLOv8s
 #   Hierarchical:  Swin-T
 #   Self-supervised ViT: DINOv2-ViT-B/14
 #   Vision-Language: CLIP ViT-L/14, SmolVLM-500M
 #   OCR encoder:   TrOCR-base-printed
+#
+# Warmup: MobileNetV3-Small (lightweight distilled model for initialization)
 #
 # Usage:
 #   python framework/scripts/train_ensemble.py framework/configs/ensemble_broad.yaml
@@ -35,13 +37,9 @@ strategies:
     strategy_id: 0
 
 # ---------------------------------------------------------------------------
-# Model pool — 9 models spanning 4 vision tasks
+# Model pool — 8 models spanning 4 vision tasks
 # ---------------------------------------------------------------------------
 models:
-  - name: mobilenetv3_small
-    architecture: mobilenetv3_small
-    domain_type: classification
-
   - name: resnet50
     architecture: resnet50
     domain_type: classification
