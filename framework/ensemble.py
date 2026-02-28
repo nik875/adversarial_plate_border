@@ -275,8 +275,6 @@ class EnsembleTrainer:
         max_epochs: int = 100,
         output_dir: str = 'ensemble_output',
         save_every_epochs: int = 5,
-        warmup_steps: int = 0,
-        warmup_model: Optional[str] = None,
         num_prefetch_workers: int = 8,
         val_paths: Optional[List[str]] = None,
         device: Optional[torch.device] = None,
@@ -300,8 +298,6 @@ class EnsembleTrainer:
         self.max_epochs = max_epochs
         self.output_dir = Path(output_dir)
         self.save_every_epochs = save_every_epochs
-        self.warmup_steps = warmup_steps
-        self.warmup_model = warmup_model
         self.num_prefetch_workers = num_prefetch_workers
         self.val_paths = list(val_paths) if val_paths else []
 
@@ -908,7 +904,7 @@ class EnsembleTrainer:
         # One epoch = ceil(total_images / images_per_batch) optimizer steps
         total_images = self.dataset_pool.total_images()
         steps_per_epoch = max(1, math.ceil(total_images / self.images_per_batch))
-        total_steps = self.warmup_steps + steps_per_epoch * self.max_epochs + 1
+        total_steps = steps_per_epoch * self.max_epochs + 1
 
         # If max_steps is set, design the LR schedule for that budget
         schedule_steps = max_steps if max_steps is not None else total_steps
@@ -988,47 +984,6 @@ class EnsembleTrainer:
         prefetch_iter = iter(prefetch_loader)
         print(f"Prefetch DataLoader: {self.num_prefetch_workers} workers, "
               f"batch_size={self.images_per_batch}, pin_memory={self._device.type == 'cuda'}\n")
-
-        # --- Warmup phase ---
-        if self.warmup_steps > 0 and self.warmup_model and global_step == 0:
-            warmup_entries = [e for e in self.ensemble._entries if e.name == self.warmup_model]
-            if not warmup_entries:
-                print(f"WARNING: warmup_model '{self.warmup_model}' not found in ensemble — skipping warmup")
-            else:
-                print(f"\n{'='*60}")
-                print(f"Warmup phase: {self.warmup_steps} steps on '{self.warmup_model}'")
-                print(f"{'='*60}")
-                self.generator.train(); self.task_encoder.train()
-                all_params = list(self.generator.parameters()) + list(self.task_encoder.parameters())
-                try:
-                    with tqdm(total=self.warmup_steps, desc="Warmup") as wpbar:
-                        for _ in range(self.warmup_steps):
-                            optimizer.zero_grad()
-                            prefetched = next(prefetch_iter)
-                            info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
-                            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
-                            optimizer.step()
-                            scheduler.step()
-                            global_step += 1
-                            if global_step % 10 == 0:
-                                self._save_samples(global_step, samples_dir)
-                            wpbar.set_postfix({
-                                'loss': f"{info['loss']:.4f}",
-                                'div':  f"{info['diversity']:.2f}",
-                                'qual': f"{info['final_quality']:.4f}",
-                                'tv':   f"{info['tv']:.4f}",
-                                'ssim': f"{info['spectrum']:.4f}",
-                                'lr':   f"{optimizer.param_groups[1]['lr']:.2e}",
-                            })
-                            wpbar.update(1)
-                except KeyboardInterrupt:
-                    print(f"\n  Interrupted during warmup at step {global_step}; saving checkpoint.")
-                    self._save_checkpoint(
-                        0, global_step, run_dir, optimizer, scheduler,
-                        subdir=f'checkpoint_step_{global_step:07d}'
-                    )
-                    return
-                print(f"Warmup complete. global_step={global_step}\n")
 
         for epoch in range(start_epoch, self.max_epochs + 1):
             self.generator.train()

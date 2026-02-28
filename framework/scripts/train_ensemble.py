@@ -308,8 +308,6 @@ def main():
         max_epochs=int(trainer_cfg.get('max_epochs', 10)),
         output_dir=str(trainer_cfg.get('output_dir', 'ensemble_output')),
         save_every_epochs=int(trainer_cfg.get('save_every_epochs', 5)),
-        warmup_steps=int(trainer_cfg.get('warmup_steps', 0)),
-        warmup_model=str(trainer_cfg.get('warmup_model', '')) or None,
         num_prefetch_workers=int(trainer_cfg.get('num_prefetch_workers', 8)),
         val_paths=ensemble_cfg.val_paths,
         device=compute_device,
