@@ -3,7 +3,7 @@
 # ===========================================================================
 #
 # Covers 5 architecture families × 4 vision tasks:
-#   CNNs:          ResNet-50, ConvNeXt-Small, YOLOv8s
+#   CNNs:          ResNet-50, ConvNeXt-Small, YOLOv8s, MobileNetV3-Small (warmup only)
 #   Hierarchical:  Swin-T
 #   Self-supervised ViT: DINOv2-ViT-B/14
 #   Vision-Language: CLIP ViT-L/14, SmolVLM-500M
@@ -35,9 +35,13 @@ strategies:
     strategy_id: 0
 
 # ---------------------------------------------------------------------------
-# Model pool — 8 models spanning 4 vision tasks
+# Model pool — 9 models spanning 4 vision tasks
 # ---------------------------------------------------------------------------
 models:
+  - name: mobilenetv3_small
+    architecture: mobilenetv3_small
+    domain_type: classification
+
   - name: resnet50
     architecture: resnet50
     domain_type: classification
@@ -121,7 +125,7 @@ trainer:
   patches_per_image: 8
   images_per_batch: 32
   k_neurons: 10000
-  learning_rate: 3.5e-5
+  learning_rate: 5e-5
   taesd_lr_ratio: 0.1
   lr_min: 1.0e-6
   diversity_weight: 1.0
@@ -130,6 +134,6 @@ trainer:
   spectrum_weight: 1.0
   output_dir: runs/broad_ensemble
   save_every_epochs: 1
-  warmup_steps: 100
-  warmup_model: clip_vit_l14
+  warmup_steps: 250
+  warmup_model: mobilenetv3_small
   num_prefetch_workers: 12
