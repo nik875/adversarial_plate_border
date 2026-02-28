@@ -409,6 +409,16 @@ class EnsembleTrainer:
         images_per_model = N // n_models
         remainder = N % n_models
 
+        # Pre-compute all CLIP embeddings in one batched forward pass.
+        # This avoids N serial ViT-L/14 calls inside the inner loop.
+        if prefetched is not None:
+            with torch.no_grad():
+                all_raw         = prefetched[0].to(device)          # [N, 3, H, W]
+                clip_inp        = self.clip_preprocess(all_raw)      # [N, 3, 224, 224]
+                all_clip_embeds = self.clip_encoder(clip_inp)        # [N, 1024]
+        else:
+            all_clip_embeds = None
+
         img_cursor = 0  # index into prefetched batch
 
         # Outer loop: models. Inner loop: images per model.
@@ -453,11 +463,14 @@ class EnsembleTrainer:
                     midx = midx.clamp(0, self.task_encoder.num_models    - 1)
                     sidx = sidx.clamp(0, self.task_encoder.num_strategies - 1)
 
-                    # Compute frozen CLIP embedding of the input image for task conditioning
-                    with torch.no_grad():
-                        clip_inp   = self.clip_preprocess(image)          # [1, 3, 224, 224]
-                        clip_embed = self.clip_encoder(clip_inp)          # [1, 1024]
-                    clip_embed_P = clip_embed.expand(P, -1)               # [P, 1024]
+                    # Use pre-computed batch embed or fall back to inline for smoke tests
+                    if all_clip_embeds is not None:
+                        clip_embed = all_clip_embeds[img_cursor - 1:img_cursor]  # [1, 1024]
+                    else:
+                        with torch.no_grad():
+                            clip_inp   = self.clip_preprocess(image)
+                            clip_embed = self.clip_encoder(clip_inp)             # [1, 1024]
+                    clip_embed_P = clip_embed.expand(P, -1)                      # [P, 1024]
 
                     z_enriched = self.task_encoder(z, midx, sidx, clip_embed_P)
 
