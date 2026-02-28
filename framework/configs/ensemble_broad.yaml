@@ -122,7 +122,7 @@ trainer:
   images_per_batch: 32
   k_neurons: 10000
   learning_rate: 5e-5
-lr_min: 1.0e-6
+  lr_min: 1.0e-6
   diversity_weight: 1.0
   quality_weight: 1.0
   tv_weight: 2.5
