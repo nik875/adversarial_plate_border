@@ -65,6 +65,7 @@ class EnsembleConfig:
     trainer_cfg: Dict             # dict of EnsembleTrainer hyperparameters
     models_cfg: List[Dict]        # raw list of model configs from YAML
     strategies_cfg: List[Dict]    # raw list of strategy configs from YAML
+    val_paths: List[str]          # image paths from manifest split='val'
     raw: Dict                     # full original YAML dict
 
 
@@ -225,6 +226,12 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
         alpha=te_cfg.get('alpha', 0.5),
     )
 
+    # Collect validation paths from manifest (any dataset with split='val')
+    val_paths: List[str] = []
+    for (_, split), paths in manifest.items():
+        if split == 'val':
+            val_paths.extend(paths)
+
     return EnsembleConfig(
         ensemble_pool=ensemble_pool,
         dataset_pool=dataset_pool,
@@ -234,6 +241,7 @@ def load_ensemble_config(config_path: str | Path) -> EnsembleConfig:
         trainer_cfg=cfg.get('trainer', {}),
         models_cfg=models_cfg,
         strategies_cfg=strategies_cfg,
+        val_paths=val_paths,
         raw=cfg,
     )
 

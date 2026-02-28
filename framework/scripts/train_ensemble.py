@@ -311,6 +311,7 @@ def main():
         warmup_steps=int(trainer_cfg.get('warmup_steps', 0)),
         warmup_model=str(trainer_cfg.get('warmup_model', '')) or None,
         num_prefetch_workers=int(trainer_cfg.get('num_prefetch_workers', 8)),
+        val_paths=ensemble_cfg.val_paths,
         device=compute_device,
     )
 

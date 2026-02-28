@@ -278,6 +278,7 @@ class EnsembleTrainer:
         warmup_steps: int = 0,
         warmup_model: Optional[str] = None,
         num_prefetch_workers: int = 8,
+        val_paths: Optional[List[str]] = None,
         device: Optional[torch.device] = None,
         clip_encoder: Optional[nn.Module] = None,
     ):
@@ -302,6 +303,7 @@ class EnsembleTrainer:
         self.warmup_steps = warmup_steps
         self.warmup_model = warmup_model
         self.num_prefetch_workers = num_prefetch_workers
+        self.val_paths = list(val_paths) if val_paths else []
 
         self._device = device or ensemble.compute_device
         self.generator = self.generator.to(self._device)
@@ -716,14 +718,59 @@ class EnsembleTrainer:
         torch.save(ckpt, ckpt_path)
         print(f"  ✓ Checkpoint saved: {ckpt_path}")
 
-        # Save a few example patches
+        # Save sample patches: raw generator outputs + composited onto val images
+        n_samples = 4
+        patch_h = self.generator.patch_height
+        patch_w = self.generator.patch_width
+        self.generator.eval()
+        self.task_encoder.eval()
         with torch.no_grad():
-            z = torch.randn(4, self.generator.latent_dim, device=self._device)
-            patches = self.generator(z)
+            z = torch.randn(n_samples, self.generator.latent_dim, device=self._device)
+            model_idx    = torch.zeros(n_samples, dtype=torch.long, device=self._device)
+            strategy_idx = torch.zeros(n_samples, dtype=torch.long, device=self._device)
+
+            # Load val images and compute CLIP embeddings
+            if self.val_paths:
+                import random as _random
+                chosen = _random.sample(self.val_paths, min(n_samples, len(self.val_paths)))
+                val_transform = T.Compose([T.Resize((patch_h, patch_w)), T.ToTensor()])
+                val_images = torch.stack([
+                    val_transform(PIL.Image.open(p).convert('RGB')) for p in chosen
+                ]).to(self._device)                              # [N, 3, H, W]
+                clip_embeds = self.clip_encoder(
+                    self.clip_preprocess(val_images)
+                )                                                # [N, 1024]
+            else:
+                val_images = None
+                clip_embeds = torch.zeros(n_samples, 1024, device=self._device)
+
+            z_enriched = self.task_encoder(z, model_idx, strategy_idx, clip_embeds)
+            patches = self.generator(z, z_enriched)              # [N, 3, H, W]
+
             for i, patch in enumerate(patches):
-                T.ToPILImage()(patch.cpu()).save(
-                    ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}.png'
+                T.ToPILImage()(patch.cpu().clamp(0, 1)).save(
+                    ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}_raw.png'
                 )
+
+            # Composite patch onto each val image
+            if val_images is not None and self.ensemble._strategies:
+                strategy = self.ensemble._strategies[0].strategy
+                model_input_shape = (
+                    self.ensemble._entries[0].input_shape
+                    if self.ensemble._entries else None
+                )
+                for i in range(len(val_images)):
+                    img = val_images[i:i + 1]   # [1, 3, H, W]
+                    patch = patches[i]           # [3, H, W]
+                    kwargs = strategy.sample_kwargs(
+                        img, patch_h, patch_w, model_input_shape=model_input_shape
+                    )
+                    composited, _ = strategy.apply(img, patch, **kwargs)
+                    T.ToPILImage()(composited[0].cpu().clamp(0, 1)).save(
+                        ckpt_dir / f'patch_epoch_{epoch:04d}_sample_{i}_composited.png'
+                    )
+        self.generator.train()
+        self.task_encoder.train()
 
     # ------------------------------------------------------------------
     # Debug visualizations
