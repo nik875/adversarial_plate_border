@@ -252,9 +252,8 @@ class EnsembleTrainer:
         optimizer.step()              ← one update per images_per_batch images
 
     Optimizer groups (AdamW):
-        - TAESD decoder params:    lr = learning_rate * vae_lr_ratio
         - TaskEncoder params:      lr = learning_rate
-        - All other generator params (adapters, transformers, channel_mixer): lr = learning_rate
+        - All generator params (taesd_decoders, adapters, transformers, channel_mixer): lr = learning_rate
     """
 
     def __init__(
@@ -272,7 +271,6 @@ class EnsembleTrainer:
         tv_weight: float = 2.5,
         spectrum_weight: float = 1.0,
         learning_rate: float = 1e-4,
-        vae_lr_ratio: float = 0.1,
         lr_min: float = 1e-6,
         max_epochs: int = 100,
         output_dir: str = 'ensemble_output',
@@ -297,7 +295,6 @@ class EnsembleTrainer:
         self.tv_weight = tv_weight
         self.spectrum_weight = spectrum_weight
         self.learning_rate = learning_rate
-        self.vae_lr_ratio = vae_lr_ratio
         self.lr_min = lr_min
         self.max_epochs = max_epochs
         self.output_dir = Path(output_dir)
@@ -324,48 +321,32 @@ class EnsembleTrainer:
     # ------------------------------------------------------------------
 
     def _build_optimizer(self, total_steps: int):
-        """Build AdamW with 3 parameter groups + cosine annealing scheduler."""
+        """Build AdamW with 2 parameter groups + cosine annealing scheduler."""
         gen = self.generator
 
-        # Group 1: TAESD decoder params (lower LR — pretrained)
-        taesd_params = [
-            p for name, p in gen.named_parameters()
-            if 'taesd_decoders.' in name and p.requires_grad
-        ]
-
-        # Group 2: TaskEncoder params
+        # Group 1: TaskEncoder params
         task_params = list(self.task_encoder.parameters())
 
-        # Group 3: all other generator params (adapters, transformers, channel_mixer)
-        taesd_ids = {id(p) for p in taesd_params}
-        other_gen_params = [
-            p for n, p in gen.named_parameters()
-            if p.requires_grad and id(p) not in taesd_ids
-        ]
+        # Group 2: all generator params (taesd_decoders, adapters, transformers, channel_mixer)
+        task_ids = {id(p) for p in task_params}
+        gen_params = [p for p in gen.parameters() if p.requires_grad]
 
-        taesd_lr = self.learning_rate * self.vae_lr_ratio
         optimizer = optim.AdamW([
-            {'params': taesd_params,     'lr': taesd_lr,            'name': 'taesd_decoders'},
-            {'params': task_params,      'lr': self.learning_rate,   'name': 'task_encoder'},
-            {'params': other_gen_params, 'lr': self.learning_rate,   'name': 'generator_custom'},
+            {'params': task_params, 'lr': self.learning_rate, 'name': 'task_encoder'},
+            {'params': gen_params,  'lr': self.learning_rate, 'name': 'generator'},
         ])
 
         warmup_steps = 5
-        lrs = [taesd_lr, self.learning_rate, self.learning_rate]
-        scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=[
-                (lambda base: lambda step: (
-                    (step + 1) / warmup_steps  # linear warmup: 0.2, 0.4, 0.6, 0.8, 1.0
-                    if step < warmup_steps
-                    else (
-                        self.lr_min / base
-                        + (1 - self.lr_min / base)
-                        * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))) / 2
-                    )
-                ))(lr) for lr in lrs
-            ],
+        lr_lambda = lambda step: (
+            (step + 1) / warmup_steps
+            if step < warmup_steps
+            else (
+                self.lr_min / self.learning_rate
+                + (1 - self.lr_min / self.learning_rate)
+                * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))) / 2
+            )
         )
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[lr_lambda, lr_lambda])
 
         return optimizer, scheduler
 
