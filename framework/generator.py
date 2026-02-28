@@ -177,8 +177,8 @@ class LightPatchTransformer(nn.Module):
         out = out.permute(0, 3, 1, 4, 2, 5).contiguous()
         out = out.view(B, 3, self.input_size, self.input_size)
 
-        # Residual + sigmoid, then upsample to 512×512
-        out = torch.sigmoid(out + x_orig)
+        # Residual, then upsample to 512×512
+        out = out + x_orig
         return self.upsample(out)
 
 
