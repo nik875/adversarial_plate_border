@@ -304,7 +304,6 @@ def main():
         tv_weight=float(trainer_cfg.get('tv_weight', 2.5)),
         spectrum_weight=float(trainer_cfg.get('spectrum_weight', 1.0)),
         learning_rate=float(trainer_cfg.get('learning_rate', 1e-4)),
-        encoder_lr=float(trainer_cfg.get('encoder_lr', trainer_cfg.get('learning_rate', 1e-4))),
         lr_min=float(trainer_cfg.get('lr_min', 1e-6)),
         max_epochs=int(trainer_cfg.get('max_epochs', 10)),
         output_dir=str(trainer_cfg.get('output_dir', 'ensemble_output')),
