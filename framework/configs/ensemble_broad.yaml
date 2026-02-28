@@ -28,11 +28,21 @@ manifest: ~/.cache/adversarial_plate_manifest.csv
 # Attack strategies — perturbation only
 # ---------------------------------------------------------------------------
 strategies:
+  - name: border
+    type: border
+    center_ratio: 0.91
+    strategy_id: 0
+
+  - name: sticker
+    type: sticker
+    area_fraction: 0.05
+    strategy_id: 1
+
   - name: perturbation
     type: perturbation
     budget: 0.05
     norm: linf
-    strategy_id: 0
+    strategy_id: 2
 
 # ---------------------------------------------------------------------------
 # Model pool — 8 models spanning 4 vision tasks
@@ -121,7 +131,7 @@ trainer:
   patches_per_image: 8
   images_per_batch: 32
   k_neurons: 10000
-  learning_rate: 3.5e-5
+  learning_rate: 3e-5
   lr_min: 1.0e-6
   diversity_weight: 1.0
   quality_weight: 12.0

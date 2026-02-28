@@ -338,7 +338,7 @@ class EnsembleTrainer:
             {'params': gen_params,  'lr': self.learning_rate, 'name': 'generator'},
         ])
 
-        warmup_steps = 5
+        warmup_steps = 20
         lr_lambda = lambda step: (
             (step + 1) / warmup_steps
             if step < warmup_steps
@@ -730,19 +730,20 @@ class EnsembleTrainer:
             strategy_idx = torch.zeros(n_samples, dtype=torch.long, device=self._device)
 
             # Load val images and compute CLIP embeddings
-            if self.val_paths:
-                import random as _random
-                chosen = _random.sample(self.val_paths, min(n_samples, len(self.val_paths)))
-                val_transform = T.Compose([T.Resize((patch_h, patch_w)), T.ToTensor()])
-                val_images = torch.stack([
-                    val_transform(PIL.Image.open(p).convert('RGB')) for p in chosen
-                ]).to(self._device)                              # [N, 3, H, W]
-                clip_embeds = self.clip_encoder(
-                    self.clip_preprocess(val_images)
-                )                                                # [N, 1024]
-            else:
-                val_images = None
-                clip_embeds = torch.zeros(n_samples, 1024, device=self._device)
+            if not self.val_paths:
+                raise RuntimeError(
+                    "No validation paths found (manifest has no split='val' entries). "
+                    "Cannot save sample images without val data."
+                )
+            import random as _random
+            chosen = _random.sample(self.val_paths, min(n_samples, len(self.val_paths)))
+            val_transform = T.Compose([T.Resize((patch_h, patch_w)), T.ToTensor()])
+            val_images = torch.stack([
+                val_transform(PIL.Image.open(p).convert('RGB')) for p in chosen
+            ]).to(self._device)                              # [N, 3, H, W]
+            clip_embeds = self.clip_encoder(
+                self.clip_preprocess(val_images)
+            )                                                # [N, 1024]
 
             z_enriched = self.task_encoder(z, model_idx, strategy_idx, clip_embeds)
             patches = self.generator(z, z_enriched)              # [N, 3, H, W]
@@ -753,7 +754,7 @@ class EnsembleTrainer:
                 )
 
             # Composite patch onto each val image
-            if val_images is not None and self.ensemble._strategies:
+            if self.ensemble._strategies:
                 strategy = self.ensemble._strategies[0].strategy
                 model_input_shape = (
                     self.ensemble._entries[0].input_shape
