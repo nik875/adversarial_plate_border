@@ -519,7 +519,7 @@ class NeuronSampler:
 
         layer_names = list(shapes.keys())
         if layer_names:
-            self._final_layer_names[model_id] = layer_names[-1]
+            self._final_layer_names[model_id] = layer_names[-2] if len(layer_names) >= 2 else layer_names[-1]
 
         # β = 10% of median live-neuron std
         all_stds = torch.cat([s.flatten() for s in stds.values()])
@@ -589,10 +589,11 @@ class NeuronSampler:
         """
         Return ALL (layer_name, flat_idx) tuples from the final layer.
 
-        The final layer is the last leaf module to fire during the profiling
-        forward pass.  All neurons are returned because fql is computed as a
-        simple average over neurons (no gram matrix), so using every neuron
-        gives a more accurate estimate with no added cost.
+        The target layer is the second-to-last leaf module to fire during the
+        profiling forward pass (penultimate layer).  All neurons are returned
+        because fql is computed as a simple average over neurons (no gram
+        matrix), so using every neuron gives a more accurate estimate with no
+        added cost.
         Returns [] if the model hasn't been profiled.
         """
         layer_name = self._final_layer_names.get(model_id, '')
