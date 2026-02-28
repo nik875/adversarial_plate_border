@@ -378,7 +378,6 @@ class EnsembleTrainer:
         optimizer: optim.Optimizer,
         prefetched: Optional[Tuple[Tensor, Tensor]] = None,
         entries_override=None,
-        use_stream_gating: bool = False,
     ) -> Dict[str, float]:
         """
         One optimizer update accumulating gradients over images_per_batch images.
@@ -474,18 +473,7 @@ class EnsembleTrainer:
 
                     z_enriched = self.task_encoder(z, midx, sidx, clip_embed_P)
 
-                    # Stream gating: during warmup, each strategy uses a dedicated
-                    # subset of TAESD streams so each specialises early on.
-                    active_streams = None
-                    if use_stream_gating:
-                        num_strats = self.task_encoder.num_strategies
-                        streams_per_strat = max(1, gen.num_taesd // num_strats)
-                        start = strat_entry.strategy_id * streams_per_strat
-                        active_streams = list(range(
-                            start, min(start + streams_per_strat, gen.num_taesd)
-                        ))
-
-                    patches = gen(z, z_enriched, active_streams=active_streams)  # [P, 3, H, W]
+                    patches = gen(z, z_enriched)  # [P, 3, H, W]
 
                     # --- 3. Build [P+1, 3, H', W'] batch: ctrl first, then P adv ---
                     ctrl_inp = entry.preprocess_fn(
@@ -988,7 +976,7 @@ class EnsembleTrainer:
                         for _ in range(self.warmup_steps):
                             optimizer.zero_grad()
                             prefetched = next(prefetch_iter)
-                            info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries, use_stream_gating=True)
+                            info = self._train_step(optimizer, prefetched=prefetched, entries_override=warmup_entries)
                             torch.nn.utils.clip_grad_norm_(all_params, 1.0)
                             optimizer.step()
                             scheduler.step()
