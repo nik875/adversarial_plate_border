@@ -271,6 +271,7 @@ class EnsembleTrainer:
         tv_weight: float = 2.5,
         spectrum_weight: float = 1.0,
         learning_rate: float = 1e-4,
+        encoder_lr: float = 1e-4,
         lr_min: float = 1e-6,
         max_epochs: int = 100,
         output_dir: str = 'ensemble_output',
@@ -296,6 +297,7 @@ class EnsembleTrainer:
         self.tv_weight = tv_weight
         self.spectrum_weight = spectrum_weight
         self.learning_rate = learning_rate
+        self.encoder_lr = encoder_lr
         self.lr_min = lr_min
         self.max_epochs = max_epochs
         self.output_dir = Path(output_dir)
@@ -334,21 +336,27 @@ class EnsembleTrainer:
         gen_params = [p for p in gen.parameters() if p.requires_grad]
 
         optimizer = optim.AdamW([
-            {'params': task_params, 'lr': self.learning_rate, 'name': 'task_encoder'},
+            {'params': task_params, 'lr': self.encoder_lr,    'name': 'task_encoder'},
             {'params': gen_params,  'lr': self.learning_rate, 'name': 'generator'},
         ])
 
         warmup_steps = 20
-        lr_lambda = lambda step: (
-            (step + 1) / warmup_steps
-            if step < warmup_steps
-            else (
-                self.lr_min / self.learning_rate
-                + (1 - self.lr_min / self.learning_rate)
-                * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))) / 2
+
+        def _cosine_lambda(base_lr):
+            return lambda step: (
+                (step + 1) / warmup_steps
+                if step < warmup_steps
+                else (
+                    self.lr_min / base_lr
+                    + (1 - self.lr_min / base_lr)
+                    * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))) / 2
+                )
             )
+
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=[_cosine_lambda(self.encoder_lr), _cosine_lambda(self.learning_rate)],
         )
-        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[lr_lambda, lr_lambda])
 
         return optimizer, scheduler
 
