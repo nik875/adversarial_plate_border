@@ -355,18 +355,21 @@ class FoundationPatchGenerator(nn.Module):
             for _ in range(num_taesd)
         ])
 
-        # 6 TAESD decoder copies (encoder deleted, fully trainable)
-        print(f"Loading {num_taesd} TAESD decoder copies from madebyollin/taesd ...")
+        # 6 TAESD decoder copies (encoder deleted, randomly initialized)
+        print(f"Creating {num_taesd} randomly-initialized TAESD decoder copies ...")
+        taesd_config = AutoencoderTiny.load_config("madebyollin/taesd")
         self.taesd_decoders = nn.ModuleList()
         for i in range(num_taesd):
-            vae = AutoencoderTiny.from_pretrained(
-                "madebyollin/taesd",
-                torch_dtype=torch.float32,
-            )
+            vae = AutoencoderTiny.from_config(taesd_config)
             del vae.encoder
             vae.encoder = None
+            for m in vae.decoder.modules():
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
             self.taesd_decoders.append(vae)
-            print(f"  TAESD decoder {i + 1}/{num_taesd} loaded")
+            print(f"  TAESD decoder {i + 1}/{num_taesd} randomly initialized")
 
         # 6 spatial transformers (operate at 256×256, upsample to 512×512)
         self.transformers = nn.ModuleList([
