@@ -103,7 +103,7 @@ task_encoder:
 # Generator (multi-TAESD architecture)
 # ---------------------------------------------------------------------------
 generator:
-  latent_dim: 16
+  latent_dim: 64
   patch_height: 512
   patch_width: 512
   num_taesd: 6
