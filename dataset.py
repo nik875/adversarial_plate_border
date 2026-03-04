@@ -40,7 +40,6 @@ def load_image(filepath):
     """Load image with support for HEIC files"""
     # Transform path based on current user
     filepath = transform_path_for_user(filepath)
-
     file_ext = os.path.splitext(filepath)[1].lower()
 
     if file_ext in ['.heic', '.heif']:
@@ -60,11 +59,74 @@ def load_image(filepath):
     return img
 
 
+def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.ndarray, 
+                        target_size: int = 384) -> tuple:
+    """Preprocess image with letterbox resizing (YOLO-style).
+    
+    Args:
+        img: Input image in BGR format (H, W, C)
+        corners: Plate corners as numpy array shape (4, 2) or (8,)
+        homography: 3x3 homography matrix
+        target_size: Target size for square output
+    
+    Returns:
+        Tuple of (preprocessed_img_bgr, new_corners, new_homography, scale_factor, dw, dh)
+    """
+    shape = img.shape[:2]  # current shape [height, width]
+    
+    # Reshape corners if flat
+    if corners.ndim == 1:
+        corners = corners.reshape(4, 2)
+    corners = corners.copy().astype(np.float32)
+    
+    # Calculate scaling ratio
+    r = min(target_size / shape[0], target_size / shape[1])
+    
+    # Calculate new unpadded dimensions
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    dw = (target_size - new_unpad[0]) / 2
+    dh = (target_size - new_unpad[1]) / 2
+    
+    # Transform corners
+    new_corners = corners * r
+    new_corners[:, 0] += dw  # x coordinates
+    new_corners[:, 1] += dh  # y coordinates
+    
+    # Transform homography
+    T = np.array([
+        [r, 0, dw],
+        [0, r, dh],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    new_homography = homography @ T
+    
+    # Resize image
+    if shape[::-1] != new_unpad:
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    
+    # Add padding
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, 
+                             cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    
+    return img, new_corners, new_homography, r, dw, dh
+
+
 class AdversarialPatchDataset(Dataset):
-    def __init__(self, df, transform=None, preload=False):
+    def __init__(self, df, transform=None, preload=False, target_size=384):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
         self.preload = preload
+        self.target_size = target_size
+        
+        # Check if CSV has preprocessed images or needs on-the-fly preprocessing
+        self.has_preprocessed = 'preprocessed_filename' in df.columns
+        
+        if self.has_preprocessed:
+            print(f"Using preprocessed images from CSV")
+        else:
+            print(f"No preprocessed images found - will preprocess on-the-fly to {target_size}x{target_size}")
 
         if self.preload:
             desc = f"Preloading {len(self.df)} images"
@@ -72,8 +134,36 @@ class AdversarialPatchDataset(Dataset):
             for idx, row in tqdm(self.df.iterrows(), total=len(self.df), desc=desc):
                 # PIL will raise IOError if files don't exist - letting it fail loudly
                 orig_img = load_image(row['filename'])
-                prep_img = load_image(row['preprocessed_filename'])
-                self.preloaded_images.append((orig_img, prep_img))
+                
+                if self.has_preprocessed:
+                    prep_img = load_image(row['preprocessed_filename'])
+                    self.preloaded_images.append((orig_img, prep_img, None))
+                else:
+                    # Preprocess on-the-fly during preload
+                    corners = np.array([
+                        [row['p1_x'], row['p1_y']],
+                        [row['p2_x'], row['p2_y']],
+                        [row['p3_x'], row['p3_y']],
+                        [row['p4_x'], row['p4_y']]
+                    ], dtype=np.float32)
+                    
+                    H = np.array([
+                        [row['H00'], row['H01'], row['H02']],
+                        [row['H10'], row['H11'], row['H12']],
+                        [row['H20'], row['H21'], row['H22']]
+                    ], dtype=np.float32)
+                    
+                    prep_img, new_corners, new_H, r, dw, dh = letterbox_preprocess(
+                        orig_img, corners, H, self.target_size)
+                    
+                    prep_data = {
+                        'new_corners': new_corners,
+                        'new_H': new_H,
+                        'scale_factor': r,
+                        'dw': dw,
+                        'dh': dh
+                    }
+                    self.preloaded_images.append((orig_img, prep_img, prep_data))
         else:
             self.preloaded_images = None
 
@@ -85,11 +175,39 @@ class AdversarialPatchDataset(Dataset):
 
         # Load images - from memory if preloaded, from disk otherwise
         if self.preload:
-            orig_img, prep_img = self.preloaded_images[idx]
+            orig_img, prep_img, prep_data = self.preloaded_images[idx]
         else:
-            # PIL will raise IOError if files don't exist - letting it fail loudly
+            # Load from disk
             orig_img = load_image(row['filename'])
-            prep_img = load_image(row['preprocessed_filename'])
+            
+            if self.has_preprocessed:
+                prep_img = load_image(row['preprocessed_filename'])
+                prep_data = None
+            else:
+                # Preprocess on-the-fly
+                corners = np.array([
+                    [row['p1_x'], row['p1_y']],
+                    [row['p2_x'], row['p2_y']],
+                    [row['p3_x'], row['p3_y']],
+                    [row['p4_x'], row['p4_y']]
+                ], dtype=np.float32)
+                
+                H = np.array([
+                    [row['H00'], row['H01'], row['H02']],
+                    [row['H10'], row['H11'], row['H12']],
+                    [row['H20'], row['H21'], row['H22']]
+                ], dtype=np.float32)
+                
+                prep_img, new_corners, new_H, r, dw, dh = letterbox_preprocess(
+                    orig_img, corners, H, self.target_size)
+                
+                prep_data = {
+                    'new_corners': new_corners,
+                    'new_H': new_H,
+                    'scale_factor': r,
+                    'dw': dw,
+                    'dh': dh
+                }
 
         if self.transform:
             orig_img = self.transform(orig_img)
@@ -103,14 +221,6 @@ class AdversarialPatchDataset(Dataset):
             [row['p4_x'], row['p4_y']]
         ], dtype=torch.float32)
 
-        # New corners (4x2 tensor)
-        new_corners = torch.tensor([
-            [row['new_p1_x'], row['new_p1_y']],
-            [row['new_p2_x'], row['new_p2_y']],
-            [row['new_p3_x'], row['new_p3_y']],
-            [row['new_p4_x'], row['new_p4_y']]
-        ], dtype=torch.float32)
-
         # Original homography (3x3 tensor)
         orig_H = torch.tensor([
             [row['H00'], row['H01'], row['H02']],
@@ -118,14 +228,27 @@ class AdversarialPatchDataset(Dataset):
             [row['H20'], row['H21'], row['H22']]
         ], dtype=torch.float32)
 
-        # New homography (3x3 tensor)
-        new_H = torch.tensor([
-            [row['new_H00'], row['new_H01'], row['new_H02']],
-            [row['new_H10'], row['new_H11'], row['new_H12']],
-            [row['new_H20'], row['new_H21'], row['new_H22']]
-        ], dtype=torch.float32)
+        # Get new corners and homography (from CSV or preprocessing)
+        if self.has_preprocessed:
+            new_corners = torch.tensor([
+                [row['new_p1_x'], row['new_p1_y']],
+                [row['new_p2_x'], row['new_p2_y']],
+                [row['new_p3_x'], row['new_p3_y']],
+                [row['new_p4_x'], row['new_p4_y']]
+            ], dtype=torch.float32)
 
-        transform = torch.tensor([row['scale_factor'], row['dw'], row['dh']])
+            new_H = torch.tensor([
+                [row['new_H00'], row['new_H01'], row['new_H02']],
+                [row['new_H10'], row['new_H11'], row['new_H12']],
+                [row['new_H20'], row['new_H21'], row['new_H22']]
+            ], dtype=torch.float32)
+
+            transform = torch.tensor([row['scale_factor'], row['dw'], row['dh']])
+        else:
+            # Use preprocessed data from on-the-fly processing
+            new_corners = torch.from_numpy(prep_data['new_corners'])
+            new_H = torch.from_numpy(prep_data['new_H'])
+            transform = torch.tensor([prep_data['scale_factor'], prep_data['dw'], prep_data['dh']])
 
         return {
             'orig_image': orig_img,

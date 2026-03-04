@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
-from fast_alpr import ALPR
+import asyncio
+from fastanpr import FastANPR
 from PIL import Image, ImageDraw, ImageFont
 import tkinter as tk
 from tkinter import filedialog
@@ -19,17 +20,14 @@ except ImportError:
 
 class LicensePlateDetector:
     def __init__(self):
-        self.alpr = None
+        self.anpr = None
         self.target_plate = "VRJ7774"
 
     def initialize_alpr(self):
-        """Initialize ALPR models"""
-        print("Initializing ALPR models...")
-        self.alpr = ALPR(
-            detector_model="yolo-v9-t-384-license-plate-end2end",
-            ocr_model="cct-xs-v1-global-model",
-        )
-        print("✓ ALPR initialized")
+        """Initialize FastANPR model"""
+        print("Initializing FastANPR models...")
+        self.anpr = FastANPR()
+        print("✓ FastANPR initialized")
 
     def load_image(self, image_path):
         """Load image with HEIC support"""
@@ -44,10 +42,10 @@ class LicensePlateDetector:
 
     def detect_target_plates(self, image_path):
         """Detect all license plates and filter for target plate"""
-        if self.alpr is None:
+        if self.anpr is None:
             self.initialize_alpr()
 
-        # Load image for ALPR (OpenCV format)
+        # Load image for FastANPR (OpenCV format first)
         file_ext = os.path.splitext(image_path)[1].lower()
         if file_ext in ['.heic', '.heif'] and HEIC_SUPPORT:
             pil_image = Image.open(image_path).convert('RGB')
@@ -58,35 +56,36 @@ class LicensePlateDetector:
         if cv_image is None:
             raise ValueError(f"Could not load image: {image_path}")
 
-        # Run ALPR detection
-        predictions = self.alpr.predict(cv_image)
-        if not predictions:
+        # Convert BGR to RGB for fastanpr
+        rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+
+        # Run FastANPR detection (async call wrapped in asyncio.run)
+        plates = asyncio.run(self.anpr.run([rgb_image]))
+        
+        if not plates or not plates[0]:
             return [], []
 
         # Separate all plates and target plates
         all_plates = []
         target_plates = []
 
-        for pred in predictions:
-            detection = pred.detection
-            ocr = pred.ocr
-            bbox = detection.bounding_box
-
+        for plate in plates[0]:
             plate_info = {
-                'text': ocr.text,
-                'confidence': ocr.confidence,
-                'x1': int(bbox.x1),
-                'y1': int(bbox.y1),
-                'x2': int(bbox.x2),
-                'y2': int(bbox.y2),
-                'width': int(bbox.x2 - bbox.x1),
-                'height': int(bbox.y2 - bbox.y1)
+                'text': plate.rec_text,
+                'confidence': plate.rec_conf,
+                'x1': int(plate.det_box[0]),
+                'y1': int(plate.det_box[1]),
+                'x2': int(plate.det_box[2]),
+                'y2': int(plate.det_box[3]),
+                'width': int(plate.det_box[2] - plate.det_box[0]),
+                'height': int(plate.det_box[3] - plate.det_box[1]),
+                'det_conf': plate.det_conf
             }
 
             all_plates.append(plate_info)
 
             # Check if this matches our target plate
-            if ocr.text == self.target_plate:
+            if plate.rec_text == self.target_plate:
                 target_plates.append(plate_info)
 
         return all_plates, target_plates
