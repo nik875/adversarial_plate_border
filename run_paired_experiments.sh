@@ -5,9 +5,10 @@
 # Train one adversarial patch per explicit detector+OCR pairing.
 #
 # Pairings configured by default:
-#   1) yolov8     + crnn
-#   2) fasterrcnn + dtrb (ViTSTR checkpoint)
-#   3) rtdetr     + trocr
+#   1) rtdetr     + trocr
+#   2) yolo-v9-384 + cct (FastANPR)
+#   3) fasterrcnn + dtrb (ViTSTR checkpoint)
+#   4) yolov8     + crnn
 #
 # Usage:
 #   chmod +x run_paired_experiments.sh
@@ -38,6 +39,8 @@ YOLOV8_WEIGHTS="weights/lp_yolov8.pt"
 FASTERRCNN_WEIGHTS="weights/model.pt"
 RTDETR_WEIGHTS="weights/rtdetr-v2-license-plates"
 RTDETR_WEIGHTS_FALLBACK="weights/rtdetr-v2-license-plate"
+YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
+CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
 CRNN_WEIGHTS="weights/crnn_synth90k.pt"
 DTRB_WEIGHTS="weights/vitstr_small_patch16_224.pth"
@@ -135,9 +138,10 @@ fi
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights|needs_dtrb
 PAIRS=(
-    "pair_yolov8_crnn|yolov8|$YOLOV8_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
-    "pair_fasterrcnn_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|dtrb|$DTRB_WEIGHTS|true"
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
+    "pair_fastanpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
+    "pair_fasterrcnn_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|dtrb|$DTRB_WEIGHTS|true"
+    "pair_yolov8_crnn|yolov8|$YOLOV8_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
 )
 
 log "━━━━  Paired Training  ━━━━"
