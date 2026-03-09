@@ -88,18 +88,26 @@ def main():
         return
 
     # ------------------------------------------------------------------
-    # Training subset (streaming + .take() — only downloads what's needed)
+    # Training subset (load from cache or public ImageNet source)
+    #
+    # Note: HuggingFace's ILSVRC/imagenet-1k requires resolving all 294
+    # parquet files upfront (unavoidable with their infrastructure).
+    # For faster downloads, consider:
+    #   1. Using a pre-cached copy
+    #   2. Downloading from official ImageNet source
+    #   3. Using a smaller alternative like benjamin-paine/imagenet-1k-256x256
     # ------------------------------------------------------------------
     train_dir = out / 'train'
     train_done = train_dir / '.done'
     if train_done.exists():
         print(f'Training subset already downloaded → {train_dir}  (delete .done to re-run)')
     else:
-        print(f'\n==> ImageNet-1K training subset ({args.train_samples:,} images, streaming)...')
+        print(f'\n==> ImageNet-1K training subset ({args.train_samples:,} images)...')
+        print('    WARNING: HuggingFace requires resolving all 294 parquet files.')
+        print('    For faster download, consider alternative sources.')
         train_dir.mkdir(parents=True, exist_ok=True)
         ds_train = load_dataset('ILSVRC/imagenet-1k', split='train',
                                 token=token, streaming=True)
-        # Use .take() to only fetch the exact number of samples needed
         ds_train = ds_train.take(args.train_samples)
         saved = 0
         for sample in ds_train:
