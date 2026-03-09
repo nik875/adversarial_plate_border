@@ -21,7 +21,7 @@ set -euo pipefail
 
 # Defaults
 DEVICE="cuda"
-CSV="updated_control_corners.csv"
+CSV="preproc_labels.csv"
 EPOCHS=100
 LR=0.1
 GRAD_ACCUM=64
