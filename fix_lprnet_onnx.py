@@ -108,14 +108,13 @@ for vi in model_inferred.graph.value_info:
 
 # Build a new output ValueInfo for the Softmax tensor
 if softmax_info is not None:
-    new_out = onnx.helper.make_value_info(
-        softmax_output,
-        softmax_info.type.tensor_type.elem_type,
-        [d.dim_value for d in softmax_info.type.tensor_type.shape.dim],
-    )
+    shape = [d.dim_value for d in softmax_info.type.tensor_type.shape.dim]
+    elem_type = softmax_info.type.tensor_type.elem_type
 else:
-    # Fall back: float32, unknown shape
-    new_out = onnx.helper.make_value_info(softmax_output, onnx.TensorProto.FLOAT, None)
+    shape = None   # unknown — onnx2torch will infer at runtime
+    elem_type = onnx.TensorProto.FLOAT
+
+new_out = onnx.helper.make_tensor_value_info(softmax_output, elem_type, shape)
 
 while graph.output:
     graph.output.pop()
