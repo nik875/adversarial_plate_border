@@ -35,6 +35,7 @@ Other design decisions
 from __future__ import annotations
 
 import csv
+import re
 import warnings
 import argparse
 from datetime import datetime
@@ -357,6 +358,16 @@ class AdversarialPatchTrainer:
                             corners[:, 0].max(), corners[:, 1].max()])
 
     @staticmethod
+    def _plate_text_matches(text: str, expected: str) -> bool:
+        """
+        Fuzzy match for sanity-check categorisation only (not the training objective).
+        Strips all non-alphanumeric characters from both strings and compares
+        case-insensitively, so "VRJ-7774", "VRJ 7774", and "VRJ7774" all match.
+        """
+        normalise = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
+        return normalise(text) == normalise(expected)
+
+    @staticmethod
     def _boxes_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         a1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
         a2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
@@ -612,9 +623,9 @@ class AdversarialPatchTrainer:
                         ocr_result = self.ocr.predict(crop.squeeze(0))
 
                     text = ocr_result.text or ""
-                    if text.upper() == self.expected_plate_text.upper():
+                    if self._plate_text_matches(text, self.expected_plate_text):
                         cat = "correct"
-                    elif self.impersonation_target and text.upper() == self.impersonation_target.upper():
+                    elif self.impersonation_target and self._plate_text_matches(text, self.impersonation_target):
                         cat = "impersonation"
                     else:
                         cat = "misread"
@@ -712,7 +723,7 @@ class AdversarialPatchTrainer:
 
             text       = ocr_result.text or ""
             conf       = ocr_result.confidence
-            is_correct = text.upper() == self.expected_plate_text.upper()
+            is_correct = self._plate_text_matches(text, self.expected_plate_text)
 
             vis = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
