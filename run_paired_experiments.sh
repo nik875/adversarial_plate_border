@@ -14,7 +14,7 @@
 #   chmod +x run_paired_experiments.sh
 #   ./run_paired_experiments.sh
 #   ./run_paired_experiments.sh --epochs 20 --device cuda --limit 64
-#   ./run_paired_experiments.sh --dry-run
+#   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
 # =============================================================================
 
 set -euo pipefail
@@ -78,7 +78,12 @@ run() {
     local logfile="$LOG_DIR/${label}.log"
     log "START  $label"
     if $DRY_RUN; then
-        echo "  DRY-RUN: $*"
+        # Pass --dry-run through to trainer (sanity check + debug output only, no training)
+        "$@" --dry-run 2>&1 | tee "$logfile"
+        if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+            log "FAILED $label — see $logfile"
+            exit 1
+        fi
     else
         "$@" 2>&1 | tee "$logfile"
         if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
@@ -174,6 +179,9 @@ for row in "${PAIRS[@]}"; do
             --ocr-backend "$ocr" \
             --ocr-model-path "$ocr_w" \
             "${EXTRA_ARGS[@]}"
+
+    # Skip artifact staging in dry-run mode (no patches are saved)
+    $DRY_RUN && continue
 
     latest_patch=$(best_patch "$det")
     if [[ -z "$latest_patch" ]]; then
