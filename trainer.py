@@ -111,14 +111,16 @@ PATCH_HEIGHT = 256
 
 
 def _bbox_ocr_crop(
-    img: torch.Tensor,          # [1, C, H, W]
-    corners: torch.Tensor,      # [4, 2]  (x, y) in image coords
-    target_size: Tuple[int, int],  # (h, w)
-) -> torch.Tensor:              # [1, C, target_h, target_w]
+    img: torch.Tensor,                      # [1, C, H, W]
+    corners: torch.Tensor,                  # [4, 2]  (x, y) in image coords
+    target_size: Tuple[int, Optional[int]], # (h, w) — w=None preserves aspect ratio
+) -> torch.Tensor:                          # [1, C, target_h, target_w]
     """
     Rectangular bbox crop + bilinear resize for OCR.
     No perspective correction — just clips the axis-aligned bounding box
     of the plate corners out of the image and resizes it.
+    If target_size[1] is None, only the height is fixed and width is scaled
+    to preserve the crop's natural aspect ratio (avoids character distortion).
     """
     H, W = img.shape[-2], img.shape[-1]
     x1 = int(corners[:, 0].min().clamp(0, W).item())
@@ -126,7 +128,11 @@ def _bbox_ocr_crop(
     x2 = int(corners[:, 0].max().clamp(0, W).item())
     y2 = int(corners[:, 1].max().clamp(0, H).item())
     crop = img[..., y1:y2, x1:x2]
-    return F.interpolate(crop, size=target_size, mode="bilinear", align_corners=False)
+    th, tw = target_size
+    if tw is None:
+        crop_h, crop_w = crop.shape[-2], crop.shape[-1]
+        tw = max(1, int(crop_w * th / max(crop_h, 1)))
+    return F.interpolate(crop, size=(th, tw), mode="bilinear", align_corners=False)
 
 
 

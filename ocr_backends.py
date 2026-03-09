@@ -319,7 +319,7 @@ class CRNNBackend(OCRBackend):
 
     name         = "crnn"
     is_trainable  = True
-    ocr_crop_size = (32, 128)   # (H, W) — CRNN input height is 32
+    ocr_crop_size = (32, None)  # (H, W=None) — resize to h=32, preserve aspect ratio
 
     # synth90k uses lowercase — matches crnn_synth90k.pt exactly
     DEFAULT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
