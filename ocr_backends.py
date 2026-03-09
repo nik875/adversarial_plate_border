@@ -510,14 +510,16 @@ class CRNNBackend(OCRBackend):
     def _ctc_decode(self, pred_ids: torch.Tensor,
                     log_probs: torch.Tensor) -> tuple[Optional[str], float]:
         """Greedy CTC decode: collapse repeats, remove blanks."""
-        blank_id = self.num_classes - 1
+        # crnn_synth90k.pt uses blank=0 (Baek/DTRB convention):
+        #   index 0 → CTC blank, indices 1..N → alphabet[0..N-1]
+        blank_id = 0
         chars    = []
         prev     = blank_id
         confs    = []
 
         for t, idx in enumerate(pred_ids.tolist()):
             if idx != prev and idx != blank_id:
-                chars.append(self.alphabet[idx])
+                chars.append(self.alphabet[idx - 1])   # -1: blank at 0 shifts chars up by 1
                 confs.append(log_probs[t, 0, idx].exp().item())
             prev = idx
 
@@ -544,8 +546,9 @@ class CRNNBackend(OCRBackend):
             Scalar CTC loss (lower = closer to target_text).
         """
         log_probs   = F.log_softmax(logits.unsqueeze(1), dim=2)  # [T, 1, C]
+        # blank=0 convention: character indices are 1-based
         target_ids  = torch.tensor(
-            [self.alphabet.index(c) for c in target_text if c in self.alphabet],
+            [self.alphabet.index(c) + 1 for c in target_text if c in self.alphabet],
             dtype=torch.long,
         )
         input_len   = torch.tensor([log_probs.shape[0]], dtype=torch.long)
@@ -554,7 +557,7 @@ class CRNNBackend(OCRBackend):
         return F.ctc_loss(
             log_probs, target_ids.unsqueeze(0),
             input_len, target_len,
-            blank=self.num_classes - 1,
+            blank=0,
             reduction="mean",
             zero_infinity=True,
         )
