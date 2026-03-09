@@ -6,7 +6,7 @@
 #
 # Pairings configured by default:
 #   1) rtdetr     + trocr
-#   2) yolo-v9-384 + cct (FastANPR)
+#   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
 #   3) fasterrcnn + dtrb (ViTSTR checkpoint)
 #   4) yolov8     + crnn
 #
@@ -144,7 +144,7 @@ fi
 # label|detector|det_weights|ocr|ocr_weights|needs_dtrb
 PAIRS=(
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
-    "pair_fastanpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
+    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
     "pair_fasterrcnn_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|dtrb|$DTRB_WEIGHTS|true"
     "pair_yolov8_crnn|yolov8|$YOLOV8_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
 )
