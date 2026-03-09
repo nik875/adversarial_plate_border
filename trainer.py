@@ -465,59 +465,64 @@ class AdversarialPatchTrainer:
         Raises RuntimeError if < 50% read correctly.
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
+        total = (min(n_samples, len(self.train_loader) + len(self.val_loader))
+                 if n_samples is not None
+                 else len(self.train_loader) + len(self.val_loader))
         results = []
         count = 0
         done = False
-        for loader in [self.train_loader, self.val_loader]:
-            if done:
-                break
-            for batch in tqdm(loader, desc="Sanity check", leave=False):
-                if n_samples is not None and count >= n_samples:
-                    done = True
+        with tqdm(total=total, desc="Sanity check", leave=False) as pbar:
+            for loader in [self.train_loader, self.val_loader]:
+                if done:
                     break
-                fn = (batch["filename"][0]
-                      if isinstance(batch["filename"], (list, tuple))
-                      else batch["filename"])
-                prep_tensor = batch["prep_image"][0].to(self.device)
-                new_corners = batch["new_corners"][0].to(self.device)
-                count += 1
-                target_box  = self.corners_to_bbox(new_corners)
+                for batch in loader:
+                    if n_samples is not None and count >= n_samples:
+                        done = True
+                        break
+                    fn = (batch["filename"][0]
+                          if isinstance(batch["filename"], (list, tuple))
+                          else batch["filename"])
+                    prep_tensor = batch["prep_image"][0].to(self.device)
+                    new_corners = batch["new_corners"][0].to(self.device)
+                    count += 1
+                    pbar.update(1)
+                    target_box  = self.corners_to_bbox(new_corners)
 
-                with torch.no_grad():
-                    detections = self.detector.predict(prep_tensor)
+                    with torch.no_grad():
+                        detections = self.detector.predict(prep_tensor)
 
-                if not detections:
-                    results.append({"filename": fn, "category": "no_detection",
-                                    "text": None, "confidence": 0.0})
-                    continue
+                    if not detections:
+                        results.append({"filename": fn, "category": "no_detection",
+                                        "text": None, "confidence": 0.0})
+                        continue
 
-                best_det = max(
-                    detections,
-                    key=lambda d: (
-                        self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                        target_box.unsqueeze(0)).item()
-                        * d.confidence
-                    ),
-                )
-
-                with torch.no_grad():
-                    crop = kornia.geometry.crop_and_resize(
-                        prep_tensor.unsqueeze(0),
-                        new_corners.unsqueeze(0),
-                        self.ocr.ocr_crop_size,
-                        mode="bilinear", align_corners=True,
+                    best_det = max(
+                        detections,
+                        key=lambda d: (
+                            self._boxes_iou(d.box.to(self.device).unsqueeze(0),
+                                            target_box.unsqueeze(0)).item()
+                            * d.confidence
+                        ),
                     )
-                    ocr_result = self.ocr.predict(crop.squeeze(0))
 
-                text = ocr_result.text or ""
-                if text.upper() == self.expected_plate_text.upper():
-                    cat = "correct"
-                elif self.impersonation_target and text.upper() == self.impersonation_target.upper():
-                    cat = "impersonation"
-                else:
-                    cat = "misread"
-                results.append({"filename": fn, "category": cat,
-                                 "text": text, "confidence": ocr_result.confidence})
+                    with torch.no_grad():
+                        crop = kornia.geometry.crop_and_resize(
+                            prep_tensor.unsqueeze(0),
+                            new_corners.unsqueeze(0),
+                            self.ocr.ocr_crop_size,
+                            mode="bilinear", align_corners=True,
+                        )
+                        ocr_result = self.ocr.predict(crop.squeeze(0))
+
+                    text = ocr_result.text or ""
+                    if text.upper() == self.expected_plate_text.upper():
+                        cat = "correct"
+                    elif self.impersonation_target and text.upper() == self.impersonation_target.upper():
+                        cat = "impersonation"
+                    else:
+                        cat = "misread"
+                    results.append({"filename": fn, "category": cat,
+                                    "text": text, "confidence": ocr_result.confidence})
 
         counts = {"correct": 0, "impersonation": 0, "misread": 0, "no_detection": 0}
         for r in results:
@@ -553,13 +558,16 @@ class AdversarialPatchTrainer:
         debug_dir = self.run_dir / "debug"
 
         # Collect (fn, prep_tensor, new_corners_np) from both loaders
+        total = len(self.train_loader) + len(self.val_loader)
         all_items = []
-        for loader in [self.train_loader, self.val_loader]:
-            for batch in loader:
-                fn = (batch["filename"][0]
-                      if isinstance(batch["filename"], (list, tuple))
-                      else batch["filename"])
-                all_items.append((fn, batch["prep_image"][0], batch["new_corners"][0].numpy()))
+        with tqdm(total=total, desc="Loading images for debug", leave=False) as pbar:
+            for loader in [self.train_loader, self.val_loader]:
+                for batch in loader:
+                    fn = (batch["filename"][0]
+                          if isinstance(batch["filename"], (list, tuple))
+                          else batch["filename"])
+                    all_items.append((fn, batch["prep_image"][0], batch["new_corners"][0].numpy()))
+                    pbar.update(1)
 
         np.random.seed(42)
         indices      = np.random.choice(len(all_items), min(n, len(all_items)), replace=False)
