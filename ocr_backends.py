@@ -1229,27 +1229,52 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         # Load checkpoint to inspect architecture
         state = torch.load(str(self.model_path), map_location="cpu")
         state = state.get("state_dict", state)
-        
+
+        # Strip DataParallel 'module.' prefix if present (checkpoint saved with nn.DataParallel)
+        if any(k.startswith("module.") for k in state):
+            state = {(k[len("module."):] if k.startswith("module.") else k): v
+                     for k, v in state.items()}
+            print(f"[dtrb] Stripped 'module.' prefix from checkpoint keys")
+
         pred = self.prediction
         self._prediction = "CTC" if pred == "CTC" else "Attn"
+
+        # Auto-detect ViTSTR from feature extraction name
+        is_vitstr = "vitstr" in self.feature_extraction.lower() or "vit" in self.feature_extraction.lower()
+
+        # Detect actual input channels from checkpoint
+        input_channel = 1  # default
+        for k, v in state.items():
+            if "patch_embed" in k and "proj.weight" in k:
+                input_channel = int(v.shape[1])  # [out_ch, in_ch, h, w]
+                break
+        self.input_channel = input_channel
+
+        # Auto-detect character set from head shape.
+        # AttnLabelConverter adds 2 special tokens ([GO], [s]), so:
+        #   num_class = 2 + len(character)
+        # DTRB "sensitive" mode uses string.printable[:-6] (94 chars) → 96 classes.
+        if is_vitstr:
+            import string as _string
+            for k, v in state.items():
+                if k.endswith("head.weight") and v.dim() == 2:
+                    detected_num_class = v.shape[0]
+                    expected_char_len = detected_num_class - 2  # subtract GO + EOS tokens
+                    if expected_char_len != len(self.character):
+                        if expected_char_len == 94:
+                            self.character = _string.printable[:-6]
+                        else:
+                            # Best-effort: truncate or warn
+                            print(f"[dtrb] WARNING: head has {detected_num_class} classes but "
+                                  f"character set gives {len(self.character)+2}. "
+                                  f"Override --dtrb-character if results are wrong.")
+                        print(f"[dtrb] Auto-detected character set: {detected_num_class} classes "
+                              f"→ {len(self.character)} chars")
+                    break
 
         converter_cls = CTCLabelConverter if self._prediction == "CTC" else AttnLabelConverter
         self._converter = converter_cls(self.character)
 
-        # Auto-detect ViTSTR from feature extraction name
-        is_vitstr = "vitstr" in self.feature_extraction.lower() or "vit" in self.feature_extraction.lower()
-        
-        # Detect actual input channels from checkpoint (some ViTSTR models use grayscale)
-        input_channel = 1  # default
-        if is_vitstr:
-            # Check patch_embed layer in checkpoint
-            for k, v in state.items():
-                if "patch_embed" in k and "proj.weight" in k:
-                    input_channel = int(v.shape[1])  # [out_ch, in_ch, h, w]
-                    break
-        
-        self.input_channel = input_channel  # Store for _preprocess
-        
         opt = SimpleNamespace(
             Transformation=self.transformation,
             FeatureExtraction=self.feature_extraction,
