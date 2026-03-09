@@ -1164,6 +1164,15 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         sequence_modeling: str = "BiLSTM",
     ):
         super().__init__(model_path, device)
+
+        # Auto-detect ViTSTR: ViTSTR uses attention decoding, not CTC.
+        # Silently override prediction="CTC" → "Attn" for ViTSTR models so that
+        # the architecture built from opt matches the checkpoint.
+        is_vitstr = "vitstr" in feature_extraction.lower() or "vit" in feature_extraction.lower()
+        if is_vitstr and prediction.upper() == "CTC":
+            print(f"[dtrb] ViTSTR detected — overriding prediction CTC → Attn")
+            prediction = "Attn"
+
         requested_prediction = prediction.upper()
         if requested_prediction not in {"CTC", "ATTN"}:
             raise ValueError("dtrb prediction must be one of: CTC, Attn")
@@ -1172,11 +1181,9 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         self.is_trainable = requested_prediction == "CTC"
         self.dtrb_root = dtrb_root
         self.character = character
-        
-        # Auto-detect ViTSTR and adjust image size
-        is_vitstr = "vitstr" in feature_extraction.lower() or "vit" in feature_extraction.lower()
+
+        # Adjust image size for ViTSTR
         if is_vitstr and img_h == 32 and img_w == 100:
-            # Override defaults for ViTSTR which expects 224x224
             img_h = 224
             img_w = 224
         
