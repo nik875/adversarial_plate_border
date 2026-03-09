@@ -691,7 +691,17 @@ class AdversarialPatchTrainer:
     # Debug images
     # ====================================================================
 
-def save_debug_images(self, n: int = 20) -> None:
+    @staticmethod
+    def _shrink_for_save(img_hwc: np.ndarray, max_dim: int = 1280) -> np.ndarray:
+        """Downscale an HWC uint8 image so its longest side ≤ max_dim."""
+        h, w = img_hwc.shape[:2]
+        scale = min(max_dim / max(h, w), 1.0)
+        if scale < 1.0:
+            img_hwc = cv2.resize(img_hwc, (int(w * scale), int(h * scale)),
+                                 interpolation=cv2.INTER_AREA)
+        return img_hwc
+
+    def save_debug_images(self, n: int = 20) -> None:
         from torch.utils.data import Subset, DataLoader as DL
 
         debug_dir = self.run_dir / "debug"
@@ -764,7 +774,8 @@ def save_debug_images(self, n: int = 20) -> None:
                 cv2.rectangle(vis, (x1, y1), (x2, y2), color=(0, 0, 255), thickness=2)
             cv2.putText(vis, f"{text} ({conf:.2f})", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_a_preprocessed_detection.png"), vis)
+            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_a_preprocessed_detection.png"),
+                        self._shrink_for_save(vis))
 
             # (b) raw OCR crop
             crop_np = (crop.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -779,7 +790,8 @@ def save_debug_images(self, n: int = 20) -> None:
                     patch_norm=rand_patch,
                 )
             patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"), patch_vis)
+            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"),
+                        self._shrink_for_save(patch_vis))
 
             # (d) cv2 preprocessing vs differentiable preprocessing comparison
             with torch.no_grad():
@@ -788,7 +800,8 @@ def save_debug_images(self, n: int = 20) -> None:
                 diff_prep_np  = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 cv2_prep_np   = (cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
-                cv2.imwrite(str(debug_dir / f"{img_idx:02d}_d_prep_comparison.png"), comparison)
+                cv2.imwrite(str(debug_dir / f"{img_idx:02d}_d_prep_comparison.png"),
+                            self._shrink_for_save(comparison))
 
             row = {
                 "index": img_idx, "filename": fn,
