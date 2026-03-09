@@ -59,7 +59,51 @@ def load_image(filepath):
     return img
 
 
-def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.ndarray, 
+# ---------------------------------------------------------------------------
+# Detector-specific preprocessing factories
+# ---------------------------------------------------------------------------
+
+def make_letterbox_prep(target_size: int):
+    """Return a prep_fn that letterboxes to a square with grey padding, ÷255."""
+    def fn(img_hwc: np.ndarray, corners: np.ndarray):
+        shape = img_hwc.shape[:2]
+        r = min(target_size / shape[0], target_size / shape[1])
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw = (target_size - new_unpad[0]) / 2
+        dh = (target_size - new_unpad[1]) / 2
+        img = cv2.resize(img_hwc, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top    = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
+        left   = int(round(dw - 0.1)); right  = int(round(dw + 0.1))
+        img    = cv2.copyMakeBorder(img, top, bottom, left, right,
+                                    cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        new_corners = corners.astype(np.float32).copy()
+        new_corners[:, 0] = new_corners[:, 0] * r + dw
+        new_corners[:, 1] = new_corners[:, 1] * r + dh
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0, new_corners
+    return fn
+
+
+def make_resize_prep(width: int, height: int):
+    """Return a prep_fn that hard-resizes to (width, height), ÷255."""
+    def fn(img_hwc: np.ndarray, corners: np.ndarray):
+        orig_h, orig_w = img_hwc.shape[:2]
+        img = cv2.resize(img_hwc, (width, height), interpolation=cv2.INTER_LINEAR)
+        new_corners = corners.astype(np.float32).copy()
+        new_corners[:, 0] *= width  / orig_w
+        new_corners[:, 1] *= height / orig_h
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0, new_corners
+    return fn
+
+
+def make_passthrough_prep():
+    """Return a prep_fn that only divides by 255, leaving corners unchanged."""
+    def fn(img_hwc: np.ndarray, corners: np.ndarray):
+        return (torch.from_numpy(img_hwc).permute(2, 0, 1).float() / 255.0,
+                corners.astype(np.float32).copy())
+    return fn
+
+
+def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.ndarray,
                         target_size: int = 384) -> tuple:
     """Preprocess image with letterbox resizing (YOLO-style).
     
@@ -115,12 +159,13 @@ def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.nd
 
 class AdversarialPatchDataset(Dataset):
     def __init__(self, df, transform=None, preload=False, target_size=384,
-                 use_original: bool = False):
+                 use_original: bool = False, prep_fn=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
         self.preload = preload
         self.target_size = target_size
         self.use_original = use_original
+        self.prep_fn = prep_fn
 
         # When use_original=True, always ignore preprocessed_filename
         if use_original:
@@ -236,14 +281,19 @@ class AdversarialPatchDataset(Dataset):
 
         # When use_original=True, return only the full-res image + original corners
         if self.use_original:
-            if self.transform:
-                orig_img = self.transform(orig_img)
-            return {
-                'orig_image': orig_img,
+            result = {
                 'orig_corners': orig_corners,
                 'orig_homography': orig_H,
                 'filename': row['filename'],
             }
+            if self.prep_fn is not None:
+                prep_img, new_c = self.prep_fn(orig_img, orig_corners.numpy())
+                result['prep_image'] = prep_img
+                result['new_corners'] = torch.from_numpy(new_c)
+            if self.transform:
+                orig_img = self.transform(orig_img)
+            result['orig_image'] = orig_img
+            return result
 
         if self.transform:
             orig_img = self.transform(orig_img)
@@ -285,7 +335,8 @@ class AdversarialPatchDataset(Dataset):
 
 def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=0.8,
                        n_jobs=1, limit=0, use_all_for_train=False,
-                       use_original: bool = False, pin_memory=True, **kwargs):
+                       use_original: bool = False, prep_fn=None,
+                       pin_memory=True, **kwargs):
     """Create train and validation DataLoaders
 
     Args:
@@ -298,6 +349,14 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         pin_memory: Enable DataLoader pinned memory (useful for CUDA, but can increase RAM pressure)
         **kwargs: Additional arguments passed to AdversarialPatchDataset
     """
+    preload = kwargs.get("preload", False)
+    if preload and n_jobs > 0:
+        raise ValueError(
+            "preload=True and num_workers>0 are incompatible: each DataLoader worker "
+            "would hold a full in-memory copy of the dataset. "
+            "Use preload=True with num_workers=0, or preload=False with num_workers>0."
+        )
+
     df = pd.read_csv(csv_path)
     if limit:
         df = df.iloc[-limit:]
@@ -317,8 +376,8 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Create datasets
-    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, **kwargs)
-    val_dataset = AdversarialPatchDataset(val_df, use_original=use_original, **kwargs)
+    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, prep_fn=prep_fn, **kwargs)
+    val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, prep_fn=prep_fn, **kwargs)
 
     # Create dataloaders
     train_loader = DataLoader(

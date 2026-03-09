@@ -23,7 +23,7 @@ The inductive bias imposed by the decoder:
 Other design decisions
 ----------------------
 * Full-resolution HEIC images loaded from preproc_labels.csv.
-* Detector-specific preprocessing cached once at init.
+* Detector-specific preprocessing runs inside DataLoader workers (parallel).
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
@@ -54,7 +54,7 @@ from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
-from dataset import create_dataloaders
+from dataset import create_dataloaders, make_letterbox_prep, make_resize_prep, make_passthrough_prep
 
 warnings.filterwarnings("ignore")
 
@@ -62,64 +62,6 @@ PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
 
-# ---------------------------------------------------------------------------
-# Detector-specific preprocessing helper
-# ---------------------------------------------------------------------------
-
-def preprocess_for_detector(
-    img_hwc_uint8: np.ndarray,
-    corners_np: np.ndarray,
-    backend: DetectorBackend,
-) -> Tuple[torch.Tensor, np.ndarray]:
-    """
-    Apply detector-specific preprocessing to a single image.
-
-    Called once per image at init time (non-differentiable).
-    Returns a CHW float32 [0,1] tensor and corners in the new space.
-    """
-    name = backend.name
-    H, W = img_hwc_uint8.shape[:2]
-
-    if name in ("yolov8", "yolov11"):
-        from ultralytics.utils.ops import letterbox
-        imgsz = 640
-        if hasattr(backend, "_yolo") and backend._yolo is not None:
-            raw = backend._yolo.imgsz
-            imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
-        img_lb, ratio, (dw, dh) = letterbox(
-            img_hwc_uint8, (imgsz, imgsz),
-            color=(114, 114, 114), auto=False, stride=32,
-        )
-        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
-        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
-
-    elif name == "rtdetr":
-        img_resized  = cv2.resize(img_hwc_uint8, (640, 640), interpolation=cv2.INTER_LINEAR)
-        img_tensor   = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-        sx, sy       = 640.0 / W, 640.0 / H
-        new_corners  = corners_np * np.array([sx, sy], dtype=np.float32)
-
-    elif name == "fasterrcnn":
-        img_tensor   = torch.from_numpy(img_hwc_uint8).permute(2, 0, 1).float() / 255.0
-        new_corners  = corners_np.copy().astype(np.float32)
-
-    elif name == "yolo-v9-384":
-        from ultralytics.utils.ops import letterbox
-        img_lb, ratio, (dw, dh) = letterbox(
-            img_hwc_uint8, (384, 384), color=(114, 114, 114), auto=False,
-        )
-        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
-        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
-
-    else:
-        from ultralytics.utils.ops import letterbox
-        img_lb, ratio, (dw, dh) = letterbox(
-            img_hwc_uint8, (384, 384), color=(114, 114, 114), auto=False,
-        )
-        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
-        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
-
-    return img_tensor, new_corners.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -237,11 +179,8 @@ class AdversarialPatchTrainer:
             limit=limit,
             use_all_for_train=use_all_for_train,
             use_original=True,
+            prep_fn=self._make_prep_fn(),
         )
-
-        # ── Preprocessing cache ────────────────────────────────────────
-        self._prep_cache: Dict[str, Tuple[torch.Tensor, np.ndarray]] = {}
-        self._build_prep_cache()
 
         self.epoch_stats: list = []
 
@@ -284,23 +223,26 @@ class AdversarialPatchTrainer:
         return patch   # [3, 256, 512]
 
     # ====================================================================
-    # Preprocessing cache
+    # Detector preprocessing selection
     # ====================================================================
 
-    def _build_prep_cache(self) -> None:
-        total = sum(len(ld) for ld in [self.train_loader, self.val_loader])
-        with tqdm(total=total, desc="Preprocessing images for detector") as pbar:
-            for loader in [self.train_loader, self.val_loader]:
-                for batch in loader:
-                    fn = batch["filename"][0]
-                    if fn not in self._prep_cache:
-                        orig_chw = batch["orig_image"][0]
-                        img_hwc  = (orig_chw.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                        corners  = batch["orig_corners"][0].numpy()
-                        prep_t, new_c = preprocess_for_detector(img_hwc, corners, self.detector)
-                        self._prep_cache[fn] = (prep_t, new_c)
-                    pbar.update(1)
-        print(f"  Cached {len(self._prep_cache)} preprocessed images")
+    def _make_prep_fn(self):
+        """Return the dataset preprocessing function for the current detector."""
+        name = self.detector.name
+        if name in ("yolov8", "yolov11"):
+            imgsz = 640
+            if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
+                raw = self.detector._yolo.imgsz
+                imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
+            return make_letterbox_prep(imgsz)
+        elif name == "rtdetr":
+            return make_resize_prep(640, 640)
+        elif name == "fasterrcnn":
+            return make_passthrough_prep()
+        elif name == "yolo-v9-384":
+            return make_letterbox_prep(384)
+        else:
+            return make_letterbox_prep(384)
 
     # ====================================================================
     # Geometry helpers
@@ -477,9 +419,8 @@ class AdversarialPatchTrainer:
               if isinstance(batch["filename"], (list, tuple))
               else batch["filename"])
 
-        prep_tensor, new_corners_np = self._prep_cache[fn]
-        prep_tensor  = prep_tensor.to(self.device)
-        new_corners  = torch.from_numpy(new_corners_np).to(self.device)
+        prep_tensor = batch["prep_image"][0].to(self.device)
+        new_corners = batch["new_corners"][0].to(self.device)
 
         # Generate patch once — shared between apply and loss
         patch_norm = self.generate_patch(training_aug=self.training)
@@ -524,48 +465,56 @@ class AdversarialPatchTrainer:
         Raises RuntimeError if < 50% read correctly.
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
-        items = list(self._prep_cache.items())
-        if n_samples is not None:
-            items = items[:n_samples]
-
         results = []
-        for fn, (prep_t, new_c) in tqdm(items, desc="Sanity check", leave=False):
-            prep_tensor  = prep_t.to(self.device)
-            new_corners  = torch.from_numpy(new_c).to(self.device)
-            target_box   = self.corners_to_bbox(new_corners)
+        count = 0
+        done = False
+        for loader in [self.train_loader, self.val_loader]:
+            if done:
+                break
+            for batch in tqdm(loader, desc="Sanity check", leave=False):
+                if n_samples is not None and count >= n_samples:
+                    done = True
+                    break
+                fn = (batch["filename"][0]
+                      if isinstance(batch["filename"], (list, tuple))
+                      else batch["filename"])
+                prep_tensor = batch["prep_image"][0].to(self.device)
+                new_corners = batch["new_corners"][0].to(self.device)
+                count += 1
+                target_box  = self.corners_to_bbox(new_corners)
 
-            with torch.no_grad():
-                detections = self.detector.predict(prep_tensor)
+                with torch.no_grad():
+                    detections = self.detector.predict(prep_tensor)
 
-            if not detections:
-                results.append({"filename": fn, "category": "no_detection",
-                                 "text": None, "confidence": 0.0})
-                continue
+                if not detections:
+                    results.append({"filename": fn, "category": "no_detection",
+                                    "text": None, "confidence": 0.0})
+                    continue
 
-            best_det = max(
-                detections,
-                key=lambda d: (
-                    self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                    target_box.unsqueeze(0)).item()
-                    * d.confidence
-                ),
-            )
-
-            with torch.no_grad():
-                crop = kornia.geometry.crop_and_resize(
-                    prep_tensor.unsqueeze(0),
-                    new_corners.unsqueeze(0),
-                    self.ocr.ocr_crop_size,
-                    mode="bilinear", align_corners=True,
+                best_det = max(
+                    detections,
+                    key=lambda d: (
+                        self._boxes_iou(d.box.to(self.device).unsqueeze(0),
+                                        target_box.unsqueeze(0)).item()
+                        * d.confidence
+                    ),
                 )
-                ocr_result = self.ocr.predict(crop.squeeze(0))
 
-            text = ocr_result.text or ""
-            cat  = ("correct"       if text.upper() == self.expected_plate_text.upper()
-                    else "misread"   if not text
-                    else "impersonation")
-            results.append({"filename": fn, "category": cat,
-                             "text": text, "confidence": ocr_result.confidence})
+                with torch.no_grad():
+                    crop = kornia.geometry.crop_and_resize(
+                        prep_tensor.unsqueeze(0),
+                        new_corners.unsqueeze(0),
+                        self.ocr.ocr_crop_size,
+                        mode="bilinear", align_corners=True,
+                    )
+                    ocr_result = self.ocr.predict(crop.squeeze(0))
+
+                text = ocr_result.text or ""
+                cat  = ("correct"       if text.upper() == self.expected_plate_text.upper()
+                        else "misread"   if not text
+                        else "impersonation")
+                results.append({"filename": fn, "category": cat,
+                                 "text": text, "confidence": ocr_result.confidence})
 
         counts = {"correct": 0, "impersonation": 0, "misread": 0, "no_detection": 0}
         for r in results:
@@ -598,17 +547,25 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def save_debug_images(self, n: int = 20) -> None:
-        debug_dir    = self.run_dir / "debug"
-        items        = list(self._prep_cache.items())
+        debug_dir = self.run_dir / "debug"
+
+        # Collect (fn, prep_tensor, new_corners_np) from both loaders
+        all_items = []
+        for loader in [self.train_loader, self.val_loader]:
+            for batch in loader:
+                fn = (batch["filename"][0]
+                      if isinstance(batch["filename"], (list, tuple))
+                      else batch["filename"])
+                all_items.append((fn, batch["prep_image"][0], batch["new_corners"][0].numpy()))
+
         np.random.seed(42)
-        sample_items = [items[i] for i in
-                        np.random.choice(len(items), min(n, len(items)), replace=False)]
-        sample_items.sort(key=lambda x: x[0])
+        indices      = np.random.choice(len(all_items), min(n, len(all_items)), replace=False)
+        sample_items = sorted([all_items[i] for i in indices], key=lambda x: x[0])
 
         print(f"  Saving {len(sample_items)} debug images → {debug_dir}")
         summary_rows = []
 
-        for img_idx, (fn, (prep_t, new_c)) in enumerate(sample_items):
+        for img_idx, (fn, prep_t, new_c) in enumerate(sample_items):
             prep_tensor = prep_t.to(self.device)
             new_corners = torch.from_numpy(new_c).to(self.device)
             target_box  = self.corners_to_bbox(new_corners)
@@ -721,12 +678,8 @@ class AdversarialPatchTrainer:
         losses = []
         with torch.no_grad():
             for batch in self.val_loader:
-                fn = (batch["filename"][0]
-                      if isinstance(batch["filename"], (list, tuple))
-                      else batch["filename"])
-                prep_tensor, new_corners_np = self._prep_cache[fn]
-                prep_tensor = prep_tensor.to(self.device)
-                new_corners = torch.from_numpy(new_corners_np).to(self.device)
+                prep_tensor = batch["prep_image"][0].to(self.device)
+                new_corners = batch["new_corners"][0].to(self.device)
                 patch_norm  = self.generate_patch(training_aug=False)
                 patched_prep, _ = self.apply_patch_to_image(
                     prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
