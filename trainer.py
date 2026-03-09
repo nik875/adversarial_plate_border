@@ -109,6 +109,25 @@ PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
 
+def _bbox_ocr_crop(
+    img: torch.Tensor,          # [1, C, H, W]
+    corners: torch.Tensor,      # [4, 2]  (x, y) in image coords
+    target_size: Tuple[int, int],  # (h, w)
+) -> torch.Tensor:              # [1, C, target_h, target_w]
+    """
+    Rectangular bbox crop + bilinear resize for OCR.
+    No perspective correction — just clips the axis-aligned bounding box
+    of the plate corners out of the image and resizes it.
+    """
+    H, W = img.shape[-2], img.shape[-1]
+    x1 = int(corners[:, 0].min().clamp(0, W).item())
+    y1 = int(corners[:, 1].min().clamp(0, H).item())
+    x2 = int(corners[:, 0].max().clamp(0, W).item())
+    y2 = int(corners[:, 1].max().clamp(0, H).item())
+    crop = img[..., y1:y2, x1:x2]
+    return F.interpolate(crop, size=target_size, mode="bilinear", align_corners=False)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -474,12 +493,7 @@ class AdversarialPatchTrainer:
         target_text = self.impersonation_target or self.expected_plate_text
         ocr_loss    = torch.tensor(0.0, device=self.device)
 
-        crop = kornia.geometry.crop_and_resize(
-            patched_orig,
-            orig_corners.unsqueeze(0).to(self.device),
-            self.ocr.ocr_crop_size,
-            mode="bilinear", align_corners=True,
-        )   # [1, 3, H_ocr, W_ocr]
+        crop = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
         if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
             ocr_loss = self.ocr.differentiable_loss(
@@ -593,12 +607,8 @@ class AdversarialPatchTrainer:
                     )
 
                     with torch.no_grad():
-                        crop = kornia.geometry.crop_and_resize(
-                            orig_tensor.unsqueeze(0),
-                            orig_corners.unsqueeze(0),
-                            self.ocr.ocr_crop_size,
-                            mode="bilinear", align_corners=True,
-                        )
+                        crop       = _bbox_ocr_crop(orig_tensor.unsqueeze(0), orig_corners,
+                                                    self.ocr.ocr_crop_size)
                         ocr_result = self.ocr.predict(crop.squeeze(0))
 
                     text = ocr_result.text or ""
@@ -690,10 +700,8 @@ class AdversarialPatchTrainer:
 
             with torch.no_grad():
                 detections = self.detector.predict(prep_tensor)
-                crop = kornia.geometry.crop_and_resize(
-                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
-                    self.ocr.ocr_crop_size, mode="bilinear", align_corners=True,
-                )
+                crop       = _bbox_ocr_crop(orig_tensor.unsqueeze(0), orig_corners,
+                                            self.ocr.ocr_crop_size)
                 ocr_result = self.ocr.predict(crop.squeeze(0))
 
             text       = ocr_result.text or ""
