@@ -127,8 +127,14 @@ for o in graph.output:
 
 # ── 4. Save and verify ─────────────────────────────────────────────────────────
 onnx.checker.check_model(model)
+
+# Upgrade opset to 14 so onnx2torch supports the LSTM node (opset 7 LSTM is unsupported)
+print("\n=== Upgrading ONNX opset 7 → 14 ===")
+model = onnx.version_converter.convert_version(model, 14)
+print(f"  opset_version now: {model.opset_import[0].version}")
+
 onnx.save(model, DST)
-print(f"\nSaved patched model → {DST}")
+print(f"Saved patched model → {DST}")
 
 # ── 5. Try onnx2torch conversion ───────────────────────────────────────────────
 print("\n=== onnx2torch conversion ===")
