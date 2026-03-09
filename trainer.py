@@ -366,12 +366,14 @@ class AdversarialPatchTrainer:
 
     def partial_loss(
         self,
-        patched_prep: torch.Tensor,   # [1, C, H, W]
-        new_corners:  torch.Tensor,   # [4, 2]
+        patched_prep: torch.Tensor,   # [1, C, H_prep, W_prep] — for detector
+        new_corners:  torch.Tensor,   # [4, 2] — detector-space corners
+        patched_orig: torch.Tensor,   # [1, C, H_full, W_full] — for OCR crop
+        orig_corners: torch.Tensor,   # [4, 2] — full-res corners
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         target_box = self.corners_to_bbox(new_corners)
 
-        # ── Detection ──────────────────────────────────────────────────
+        # ── Detection (preprocessed resolution) ────────────────────────
         detections = self.detector.predict(patched_prep.squeeze(0))
         det_loss   = torch.tensor(0.0, device=self.device)
 
@@ -388,13 +390,13 @@ class AdversarialPatchTrainer:
                                         target_box.unsqueeze(0))
             det_loss = (iou_val * best_det.conf.to(self.device)).squeeze()
 
-        # ── OCR ────────────────────────────────────────────────────────
+        # ── OCR (full-res crop for maximum detail) ──────────────────────
         target_text = self.impersonation_target or self.expected_plate_text
         ocr_loss    = torch.tensor(0.0, device=self.device)
 
         crop = kornia.geometry.crop_and_resize(
-            patched_prep,
-            new_corners.unsqueeze(0).to(self.device),
+            patched_orig,
+            orig_corners.unsqueeze(0).to(self.device),
             self.ocr.ocr_crop_size,
             mode="bilinear", align_corners=True,
         )   # [1, 3, H_ocr, W_ocr]
@@ -415,23 +417,23 @@ class AdversarialPatchTrainer:
         return det_loss, ocr_loss
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        fn = (batch["filename"][0]
-              if isinstance(batch["filename"], (list, tuple))
-              else batch["filename"])
+        prep_tensor  = batch["prep_image"][0].to(self.device)
+        new_corners  = batch["new_corners"][0].to(self.device)
+        orig_tensor  = batch["orig_image"][0].to(self.device)
+        orig_corners = batch["orig_corners"][0].to(self.device)
 
-        prep_tensor = batch["prep_image"][0].to(self.device)
-        new_corners = batch["new_corners"][0].to(self.device)
-
-        # Generate patch once — shared between apply and loss
+        # Generate patch once — reused for both applications
         patch_norm = self.generate_patch(training_aug=self.training)
 
         patched_prep, _ = self.apply_patch_to_image(
-            prep_tensor.unsqueeze(0),
-            new_corners.unsqueeze(0),
-            patch_norm=patch_norm,
+            prep_tensor.unsqueeze(0), new_corners.unsqueeze(0), patch_norm=patch_norm,
+        )
+        patched_orig, _ = self.apply_patch_to_image(
+            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
         )
 
-        det_loss, ocr_loss = self.partial_loss(patched_prep, new_corners)
+        det_loss, ocr_loss = self.partial_loss(
+            patched_prep, new_corners, patched_orig, orig_corners)
         return (det_loss + ocr_loss) / 2
 
     # ====================================================================
@@ -482,8 +484,10 @@ class AdversarialPatchTrainer:
                     fn = (batch["filename"][0]
                           if isinstance(batch["filename"], (list, tuple))
                           else batch["filename"])
-                    prep_tensor = batch["prep_image"][0].to(self.device)
-                    new_corners = batch["new_corners"][0].to(self.device)
+                    prep_tensor  = batch["prep_image"][0].to(self.device)
+                    new_corners  = batch["new_corners"][0].to(self.device)
+                    orig_tensor  = batch["orig_image"][0].to(self.device)
+                    orig_corners = batch["orig_corners"][0].to(self.device)
                     count += 1
                     pbar.update(1)
                     target_box  = self.corners_to_bbox(new_corners)
@@ -507,8 +511,8 @@ class AdversarialPatchTrainer:
 
                     with torch.no_grad():
                         crop = kornia.geometry.crop_and_resize(
-                            prep_tensor.unsqueeze(0),
-                            new_corners.unsqueeze(0),
+                            orig_tensor.unsqueeze(0),
+                            orig_corners.unsqueeze(0),
                             self.ocr.ocr_crop_size,
                             mode="bilinear", align_corners=True,
                         )
@@ -557,7 +561,7 @@ class AdversarialPatchTrainer:
     def save_debug_images(self, n: int = 20) -> None:
         debug_dir = self.run_dir / "debug"
 
-        # Collect (fn, prep_tensor, new_corners_np) from both loaders
+        # Collect items from both loaders
         total = len(self.train_loader) + len(self.val_loader)
         all_items = []
         with tqdm(total=total, desc="Loading images for debug", leave=False) as pbar:
@@ -566,7 +570,13 @@ class AdversarialPatchTrainer:
                     fn = (batch["filename"][0]
                           if isinstance(batch["filename"], (list, tuple))
                           else batch["filename"])
-                    all_items.append((fn, batch["prep_image"][0], batch["new_corners"][0].numpy()))
+                    all_items.append((
+                        fn,
+                        batch["prep_image"][0],
+                        batch["new_corners"][0].numpy(),
+                        batch["orig_image"][0],
+                        batch["orig_corners"][0],
+                    ))
                     pbar.update(1)
 
         np.random.seed(42)
@@ -576,18 +586,20 @@ class AdversarialPatchTrainer:
         print(f"  Saving {len(sample_items)} debug images → {debug_dir}")
         summary_rows = []
 
-        for img_idx, (fn, prep_t, new_c) in enumerate(sample_items):
-            prep_tensor = prep_t.to(self.device)
-            new_corners = torch.from_numpy(new_c).to(self.device)
-            target_box  = self.corners_to_bbox(new_corners)
+        for img_idx, (fn, prep_t, new_c, orig_t, orig_c) in enumerate(sample_items):
+            prep_tensor  = prep_t.to(self.device)
+            new_corners  = torch.from_numpy(new_c).to(self.device)
+            orig_tensor  = orig_t.to(self.device)
+            orig_corners = orig_c.to(self.device)
+            target_box   = self.corners_to_bbox(new_corners)
 
             with torch.no_grad():
-                detections  = self.detector.predict(prep_tensor)
+                detections = self.detector.predict(prep_tensor)
                 crop = kornia.geometry.crop_and_resize(
-                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
+                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
                     self.ocr.ocr_crop_size, mode="bilinear", align_corners=True,
                 )
-                ocr_result  = self.ocr.predict(crop.squeeze(0))
+                ocr_result = self.ocr.predict(crop.squeeze(0))
 
             text       = ocr_result.text or ""
             conf       = ocr_result.confidence
@@ -689,14 +701,19 @@ class AdversarialPatchTrainer:
         losses = []
         with torch.no_grad():
             for batch in self.val_loader:
-                prep_tensor = batch["prep_image"][0].to(self.device)
-                new_corners = batch["new_corners"][0].to(self.device)
-                patch_norm  = self.generate_patch(training_aug=False)
+                prep_tensor  = batch["prep_image"][0].to(self.device)
+                new_corners  = batch["new_corners"][0].to(self.device)
+                orig_tensor  = batch["orig_image"][0].to(self.device)
+                orig_corners = batch["orig_corners"][0].to(self.device)
+                patch_norm   = self.generate_patch(training_aug=False)
                 patched_prep, _ = self.apply_patch_to_image(
-                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
-                    patch_norm=patch_norm,
+                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0), patch_norm=patch_norm,
                 )
-                det_loss, ocr_loss = self.partial_loss(patched_prep, new_corners)
+                patched_orig, _ = self.apply_patch_to_image(
+                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
+                )
+                det_loss, ocr_loss = self.partial_loss(
+                    patched_prep, new_corners, patched_orig, orig_corners)
                 losses.append(((det_loss + ocr_loss) / 2).item())
         return float(np.mean(losses)) if losses else 0.0
 
