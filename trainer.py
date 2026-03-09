@@ -40,7 +40,7 @@ import warnings
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict
 
 import cv2
 import numpy as np
@@ -358,6 +358,23 @@ class AdversarialPatchTrainer:
                             corners[:, 0].max(), corners[:, 1].max()])
 
     @staticmethod
+    def _plate_text_variants(text: str) -> List[str]:
+        """
+        Generate spelling variants of a plate string by inserting common
+        separators at the letter→digit (or digit→letter) boundary.
+
+        E.g. "VRJ7774" → ["VRJ-7774", "VRJ 7774", "VRJ+7774"]
+        The normalised base form is NOT included — callers pass it as target_text.
+        Returns [] if no boundary is found (purely letters or purely digits).
+        """
+        clean = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+        m = re.search(r"(?<=[A-Z])(?=[0-9])|(?<=[0-9])(?=[A-Z])", clean)
+        if not m:
+            return []
+        pre, suf = clean[:m.start()], clean[m.start():]
+        return [f"{pre}{sep}{suf}" for sep in ("-", " ", "+")]
+
+    @staticmethod
     def _plate_text_matches(text: str, expected: str) -> bool:
         """
         Fuzzy match for sanity-check categorisation only (not the training objective).
@@ -507,8 +524,10 @@ class AdversarialPatchTrainer:
         crop = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
         if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
+            variants = self._plate_text_variants(target_text)
             ocr_loss = self.ocr.differentiable_loss(
                 crop, target_text, impersonation=bool(self.impersonation_target),
+                variants=variants,
             )
         else:
             with torch.no_grad():

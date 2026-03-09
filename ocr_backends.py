@@ -1054,45 +1054,62 @@ class TrOCROCRBackend(OCRBackend):
         outputs = self._model(pixel_values=pixel_values, labels=labels)
         return outputs.loss
 
-    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+    def _sequence_log_prob(
+        self, pixel_values: torch.Tensor, text: str
+    ) -> torch.Tensor:
         """
-        Differentiable seq2seq loss that bypasses PIL entirely.
+        Log P(text | image) via a single teacher-forced forward pass.
 
-        Parameters
-        ----------
-        crop : torch.Tensor
-            Shape [1, 3, 384, 384] in [0, 1] from kornia.geometry.crop_and_resize.
-        target_text : str
-            Target plate string.
-        impersonation : bool
-            True → minimise loss toward target_text.
-            False → maximise loss (negate).
+        pixel_values : [1, 3, H, W], already normalised to [-1, 1].
+        Returns a scalar log-probability (≤ 0).  Fully differentiable.
+        """
+        tok = self._processor.tokenizer(
+            text, return_tensors="pt", truncation=True,
+            max_length=self.max_new_tokens,
+        ).input_ids.to(self.device)   # [1, L]
 
-        Confirmed from HF preprocessor_config.json:
-            size=384, mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]
+        if tok.shape[1] < 2:
+            return torch.tensor(float("-inf"), device=self.device,
+                                dtype=pixel_values.dtype)
+
+        decoder_input_ids = tok[:, :-1]   # [1, L-1]: BOS + all-but-last
+        label_ids         = tok[:, 1:]    # [1, L-1]: all-but-BOS
+
+        outputs   = self._model(pixel_values=pixel_values,
+                                decoder_input_ids=decoder_input_ids)
+        log_probs = F.log_softmax(outputs.logits, dim=-1)   # [1, L-1, vocab]
+        token_lp  = log_probs.gather(2, label_ids.unsqueeze(-1)).squeeze(-1)
+        return token_lp.sum()   # scalar log P(sequence)
+
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False,
+                             variants: list = []) -> torch.Tensor:
+        """
+        Differentiable loss based on the combined log-probability of the target
+        text and any spelling variants (e.g. "VRJ-7774", "VRJ 7774").
+
+        Computes log P(any variant | image) via log-sum-exp of individual
+        teacher-forced log-probabilities, which is numerically stable and
+        avoids vanishing products.
+
+        Disruption  (impersonation=False): minimise log P → probability falls.
+        Impersonation (impersonation=True): maximise log P → probability rises.
+
+        crop     : [1, 3, 384, 384] in [0, 1].
+        variants : extra acceptable spellings of target_text (base NOT included).
         """
         self.ensure_loaded()
-        # crop is already [0,1]; processor rescale factor = 1/255 is effectively
-        # a no-op here (it would apply ÷255 but the image is already ÷255).
-        # Normalization: (x - 0.5) / 0.5
-        pixel_values = (crop - 0.5) / 0.5   # differentiable, shape [1, 3, 384, 384]
-        pixel_values = pixel_values.to(self.device)
+        pixel_values = (crop - 0.5) / 0.5   # [1, 3, H, W], differentiable
 
-        labels = self._processor.tokenizer(
-            target_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_new_tokens,
-        ).input_ids.to(self.device)
+        all_texts  = [target_text] + list(variants)
+        log_probs  = torch.stack([
+            self._sequence_log_prob(pixel_values, t) for t in all_texts
+        ])
+        total_log_prob = torch.logsumexp(log_probs, dim=0)   # log P(any variant)
 
-        pad_id = self._processor.tokenizer.pad_token_id
-        if pad_id is not None:
-            labels = labels.masked_fill(labels == pad_id, -100)
-
-        outputs = self._model(pixel_values=pixel_values, labels=labels)
-        base = outputs.loss
-        return base if impersonation else -base
+        # Disruption : return log P  (optimiser minimises → P decreases)
+        # Impersonation: return -log P (optimiser minimises → P increases)
+        return -total_log_prob if impersonation else total_log_prob
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
