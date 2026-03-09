@@ -369,46 +369,113 @@ class YOLOv5Backend(DetectorBackend):
 
 class RTDETRBackend(DetectorBackend):
     """
-    Wraps an Ultralytics RT-DETR model.
-
-    Output normalisation is identical to YOLOv8Backend because RT-DETR is
-    accessed through the same Ultralytics API.
+    Wraps a Hugging Face Transformers RT-DETR model.
+    
+    Uses the fine-tuned license plate detection model from:
+    justjuu/rtdetr-v2-license-plate-detection
     """
 
     name = "rtdetr"
 
     def __init__(self, model_path: str, device: str = "cpu",
-                 conf_threshold: float = 0.25):
+                 conf_threshold: float = 0.25, model_id: str = "justjuu/rtdetr-v2-license-plate-detection"):
         super().__init__(model_path, device)
         self.conf_threshold = conf_threshold
-        self._rtdetr = None
+        self.model_id = model_id
         self._model: Optional[nn.Module] = None
+        self._processor = None
 
     def load(self) -> None:
-        from ultralytics import RTDETR
-
-        if not self.model_path.exists():
-            raise FileNotFoundError(f"RT-DETR weights not found: {self.model_path}")
-
-        self._rtdetr = RTDETR(str(self.model_path))
-        self._model  = self._rtdetr.model
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        
+        # Use model_id if path is "none" or doesn't exist
+        if str(self.model_path) in {"", "none"} or not self.model_path.exists():
+            source = self.model_id
+            print(f"[{self.name}] Loading from Hugging Face: {source}")
+        else:
+            source = str(self.model_path)
+            print(f"[{self.name}] Loading from local path: {source}")
+        
+        self._processor = AutoImageProcessor.from_pretrained(source)
+        self._model = AutoModelForObjectDetection.from_pretrained(source)
         self._model.to(self.device)
         self._model.eval()
-        print(f"[{self.name}] Loaded from {self.model_path}")
+        print(f"[{self.name}] Model loaded successfully")
 
     def predict(self, image: torch.Tensor) -> List[Detection]:
         """
-        Use the high-level ultralytics API.
-
-        Calling ``self._model(batch)`` directly returns a raw
-        ``(tensor, dict)`` tuple whose layout differs from YOLOv8's flat
-        rows — hence the IndexError you'd see when trying ``row[6]``.
-        The high-level ``.predict()`` normalises everything into Results.
+        Run RT-DETR detection on image.
+        
+        Parameters
+        ----------
+        image : torch.Tensor
+            Shape [C, H, W], dtype float32, values in [0, 1]
+        
+        Returns
+        -------
+        List[Detection]
+            Detected bounding boxes sorted by confidence
         """
         self.ensure_loaded()
-        img_np  = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
-        results = self._rtdetr.predict(img_np, conf=self.conf_threshold, verbose=False)
-        return _results_to_detections(results, self.conf_threshold, image)
+        
+        # Convert to PIL Image format expected by processor
+        # image is [C, H, W] in [0, 1]
+        img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        
+        # Use processor to prepare inputs
+        from PIL import Image
+        pil_img = Image.fromarray(img_np)
+        inputs = self._processor(images=pil_img, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Get original image size for denormalization
+        orig_h, orig_w = image.shape[1], image.shape[2]
+        
+        # Run inference
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+        
+        # Post-process outputs
+        # RT-DETR returns logits [batch, num_queries, num_classes] and boxes [batch, num_queries, 4]
+        # boxes are in cxcywh format normalized to [0, 1]
+        target_sizes = torch.tensor([[orig_h, orig_w]], device=self.device)
+        results = self._processor.post_process_object_detection(
+            outputs, 
+            threshold=self.conf_threshold,
+            target_sizes=target_sizes
+        )[0]  # Get first (and only) image results
+        
+        # Convert to Detection objects
+        detections: List[Detection] = []
+        
+        scores = results["scores"].cpu()
+        labels = results["labels"].cpu()
+        boxes = results["boxes"].cpu()  # Already in xyxy format from post_process
+        
+        for i in range(len(scores)):
+            score = scores[i].item()
+            if score < self.conf_threshold:
+                continue
+            
+            x1, y1, x2, y2 = boxes[i].tolist()
+            class_id = labels[i].item()
+            
+            # Build synthetic raw tensor for gradient compatibility
+            synthetic = torch.tensor(
+                [0.0, x1, y1, x2, y2, class_id, score],
+                dtype=torch.float32,
+            )
+            
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=score,
+                class_id=int(class_id),
+                raw=synthetic,
+            ))
+        
+        # Sort by confidence descending
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -458,15 +525,537 @@ class MockBackend(DetectorBackend):
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# FastANPR backend  (detection-only wrapper around fastanpr.FastANPR)
 # ---------------------------------------------------------------------------
 
-REGISTRY: dict[str, type[DetectorBackend]] = {
-    "yolov8":  YOLOv8Backend,
-    "yolov5":  YOLOv5Backend,
-    "rtdetr":  RTDETRBackend,
-    "mock":    MockBackend,
+class FastANPRBackend(DetectorBackend):
+    """
+    Wraps the ``fastanpr.FastANPR`` pipeline as a DetectorBackend.
+
+    FastANPR bundles its own internal YOLOv8 detector, so no ``model_path``
+    is needed — pass ``"none"`` on the CLI.  The library is async-native;
+    this wrapper calls ``asyncio.run()`` to keep the synchronous predict()
+    contract.
+
+    Important limitations
+    ---------------------
+    * **Not differentiable.**  FastANPR runs through numpy and PaddleOCR
+      with no PyTorch gradient graph, so ``Detection.raw`` carries only
+      plain float tensors.  Use this backend for *evaluation* only;
+      adversarial *training* requires a backend whose forward pass stays
+      inside the PyTorch autograd graph.
+    * Coordinates returned by ``plate.det_box`` are in the original image
+      pixel space (no letterboxing correction needed).
+    """
+
+    name = "fastanpr"
+
+    def __init__(self, model_path: str = "none", device: str = "cpu",
+                 conf_threshold: float = 0.25):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self._anpr = None
+
+    def load(self) -> None:
+        import asyncio
+        from fastanpr import FastANPR  # deferred import
+
+        self._anpr = FastANPR()
+        print(f"[{self.name}] FastANPR initialised (built-in YOLOv8 + PaddleOCR)")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        """
+        Run FastANPR on a single CHW float32 tensor.
+
+        The tensor is converted to a HWC uint8 numpy array (RGB) before
+        being passed to FastANPR, which expects that format.
+        """
+        import asyncio
+        self.ensure_loaded()
+
+        # CHW float32 [0,1]  →  HWC uint8
+        img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+
+        # FastANPR is async; run it synchronously
+        results = asyncio.run(self._anpr.run([img_np]))
+
+        plates = results[0] if results else []
+        detections: List[Detection] = []
+
+        for plate in plates:
+            conf = float(plate.det_conf)
+            if conf < self.conf_threshold:
+                continue
+
+            x1, y1, x2, y2 = (float(plate.det_box[0]), float(plate.det_box[1]),
+                               float(plate.det_box[2]), float(plate.det_box[3]))
+
+            # Build a plain (non-grad) synthetic raw tensor so downstream
+            # code that reads det.raw[1:5] / det.raw[6] still works.
+            synthetic = torch.tensor(
+                [0.0, x1, y1, x2, y2, 0.0, conf], dtype=torch.float32
+            )
+
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf,
+                class_id=0,
+                raw=synthetic,
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        return iter([])  # no exposed PyTorch parameters
+
+    def to(self, device: str) -> "FastANPRBackend":
+        # FastANPR manages its own device internally; we track it for
+        # consistency but can't force it from here.
+        self.device = device
+        return self
+
+
+# ---------------------------------------------------------------------------
+# open-image-models backend  (ONNX YOLOv9 — pip install open-image-models[onnx-cpu])
+# ---------------------------------------------------------------------------
+
+class OpenImageModelsBackend(DetectorBackend):
+    """
+    Wraps ``open-image-models`` LicensePlateDetector.
+
+    Uses pre-trained YOLOv9 ONNX models — no custom weights file required,
+    models are downloaded automatically on first use.
+
+    Install
+    -------
+    CPU:  pip install open-image-models[onnx-cpu]
+    GPU:  pip install open-image-models[onnx-gpu]
+
+    Available detector_model strings (pass via model_path):
+        yolo-v9-t-256-license-plate-end2end  (default, fastest)
+        yolo-v9-t-384-license-plate-end2end  (balanced)
+        yolo-v9-s-384-license-plate-end2end  (more accurate)
+        yolo-v9-c-384-license-plate-end2end  (most accurate)
+
+    Pass the model string as model_path:
+        OpenImageModelsBackend("yolo-v9-t-384-license-plate-end2end")
+    """
+
+    name = "open-image-models"
+
+    def __init__(self, model_path: str = "yolo-v9-t-384-license-plate-end2end",
+                 device: str = "cpu", conf_threshold: float = 0.25):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self.detector_model_name = str(model_path)  # model_path holds the model string
+        self._detector = None
+
+    def load(self) -> None:
+        from open_image_models import LicensePlateDetector  # deferred import
+
+        self._detector = LicensePlateDetector(
+            detection_model=self.detector_model_name,
+            conf_thresh=self.conf_threshold,
+        )
+        print(f"[{self.name}] Loaded model '{self.detector_model_name}'")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        # CHW float32 [0,1] → HWC uint8 BGR  (open-image-models uses OpenCV convention)
+        img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        # open-image-models expects BGR
+        import cv2
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        raw_dets = self._detector.predict(img_bgr)  # list of detection objects
+
+        detections: List[Detection] = []
+        for det in (raw_dets or []):
+            # open-image-models returns objects with .bounding_box [x1,y1,x2,y2]
+            # and .confidence — handle both list and array formats
+            try:
+                bb   = det.bounding_box
+                conf = float(det.confidence)
+            except AttributeError:
+                # Fallback: some versions return namedtuples or plain arrays
+                bb   = det[:4]
+                conf = float(det[4])
+
+            if conf < self.conf_threshold:
+                continue
+
+            x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+            synthetic = torch.tensor([0.0, x1, y1, x2, y2, 0.0, conf],
+                                     dtype=torch.float32)
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf, class_id=0, raw=synthetic,
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        return iter([])
+
+
+# ---------------------------------------------------------------------------
+# Faster R-CNN backend  (torchvision / fine-tuned .pt)
+# ---------------------------------------------------------------------------
+
+class FasterRCNNBackend(DetectorBackend):
+    """
+    Wraps a fine-tuned Faster R-CNN checkpoint saved as ``.pt``.
+
+    Supports either:
+    - a serialized nn.Module, or
+    - a checkpoint dict containing ``model_state_dict`` / ``state_dict``.
+    """
+
+    name = "fasterrcnn"
+
+    def __init__(self, model_path: str, device: str = "cpu",
+                 conf_threshold: float = 0.25):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self._model: Optional[nn.Module] = None
+
+    def _build_default_model(self, num_classes: int = 2) -> nn.Module:
+        from torchvision.models.detection import fasterrcnn_resnet50_fpn
+        return fasterrcnn_resnet50_fpn(
+            weights=None,
+            weights_backbone=None,
+            num_classes=num_classes,
+        )
+
+    def load(self) -> None:
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Faster R-CNN weights not found: {self.model_path}")
+
+        checkpoint = torch.load(str(self.model_path), map_location="cpu")
+
+        if isinstance(checkpoint, nn.Module):
+            model = checkpoint
+        elif isinstance(checkpoint, dict):
+            if isinstance(checkpoint.get("model"), nn.Module):
+                model = checkpoint["model"]
+            else:
+                state = checkpoint.get("model_state_dict")
+                if state is None:
+                    state = checkpoint.get("state_dict", checkpoint)
+                num_classes = int(checkpoint.get("num_classes", 2))
+                model = self._build_default_model(num_classes=num_classes)
+                model.load_state_dict(state, strict=False)
+        else:
+            raise RuntimeError(
+                f"Unsupported Faster R-CNN checkpoint format at {self.model_path}. "
+                "Expected nn.Module or checkpoint dict."
+            )
+
+        self._model = model.to(self.device)
+        self._model.eval()
+        print(f"[{self.name}] Loaded from {self.model_path}")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        inp = image.to(self.device)
+        if inp.dim() == 3:
+            inp = inp.unsqueeze(0)
+
+        with torch.no_grad():
+            outputs = self._model(inp)
+
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        if not outputs:
+            return []
+
+        out = outputs[0]
+        boxes = out.get("boxes")
+        scores = out.get("scores")
+        labels = out.get("labels")
+        if boxes is None or scores is None or labels is None:
+            return []
+
+        detections: List[Detection] = []
+        for i in range(len(scores)):
+            conf = float(scores[i].item())
+            if conf < self.conf_threshold:
+                continue
+
+            x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
+            class_id = int(labels[i].item())
+            synthetic = torch.tensor([0.0, x1, y1, x2, y2, float(class_id), conf],
+                                     dtype=torch.float32)
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf, class_id=class_id, raw=synthetic,
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "FasterRCNNBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def train_mode(self) -> "FasterRCNNBackend":
+        if self._model is not None:
+            self._model.train()
+        return self
+
+    def to(self, device: str) -> "FasterRCNNBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
+# ---------------------------------------------------------------------------
+# YOLO-NAS backend  (Deci AI super-gradients)
+# pip install super-gradients
+# ---------------------------------------------------------------------------
+
+class YOLONASBackend(DetectorBackend):
+    """
+    Wraps Deci AI's YOLO-NAS via the ``super-gradients`` library.
+
+    YOLO-NAS models come in three sizes: yolo_nas_s, yolo_nas_m, yolo_nas_l.
+    Pass the size string as model_path (no .pt extension).
+
+    Install
+    -------
+    pip install super-gradients
+
+    The first call to load() downloads COCO pre-trained weights automatically.
+    For license-plate fine-tuned weights, pass a local checkpoint path instead
+    and set ``pretrained_weights=None`` in the constructor.
+
+    model_path examples:
+        "yolo_nas_s"   – small  (fastest)
+        "yolo_nas_m"   – medium
+        "yolo_nas_l"   – large  (most accurate)
+        "path/to/custom_ckpt.pth"  – custom fine-tuned checkpoint
+
+    Note: YOLO-NAS uses its own non-PyTorch-differentiable post-processing,
+    so this backend is evaluation-only.
+    """
+
+    name = "yolo-nas"
+
+    _KNOWN_ARCHS = {"yolo_nas_s", "yolo_nas_m", "yolo_nas_l"}
+
+    def __init__(self, model_path: str = "yolo_nas_s", device: str = "cpu",
+                 conf_threshold: float = 0.25,
+                 num_classes: int = 1,
+                 pretrained_weights: Optional[str] = "coco"):
+        super().__init__(model_path, device)
+        self.conf_threshold  = conf_threshold
+        self.num_classes     = num_classes
+        self.pretrained_weights = pretrained_weights
+        self._model          = None
+        self._arch           = str(model_path)
+
+    def load(self) -> None:
+        from super_gradients.training import models as sg_models  # deferred import
+
+        is_known_arch = self._arch in self._KNOWN_ARCHS
+
+        if is_known_arch:
+            # Load from super-gradients model zoo (downloads weights automatically)
+            self._model = sg_models.get(
+                self._arch,
+                num_classes=self.num_classes,
+                pretrained_weights=self.pretrained_weights,
+            )
+        else:
+            # Custom checkpoint path: load architecture then restore weights
+            import torch as _torch
+            arch = "yolo_nas_s"  # default arch for custom ckpt; override if needed
+            self._model = sg_models.get(arch, num_classes=self.num_classes)
+            ckpt = _torch.load(str(self.model_path), map_location="cpu")
+            state = ckpt.get("net", ckpt)
+            self._model.load_state_dict(state, strict=False)
+
+        self._model = self._model.to(self.device)
+        self._model.eval()
+        print(f"[{self.name}] Loaded '{self._arch}' "
+              f"({'pretrained: ' + self.pretrained_weights if self.pretrained_weights else 'custom ckpt'})")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        import cv2
+        img_np  = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # super-gradients predict returns an ImageDetectionPrediction
+        result = self._model.predict(img_bgr, conf=self.conf_threshold)
+        pred   = result.prediction                   # DetectionPrediction
+        bboxes = pred.bboxes_xyxy                   # numpy [N, 4]
+        confs  = pred.confidence                    # numpy [N]
+        labels = pred.labels.astype(int)            # numpy [N]
+
+        detections: List[Detection] = []
+        for i in range(len(bboxes)):
+            conf = float(confs[i])
+            if conf < self.conf_threshold:
+                continue
+            x1, y1, x2, y2 = (float(bboxes[i, 0]), float(bboxes[i, 1]),
+                               float(bboxes[i, 2]), float(bboxes[i, 3]))
+            synthetic = torch.tensor([0.0, x1, y1, x2, y2, float(labels[i]), conf],
+                                     dtype=torch.float32)
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf, class_id=int(labels[i]), raw=synthetic,
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "YOLONASBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def to(self, device: str) -> "YOLONASBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
+
+
+# ---------------------------------------------------------------------------
+# YOLOv11 backend  (ultralytics — fine-tuned LP weights available on HuggingFace)
+# pip install ultralytics huggingface_hub
+# ---------------------------------------------------------------------------
+
+class YOLOv11Backend(DetectorBackend):
+    """
+    Wraps Ultralytics YOLOv11.
+
+    Pre-trained LP weights are available directly from HuggingFace:
+      morsetechlab/yolov11-license-plate-detection
+    Sizes: n, s, m, l, x — pass the filename as model_path.
+
+    Downloading weights
+    -------------------
+    Option A — HuggingFace Hub (automatic):
+        backend = YOLOv11Backend("yolov11s-license-plate.pt", download_hf=True)
+
+    Option B — manual wget then pass local path:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download("morsetechlab/yolov11-license-plate-detection",
+                               "yolov11s-license-plate.pt")
+        backend = YOLOv11Backend(path)
+
+    Install: pip install ultralytics huggingface_hub
+    """
+
+    name = "yolov11"
+    _HF_REPO = "morsetechlab/yolov11-license-plate-detection"
+    _VALID_SIZES = {"n", "s", "m", "l", "x"}
+
+    def __init__(self, model_path: str, device: str = "cpu",
+                 conf_threshold: float = 0.25, download_hf: bool = True):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self.download_hf    = download_hf
+        self._yolo          = None
+        self._model: Optional[nn.Module] = None
+
+    def load(self) -> None:
+        from ultralytics import YOLO
+
+        local_path = str(self.model_path)
+
+        # Auto-download from HuggingFace if requested or if file doesn't exist
+        if self.download_hf or not self.model_path.exists():
+            from huggingface_hub import hf_hub_download
+            filename = self.model_path.name  # e.g. "yolov11s-license-plate.pt"
+            print(f"[{self.name}] Downloading '{filename}' from HF Hub "
+                  f"({self._HF_REPO})...")
+            local_path = hf_hub_download(self._HF_REPO, filename)
+            print(f"[{self.name}] Saved to {local_path}")
+        elif not self.model_path.exists():
+            raise FileNotFoundError(
+                f"YOLOv11 weights not found: {self.model_path}\n"
+                f"Pass download_hf=True or download manually from:\n"
+                f"  https://huggingface.co/{self._HF_REPO}"
+            )
+
+        self._yolo  = YOLO(local_path)
+        self._model = self._yolo.model
+        self._model.to(self.device)
+        self._model.eval()
+        print(f"[{self.name}] Loaded from {local_path}")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        img_np  = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        results = self._yolo.predict(img_np, conf=self.conf_threshold, verbose=False)
+        return _results_to_detections(results, self.conf_threshold, image)
+
+    def raw_forward(self, batch: torch.Tensor):
+        self.ensure_loaded()
+        return self._model(batch)
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "YOLOv11Backend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def train_mode(self) -> "YOLOv11Backend":
+        if self._model is not None:
+            self._model.train()
+        return self
+
+    def to(self, device: str) -> "YOLOv11Backend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
+# Backends where gradients flow through the detector — usable for adversarial training.
+TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
+    "yolov8":  YOLOv8Backend,    # pip install ultralytics  |  weights: your fine-tuned .pt
+    "fasterrcnn": FasterRCNNBackend,  # pip install torchvision  |  weights: weights/model.pt
+    "yolov11": YOLOv11Backend,   # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
+    "rtdetr":  RTDETRBackend,    # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
 }
+
+# Backends that run through ONNX / external C++ / numpy — no autograd.
+# Useful for evaluation / baseline comparison only.
+EVAL_ONLY_REGISTRY: dict[str, type[DetectorBackend]] = {
+    "open-image-models": OpenImageModelsBackend,  # pip install open-image-models[onnx-cpu]
+    "fastanpr":          FastANPRBackend,          # pip install fastanpr
+    "yolo-nas":          YOLONASBackend,           # pip install super-gradients
+    "yolov5":            YOLOv5Backend,            # torch.hub (numpy pipeline)
+    "mock":              MockBackend,
+}
+
+REGISTRY: dict[str, type[DetectorBackend]] = {
+    **TRAINABLE_REGISTRY,
+    **EVAL_ONLY_REGISTRY,
+}
+
+NON_DIFFERENTIABLE_BACKENDS = set(EVAL_ONLY_REGISTRY.keys())
 
 
 def build_backend(name: str, model_path: str, device: str = "cpu",
@@ -477,9 +1066,10 @@ def build_backend(name: str, model_path: str, device: str = "cpu",
     Parameters
     ----------
     name : str
-        Key into REGISTRY (e.g. ``"yolov8"``, ``"yolov5"``).
+        Key into REGISTRY (e.g. ``"yolov8"``, ``"open-image-models"``).
     model_path : str
-        Path to model weights file.
+        Path to model weights file, or a model-name string for backends that
+        don't need a local file (open-image-models, yolo-nas, fastanpr → "none").
     device : str
         Torch device string.
     **kwargs
@@ -488,6 +1078,8 @@ def build_backend(name: str, model_path: str, device: str = "cpu",
     Example
     -------
     >>> backend = build_backend("yolov8", "weights/lp.pt", device="cuda")
+    >>> backend.load()
+    >>> backend = build_backend("open-image-models", "yolo-v9-t-384-license-plate-end2end")
     >>> backend.load()
     """
     if name not in REGISTRY:

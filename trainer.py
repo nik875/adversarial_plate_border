@@ -34,10 +34,10 @@ import kornia
 import kornia.geometry as K
 import matplotlib.pyplot as plt
 from matplotlib import patches as mpatches
-import fastanpr
 from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
+from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import create_dataloaders
 
 warnings.filterwarnings("ignore")
@@ -50,7 +50,13 @@ class AdversarialPatchTrainer:
     def __init__(
         self,
         csv_path: str,
-        detector: DetectorBackend,          # ← injected, not constructed here
+        detector: DetectorBackend,
+        ocr: OCRBackend,                     # ← injected, swappable
+        preload_images: bool = False,
+        num_workers: int = 0,
+        pin_memory: bool = False,
+        limit: int = 0,
+        use_all_for_train: bool = False,
         grad_accumulate: int = None,
         match_detection: bool = False,
         impersonation_target: Optional[str] = None,
@@ -82,7 +88,12 @@ class AdversarialPatchTrainer:
         # ── Data ────────────────────────────────────────────────────────
         self.train_loader, self.val_loader = create_dataloaders(
             csv_path, transform=self.transform,
-            preload=True, batch_size=1, n_jobs=0,
+            preload=preload_images,
+            batch_size=1,
+            n_jobs=num_workers,
+            pin_memory=pin_memory,
+            limit=limit,
+            use_all_for_train=use_all_for_train,
         )
 
         # ── Adversarial patch parameter ─────────────────────────────────
@@ -91,17 +102,15 @@ class AdversarialPatchTrainer:
                         device=self.device) * 0.1
         )
 
-        # ── OCR ─────────────────────────────────────────────────────────
-        print("Loading fastanpr OCR...")
-        self.ocr_recogniser  = fastanpr.recognition.Recogniser(device=self.device)
-        self.ocr_input_shape = (64, 128, 3)
-        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
-
-        if self.impersonation_target:
-            self.ocr_target = self._text_to_target_tensor(
-                self.impersonation_target, 9, alphabet)
+        # ── OCR (swappable) ─────────────────────────────────────────────
+        self.ocr = ocr
+        self.ocr_input_shape = (64, 128, 3)   # H, W fed to OCR crop
+        # Keep trainable OCR unfrozen so gradients can flow
+        if not self.ocr.is_trainable:
+            self.ocr.eval()
+            self.ocr.freeze()
         else:
-            self.ocr_target = self._text_to_target_tensor("VRJ7774", 9, alphabet)
+            self.ocr.eval()  # Start in eval, switch to train during training
 
         # Baselines (computed on clean images)
         self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
@@ -316,33 +325,49 @@ class AdversarialPatchTrainer:
             orig_projection = self.invert_bbox(pred_box.cpu(), batch["transform"])
             corners_box     = self.bbox_to_corners(orig_projection, device="cpu")
 
+            # Crop plate region — keep in the autograd graph for trainable OCR
             cropped = kornia.geometry.crop_and_resize(
                 batch["orig_image"].unsqueeze(0),
                 corners_box,
                 self.ocr_input_shape[:2],
                 mode="bilinear", align_corners=True,
-            ).to(self.device)
-
-            ocr_np  = (cropped.squeeze(0).permute(1, 2, 0)
-                       .detach().cpu().numpy() * 255).astype(np.uint8)
-            result  = self.ocr_recogniser.run(ocr_np)
+            ).to(self.device).squeeze(0)   # [C, H, W]
 
             target_text = self.impersonation_target or "VRJ7774"
+            ocr_result  = self.ocr.predict(cropped)
 
-            if result is not None:
-                ocr_text = result.text
-                correct  = sum(a == b for a, b in
-                               zip(ocr_text.ljust(7), target_text))
-                accuracy = correct / len(target_text)
-                ocr_loss = (1.0 - accuracy) if self.impersonation_target else accuracy
+            if self.ocr.is_trainable and hasattr(self.ocr, "compute_target_loss"):
+                # Backend-native differentiable loss (e.g., TrOCR seq2seq loss)
+                base_loss = self.ocr.compute_target_loss(cropped, target_text)
+                if self.impersonation_target:
+                    ocr_loss = base_loss
+                else:
+                    # Disruption: maximise recognition loss
+                    ocr_loss = -base_loss
+            elif self.ocr.is_trainable and ocr_result.logits is not None:
+                # Differentiable CTC path (CRNN-like backends)
+                if self.impersonation_target:
+                    # Impersonation: minimise CTC loss toward target
+                    ocr_loss = self.ocr.ctc_loss(ocr_result.logits, target_text)
+                else:
+                    # Disruption: maximise CTC loss for the true plate text
+                    # (minimise negative CTC loss)
+                    ocr_loss = -self.ocr.ctc_loss(ocr_result.logits, target_text)
             else:
-                ocr_loss = 1.0 if not self.impersonation_target else 0.0
+                # Non-differentiable path: character-accuracy heuristic
+                accuracy = ocr_result.char_accuracy(target_text)
+                ocr_loss = (1.0 - accuracy) if self.impersonation_target else accuracy
 
             if use_ocr_baseline and hasattr(self, "ocr_baseline"):
-                if self.impersonation_target:
+                if isinstance(ocr_loss, torch.Tensor):
                     ocr_loss = ocr_loss / (self.ocr_baseline + 1e-8)
                 else:
-                    ocr_loss = self.ocr_baseline / (ocr_loss + 1e-8)
+                    # Keep scalar heuristic stable across OCR backends.
+                    # The previous disruption path used baseline/accuracy,
+                    # which explodes when accuracy ~= 0 and causes huge
+                    # oscillations in val loss.
+                    baseline = max(float(self.ocr_baseline), 1e-4)
+                    ocr_loss = float(ocr_loss) / baseline
 
         return det_loss, ocr_loss
 
@@ -384,6 +409,10 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def train_epoch(self, optimizer, epoch: int) -> float:
+        # Ensure trainable OCR is in train mode for CuDNN RNN backward.
+        if self.ocr.is_trainable:
+            self.ocr.train()
+        
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
@@ -432,6 +461,10 @@ class AdversarialPatchTrainer:
         return total_loss / max(total_steps, 1)
 
     def validate(self) -> float:
+        # Set OCR back to eval mode for validation
+        if self.ocr.is_trainable:
+            self.ocr.eval()
+        
         losses = []
         with torch.no_grad():
             for batch in self.val_loader:
@@ -519,15 +552,43 @@ class AdversarialPatchTrainer:
 def main():
     parser = argparse.ArgumentParser(description="Adversarial patch trainer (modular backend)")
     parser.add_argument("--csv", default="updated_control_corners.csv")
-    parser.add_argument("--backend", default="yolov8",
-                        choices=["yolov8", "yolov5", "rtdetr", "mock"],
-                        help="Detector backend to train against")
+    # Only backends with a fully differentiable PyTorch forward pass are valid
+    # training targets. ONNX/numpy backends (fastanpr, open-image-models,
+    # yolov5, yolo-nas) break the autograd graph -- use evaluator.py for those.
+    TRAINABLE_DET = ["yolov8", "fasterrcnn", "yolov11", "rtdetr"]
+    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "fastanpr-ocr"]
+    parser.add_argument("--backend", default="yolov8", choices=TRAINABLE_DET,
+                        help=f"Detector to train a patch against. "
+                             f"One of: {', '.join(TRAINABLE_DET)}. "
+                             f"For eval-only backends use evaluator.py.")
     parser.add_argument("--model-path", default="license_plate_detector.pt",
-                        help="Path to model weights (.pt file)")
+                        help="Path to detector weights (.pt file).")
+    parser.add_argument("--ocr-backend", default="fastanpr-ocr", choices=TRAINABLE_OCR,
+                        help="OCR backend. Use 'crnn', 'trocr', or 'dtrb' for differentiable training.")
+    parser.add_argument("--ocr-model-path", default="none",
+                        help="Path to OCR weights/checkpoint. For trocr pass 'none' (uses HF default) or a model id/path.")
+    parser.add_argument("--ocr-repo-root", default="/home/ubuntu/deep-text-recognition-benchmark",
+                        help="Path to DTRB repo for model definitions (required for --ocr-backend dtrb).")
+    parser.add_argument("--dtrb-feature-extraction", default="vitstr_small_patch16_224",
+                        help="DTRB feature extraction module (e.g. 'ResNet', 'vitstr_small_patch16_224').")
+    parser.add_argument("--dtrb-sequence-modeling", default="None",
+                        help="DTRB sequence modeling (e.g. 'BiLSTM', 'None' for ViTSTR).")
+    parser.add_argument("--dtrb-transformation", default="None",
+                        help="DTRB transformation (e.g. 'TPS', 'None').")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--grad-accumulate", type=int, default=64)
+    parser.add_argument("--preload-images", action="store_true",
+                        help="Preload all images into RAM (faster, but high memory use).")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="DataLoader workers. 0 is safest for low-memory hosts.")
+    parser.add_argument("--pin-memory", action="store_true",
+                        help="Enable pinned host memory for DataLoader (can increase RAM usage).")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Use only the last N samples from CSV (0 = all).")
+    parser.add_argument("--use-all-for-train", action="store_true",
+                        help="Skip validation split and train on the full CSV.")
     parser.add_argument("--match-detection", action="store_true")
     parser.add_argument("--impersonation-target", default=None)
     parser.add_argument("--disable-tv-loss", action="store_true")
@@ -537,9 +598,32 @@ def main():
     backend = build_backend(args.backend, args.model_path, device=args.device)
     backend.load()
 
+    ocr_kwargs = {}
+    if args.ocr_backend == "dtrb":
+        if args.ocr_repo_root:
+            ocr_kwargs["dtrb_root"] = args.ocr_repo_root
+        ocr_kwargs["feature_extraction"] = args.dtrb_feature_extraction
+        ocr_kwargs["sequence_modeling"] = args.dtrb_sequence_modeling
+        ocr_kwargs["transformation"] = args.dtrb_transformation
+    ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path, device=args.device, **ocr_kwargs)
+    ocr.load()
+
+    if not ocr.is_trainable:
+        print(
+            f"Note: '{args.ocr_backend}' OCR has no gradient graph — "
+            "OCR loss will use character-accuracy heuristic only.\n"
+            "      Use --ocr-backend crnn for fully differentiable training."
+        )
+
     trainer = AdversarialPatchTrainer(
         csv_path             = args.csv,
         detector             = backend,
+        ocr                  = ocr,
+        preload_images       = args.preload_images,
+        num_workers          = args.num_workers,
+        pin_memory           = args.pin_memory,
+        limit                = args.limit,
+        use_all_for_train    = args.use_all_for_train,
         grad_accumulate      = args.grad_accumulate,
         match_detection      = args.match_detection,
         impersonation_target = args.impersonation_target,
