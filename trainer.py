@@ -787,16 +787,33 @@ class AdversarialPatchTrainer:
                 comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
                 cv2.imwrite(str(debug_dir / f"{img_idx:02d}_d_prep_comparison.png"), comparison)
 
-            summary_rows.append({
+            row = {
                 "index": img_idx, "filename": fn,
                 "detected_text": text, "confidence": f"{conf:.4f}",
                 "correct": is_correct,
-            })
+            }
+
+            if hasattr(self.ocr, "_sequence_log_prob"):
+                target_text = self.expected_plate_text
+                variants    = self._plate_text_variants(target_text)
+                all_texts   = [target_text] + variants
+                with torch.no_grad():
+                    pixel_values = (crop - 0.5) / 0.5
+                    log_probs    = torch.stack([
+                        self.ocr._sequence_log_prob(pixel_values, t) for t in all_texts
+                    ])
+                row["log_prob"] = f"{torch.logsumexp(log_probs, dim=0).item():.4f}"
+
+            summary_rows.append(row)
+
+        has_log_prob = hasattr(self.ocr, "_sequence_log_prob")
+        fieldnames   = ["index", "filename", "detected_text", "confidence", "correct"]
+        if has_log_prob:
+            fieldnames.append("log_prob")
 
         csv_path = debug_dir / "debug_summary.csv"
         with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["index", "filename", "detected_text", "confidence", "correct"])
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
         print(f"  Debug summary → {csv_path}")
