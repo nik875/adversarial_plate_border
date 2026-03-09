@@ -638,6 +638,12 @@ class AdversarialPatchTrainer:
         print(report)
         (self.run_dir / "sanity_check.txt").write_text(report + "\n")
 
+        csv_out = self.run_dir / "sanity_check.csv"
+        with open(csv_out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["filename", "category", "text", "confidence"])
+            writer.writeheader()
+            writer.writerows(results)
+
         frac = counts["correct"] / total
         if frac < 0.50:
             raise RuntimeError(
