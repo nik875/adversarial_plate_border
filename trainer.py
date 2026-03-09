@@ -513,9 +513,7 @@ class AdversarialPatchTrainer:
                     * d.confidence
                 ),
             )
-            iou_val  = self._boxes_iou(best_det.box.to(self.device).unsqueeze(0),
-                                        target_box.unsqueeze(0))
-            det_loss = (iou_val * best_det.conf.to(self.device)).squeeze()
+            det_loss = best_det.conf.to(self.device).squeeze()
 
         # ── OCR (full-res crop for maximum detail) ──────────────────────
         target_text = self.impersonation_target or self.expected_plate_text
