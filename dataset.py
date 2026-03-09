@@ -114,19 +114,26 @@ def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.nd
 
 
 class AdversarialPatchDataset(Dataset):
-    def __init__(self, df, transform=None, preload=False, target_size=384):
+    def __init__(self, df, transform=None, preload=False, target_size=384,
+                 use_original: bool = False):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
         self.preload = preload
         self.target_size = target_size
-        
-        # Check if CSV has preprocessed images or needs on-the-fly preprocessing
-        self.has_preprocessed = 'preprocessed_filename' in df.columns
-        
-        if self.has_preprocessed:
-            print(f"Using preprocessed images from CSV")
+        self.use_original = use_original
+
+        # When use_original=True, always ignore preprocessed_filename
+        if use_original:
+            self.has_preprocessed = False
+            print("use_original=True: returning full-res images without letterbox preprocessing")
         else:
-            print(f"No preprocessed images found - will preprocess on-the-fly to {target_size}x{target_size}")
+            # Check if CSV has preprocessed images or needs on-the-fly preprocessing
+            self.has_preprocessed = 'preprocessed_filename' in df.columns
+
+            if self.has_preprocessed:
+                print(f"Using preprocessed images from CSV")
+            else:
+                print(f"No preprocessed images found - will preprocess on-the-fly to {target_size}x{target_size}")
 
         if self.preload:
             desc = f"Preloading {len(self.df)} images"
@@ -179,8 +186,11 @@ class AdversarialPatchDataset(Dataset):
         else:
             # Load from disk
             orig_img = load_image(row['filename'])
-            
-            if self.has_preprocessed:
+
+            if self.use_original:
+                prep_img = None
+                prep_data = None
+            elif self.has_preprocessed:
                 prep_img = load_image(row['preprocessed_filename'])
                 prep_data = None
             else:
@@ -191,16 +201,16 @@ class AdversarialPatchDataset(Dataset):
                     [row['p3_x'], row['p3_y']],
                     [row['p4_x'], row['p4_y']]
                 ], dtype=np.float32)
-                
+
                 H = np.array([
                     [row['H00'], row['H01'], row['H02']],
                     [row['H10'], row['H11'], row['H12']],
                     [row['H20'], row['H21'], row['H22']]
                 ], dtype=np.float32)
-                
+
                 prep_img, new_corners, new_H, r, dw, dh = letterbox_preprocess(
                     orig_img, corners, H, self.target_size)
-                
+
                 prep_data = {
                     'new_corners': new_corners,
                     'new_H': new_H,
@@ -208,10 +218,6 @@ class AdversarialPatchDataset(Dataset):
                     'dw': dw,
                     'dh': dh
                 }
-
-        if self.transform:
-            orig_img = self.transform(orig_img)
-            prep_img = self.transform(prep_img)
 
         # Original corners (4x2 tensor: [p1, p2, p3, p4])
         orig_corners = torch.tensor([
@@ -227,6 +233,21 @@ class AdversarialPatchDataset(Dataset):
             [row['H10'], row['H11'], row['H12']],
             [row['H20'], row['H21'], row['H22']]
         ], dtype=torch.float32)
+
+        # When use_original=True, return only the full-res image + original corners
+        if self.use_original:
+            if self.transform:
+                orig_img = self.transform(orig_img)
+            return {
+                'orig_image': orig_img,
+                'orig_corners': orig_corners,
+                'orig_homography': orig_H,
+                'filename': row['filename'],
+            }
+
+        if self.transform:
+            orig_img = self.transform(orig_img)
+            prep_img = self.transform(prep_img)
 
         # Get new corners and homography (from CSV or preprocessing)
         if self.has_preprocessed:
@@ -262,16 +283,9 @@ class AdversarialPatchDataset(Dataset):
         }
 
 
-def create_dataloaders(
-    csv_path,
-    batch_size=8,
-    train_split=0.8,
-    n_jobs=1,
-    limit=0,
-    use_all_for_train=False,
-    pin_memory=True,
-    **kwargs,
-):
+def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=0.8,
+                       n_jobs=1, limit=0, use_all_for_train=False,
+                       use_original: bool = False, pin_memory=True, **kwargs):
     """Create train and validation DataLoaders
 
     Args:
@@ -303,8 +317,8 @@ def create_dataloaders(
         print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Create datasets
-    train_dataset = AdversarialPatchDataset(train_df, **kwargs)
-    val_dataset = AdversarialPatchDataset(val_df, **kwargs)
+    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, **kwargs)
+    val_dataset = AdversarialPatchDataset(val_df, use_original=use_original, **kwargs)
 
     # Create dataloaders
     train_loader = DataLoader(

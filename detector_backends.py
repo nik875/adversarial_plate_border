@@ -760,11 +760,11 @@ class FasterRCNNBackend(DetectorBackend):
     def predict(self, image: torch.Tensor) -> List[Detection]:
         self.ensure_loaded()
         inp = image.to(self.device)
-        if inp.dim() == 3:
-            inp = inp.unsqueeze(0)
+        if inp.dim() == 4:
+            inp = inp.squeeze(0)   # GeneralizedRCNN expects List[Tensor], not batched
 
         with torch.no_grad():
-            outputs = self._model(inp)
+            outputs = self._model([inp])
 
         if isinstance(outputs, dict):
             outputs = [outputs]
@@ -1032,12 +1032,126 @@ class YOLOv11Backend(DetectorBackend):
         return self
 
 
+# ---------------------------------------------------------------------------
+# YOLOv9 384 onnx2torch backend  — differentiable via onnx2torch
+# ---------------------------------------------------------------------------
+
+class Yolov9Onnx2TorchBackend(DetectorBackend):
+    """
+    Wraps the YOLOv9-t-384 licence-plate ONNX model via onnx2torch.
+
+    The ONNX model is downloaded automatically on first use by instantiating
+    LicensePlateDetector from open-image-models.  After that, onnx2torch
+    converts it to a native PyTorch nn.Module whose forward pass is fully
+    differentiable — gradients flow from the detection outputs back through
+    the input image into the adversarial patch.
+
+    Model path
+    ----------
+    ~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/
+        yolo-v9-t-384-license-plates-end2end.onnx
+
+    Input convention
+    ----------------
+    CHW float32 [0, 1], letterboxed to 384×384, BGR channel order.
+
+    Output convention (after onnx2torch)
+    -------------------------------------
+    The model returns a list of 7-element tensors, one per detection:
+        [batch_idx, x1, y1, x2, y2, class_id, confidence]
+    NMS is embedded ("end2end"), so no post-processing is needed.
+    """
+
+    name = "yolo-v9-384"
+
+    ONNX_PATH = ("~/.cache/open-image-models/"
+                 "yolo-v9-t-384-license-plate-end2end/"
+                 "yolo-v9-t-384-license-plates-end2end.onnx")
+
+    def __init__(self, model_path: str = "none", device: str = "cpu",
+                 conf_threshold: float = 0.25):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self._model: Optional[nn.Module] = None
+
+    def load(self) -> None:
+        import onnx
+        import onnx2torch
+
+        onnx_path = Path(self.ONNX_PATH).expanduser()
+
+        if not onnx_path.exists():
+            # Trigger download via open-image-models cache
+            print(f"[{self.name}] ONNX model not found — downloading via open-image-models…")
+            from open_image_models import LicensePlateDetector
+            LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+
+        if not onnx_path.exists():
+            raise FileNotFoundError(
+                f"[{self.name}] ONNX model still not found after download attempt: {onnx_path}"
+            )
+
+        onnx_model = onnx.load(str(onnx_path))
+        self._model = onnx2torch.convert(onnx_model)
+        self._model.to(self.device)
+        self._model.eval()
+        for p in self._model.parameters():
+            p.requires_grad_(False)
+
+        print(f"[{self.name}] Loaded from {onnx_path}")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        """
+        Run detection.  Gradients flow through the output tensors because the
+        model parameters are frozen but the computation graph is intact.
+        """
+        self.ensure_loaded()
+        # image: CHW float32 [0,1] at 384×384
+        batch = image.unsqueeze(0).to(self.device)   # [1, 3, 384, 384]
+        # Do NOT wrap in no_grad — we need the autograd graph for adversarial training.
+        output = self._model(batch)
+
+        detections: List[Detection] = []
+        for det in output:
+            if det.numel() < 7:
+                continue
+            conf = det[6].item()
+            if conf < self.conf_threshold:
+                continue
+            x1, y1, x2, y2 = det[1].item(), det[2].item(), det[3].item(), det[4].item()
+            detections.append(Detection(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf,
+                class_id=int(det[5].item()),
+                raw=det,   # keep the live tensor so gradients can flow
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "Yolov9Onnx2TorchBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def to(self, device: str) -> "Yolov9Onnx2TorchBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
 # Backends where gradients flow through the detector — usable for adversarial training.
 TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
-    "yolov8":  YOLOv8Backend,    # pip install ultralytics  |  weights: your fine-tuned .pt
-    "fasterrcnn": FasterRCNNBackend,  # pip install torchvision  |  weights: weights/model.pt
-    "yolov11": YOLOv11Backend,   # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
-    "rtdetr":  RTDETRBackend,    # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
+    "yolov8":      YOLOv8Backend,            # pip install ultralytics  |  weights: your fine-tuned .pt
+    "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
+    "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
+    "rtdetr":      RTDETRBackend,            # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
+    "yolo-v9-384": Yolov9Onnx2TorchBackend, # pip install onnx onnx2torch open-image-models  |  auto-downloaded
 }
 
 # Backends that run through ONNX / external C++ / numpy — no autograd.

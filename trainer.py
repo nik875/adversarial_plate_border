@@ -1,29 +1,47 @@
 """
-trainer.py  (refactored)
+trainer.py
 
-AdversarialPatchTrainer now accepts any DetectorBackend so you can swap
-the detector without touching training logic.
+AdversarialPatchTrainer — trains an adversarial border patch against a
+pluggable detector + OCR backend pair.
 
-Key changes from the original
-------------------------------
-* ``self.model`` replaced by ``self.detector`` (a DetectorBackend).
-* Model loading removed from __init__ / load_yolo_model – callers supply
-  a pre-built, *already loaded* backend.
-* ``partial_loss`` reads detections via ``backend.predict()`` which returns
-  ``List[Detection]``; the raw 7-element tensor is still available via
-  ``det.raw`` for gradient-compatible operations.
-* ``build_trainer_from_args`` helper creates the backend + trainer in one
-  call for CLI use.
+Patch parameterization
+----------------------
+The patch is produced by a trainable ConvTranspose2d decoder that grows a
+compact seed tensor from [C, 4, 8] to [3, 256, 512] through six stride-2
+layers.  Both the seed and the decoder weights are optimised jointly.
+This replaces the direct pixel-level nn.Parameter used in earlier versions.
+
+The inductive bias imposed by the decoder:
+  * Early layers capture global structure (the seed operates on a 4×8 grid
+    that sees the entire patch simultaneously).
+  * Later layers add finer spatial detail at progressively higher resolution.
+  * The convolutional weight sharing acts as a natural regulariser, making TV
+    loss unnecessary.
+  * The parameterisation is strictly more expressive than raw pixels while
+    using far fewer "free" degrees of freedom in the seed (~4 K vs 393 K).
+
+Other design decisions
+----------------------
+* Full-resolution HEIC images loaded from preproc_labels.csv.
+* Detector-specific preprocessing cached once at init.
+* Patch applied to preprocessed image; OCR crop from same space.
+* Detection loss target: corners_to_bbox (not expanded border).
+* Best detection selected by max(IoU × confidence).
+* CosineAnnealingLR, 150 epochs, no early stopping.
+* validate_pipeline() sanity-checks before training.
+* save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
 
 from __future__ import annotations
 
-import os
+import csv
 import warnings
 import argparse
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,8 +50,6 @@ from torch import optim
 import torchvision.transforms as T
 import kornia
 import kornia.geometry as K
-import matplotlib.pyplot as plt
-from matplotlib import patches as mpatches
 from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
@@ -46,132 +62,270 @@ PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
 
+# ---------------------------------------------------------------------------
+# Detector-specific preprocessing helper
+# ---------------------------------------------------------------------------
+
+def preprocess_for_detector(
+    img_hwc_uint8: np.ndarray,
+    corners_np: np.ndarray,
+    backend: DetectorBackend,
+) -> Tuple[torch.Tensor, np.ndarray]:
+    """
+    Apply detector-specific preprocessing to a single image.
+
+    Called once per image at init time (non-differentiable).
+    Returns a CHW float32 [0,1] tensor and corners in the new space.
+    """
+    name = backend.name
+    H, W = img_hwc_uint8.shape[:2]
+
+    if name in ("yolov8", "yolov11"):
+        from ultralytics.utils.ops import letterbox
+        imgsz = 640
+        if hasattr(backend, "_yolo") and backend._yolo is not None:
+            raw = backend._yolo.imgsz
+            imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
+        img_lb, ratio, (dw, dh) = letterbox(
+            img_hwc_uint8, (imgsz, imgsz),
+            color=(114, 114, 114), auto=False, stride=32,
+        )
+        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
+        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
+
+    elif name == "rtdetr":
+        img_resized  = cv2.resize(img_hwc_uint8, (640, 640), interpolation=cv2.INTER_LINEAR)
+        img_tensor   = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+        sx, sy       = 640.0 / W, 640.0 / H
+        new_corners  = corners_np * np.array([sx, sy], dtype=np.float32)
+
+    elif name == "fasterrcnn":
+        img_tensor   = torch.from_numpy(img_hwc_uint8).permute(2, 0, 1).float() / 255.0
+        new_corners  = corners_np.copy().astype(np.float32)
+
+    elif name == "yolo-v9-384":
+        from ultralytics.utils.ops import letterbox
+        img_lb, ratio, (dw, dh) = letterbox(
+            img_hwc_uint8, (384, 384), color=(114, 114, 114), auto=False,
+        )
+        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
+        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
+
+    else:
+        from ultralytics.utils.ops import letterbox
+        img_lb, ratio, (dw, dh) = letterbox(
+            img_hwc_uint8, (384, 384), color=(114, 114, 114), auto=False,
+        )
+        img_tensor   = torch.from_numpy(img_lb).permute(2, 0, 1).float() / 255.0
+        new_corners  = corners_np * ratio + np.array([dw, dh], dtype=np.float32)
+
+    return img_tensor, new_corners.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Patch decoder
+# ---------------------------------------------------------------------------
+
+class PatchDecoder(nn.Module):
+    """
+    Trainable ConvTranspose2d decoder that maps a compact seed tensor
+    [1, seed_channels, 4, 8] → [1, 3, 256, 512].
+
+    Six stride-2 layers double the spatial dimensions at each step:
+        4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
+
+    Channel schedule halves from seed_channels→256→128→64→32→16→3,
+    so the expensive (many-channel) work is done at small spatial grids.
+    Output is passed through tanh and scaled to [0, 1].
+
+    Both the seed and the decoder weights are optimised during training —
+    the seed controls global structure while the decoder weights determine
+    how that structure is elaborated into pixel-level detail.
+    """
+
+    def __init__(self, seed_channels: int = 128):
+        super().__init__()
+        c = seed_channels
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
+        )
+
+    def forward(self, seed: torch.Tensor) -> torch.Tensor:
+        """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
+        return torch.tanh(self.net(seed)) * 0.5 + 0.5
+
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
+
 class AdversarialPatchTrainer:
     def __init__(
         self,
-        csv_path: str,
-        detector: DetectorBackend,
-        ocr: OCRBackend,                     # ← injected, swappable
-        preload_images: bool = False,
-        num_workers: int = 0,
-        pin_memory: bool = False,
-        limit: int = 0,
-        use_all_for_train: bool = False,
-        grad_accumulate: int = None,
-        match_detection: bool = False,
-        impersonation_target: Optional[str] = None,
-        print_blur: float = 0.0,
-        training: bool = False,
-        use_tv_loss: bool = True,
-        use_homography: bool = True,
+        detector:             DetectorBackend,
+        ocr:                  OCRBackend,
+        csv_path:             str            = "preproc_labels.csv",
+        seed_channels:        int            = 128,
+        preload_images:       bool           = False,
+        num_workers:          int            = 0,
+        pin_memory:           bool           = False,
+        limit:                int            = 0,
+        use_all_for_train:    bool           = False,
+        grad_accumulate:      Optional[int]  = None,
+        impersonation_target: Optional[str]  = None,
+        expected_plate_text:  str            = "VRJ7774",
+        print_blur:           float          = 0.0,
+        training:             bool           = False,
+        use_homography:       bool           = True,
+        run_name:             Optional[str]  = None,
     ):
         self.training             = training
         self.print_blur           = print_blur
-        self.use_tv_loss          = use_tv_loss
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
-        self.match_detection      = match_detection
         self.impersonation_target = impersonation_target
+        self.expected_plate_text  = expected_plate_text
 
-        # ── Detector (swappable) ────────────────────────────────────────
+        # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
         self.device   = detector.device
         self.detector.eval()
         self.detector.freeze()
 
-        # ── Image transforms ────────────────────────────────────────────
+        # ── OCR ────────────────────────────────────────────────────────
+        self.ocr = ocr
+        if not self.ocr.is_trainable:
+            self.ocr.eval()
+            self.ocr.freeze()
+        else:
+            self.ocr.eval()
+
+        # ── Run output directory ───────────────────────────────────────
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix    = run_name or timestamp
+        self.run_dir = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
+        (self.run_dir / "patches").mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "debug").mkdir(parents=True, exist_ok=True)
+        print(f"  Run directory : {self.run_dir}")
+
+        # ── Patch decoder (seed + decoder jointly optimised) ───────────
+        self.patch_width   = PATCH_WIDTH
+        self.patch_height  = PATCH_HEIGHT
+        self.seed_channels = seed_channels
+        # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
+        self.seed    = nn.Parameter(
+            torch.randn(1, seed_channels, 4, 8, device=self.device) * 0.1
+        )
+        self.decoder = PatchDecoder(seed_channels).to(self.device)
+
+        # ── Image transform ────────────────────────────────────────────
         self.transform = T.Compose([T.ToTensor()])
 
-        self.patch_width  = PATCH_WIDTH
-        self.patch_height = PATCH_HEIGHT
-
-        # ── Data ────────────────────────────────────────────────────────
+        # ── DataLoaders ────────────────────────────────────────────────
         self.train_loader, self.val_loader = create_dataloaders(
-            csv_path, transform=self.transform,
+            csv_path,
+            transform=self.transform,
             preload=preload_images,
             batch_size=1,
             n_jobs=num_workers,
             pin_memory=pin_memory,
             limit=limit,
             use_all_for_train=use_all_for_train,
+            use_original=True,
         )
 
-        # ── Adversarial patch parameter ─────────────────────────────────
-        self.patch = nn.Parameter(
-            torch.randn(3, self.patch_height, self.patch_width,
-                        device=self.device) * 0.1
-        )
-
-        # ── OCR (swappable) ─────────────────────────────────────────────
-        self.ocr = ocr
-        self.ocr_input_shape = (64, 128, 3)   # H, W fed to OCR crop
-        # Keep trainable OCR unfrozen so gradients can flow
-        if not self.ocr.is_trainable:
-            self.ocr.eval()
-            self.ocr.freeze()
-        else:
-            self.ocr.eval()  # Start in eval, switch to train during training
-
-        # Baselines (computed on clean images)
-        self.detection_baseline, self.ocr_baseline = self._calculate_baseline_loss()
+        # ── Preprocessing cache ────────────────────────────────────────
+        self._prep_cache: Dict[str, Tuple[torch.Tensor, np.ndarray]] = {}
+        self._build_prep_cache()
 
         self.epoch_stats: list = []
 
     # ====================================================================
-    # Helpers
+    # Patch generation
     # ====================================================================
 
-    def _text_to_target_tensor(self, text: str, max_slots: int,
-                                alphabet: str) -> torch.Tensor:
-        padded  = (text + "_" * max_slots)[:max_slots]
-        indices = [alphabet.index(c) for c in padded]
-        target  = torch.zeros(1, max_slots, len(alphabet))
-        for i, idx in enumerate(indices):
-            target[0, i, idx] = 1.0
-        return target.to(self.device)
+    def _trainable_params(self):
+        """All parameters that the optimiser should update."""
+        return [self.seed] + list(self.decoder.parameters())
 
-    def invert_bbox(self, corners: torch.Tensor, transform) -> torch.Tensor:
-        r, dw, dh = transform
-        corners = corners.clone()
-        corners[::2]  -= dw
-        corners[1::2] -= dh
-        corners /= r
-        return corners
+    def generate_patch(self, training_aug: bool = False) -> torch.Tensor:
+        """
+        Run the decoder forward to produce the patch.
 
-    def bbox_to_corners(self, bbox, device=None) -> torch.Tensor:
+        Parameters
+        ----------
+        training_aug : bool
+            When True, applies the random brightness jitter used during
+            training to simulate print variation.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape [3, H, W], values in [0, 1], on self.device.
+            Gradient graph is intact (suitable for loss.backward()).
+        """
+        patch = self.decoder(self.seed).squeeze(0)   # [3, 256, 512]
+
+        if self.print_blur > 0:
+            patch = kornia.filters.gaussian_blur2d(
+                patch.unsqueeze(0), (3, 3),
+                (self.print_blur, self.print_blur),
+            ).squeeze(0)
+
+        if training_aug:
+            factor = torch.rand(1, device=self.device) * 0.2
+            patch  = patch * (1.0 - factor)
+
+        return patch   # [3, 256, 512]
+
+    # ====================================================================
+    # Preprocessing cache
+    # ====================================================================
+
+    def _build_prep_cache(self) -> None:
+        total = sum(len(ld) for ld in [self.train_loader, self.val_loader])
+        with tqdm(total=total, desc="Preprocessing images for detector") as pbar:
+            for loader in [self.train_loader, self.val_loader]:
+                for batch in loader:
+                    fn = batch["filename"][0]
+                    if fn not in self._prep_cache:
+                        orig_chw = batch["orig_image"][0]
+                        img_hwc  = (orig_chw.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                        corners  = batch["orig_corners"][0].numpy()
+                        prep_t, new_c = preprocess_for_detector(img_hwc, corners, self.detector)
+                        self._prep_cache[fn] = (prep_t, new_c)
+                    pbar.update(1)
+        print(f"  Cached {len(self._prep_cache)} preprocessed images")
+
+    # ====================================================================
+    # Geometry helpers
+    # ====================================================================
+
+    def bbox_to_corners(self, bbox: torch.Tensor, device=None) -> torch.Tensor:
         x1, y1, x2, y2 = bbox
-        return torch.tensor([[
-            [x1, y1], [x2, y1], [x2, y2], [x1, y2]
-        ]], device=device or self.device)
+        return torch.tensor([[[x1, y1], [x2, y1], [x2, y2], [x1, y2]]],
+                             device=device or self.device)
 
     def corners_to_bbox(self, corners: torch.Tensor) -> torch.Tensor:
-        return torch.stack([
-            corners[:, 0].min(), corners[:, 1].min(),
-            corners[:, 0].max(), corners[:, 1].max(),
-        ])
-
-    def get_patch_bounding_box(self, corners: torch.Tensor,
-                               border_scale: float = 1.4) -> torch.Tensor:
-        cx = corners[:, 0].mean()
-        cy = corners[:, 1].mean()
-        center = torch.tensor([cx, cy], device=self.device)
-        border = center.unsqueeze(0) + (corners - center.unsqueeze(0)) * border_scale
-        return torch.stack([border[:, 0].min(), border[:, 1].min(),
-                            border[:, 0].max(), border[:, 1].max()])
+        return torch.stack([corners[:, 0].min(), corners[:, 1].min(),
+                            corners[:, 0].max(), corners[:, 1].max()])
 
     @staticmethod
     def _boxes_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-        area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
-        area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
-        b1 = boxes1.unsqueeze(1)
-        b2 = boxes2.unsqueeze(0)
-        inter_w = torch.clamp(torch.min(b1[..., 2], b2[..., 2]) -
-                              torch.max(b1[..., 0], b2[..., 0]), min=0)
-        inter_h = torch.clamp(torch.min(b1[..., 3], b2[..., 3]) -
-                              torch.max(b1[..., 1], b2[..., 1]), min=0)
-        inter = inter_w * inter_h
-        union = area1 + area2 - inter
-        return inter / (union + 1e-8)
+        a1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+        a2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+        b1, b2 = boxes1.unsqueeze(1), boxes2.unsqueeze(0)
+        iw = torch.clamp(torch.min(b1[..., 2], b2[..., 2]) -
+                         torch.max(b1[..., 0], b2[..., 0]), min=0)
+        ih = torch.clamp(torch.min(b1[..., 3], b2[..., 3]) -
+                         torch.max(b1[..., 1], b2[..., 1]), min=0)
+        inter = iw * ih
+        return inter / (a1 + a2 - inter + 1e-8)
 
     # ====================================================================
     # Patch application
@@ -182,23 +336,21 @@ class AdversarialPatchTrainer:
                              border_scale: float = 1.4) -> Tuple[torch.Tensor, torch.Tensor]:
         B, C, H, W = image.shape
         plate = corners[0]
-        cx = plate[:, 0].mean()
-        cy = plate[:, 1].mean()
-        ctr = torch.tensor([cx, cy], device=self.device)
+        cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
+        ctr    = torch.tensor([cx, cy], device=self.device)
         border = ctr.unsqueeze(0) + (plate - ctr.unsqueeze(0)) * border_scale
 
         bx1 = torch.clamp(border[:, 0].min(), 0, W).int()
         bx2 = torch.clamp(border[:, 0].max(), 0, W).int()
         by1 = torch.clamp(border[:, 1].min(), 0, H).int()
         by2 = torch.clamp(border[:, 1].max(), 0, H).int()
-        px1 = torch.clamp(plate[:, 0].min(), 0, W).int()
-        px2 = torch.clamp(plate[:, 0].max(), 0, W).int()
-        py1 = torch.clamp(plate[:, 1].min(), 0, H).int()
-        py2 = torch.clamp(plate[:, 1].max(), 0, H).int()
+        px1 = torch.clamp(plate[:, 0].min(),  0, W).int()
+        px2 = torch.clamp(plate[:, 0].max(),  0, W).int()
+        py1 = torch.clamp(plate[:, 1].min(),  0, H).int()
+        py2 = torch.clamp(plate[:, 1].max(),  0, H).int()
 
         result = image.clone()
         mask   = torch.zeros(B, 3, H, W, device=self.device)
-
         bh, bw = by2 - by1, bx2 - bx1
         if bh > 0 and bw > 0:
             resized = F.interpolate(patch_norm.unsqueeze(0), size=(bh, bw),
@@ -209,39 +361,42 @@ class AdversarialPatchTrainer:
                 if py2 > py1 and px2 > px1:
                     result[b, :, py1:py2, px1:px2] = image[b, :, py1:py2, px1:px2]
                     mask[b,   :, py1:py2, px1:px2] = 0.0
-
         return torch.clamp(result, 0, 1), mask
 
-    def apply_patch_to_image(self, image: torch.Tensor, corners: torch.Tensor,
-                              border_scale: float = 1.4) -> Tuple[torch.Tensor, torch.Tensor]:
-        B = image.shape[0]
+    def apply_patch_to_image(
+        self,
+        image:          torch.Tensor,
+        corners:        torch.Tensor,
+        patch_norm:     Optional[torch.Tensor] = None,
+        border_scale:   float = 1.4,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Warp the patch onto the image using the plate corners.
+
+        Parameters
+        ----------
+        patch_norm : torch.Tensor or None
+            Pre-generated [3, H, W] patch in [0, 1].  If None, calls
+            generate_patch(training_aug=self.training) internally.
+        """
+        if patch_norm is None:
+            patch_norm = self.generate_patch(training_aug=self.training)
+
+        B    = image.shape[0]
         H, W = image.shape[2], image.shape[3]
-
-        patch_norm = torch.tanh(self.patch) * 0.5 + 0.5
-
-        if self.print_blur > 0:
-            patch_norm = kornia.filters.gaussian_blur2d(
-                patch_norm.unsqueeze(0), (3, 3),
-                (self.print_blur, self.print_blur),
-            ).squeeze(0)
-
-        if self.training:
-            factor = torch.rand(1, device=self.device) * 0.2
-            patch_norm = patch_norm * (1.0 - factor)
 
         if not self.use_homography:
             return self._apply_patch_simple(image, corners, patch_norm, border_scale)
 
         plate  = corners[0]
-        cx     = plate[:, 0].mean()
-        cy     = plate[:, 1].mean()
+        cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
         center = torch.tensor([cx, cy], device=self.device)
         border = (center.unsqueeze(0) +
                   (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)
 
         ph, pw = self.patch_height, self.patch_width
-        src = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
-                            dtype=torch.float32, device=self.device).unsqueeze(0)
+        src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
+                               dtype=torch.float32, device=self.device).unsqueeze(0)
 
         M_border = K.get_perspective_transform(src, border)
         M_plate  = K.get_perspective_transform(src, corners)
@@ -252,10 +407,10 @@ class AdversarialPatchTrainer:
         warped  = K.warp_perspective(patch_batch, M_border, (H, W),
                                      mode="bilinear", padding_mode="zeros",
                                      align_corners=True)
-        w_bord  = K.warp_perspective(ones,        M_border, (H, W),
+        w_bord  = K.warp_perspective(ones, M_border, (H, W),
                                      mode="bilinear", padding_mode="zeros",
                                      align_corners=True)
-        w_plate = K.warp_perspective(ones,        M_plate,  (H, W),
+        w_plate = K.warp_perspective(ones, M_plate, (H, W),
                                      mode="bilinear", padding_mode="zeros",
                                      align_corners=True)
 
@@ -264,155 +419,258 @@ class AdversarialPatchTrainer:
         return torch.clamp(result, 0, 1), mask
 
     # ====================================================================
-    # Loss computation
+    # Loss
     # ====================================================================
 
-    def patch_reg_loss(self) -> torch.Tensor:
-        p   = self.patch
-        C, H, W = p.shape
-        tv_h = torch.pow(p[:, :, 1:] - p[:, :, :-1], 2).sum()
-        tv_v = torch.pow(p[:, 1:, :] - p[:, :-1, :], 2).sum()
-        n    = C * (H * (W - 1) + (H - 1) * W)
-        return (tv_h + tv_v) / n * 2.5
+    def partial_loss(
+        self,
+        patched_prep: torch.Tensor,   # [1, C, H, W]
+        new_corners:  torch.Tensor,   # [4, 2]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_box = self.corners_to_bbox(new_corners)
 
-    def partial_loss(self, batch: dict,
-                     use_ocr_baseline: bool = True) -> Tuple[torch.Tensor, float]:
-        """
-        Core loss: detection suppression + OCR disruption/impersonation.
+        # ── Detection ──────────────────────────────────────────────────
+        detections = self.detector.predict(patched_prep.squeeze(0))
+        det_loss   = torch.tensor(0.0, device=self.device)
 
-        Uses ``self.detector.predict()`` so the backend is fully swappable.
-        Gradient flow is preserved through ``Detection.raw``.
-        """
-        prep_image = batch["prep_image"].to(self.device)
-        corners    = batch["new_corners"].to(self.device)
+        if detections:
+            best_det = max(
+                detections,
+                key=lambda d: (
+                    self._boxes_iou(d.box.to(self.device).unsqueeze(0),
+                                    target_box.unsqueeze(0)).item()
+                    * d.confidence
+                ),
+            )
+            iou_val  = self._boxes_iou(best_det.box.to(self.device).unsqueeze(0),
+                                        target_box.unsqueeze(0))
+            det_loss = (iou_val * best_det.conf.to(self.device)).squeeze()
 
-        if self.match_detection:
-            target_box = self.get_patch_bounding_box(corners)
+        # ── OCR ────────────────────────────────────────────────────────
+        target_text = self.impersonation_target or self.expected_plate_text
+        ocr_loss    = torch.tensor(0.0, device=self.device)
+
+        crop = kornia.geometry.crop_and_resize(
+            patched_prep,
+            new_corners.unsqueeze(0).to(self.device),
+            self.ocr.ocr_crop_size,
+            mode="bilinear", align_corners=True,
+        )   # [1, 3, H_ocr, W_ocr]
+
+        if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
+            ocr_loss = self.ocr.differentiable_loss(
+                crop, target_text, impersonation=bool(self.impersonation_target),
+            )
         else:
-            target_box = self.corners_to_bbox(corners)
-
-        # ── Detection loss ──────────────────────────────────────────────
-        detections = self.detector.predict(prep_image)
-
-        best_detection: Optional[Detection] = None
-        det_loss = torch.tensor(0.0, device=self.device)
-
-        for det in detections:
-            pred_box = det.box.to(self.device)
-            conf     = det.conf.to(self.device)
-            iou      = self._boxes_iou(pred_box.unsqueeze(0),
-                                       target_box.unsqueeze(0))
-
-            if self.match_detection:
-                this_loss = -iou * conf       # minimise → maximise overlap
-            else:
-                this_loss = iou * conf        # minimise → suppress plate
-
-            # Pick the detection that contributes most to current objective
-            if self.match_detection:
-                if (-this_loss).item() > (-det_loss).item():
-                    det_loss       = this_loss
-                    best_detection = det
-            else:
-                if this_loss.item() > det_loss.item():
-                    det_loss       = this_loss
-                    best_detection = det
-
-        # ── OCR loss ────────────────────────────────────────────────────
-        ocr_loss = 0.0
-        if best_detection is not None:
-            pred_box        = best_detection.box
-            orig_projection = self.invert_bbox(pred_box.cpu(), batch["transform"])
-            corners_box     = self.bbox_to_corners(orig_projection, device="cpu")
-
-            # Crop plate region — keep in the autograd graph for trainable OCR
-            cropped = kornia.geometry.crop_and_resize(
-                batch["orig_image"].unsqueeze(0),
-                corners_box,
-                self.ocr_input_shape[:2],
-                mode="bilinear", align_corners=True,
-            ).to(self.device).squeeze(0)   # [C, H, W]
-
-            target_text = self.impersonation_target or "VRJ7774"
-            ocr_result  = self.ocr.predict(cropped)
-
-            if self.ocr.is_trainable and hasattr(self.ocr, "compute_target_loss"):
-                # Backend-native differentiable loss (e.g., TrOCR seq2seq loss)
-                base_loss = self.ocr.compute_target_loss(cropped, target_text)
-                if self.impersonation_target:
-                    ocr_loss = base_loss
-                else:
-                    # Disruption: maximise recognition loss
-                    ocr_loss = -base_loss
-            elif self.ocr.is_trainable and ocr_result.logits is not None:
-                # Differentiable CTC path (CRNN-like backends)
-                if self.impersonation_target:
-                    # Impersonation: minimise CTC loss toward target
-                    ocr_loss = self.ocr.ctc_loss(ocr_result.logits, target_text)
-                else:
-                    # Disruption: maximise CTC loss for the true plate text
-                    # (minimise negative CTC loss)
-                    ocr_loss = -self.ocr.ctc_loss(ocr_result.logits, target_text)
-            else:
-                # Non-differentiable path: character-accuracy heuristic
-                accuracy = ocr_result.char_accuracy(target_text)
-                ocr_loss = (1.0 - accuracy) if self.impersonation_target else accuracy
-
-            if use_ocr_baseline and hasattr(self, "ocr_baseline"):
-                if isinstance(ocr_loss, torch.Tensor):
-                    ocr_loss = ocr_loss / (self.ocr_baseline + 1e-8)
-                else:
-                    # Keep scalar heuristic stable across OCR backends.
-                    # The previous disruption path used baseline/accuracy,
-                    # which explodes when accuracy ~= 0 and causes huge
-                    # oscillations in val loss.
-                    baseline = max(float(self.ocr_baseline), 1e-4)
-                    ocr_loss = float(ocr_loss) / baseline
+            with torch.no_grad():
+                ocr_result = self.ocr.predict(crop.squeeze(0))
+            accuracy = ocr_result.char_accuracy(target_text)
+            ocr_loss = torch.tensor(
+                (1.0 - accuracy) if self.impersonation_target else accuracy,
+                device=self.device,
+            )
 
         return det_loss, ocr_loss
 
-    def _calculate_baseline_loss(self) -> Tuple[float, float]:
-        total_det = total_ocr = count = 0.0
-        with tqdm(self.train_loader, desc="Baseline", leave=False):
-            with torch.no_grad():
-                for batch in self.train_loader:
-                    batch = {k: v[0] for k, v in batch.items()}
-                    d, o = self.partial_loss(batch, use_ocr_baseline=False)
-                    total_det += d if isinstance(d, float) else d.item()
-                    total_ocr += o
-                    count     += 1
-        return total_det / max(count, 1), total_ocr / max(count, 1)
-
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        batch = {k: v[0] for k, v in batch.items()}
+        fn = (batch["filename"][0]
+              if isinstance(batch["filename"], (list, tuple))
+              else batch["filename"])
 
-        # Apply patch to preprocessed image
+        prep_tensor, new_corners_np = self._prep_cache[fn]
+        prep_tensor  = prep_tensor.to(self.device)
+        new_corners  = torch.from_numpy(new_corners_np).to(self.device)
+
+        # Generate patch once — shared between apply and loss
+        patch_norm = self.generate_patch(training_aug=self.training)
+
         patched_prep, _ = self.apply_patch_to_image(
-            batch["prep_image"].to(self.device).unsqueeze(0),
-            batch["new_corners"].to(self.device).unsqueeze(0),
+            prep_tensor.unsqueeze(0),
+            new_corners.unsqueeze(0),
+            patch_norm=patch_norm,
         )
-        batch["prep_image"] = patched_prep.squeeze()
 
-        # Apply patch to original-resolution image (for OCR crop)
-        patched_orig, _ = self.apply_patch_to_image(
-            batch["orig_image"].to(self.device).unsqueeze(0),
-            batch["orig_corners"].to(self.device).unsqueeze(0),
-        )
-        batch["orig_image"] = patched_orig.squeeze()
+        det_loss, ocr_loss = self.partial_loss(patched_prep, new_corners)
+        return (det_loss + ocr_loss) / 2
 
-        det_loss, ocr_loss = self.partial_loss(batch)
-        reg_loss = self.patch_reg_loss() if self.use_tv_loss else 0.0
-        return (det_loss + ocr_loss) / 2 + reg_loss
+    # ====================================================================
+    # Patch persistence
+    # ====================================================================
+
+    def save_patch(self, epoch: int, subdir: str = "patches") -> None:
+        save_dir = self.run_dir / subdir
+        save_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+        with torch.no_grad():
+            patch_img = self.generate_patch()   # [3, H, W] in [0,1]
+            T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
+            torch.save({
+                "seed":          self.seed.detach().cpu(),
+                "decoder":       self.decoder.state_dict(),
+                "seed_channels": self.seed_channels,
+                "epoch":         epoch,
+                "backend":       self.detector.name,
+                "ocr":           self.ocr.name,
+                "patch_size":    (self.patch_height, self.patch_width),
+            }, str(save_dir / f"{stem}.pt"))
+
+    # ====================================================================
+    # Pre-training sanity check
+    # ====================================================================
+
+    def validate_pipeline(self, n_samples: Optional[int] = None) -> dict:
+        """
+        Run clean images (no patch) through detector + OCR.
+        Raises RuntimeError if < 50% read correctly.
+        """
+        print("\n── Pre-training sanity check ──────────────────────────────")
+        items = list(self._prep_cache.items())
+        if n_samples is not None:
+            items = items[:n_samples]
+
+        results = []
+        for fn, (prep_t, new_c) in tqdm(items, desc="Sanity check", leave=False):
+            prep_tensor  = prep_t.to(self.device)
+            new_corners  = torch.from_numpy(new_c).to(self.device)
+            target_box   = self.corners_to_bbox(new_corners)
+
+            with torch.no_grad():
+                detections = self.detector.predict(prep_tensor)
+
+            if not detections:
+                results.append({"filename": fn, "category": "no_detection",
+                                 "text": None, "confidence": 0.0})
+                continue
+
+            best_det = max(
+                detections,
+                key=lambda d: (
+                    self._boxes_iou(d.box.to(self.device).unsqueeze(0),
+                                    target_box.unsqueeze(0)).item()
+                    * d.confidence
+                ),
+            )
+
+            with torch.no_grad():
+                crop = kornia.geometry.crop_and_resize(
+                    prep_tensor.unsqueeze(0),
+                    new_corners.unsqueeze(0),
+                    self.ocr.ocr_crop_size,
+                    mode="bilinear", align_corners=True,
+                )
+                ocr_result = self.ocr.predict(crop.squeeze(0))
+
+            text = ocr_result.text or ""
+            cat  = ("correct"       if text.upper() == self.expected_plate_text.upper()
+                    else "misread"   if not text
+                    else "impersonation")
+            results.append({"filename": fn, "category": cat,
+                             "text": text, "confidence": ocr_result.confidence})
+
+        counts = {"correct": 0, "impersonation": 0, "misread": 0, "no_detection": 0}
+        for r in results:
+            counts[r["category"]] += 1
+        total = max(len(results), 1)
+
+        lines = [
+            f"Sanity check over {len(results)} images "
+            f"(expected: '{self.expected_plate_text}')",
+            f"  Correct reads : {counts['correct']:4d} ({counts['correct']/total*100:.1f}%)",
+            f"  Impersonation : {counts['impersonation']:4d} ({counts['impersonation']/total*100:.1f}%)",
+            f"  Misread       : {counts['misread']:4d} ({counts['misread']/total*100:.1f}%)",
+            f"  No detection  : {counts['no_detection']:4d} ({counts['no_detection']/total*100:.1f}%)",
+        ]
+        report = "\n".join(lines)
+        print(report)
+        (self.run_dir / "sanity_check.txt").write_text(report + "\n")
+
+        frac = counts["correct"] / total
+        if frac < 0.50:
+            raise RuntimeError(
+                f"\nSanity check FAILED: {counts['correct']}/{total} correct "
+                f"({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
+            )
+        print(f"  Passed ({frac*100:.1f}% correct).\n")
+        return counts
+
+    # ====================================================================
+    # Debug images
+    # ====================================================================
+
+    def save_debug_images(self, n: int = 20) -> None:
+        debug_dir    = self.run_dir / "debug"
+        items        = list(self._prep_cache.items())
+        np.random.seed(42)
+        sample_items = [items[i] for i in
+                        np.random.choice(len(items), min(n, len(items)), replace=False)]
+        sample_items.sort(key=lambda x: x[0])
+
+        print(f"  Saving {len(sample_items)} debug images → {debug_dir}")
+        summary_rows = []
+
+        for img_idx, (fn, (prep_t, new_c)) in enumerate(sample_items):
+            prep_tensor = prep_t.to(self.device)
+            new_corners = torch.from_numpy(new_c).to(self.device)
+            target_box  = self.corners_to_bbox(new_corners)
+
+            with torch.no_grad():
+                detections  = self.detector.predict(prep_tensor)
+                crop = kornia.geometry.crop_and_resize(
+                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
+                    self.ocr.ocr_crop_size, mode="bilinear", align_corners=True,
+                )
+                ocr_result  = self.ocr.predict(crop.squeeze(0))
+
+            text       = ocr_result.text or ""
+            conf       = ocr_result.confidence
+            is_correct = text.upper() == self.expected_plate_text.upper()
+
+            vis = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
+            pts = new_c.astype(np.int32)
+
+            # (a) preprocessed image + corners + OCR label
+            cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+            cv2.putText(vis, f"{text} ({conf:.2f})", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_a_preprocessed_detection.png"), vis)
+
+            # (b) raw OCR crop
+            crop_np = (crop.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_b_ocr_crop.png"), crop_np)
+
+            # (c) random patch applied — use a fresh random seed through the decoder
+            with torch.no_grad():
+                rand_seed  = torch.randn_like(self.seed)
+                rand_patch = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
+                patched, _ = self.apply_patch_to_image(
+                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
+                    patch_norm=rand_patch,
+                )
+            patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"), patch_vis)
+
+            summary_rows.append({
+                "index": img_idx, "filename": fn,
+                "detected_text": text, "confidence": f"{conf:.4f}",
+                "correct": is_correct,
+            })
+
+        csv_path = debug_dir / "debug_summary.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["index", "filename", "detected_text", "confidence", "correct"])
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        print(f"  Debug summary → {csv_path}")
 
     # ====================================================================
     # Training loop
     # ====================================================================
 
     def train_epoch(self, optimizer, epoch: int) -> float:
-        # Ensure trainable OCR is in train mode for CuDNN RNN backward.
         if self.ocr.is_trainable:
             self.ocr.train()
-        
+
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
@@ -420,7 +678,7 @@ class AdversarialPatchTrainer:
         step = num_updates = 0
 
         with tqdm(enumerate(self.train_loader),
-                  desc=f"Epoch {epoch+1} [{self.detector.name}]",
+                  desc=f"Epoch {epoch+1} [{self.detector.name}/{self.ocr.name}]",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
                 loss        = self.compute_loss(batch)
@@ -431,7 +689,7 @@ class AdversarialPatchTrainer:
                 step       += 1
 
                 if step % update_every == 0:
-                    torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
                     total_loss  += accum_loss
@@ -442,15 +700,12 @@ class AdversarialPatchTrainer:
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
                         torch.mps.empty_cache()
-
-                    avg = total_loss / (num_updates * update_every)
-                    pbar.set_postfix({"loss": f"{avg:.4f}"})
+                    pbar.set_postfix({"loss": f"{total_loss/(num_updates*update_every):.4f}"})
                 else:
                     del loss, scaled_loss
 
-            # Flush remaining gradients
             if step % update_every != 0 and self.grad_accumulate is not None:
-                torch.nn.utils.clip_grad_norm_([self.patch], max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 total_loss  += accum_loss
@@ -461,138 +716,151 @@ class AdversarialPatchTrainer:
         return total_loss / max(total_steps, 1)
 
     def validate(self) -> float:
-        # Set OCR back to eval mode for validation
         if self.ocr.is_trainable:
             self.ocr.eval()
-        
         losses = []
         with torch.no_grad():
             for batch in self.val_loader:
-                losses.append(self.compute_loss(batch).item())
-        return float(np.mean(losses))
+                fn = (batch["filename"][0]
+                      if isinstance(batch["filename"], (list, tuple))
+                      else batch["filename"])
+                prep_tensor, new_corners_np = self._prep_cache[fn]
+                prep_tensor = prep_tensor.to(self.device)
+                new_corners = torch.from_numpy(new_corners_np).to(self.device)
+                patch_norm  = self.generate_patch(training_aug=False)
+                patched_prep, _ = self.apply_patch_to_image(
+                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
+                    patch_norm=patch_norm,
+                )
+                det_loss, ocr_loss = self.partial_loss(patched_prep, new_corners)
+                losses.append(((det_loss + ocr_loss) / 2).item())
+        return float(np.mean(losses)) if losses else 0.0
 
-    def save_patch(self, epoch: int, save_dir: str = "patches") -> None:
-        Path(save_dir).mkdir(exist_ok=True)
-        with torch.no_grad():
-            img = torch.tanh(self.patch) * 0.5 + 0.5
-            T.ToPILImage()(img.cpu()).save(
-                f"{save_dir}/patch_{self.detector.name}_epoch_{epoch:04d}.png")
-            torch.save({"patch": self.patch.detach().cpu(), "epoch": epoch,
-                        "backend": self.detector.name,
-                        "patch_size": (self.patch_height, self.patch_width)},
-                       f"{save_dir}/patch_{self.detector.name}_epoch_{epoch:04d}.pt")
+    def train(
+        self,
+        num_epochs:    int   = 150,
+        learning_rate: float = 0.01,
+        save_interval: int   = 10,
+        dry_run:       bool  = False,
+    ) -> dict:
+        self.validate_pipeline()
+        self.save_debug_images()
 
-    def train(self, num_epochs: int = 100, learning_rate: float = 0.01,
-              save_interval: int = 10, early_stop_patience: int = 15) -> dict:
-        optimizer = optim.AdamW([self.patch], lr=learning_rate, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", patience=5, factor=0.5)
+        if dry_run:
+            print("\nDry run complete.")
+            return {}
 
-        history = {"loss": [], "val_score": [], "learning_rate": []}
-        best_loss = float("inf")
-        patience  = 0
+        optimizer = optim.AdamW(
+            self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs, eta_min=1e-4,
+        )
 
+        history    = {"loss": [], "val_score": [], "learning_rate": []}
+        best_loss  = float("inf")
+        best_epoch = -1
+
+        n_params = sum(p.numel() for p in self._trainable_params())
         print(f"\n{'='*60}")
-        print(f"  Adversarial Patch Training  |  backend: {self.detector.name}")
-        print(f"{'='*60}")
+        print(f"  Adversarial Patch Training")
+        print(f"  Detector  : {self.detector.name}   OCR: {self.ocr.name}")
+        print(f"  Patch gen : ConvTranspose decoder  "
+              f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
+        print(f"  Trainable : {n_params:,} params  "
+              f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Patch     : {self.patch_height}×{self.patch_width}")
-        print(f"  Device    : {self.device}")
         print(f"  Epochs    : {num_epochs}  |  LR: {learning_rate}")
-        print(f"  TV loss   : {self.use_tv_loss}  |  Homography: {self.use_homography}")
         print(f"  Mode      : "
               f"{'impersonation → ' + self.impersonation_target if self.impersonation_target else 'disruption'}")
+        print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
 
+        log_path = self.run_dir / "training_log.txt"
+        log_file = open(log_path, "w")
+
         for epoch in range(num_epochs):
-            train_loss = self.train_epoch(optimizer, epoch)
-            val_loss   = self.validate()
-            scheduler.step(train_loss)
+            self.training  = True
+            train_loss     = self.train_epoch(optimizer, epoch)
+            self.training  = False
+            val_loss       = self.validate()
+            scheduler.step()
             lr = optimizer.param_groups[0]["lr"]
 
             history["loss"].append(train_loss)
             history["val_score"].append(val_loss)
             history["learning_rate"].append(lr)
 
-            init_val = history["val_score"][0]
-            change   = (val_loss / init_val - 1) * 100
-
-            print(f"Epoch {epoch+1:3d}/{num_epochs} | "
-                  f"Loss: {train_loss:.4f} | Val: {val_loss:.4f} | "
-                  f"Δ: {change:+.1f}% | LR: {lr:.2e}")
+            init_val    = history["val_score"][0]
+            change      = (val_loss / (init_val + 1e-9) - 1) * 100
+            best_marker = ""
 
             if val_loss < best_loss:
-                best_loss = val_loss
-                patience  = 0
-                self.save_patch(epoch, "best_patches")
-            else:
-                patience += 1
+                best_loss  = val_loss
+                best_epoch = epoch
+                self.save_patch(epoch, "patches")
+                best_marker = "  ★ best"
+
+            line = (f"Epoch {epoch+1:3d}/{num_epochs} | "
+                    f"Loss: {train_loss:.4f} | Val: {val_loss:.4f} | "
+                    f"Δ: {change:+.1f}% | LR: {lr:.2e}{best_marker}")
+            print(line)
+            log_file.write(line + "\n")
+            log_file.flush()
 
             if (epoch + 1) % save_interval == 0:
-                self.save_patch(epoch, "checkpoint_patches")
+                self.save_patch(epoch, "patches")
 
-            if patience >= early_stop_patience:
-                print(f"  Early stop: no improvement for {early_stop_patience} epochs")
-                break
+        log_file.close()
 
-            if len(history["loss"]) >= 20:
-                recent = history["loss"][-20:]
-                if max(recent) - min(recent) < 1e-4:
-                    print("  Converged: loss stabilised")
-                    break
+        import pandas as pd
+        hist_path = self.run_dir / "training_history.csv"
+        pd.DataFrame(history).assign(
+            epoch=range(1, len(history["loss"]) + 1)
+        ).to_csv(str(hist_path), index=False)
 
-        print(f"\nDone. Best val loss: {best_loss:.4f}")
+        print(f"\nDone. Best val loss {best_loss:.4f} at epoch {best_epoch+1}.")
+        print(f"Training history → {hist_path}")
         return history
 
 
 # ====================================================================
-# CLI entry-point
+# CLI
 # ====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Adversarial patch trainer (modular backend)")
-    parser.add_argument("--csv", default="updated_control_corners.csv")
-    # Only backends with a fully differentiable PyTorch forward pass are valid
-    # training targets. ONNX/numpy backends (fastanpr, open-image-models,
-    # yolov5, yolo-nas) break the autograd graph -- use evaluator.py for those.
-    TRAINABLE_DET = ["yolov8", "fasterrcnn", "yolov11", "rtdetr"]
-    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "fastanpr-ocr"]
-    parser.add_argument("--backend", default="yolov8", choices=TRAINABLE_DET,
-                        help=f"Detector to train a patch against. "
-                             f"One of: {', '.join(TRAINABLE_DET)}. "
-                             f"For eval-only backends use evaluator.py.")
-    parser.add_argument("--model-path", default="license_plate_detector.pt",
-                        help="Path to detector weights (.pt file).")
-    parser.add_argument("--ocr-backend", default="fastanpr-ocr", choices=TRAINABLE_OCR,
-                        help="OCR backend. Use 'crnn', 'trocr', or 'dtrb' for differentiable training.")
-    parser.add_argument("--ocr-model-path", default="none",
-                        help="Path to OCR weights/checkpoint. For trocr pass 'none' (uses HF default) or a model id/path.")
-    parser.add_argument("--ocr-repo-root", default="/home/ubuntu/deep-text-recognition-benchmark",
-                        help="Path to DTRB repo for model definitions (required for --ocr-backend dtrb).")
-    parser.add_argument("--dtrb-feature-extraction", default="vitstr_small_patch16_224",
-                        help="DTRB feature extraction module (e.g. 'ResNet', 'vitstr_small_patch16_224').")
-    parser.add_argument("--dtrb-sequence-modeling", default="None",
-                        help="DTRB sequence modeling (e.g. 'BiLSTM', 'None' for ViTSTR).")
-    parser.add_argument("--dtrb-transformation", default="None",
-                        help="DTRB transformation (e.g. 'TPS', 'None').")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser = argparse.ArgumentParser(
+        description="Adversarial patch trainer — ConvTranspose decoder + pluggable backends"
+    )
+    parser.add_argument("--csv", default="preproc_labels.csv")
+
+    TRAINABLE_DET = ["yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
+    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr"]
+
+    parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)
+    parser.add_argument("--model-path",   default="license_plate_detector.pt")
+    parser.add_argument("--ocr-backend",  default="crnn",    choices=TRAINABLE_OCR)
+    parser.add_argument("--ocr-model-path", default="none")
+    parser.add_argument("--ocr-repo-root",  default=None)
+    parser.add_argument("--dtrb-feature-extraction", default="vitstr_small_patch16_224")
+    parser.add_argument("--dtrb-sequence-modeling",  default="None")
+    parser.add_argument("--dtrb-transformation",     default="None")
+    parser.add_argument("--seed-channels", type=int, default=128,
+                        help="Number of channels in the decoder seed (default 128 → 4096 seed params).")
+    parser.add_argument("--device",   default="cuda")
+    parser.add_argument("--epochs",   type=int,   default=150)
+    parser.add_argument("--lr",       type=float, default=0.01)
     parser.add_argument("--grad-accumulate", type=int, default=64)
-    parser.add_argument("--preload-images", action="store_true",
-                        help="Preload all images into RAM (faster, but high memory use).")
-    parser.add_argument("--num-workers", type=int, default=0,
-                        help="DataLoader workers. 0 is safest for low-memory hosts.")
-    parser.add_argument("--pin-memory", action="store_true",
-                        help="Enable pinned host memory for DataLoader (can increase RAM usage).")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Use only the last N samples from CSV (0 = all).")
-    parser.add_argument("--use-all-for-train", action="store_true",
-                        help="Skip validation split and train on the full CSV.")
-    parser.add_argument("--match-detection", action="store_true")
+    parser.add_argument("--preload-images",  action="store_true")
+    parser.add_argument("--num-workers",     type=int, default=0)
+    parser.add_argument("--pin-memory",      action="store_true")
+    parser.add_argument("--limit",           type=int, default=0)
+    parser.add_argument("--use-all-for-train", action="store_true")
     parser.add_argument("--impersonation-target", default=None)
-    parser.add_argument("--disable-tv-loss", action="store_true")
+    parser.add_argument("--expected-plate", default="VRJ7774")
     parser.add_argument("--disable-homography", action="store_true")
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--dry-run",  action="store_true")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -603,44 +871,36 @@ def main():
         if args.ocr_repo_root:
             ocr_kwargs["dtrb_root"] = args.ocr_repo_root
         ocr_kwargs["feature_extraction"] = args.dtrb_feature_extraction
-        ocr_kwargs["sequence_modeling"] = args.dtrb_sequence_modeling
-        ocr_kwargs["transformation"] = args.dtrb_transformation
-    ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path, device=args.device, **ocr_kwargs)
+        ocr_kwargs["sequence_modeling"]  = args.dtrb_sequence_modeling
+        ocr_kwargs["transformation"]     = args.dtrb_transformation
+    ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path,
+                             device=args.device, **ocr_kwargs)
     ocr.load()
 
-    if not ocr.is_trainable:
-        print(
-            f"Note: '{args.ocr_backend}' OCR has no gradient graph — "
-            "OCR loss will use character-accuracy heuristic only.\n"
-            "      Use --ocr-backend crnn for fully differentiable training."
-        )
-
     trainer = AdversarialPatchTrainer(
-        csv_path             = args.csv,
         detector             = backend,
         ocr                  = ocr,
+        csv_path             = args.csv,
+        seed_channels        = args.seed_channels,
         preload_images       = args.preload_images,
         num_workers          = args.num_workers,
         pin_memory           = args.pin_memory,
         limit                = args.limit,
         use_all_for_train    = args.use_all_for_train,
         grad_accumulate      = args.grad_accumulate,
-        match_detection      = args.match_detection,
         impersonation_target = args.impersonation_target,
+        expected_plate_text  = args.expected_plate,
         training             = True,
-        use_tv_loss          = not args.disable_tv_loss,
         use_homography       = not args.disable_homography,
+        run_name             = args.run_name,
     )
 
-    history = trainer.train(num_epochs=args.epochs, learning_rate=args.lr,
-                            save_interval=10, early_stop_patience=20)
-
-    # Save results
-    import pandas as pd
-    pd.DataFrame(history).assign(
-        epoch=range(1, len(history["loss"]) + 1)
-    ).to_csv("training_history.csv", index=False)
-    print("Training history → training_history.csv")
+    trainer.train(
+        num_epochs    = args.epochs,
+        learning_rate = args.lr,
+        save_interval = 10,
+        dry_run       = args.dry_run,
+    )
 
 
 if __name__ == "__main__":
