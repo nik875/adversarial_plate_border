@@ -701,10 +701,19 @@ class AdversarialPatchTrainer:
             is_correct = text.upper() == self.expected_plate_text.upper()
 
             vis = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
-            pts = new_c.astype(np.int32)
 
-            # (a) preprocessed image + corners + OCR label
-            cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+            # (a) preprocessed image + detected bbox (red) + OCR label
+            if detections:
+                best_det = max(
+                    detections,
+                    key=lambda d: (
+                        self._boxes_iou(d.box.to(self.device).unsqueeze(0),
+                                        target_box.unsqueeze(0)).item()
+                        * d.confidence
+                    ),
+                )
+                x1, y1, x2, y2 = best_det.box.int().tolist()
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color=(0, 0, 255), thickness=2)
             cv2.putText(vis, f"{text} ({conf:.2f})", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_a_preprocessed_detection.png"), vis)
