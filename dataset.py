@@ -61,6 +61,7 @@ def load_image(filepath):
 
 # ---------------------------------------------------------------------------
 # Detector-specific preprocessing factories
+# (kept for debug comparison only — not used in training pipeline)
 # ---------------------------------------------------------------------------
 
 def make_letterbox_prep(target_size: int):
@@ -159,13 +160,12 @@ def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.nd
 
 class AdversarialPatchDataset(Dataset):
     def __init__(self, df, transform=None, preload=False, target_size=384,
-                 use_original: bool = False, prep_fn=None):
+                 use_original: bool = False):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
         self.preload = preload
         self.target_size = target_size
         self.use_original = use_original
-        self.prep_fn = prep_fn
 
         # When use_original=True, always ignore preprocessed_filename
         if use_original:
@@ -281,19 +281,14 @@ class AdversarialPatchDataset(Dataset):
 
         # When use_original=True, return only the full-res image + original corners
         if self.use_original:
-            result = {
-                'orig_corners': orig_corners,
-                'orig_homography': orig_H,
-                'filename': row['filename'],
-            }
-            if self.prep_fn is not None:
-                prep_img, new_c = self.prep_fn(orig_img, orig_corners.numpy())
-                result['prep_image'] = prep_img
-                result['new_corners'] = torch.from_numpy(new_c)
             if self.transform:
                 orig_img = self.transform(orig_img)
-            result['orig_image'] = orig_img
-            return result
+            return {
+                'orig_image':      orig_img,
+                'orig_corners':    orig_corners,
+                'orig_homography': orig_H,
+                'filename':        row['filename'],
+            }
 
         if self.transform:
             orig_img = self.transform(orig_img)
@@ -335,7 +330,7 @@ class AdversarialPatchDataset(Dataset):
 
 def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=0.8,
                        n_jobs=1, limit=0, use_all_for_train=False,
-                       use_original: bool = False, prep_fn=None,
+                       use_original: bool = False,
                        pin_memory=True, **kwargs):
     """Create train and validation DataLoaders
 
@@ -376,8 +371,8 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Create datasets
-    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, prep_fn=prep_fn, **kwargs)
-    val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, prep_fn=prep_fn, **kwargs)
+    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, **kwargs)
+    val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, **kwargs)
 
     # Create dataloaders
     train_loader = DataLoader(

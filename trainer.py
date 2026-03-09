@@ -54,9 +54,56 @@ from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
-from dataset import create_dataloaders, make_letterbox_prep, make_resize_prep, make_passthrough_prep
+from dataset import (create_dataloaders,
+                     make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
 warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Differentiable detector preprocessing
+# ---------------------------------------------------------------------------
+
+def _diff_letterbox(
+    img_chw: torch.Tensor, target_size: int
+) -> Tuple[torch.Tensor, float, float, float]:
+    """Bilinear resize + grey pad — matches the cv2 letterbox exactly."""
+    C, H, W = img_chw.shape
+    r      = min(target_size / H, target_size / W)
+    new_h  = int(round(H * r))
+    new_w  = int(round(W * r))
+    img    = F.interpolate(img_chw.unsqueeze(0), size=(new_h, new_w),
+                           mode="bilinear", align_corners=False).squeeze(0)
+    dw     = (target_size - new_w) / 2
+    dh     = (target_size - new_h) / 2
+    top    = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
+    left   = int(round(dw - 0.1)); right  = int(round(dw + 0.1))
+    img    = F.pad(img, (left, right, top, bottom), value=114.0 / 255.0)
+    return img, r, dw, dh
+
+
+def _diff_resize(
+    img_chw: torch.Tensor, target_w: int, target_h: int
+) -> Tuple[torch.Tensor, float, float]:
+    """Bilinear hard-resize — matches cv2.resize exactly."""
+    C, H, W = img_chw.shape
+    img     = F.interpolate(img_chw.unsqueeze(0), size=(target_h, target_w),
+                            mode="bilinear", align_corners=False).squeeze(0)
+    return img, target_w / W, target_h / H
+
+
+def _corners_letterbox(corners: np.ndarray, r: float, dw: float, dh: float) -> np.ndarray:
+    c = corners.astype(np.float32).copy()
+    c[:, 0] = c[:, 0] * r + dw
+    c[:, 1] = c[:, 1] * r + dh
+    return c
+
+
+def _corners_resize(corners: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    c = corners.astype(np.float32).copy()
+    c[:, 0] *= sx
+    c[:, 1] *= sy
+    return c
+
 
 PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
@@ -138,6 +185,8 @@ class AdversarialPatchTrainer:
         self.device   = detector.device
         self.detector.eval()
         self.detector.freeze()
+        self.diff_prep    = self._make_differentiable_prep()
+        self._cv2_prep    = self._make_cv2_prep()
 
         # ── OCR ────────────────────────────────────────────────────────
         self.ocr = ocr
@@ -179,7 +228,6 @@ class AdversarialPatchTrainer:
             limit=limit,
             use_all_for_train=use_all_for_train,
             use_original=True,
-            prep_fn=self._make_prep_fn(),
         )
 
         self.epoch_stats: list = []
@@ -226,8 +274,40 @@ class AdversarialPatchTrainer:
     # Detector preprocessing selection
     # ====================================================================
 
-    def _make_prep_fn(self):
-        """Return the dataset preprocessing function for the current detector."""
+    def _make_differentiable_prep(self):
+        """
+        Return a callable  (img_chw: Tensor, corners_np: ndarray)
+                        ->  (img_chw_prep: Tensor, new_corners_np: ndarray)
+        that applies detector-specific preprocessing differentiably on the GPU.
+        """
+        name = self.detector.name
+        if name in ("yolov8", "yolov11"):
+            imgsz = 640
+            if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
+                raw = self.detector._yolo.imgsz
+                imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
+            def fn(img_chw, corners_np):
+                img, r, dw, dh = _diff_letterbox(img_chw, imgsz)
+                return img, _corners_letterbox(corners_np, r, dw, dh)
+        elif name == "rtdetr":
+            def fn(img_chw, corners_np):
+                img, sx, sy = _diff_resize(img_chw, 640, 640)
+                return img, _corners_resize(corners_np, sx, sy)
+        elif name == "fasterrcnn":
+            def fn(img_chw, corners_np):
+                return img_chw, corners_np.astype(np.float32).copy()
+        elif name == "yolo-v9-384":
+            def fn(img_chw, corners_np):
+                img, r, dw, dh = _diff_letterbox(img_chw, 384)
+                return img, _corners_letterbox(corners_np, r, dw, dh)
+        else:
+            def fn(img_chw, corners_np):
+                img, r, dw, dh = _diff_letterbox(img_chw, 384)
+                return img, _corners_letterbox(corners_np, r, dw, dh)
+        return fn
+
+    def _make_cv2_prep(self):
+        """Return the equivalent cv2-based prep fn (for debug comparison only)."""
         name = self.detector.name
         if name in ("yolov8", "yolov11"):
             imgsz = 640
@@ -417,23 +497,25 @@ class AdversarialPatchTrainer:
         return det_loss, ocr_loss
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        prep_tensor  = batch["prep_image"][0].to(self.device)
-        new_corners  = batch["new_corners"][0].to(self.device)
-        orig_tensor  = batch["orig_image"][0].to(self.device)
-        orig_corners = batch["orig_corners"][0].to(self.device)
+        orig_tensor     = batch["orig_image"][0].to(self.device)
+        orig_corners_np = batch["orig_corners"][0].numpy()
+        orig_corners    = batch["orig_corners"][0].to(self.device)
 
-        # Generate patch once — reused for both applications
         patch_norm = self.generate_patch(training_aug=self.training)
 
-        patched_prep, _ = self.apply_patch_to_image(
-            prep_tensor.unsqueeze(0), new_corners.unsqueeze(0), patch_norm=patch_norm,
-        )
+        # Apply patch once at full resolution
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
         )
 
+        # Differentiable preprocessing for detector (gradients intact)
+        patched_prep, new_corners_np = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
+        new_corners = torch.from_numpy(new_corners_np).to(self.device)
+
         det_loss, ocr_loss = self.partial_loss(
-            patched_prep, new_corners, patched_orig, orig_corners)
+            patched_prep.unsqueeze(0), new_corners,
+            patched_orig,              orig_corners,
+        )
         return (det_loss + ocr_loss) / 2
 
     # ====================================================================
@@ -484,16 +566,17 @@ class AdversarialPatchTrainer:
                     fn = (batch["filename"][0]
                           if isinstance(batch["filename"], (list, tuple))
                           else batch["filename"])
-                    prep_tensor  = batch["prep_image"][0].to(self.device)
-                    new_corners  = batch["new_corners"][0].to(self.device)
-                    orig_tensor  = batch["orig_image"][0].to(self.device)
-                    orig_corners = batch["orig_corners"][0].to(self.device)
+                    orig_tensor     = batch["orig_image"][0].to(self.device)
+                    orig_corners_np = batch["orig_corners"][0].numpy()
+                    orig_corners    = batch["orig_corners"][0].to(self.device)
                     count += 1
                     pbar.update(1)
-                    target_box  = self.corners_to_bbox(new_corners)
 
                     with torch.no_grad():
-                        detections = self.detector.predict(prep_tensor)
+                        prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
+                        new_corners = torch.from_numpy(new_corners_np).to(self.device)
+                        target_box  = self.corners_to_bbox(new_corners)
+                        detections  = self.detector.predict(prep_tensor)
 
                     if not detections:
                         results.append({"filename": fn, "category": "no_detection",
@@ -592,15 +675,18 @@ class AdversarialPatchTrainer:
         summary_rows = []
 
         for img_idx, batch in enumerate(sample_items):
-            fn           = (batch["filename"][0]
-                            if isinstance(batch["filename"], (list, tuple))
-                            else batch["filename"])
-            prep_tensor  = batch["prep_image"][0].to(self.device)
-            new_corners  = batch["new_corners"][0].to(self.device)
-            orig_tensor  = batch["orig_image"][0].to(self.device)
-            orig_corners = batch["orig_corners"][0].to(self.device)
-            new_c        = new_corners.cpu().numpy()
-            target_box   = self.corners_to_bbox(new_corners)
+            fn              = (batch["filename"][0]
+                               if isinstance(batch["filename"], (list, tuple))
+                               else batch["filename"])
+            orig_tensor     = batch["orig_image"][0].to(self.device)
+            orig_corners_np = batch["orig_corners"][0].numpy()
+            orig_corners    = batch["orig_corners"][0].to(self.device)
+
+            with torch.no_grad():
+                prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
+            new_corners = torch.from_numpy(new_corners_np).to(self.device)
+            new_c       = new_corners_np
+            target_box  = self.corners_to_bbox(new_corners)
 
             with torch.no_grad():
                 detections = self.detector.predict(prep_tensor)
@@ -637,6 +723,16 @@ class AdversarialPatchTrainer:
                 )
             patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"), patch_vis)
+
+            # (d) cv2 preprocessing vs differentiable preprocessing comparison
+            with torch.no_grad():
+                img_hwc_uint8 = (orig_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners_np)
+                diff_prep_np  = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                cv2_prep_np   = (cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                # Stack side by side: cv2 (left) | differentiable (right)
+                comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
+                cv2.imwrite(str(debug_dir / f"{img_idx:02d}_d_prep_comparison.png"), comparison)
 
             summary_rows.append({
                 "index": img_idx, "filename": fn,
@@ -710,19 +806,22 @@ class AdversarialPatchTrainer:
         losses = []
         with torch.no_grad():
             for batch in self.val_loader:
-                prep_tensor  = batch["prep_image"][0].to(self.device)
-                new_corners  = batch["new_corners"][0].to(self.device)
-                orig_tensor  = batch["orig_image"][0].to(self.device)
-                orig_corners = batch["orig_corners"][0].to(self.device)
-                patch_norm   = self.generate_patch(training_aug=False)
-                patched_prep, _ = self.apply_patch_to_image(
-                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0), patch_norm=patch_norm,
-                )
+                orig_tensor     = batch["orig_image"][0].to(self.device)
+                orig_corners_np = batch["orig_corners"][0].numpy()
+                orig_corners    = batch["orig_corners"][0].to(self.device)
+                patch_norm      = self.generate_patch(training_aug=False)
+
                 patched_orig, _ = self.apply_patch_to_image(
                     orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
                 )
+                patched_prep, new_corners_np = self.diff_prep(
+                    patched_orig.squeeze(0), orig_corners_np)
+                new_corners = torch.from_numpy(new_corners_np).to(self.device)
+
                 det_loss, ocr_loss = self.partial_loss(
-                    patched_prep, new_corners, patched_orig, orig_corners)
+                    patched_prep.unsqueeze(0), new_corners,
+                    patched_orig,              orig_corners,
+                )
                 losses.append(((det_loss + ocr_loss) / 2).item())
         return float(np.mean(losses)) if losses else 0.0
 
