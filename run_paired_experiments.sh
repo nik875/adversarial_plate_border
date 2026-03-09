@@ -143,7 +143,7 @@ fi
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights|needs_dtrb
 PAIRS=(
-    "pair_fasterrcnn_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|dtrb|$DTRB_WEIGHTS|true"
+    "pair_fasterrcnn_crnn|fasterrcnn|$FASTERRCNN_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
     "pair_yolov8_crnn|yolov8|$YOLOV8_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
     "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
