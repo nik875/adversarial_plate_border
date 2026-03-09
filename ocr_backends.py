@@ -84,10 +84,15 @@ class OCRBackend(abc.ABC):
 
     The is_trainable property signals whether gradients flow through predict().
     Only trainable backends may be used during adversarial patch training.
+
+    ocr_crop_size : (H, W)
+        Size to which the trainer crops the plate region before passing to this
+        backend.  Must match the model's expected input resolution.
     """
 
     name: str = "base"
     is_trainable: bool = False       # override to True in differentiable backends
+    ocr_crop_size: tuple = (32, 128) # (H, W) — override in each subclass
 
     def __init__(self, model_path: str = "none", device: str = "cpu"):
         self.model_path = Path(model_path)
@@ -312,8 +317,9 @@ class CRNNBackend(OCRBackend):
         LSTM hidden size (default 256, matches GitYCC default).
     """
 
-    name        = "crnn"
-    is_trainable = True
+    name         = "crnn"
+    is_trainable  = True
+    ocr_crop_size = (32, 128)   # (H, W) — CRNN input height is 32
 
     # synth90k uses lowercase — matches crnn_synth90k.pt exactly
     DEFAULT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -553,6 +559,27 @@ class CRNNBackend(OCRBackend):
             zero_infinity=True,
         )
 
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """
+        Fully differentiable CTC loss on a crop tensor.
+
+        Parameters
+        ----------
+        crop : torch.Tensor
+            Shape [1, 3, H, W] from kornia.geometry.crop_and_resize.
+        target_text : str
+            Plate string to move toward (impersonation) or away from (disruption).
+        impersonation : bool
+            True → minimise CTC loss toward target_text.
+            False → maximise CTC loss (negate).
+        """
+        self.ensure_loaded()
+        preprocessed = self._preprocess(crop)          # [1, 1, 32, W]
+        logits = self._model(preprocessed).squeeze(1)  # [T, num_classes]
+        base = self.ctc_loss(logits, target_text)
+        return base if impersonation else -base
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -718,8 +745,9 @@ class LPRNetBackend(OCRBackend):
         Maximum plate length the model was trained for.  LPRNet default is 8.
     """
 
-    name = "lprnet"
-    is_trainable = True
+    name         = "lprnet"
+    is_trainable  = True
+    ocr_crop_size = (24, 94)   # (H, W) — native LPRNet input size
 
     # Official sirius-ai CHARS list (68 symbols) used by Final_LPRNet_model.pth.
     DEFAULT_ALPHABET = (
@@ -841,6 +869,16 @@ class LPRNetBackend(OCRBackend):
             reduction="mean", zero_infinity=True,
         )
 
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """Differentiable CTC loss on a [1, 3, H, W] crop tensor."""
+        self.ensure_loaded()
+        preprocessed = self._preprocess(crop)             # [1, 3, 24, 94]
+        logits = self._model(preprocessed)                # [1, C, T]
+        logits_ctc = logits.permute(2, 0, 1).squeeze(1)  # [T, C]
+        base = self.ctc_loss(logits_ctc, target_text)
+        return base if impersonation else -base
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -876,8 +914,9 @@ class FastANPROCRBackend(OCRBackend):
     Not differentiable — use for baseline evaluation only.
     """
 
-    name = "fastanpr-ocr"
-    is_trainable = False
+    name         = "fastanpr-ocr"
+    is_trainable  = False
+    ocr_crop_size = (64, 128)   # (H, W)
 
     def __init__(self, model_path: str = "none", device: str = "cpu"):
         super().__init__(model_path, device)
@@ -918,11 +957,12 @@ class TrOCROCRBackend(OCRBackend):
     (or a local checkpoint dir) via model_path to override.
 
     This backend supports differentiable loss for training via
-    compute_target_loss().
+    differentiable_loss() which bypasses PIL entirely.
     """
 
-    name = "trocr"
-    is_trainable = True
+    name         = "trocr"
+    is_trainable  = True
+    ocr_crop_size = (384, 384)   # (H, W) — TrOCR expects 384×384
     DEFAULT_MODEL_ID = "microsoft/trocr-small-printed"
 
     def __init__(self, model_path: str = "none", device: str = "cpu",
@@ -1014,6 +1054,46 @@ class TrOCROCRBackend(OCRBackend):
         outputs = self._model(pixel_values=pixel_values, labels=labels)
         return outputs.loss
 
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """
+        Differentiable seq2seq loss that bypasses PIL entirely.
+
+        Parameters
+        ----------
+        crop : torch.Tensor
+            Shape [1, 3, 384, 384] in [0, 1] from kornia.geometry.crop_and_resize.
+        target_text : str
+            Target plate string.
+        impersonation : bool
+            True → minimise loss toward target_text.
+            False → maximise loss (negate).
+
+        Confirmed from HF preprocessor_config.json:
+            size=384, mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]
+        """
+        self.ensure_loaded()
+        # crop is already [0,1]; processor rescale factor = 1/255 is effectively
+        # a no-op here (it would apply ÷255 but the image is already ÷255).
+        # Normalization: (x - 0.5) / 0.5
+        pixel_values = (crop - 0.5) / 0.5   # differentiable, shape [1, 3, 384, 384]
+        pixel_values = pixel_values.to(self.device)
+
+        labels = self._processor.tokenizer(
+            target_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_new_tokens,
+        ).input_ids.to(self.device)
+
+        pad_id = self._processor.tokenizer.pad_token_id
+        if pad_id is not None:
+            labels = labels.masked_fill(labels == pad_id, -100)
+
+        outputs = self._model(pixel_values=pixel_values, labels=labels)
+        base = outputs.loss
+        return base if impersonation else -base
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -1045,10 +1125,11 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
     when constructing the backend.
     """
 
-    name = "dtrb"
+    name         = "dtrb"
     # CTC-based DTRB models can provide differentiable logits for training.
     # Attention-mode checkpoints remain eval-only in this backend.
-    is_trainable = True
+    is_trainable  = True
+    ocr_crop_size = (224, 224)   # (H, W) — ViTSTR/DTRB expects 224×224
     DEFAULT_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
     def __init__(
@@ -1278,6 +1359,19 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
             zero_infinity=True,
         )
 
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """Differentiable CTC loss on a [1, 3, H, W] crop tensor (CTC mode only)."""
+        if self._prediction != "CTC" or not self.is_trainable:
+            return torch.tensor(0.0, device=self.device)
+        self.ensure_loaded()
+        preprocessed = self._preprocess(crop)
+        text_for_pred = torch.LongTensor(1, self.max_label_length + 1).fill_(0).to(self.device)
+        preds = self._model(preprocessed, text_for_pred)  # [1, T, C]
+        logits = preds.squeeze(0)                          # [T, C]
+        base = self.ctc_loss(logits, target_text)
+        return base if impersonation else -base
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -1288,8 +1382,9 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
 # ---------------------------------------------------------------------------
 
 class MockOCRBackend(OCRBackend):
-    name = "mock-ocr"
-    is_trainable = False
+    name         = "mock-ocr"
+    is_trainable  = False
+    ocr_crop_size = (32, 128)
 
     def __init__(self, fixed_text: str = "ABC123", device: str = "cpu"):
         super().__init__("none", device)
@@ -1307,6 +1402,166 @@ class MockOCRBackend(OCRBackend):
 
 
 # ---------------------------------------------------------------------------
+# CCT (Compact Character Transcription) backend  — onnx2torch, differentiable
+# ---------------------------------------------------------------------------
+#
+# Model path (auto-downloaded by fast-plate-ocr on first use):
+#   ~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx
+#
+# Input convention:
+#   NHWC float32 [0, 255], shape [batch, 64, 128, 3]
+#
+# Output convention:
+#   [batch, seq_len=9, vocab_size=37]  — one logit vector per plate slot
+#
+# Alphabet: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'  (_ = pad/blank)
+#
+# Confirmed from offensive_patch.py: ocr_input_shape=(64,128,3), NHWC, ×255.
+
+class CCTOCRBackend(OCRBackend):
+    """
+    Differentiable CCT (fast-plate-ocr) backend via onnx2torch.
+
+    Wraps the cct-xs-v1-global ONNX model.  onnx2torch exposes the full
+    forward pass as a PyTorch nn.Module so gradients flow from the per-slot
+    cross-entropy loss back through the model into the adversarial patch.
+
+    Unlike CTC-based backends, CCT classifies each plate character position
+    directly (fixed-length output), so cross-entropy (not CTC) is used.
+    """
+
+    name         = "cct"
+    is_trainable  = True
+    ocr_crop_size = (64, 128)   # (H, W)
+
+    ONNX_PATH = ("~/.cache/fast-plate-ocr/"
+                 "cct-xs-v1-global-model/cct_xs_v1_global.onnx")
+    ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+
+    def __init__(self, model_path: str = "none", device: str = "cpu"):
+        super().__init__(model_path, device)
+        self._model: Optional[nn.Module] = None
+
+    def load(self) -> None:
+        import onnx
+        import onnx2torch
+
+        onnx_path = Path(self.ONNX_PATH).expanduser()
+
+        if not onnx_path.exists():
+            print(f"[{self.name}] ONNX model not found — downloading via fast-plate-ocr…")
+            try:
+                from fast_plate_ocr import ONNXPlateRecognizer
+                ONNXPlateRecognizer("global-plates-mobile-vit-v2-model")
+            except Exception:
+                pass  # model may still be downloaded into the cache dir
+
+        if not onnx_path.exists():
+            raise FileNotFoundError(
+                f"[{self.name}] CCT ONNX model not found: {onnx_path}\n"
+                "Install fast-plate-ocr and run `python -c \"from fast_plate_ocr import "
+                "ONNXPlateRecognizer; ONNXPlateRecognizer('global-plates-mobile-vit-v2-model')\"`"
+            )
+
+        onnx_model = onnx.load(str(onnx_path))
+        self._model = onnx2torch.convert(onnx_model)
+        self._model.to(self.device)
+        self._model.eval()
+        for p in self._model.parameters():
+            p.requires_grad_(False)
+
+        print(f"[{self.name}] Loaded from {onnx_path}")
+
+    def _preprocess(self, crop: torch.Tensor) -> torch.Tensor:
+        """
+        Convert [1, 3, H, W] CHW float [0,1] → NHWC [1, 64, 128, 3] float [0,255].
+        Differentiable (only F.interpolate + permute + scale).
+        """
+        x = F.interpolate(crop, size=(64, 128), mode="bilinear", align_corners=False)
+        x = x.permute(0, 2, 3, 1)   # NHWC: [1, 64, 128, 3]
+        return x * 255.0
+
+    def predict(self, image: torch.Tensor) -> "OCRResult":
+        """
+        Non-differentiable eval path.
+
+        Parameters
+        ----------
+        image : torch.Tensor
+            CHW float32 [0, 1], any spatial size.
+        """
+        self.ensure_loaded()
+        # Preprocess: resize to (64,128), convert to NHWC [0,255]
+        with torch.no_grad():
+            x = self._preprocess(image.unsqueeze(0).to(self.device))  # [1,64,128,3]
+            output = self._model(x)                                     # [1,9,37]
+
+        logits = output[0]                         # [9, 37]
+        pred_ids = logits.argmax(dim=1).tolist()   # [9]
+        chars = [self.ALPHABET[i] for i in pred_ids if i < len(self.ALPHABET)]
+        text = "".join(c for c in chars if c != "_").strip() or None
+
+        probs = torch.softmax(logits, dim=1)
+        confidence = float(probs.max(dim=1).values.mean().item())
+
+        return OCRResult(logits=logits.detach(), text=text, confidence=confidence)
+
+    def ce_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
+        """
+        Per-slot cross-entropy loss.
+
+        Parameters
+        ----------
+        logits : torch.Tensor
+            Shape [1, T, vocab] or [T, vocab].
+        target_text : str
+            Plate string, e.g. "VRJ7774".  Padded/trimmed to T slots with '_'.
+        """
+        if logits.dim() == 3:
+            logits = logits.squeeze(0)   # [T, vocab]
+        T = logits.shape[0]
+        padded = (target_text + "_" * T)[:T]
+        target_ids = torch.tensor(
+            [self.ALPHABET.index(c) if c in self.ALPHABET else len(self.ALPHABET) - 1
+             for c in padded],
+            dtype=torch.long, device=logits.device,
+        )
+        return F.cross_entropy(logits, target_ids)
+
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """
+        Differentiable CE loss on a [1, 3, H, W] crop tensor.
+        Gradients flow through onnx2torch model → crop → patch.
+        """
+        self.ensure_loaded()
+        preprocessed = self._preprocess(crop)         # [1, 64, 128, 3]
+        output = self._model(preprocessed)            # [1, 9, 37]
+        base = self.ce_loss(output, target_text)
+        return base if impersonation else -base
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "CCTOCRBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def train(self) -> "CCTOCRBackend":
+        if self._model is not None:
+            self._model.train()
+        return self
+
+    def to(self, device: str) -> "CCTOCRBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -1314,6 +1569,7 @@ TRAINABLE_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
     "crnn":   CRNNBackend,     # ~8 MB  |  pass local crnn_synth90k.pt
     "trocr":  TrOCROCRBackend, # HF VisionEncoderDecoder (trainable loss)
     "dtrb":   DeepTextRecognitionBenchmarkOCRBackend, # CTC mode is differentiable
+    "cct":    CCTOCRBackend,   # onnx2torch, fixed-length CE loss, auto-downloaded
 }
 
 EVAL_ONLY_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
