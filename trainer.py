@@ -559,38 +559,47 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def save_debug_images(self, n: int = 20) -> None:
+        from torch.utils.data import Subset, DataLoader as DL
+
         debug_dir = self.run_dir / "debug"
 
-        # Collect items from both loaders
-        total = len(self.train_loader) + len(self.val_loader)
-        all_items = []
-        with tqdm(total=total, desc="Loading images for debug", leave=False) as pbar:
-            for loader in [self.train_loader, self.val_loader]:
-                for batch in loader:
-                    fn = (batch["filename"][0]
-                          if isinstance(batch["filename"], (list, tuple))
-                          else batch["filename"])
-                    all_items.append((
-                        fn,
-                        batch["prep_image"][0],
-                        batch["new_corners"][0].numpy(),
-                        batch["orig_image"][0],
-                        batch["orig_corners"][0],
-                    ))
-                    pbar.update(1)
-
+        # Pick n random indices across the combined train+val dataset,
+        # then build a tiny DataLoader that only loads those images.
+        train_ds  = self.train_loader.dataset
+        val_ds    = self.val_loader.dataset
+        n_train   = len(train_ds)
+        total     = n_train + len(val_ds)
         np.random.seed(42)
-        indices      = np.random.choice(len(all_items), min(n, len(all_items)), replace=False)
-        sample_items = sorted([all_items[i] for i in indices], key=lambda x: x[0])
+        chosen    = np.random.choice(total, min(n, total), replace=False)
+
+        train_idx = [int(i)           for i in chosen if i <  n_train]
+        val_idx   = [int(i) - n_train for i in chosen if i >= n_train]
+
+        subsets = []
+        if train_idx:
+            subsets.append(Subset(train_ds, train_idx))
+        if val_idx:
+            subsets.append(Subset(val_ds, val_idx))
+
+        sample_loader = DL(
+            torch.utils.data.ConcatDataset(subsets),
+            batch_size=1, shuffle=False,
+            num_workers=self.train_loader.num_workers,
+        )
+        sample_items = list(sample_loader)  # only n images loaded
 
         print(f"  Saving {len(sample_items)} debug images → {debug_dir}")
         summary_rows = []
 
-        for img_idx, (fn, prep_t, new_c, orig_t, orig_c) in enumerate(sample_items):
-            prep_tensor  = prep_t.to(self.device)
-            new_corners  = torch.from_numpy(new_c).to(self.device)
-            orig_tensor  = orig_t.to(self.device)
-            orig_corners = orig_c.to(self.device)
+        for img_idx, batch in enumerate(sample_items):
+            fn           = (batch["filename"][0]
+                            if isinstance(batch["filename"], (list, tuple))
+                            else batch["filename"])
+            prep_tensor  = batch["prep_image"][0].to(self.device)
+            new_corners  = batch["new_corners"][0].to(self.device)
+            orig_tensor  = batch["orig_image"][0].to(self.device)
+            orig_corners = batch["orig_corners"][0].to(self.device)
+            new_c        = new_corners.cpu().numpy()
             target_box   = self.corners_to_bbox(new_corners)
 
             with torch.no_grad():
