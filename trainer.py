@@ -510,9 +510,12 @@ class AdversarialPatchTrainer:
                     ocr_result = self.ocr.predict(crop.squeeze(0))
 
                 text = ocr_result.text or ""
-                cat  = ("correct"       if text.upper() == self.expected_plate_text.upper()
-                        else "misread"   if not text
-                        else "impersonation")
+                if text.upper() == self.expected_plate_text.upper():
+                    cat = "correct"
+                elif self.impersonation_target and text.upper() == self.impersonation_target.upper():
+                    cat = "impersonation"
+                else:
+                    cat = "misread"
                 results.append({"filename": fn, "category": cat,
                                  "text": text, "confidence": ocr_result.confidence})
 
@@ -696,8 +699,8 @@ class AdversarialPatchTrainer:
         save_interval: int   = 10,
         dry_run:       bool  = False,
     ) -> dict:
-        self.validate_pipeline()
         self.save_debug_images()
+        self.validate_pipeline()
 
         if dry_run:
             print("\nDry run complete.")
