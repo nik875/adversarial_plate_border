@@ -262,7 +262,16 @@ class AdversarialPatchDataset(Dataset):
         }
 
 
-def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=0, use_all_for_train=False, **kwargs):
+def create_dataloaders(
+    csv_path,
+    batch_size=8,
+    train_split=0.8,
+    n_jobs=1,
+    limit=0,
+    use_all_for_train=False,
+    pin_memory=True,
+    **kwargs,
+):
     """Create train and validation DataLoaders
 
     Args:
@@ -272,6 +281,7 @@ def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=
         n_jobs: Number of worker processes
         limit: Limit number of samples (0 = no limit)
         use_all_for_train: If True, use all data for training (val_loader will be empty)
+        pin_memory: Enable DataLoader pinned memory (useful for CUDA, but can increase RAM pressure)
         **kwargs: Additional arguments passed to AdversarialPatchDataset
     """
     df = pd.read_csv(csv_path)
@@ -302,7 +312,7 @@ def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=
         batch_size=batch_size,
         shuffle=True,
         num_workers=n_jobs,
-        pin_memory=True
+        pin_memory=pin_memory
     )
 
     val_loader = DataLoader(
@@ -310,7 +320,7 @@ def create_dataloaders(csv_path, batch_size=8, train_split=0.8, n_jobs=1, limit=
         batch_size=batch_size,
         shuffle=False,
         num_workers=n_jobs,
-        pin_memory=True
+        pin_memory=pin_memory
     )
 
     return train_loader, val_loader
