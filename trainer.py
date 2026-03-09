@@ -1013,7 +1013,7 @@ def main():
     parser.add_argument("--pin-memory",      action="store_true")
     parser.add_argument("--limit",           type=int, default=0)
     parser.add_argument("--use-all-for-train", action="store_true")
-    parser.add_argument("--impersonation-target", default=None)
+    parser.add_argument("--impersonation-target", default="SHX8459")
     parser.add_argument("--expected-plate", default="VRJ7774")
     parser.add_argument("--disable-homography", action="store_true")
     parser.add_argument("--run-name", default=None)
