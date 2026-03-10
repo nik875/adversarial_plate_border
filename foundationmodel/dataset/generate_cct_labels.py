@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""
+generate_cct_labels.py
+
+Scans all pre-cropped license-plate image directories, runs every image
+through the CCT-S-V1 Global model, and writes a CSV manifest:
+
+    image_path,label
+
+The CCT-S prediction is used directly as the ground-truth label.
+
+Usage:
+    python foundationmodel/dataset/generate_cct_labels.py
+    python foundationmodel/dataset/generate_cct_labels.py \
+        --output foundationmodel/dataset/cct_labels.csv \
+        --device cuda --batch-size 256
+
+Requires:
+    pip install onnx onnx2torch torch pillow numpy tqdm
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Model config (matches test_cct_own_data.py)
+# ---------------------------------------------------------------------------
+
+ALPHABET  = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
+BLANK     = '_'
+OCR_H, OCR_W = 64, 128
+OCR_PATH  = Path.home() / ".cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
+
+# ---------------------------------------------------------------------------
+# Directories that contain pre-cropped plate images
+# ---------------------------------------------------------------------------
+
+CROP_DIRS: list[Path] = [
+    Path.home() / ".cache" / "roboflow_lpr_crops",
+    Path.home() / ".cache" / "kaggle_lp_crops",
+    Path.home() / ".cache" / "indian_plates_kaggle_crops",
+    Path.home() / ".cache" / "mercosur_crops",
+    Path.home() / ".cache" / "crpd_crops",
+    # CCPD2019 variant subdirectories
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_base",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_blur",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_challenge",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_db",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_fn",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_np",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_rotate",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_tilt",
+    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_weather",
+]
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_model(model_path: str, device: str) -> torch.nn.Module:
+    import onnx
+    import onnx2torch
+
+    ocr_onnx = onnx.load(model_path)
+    model = onnx2torch.convert(ocr_onnx).to(device).eval()
+
+    # onnx2torch stores some ONNX initializers as plain tensor attributes
+    # (not registered buffers), so .to(device) misses them — move manually.
+    for module in model.modules():
+        for attr, val in list(vars(module).items()):
+            if isinstance(val, torch.Tensor) and not isinstance(val, torch.nn.Parameter):
+                object.__setattr__(module, attr, val.to(device))
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing / decoding
+# ---------------------------------------------------------------------------
+
+def preprocess_batch(pil_images: list[Image.Image], device: torch.device) -> torch.Tensor:
+    """List of PIL images → [N, 64, 128, 3] float32 [0,255] NHWC on device."""
+    tensors = []
+    for img in pil_images:
+        rgb = img.convert("RGB")
+        arr = np.array(rgb, dtype=np.float32) / 255.0        # [H, W, 3]
+        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+        t = F.interpolate(t, size=(OCR_H, OCR_W), mode='bilinear', align_corners=False)
+        tensors.append(t.permute(0, 2, 3, 1))                 # [1, 64, 128, 3]
+    return (torch.cat(tensors, dim=0) * 255).to(device)       # [N, 64, 128, 3]
+
+
+def decode_batch(logits: torch.Tensor) -> list[str]:
+    """[N, 9, 37] logits → list of text strings (blanks stripped)."""
+    probs   = torch.softmax(logits, dim=-1)
+    indices = probs.argmax(dim=-1)   # [N, 9]
+    results = []
+    for row in indices.tolist():
+        text = "".join(ALPHABET[i] for i in row if ALPHABET[i] != BLANK)
+        results.append(text)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate CCT-S ground-truth labels for all cropped plate images"
+    )
+    parser.add_argument("--output", default="foundationmodel/dataset/cct_labels.csv",
+                        help="Output CSV path (default: foundationmodel/dataset/cct_labels.csv)")
+    parser.add_argument("--model", default=str(OCR_PATH),
+                        help=f"Path to cct_s_v1_global.onnx (default: {OCR_PATH})")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Images per inference batch (default: 128)")
+    args = parser.parse_args()
+
+    try:
+        import onnx, onnx2torch  # noqa: F401
+    except ImportError:
+        print("ERROR: pip install onnx onnx2torch")
+        raise SystemExit(1)
+
+    print(f"[CCT-S Label Generator]")
+    print(f"  Model  : {args.model}")
+    print(f"  Device : {args.device}")
+    print(f"  Output : {args.output}")
+    print(f"  Batch  : {args.batch_size}")
+
+    # -----------------------------------------------------------------------
+    # Collect all image paths
+    # -----------------------------------------------------------------------
+    all_paths: list[Path] = []
+    for d in CROP_DIRS:
+        if not d.exists():
+            print(f"  [skip] {d} — not found")
+            continue
+        found = sorted(d.glob("*.png")) + sorted(d.glob("*.jpg"))
+        print(f"  {d.name}: {len(found)} images")
+        all_paths.extend(found)
+
+    print(f"\n  Total images: {len(all_paths)}")
+    if not all_paths:
+        print("No images found. Exiting.")
+        return
+
+    # -----------------------------------------------------------------------
+    # Load model
+    # -----------------------------------------------------------------------
+    print("\n[Loading model]")
+    model  = load_model(args.model, args.device)
+    device = torch.device(args.device)
+    print("  OK")
+
+    # -----------------------------------------------------------------------
+    # Batch inference → CSV
+    # -----------------------------------------------------------------------
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    written  = 0
+    skipped  = 0
+    bs       = args.batch_size
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image_path", "label"])
+
+        pbar = tqdm(range(0, len(all_paths), bs), unit="batch", dynamic_ncols=True)
+        for start in pbar:
+            batch_paths = all_paths[start : start + bs]
+
+            pil_imgs: list[Image.Image] = []
+            valid_paths: list[Path]     = []
+
+            for p in batch_paths:
+                try:
+                    pil_imgs.append(Image.open(p))
+                    valid_paths.append(p)
+                except Exception:
+                    skipped += 1
+
+            if not pil_imgs:
+                continue
+
+            try:
+                inp = preprocess_batch(pil_imgs, device)
+                with torch.no_grad():
+                    logits = model(inp)   # [N, 9, 37]
+                labels = decode_batch(logits)
+            except Exception as e:
+                tqdm.write(f"  Warning: batch {start}-{start+bs} failed: {e}")
+                skipped += len(pil_imgs)
+                continue
+            finally:
+                for img in pil_imgs:
+                    img.close()
+
+            for path, label in zip(valid_paths, labels):
+                writer.writerow([str(path), label])
+            written += len(valid_paths)
+
+            pbar.set_postfix({"written": written, "skipped": skipped})
+
+    print(f"\nDone. Wrote {written} rows → {output_path}  (skipped {skipped})")
+
+
+if __name__ == "__main__":
+    main()
