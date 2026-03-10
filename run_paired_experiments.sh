@@ -5,10 +5,10 @@
 # Train one adversarial patch per explicit detector+OCR pairing.
 #
 # Pairings configured by default:
-#   1) rtdetr     + trocr
+#   1) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
 #   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
-#   3) yolov8     + crnn
-#   4) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
+#   3) rtdetr     + trocr
+#   4) yolov8     + lprnet
 #
 # Usage:
 #   chmod +x run_paired_experiments.sh
@@ -42,7 +42,6 @@ RTDETR_WEIGHTS_FALLBACK="weights/rtdetr-v2-license-plate"
 YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
 CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
-CRNN_WEIGHTS="weights/crnn_synth90k.pt"
 TROCR_WEIGHTS="none"
 LPRNET_WEIGHTS="us_lprnet_patched.onnx"
 DOCTR_VITSTR_WEIGHTS="weights/vitstr_small_finetuned.pt"
@@ -142,11 +141,10 @@ fi
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights
 PAIRS=(
-    "pair_fasterrcnn_crnn|fasterrcnn|$FASTERRCNN_WEIGHTS|crnn|$CRNN_WEIGHTS"
+    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"
     "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS"
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
     "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS"
-    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"
 )
 
 # Removed: pair_fasterrcnn_dtrb (dtrb/ViTSTR checkpoint backend has not worked)
