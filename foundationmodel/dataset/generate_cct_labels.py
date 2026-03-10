@@ -49,17 +49,6 @@ CROP_DIRS: list[Path] = [
     Path.home() / ".cache" / "kaggle_lp_crops",
     Path.home() / ".cache" / "indian_plates_kaggle_crops",
     Path.home() / ".cache" / "mercosur_crops",
-    Path.home() / ".cache" / "crpd_crops",
-    # CCPD2019 variant subdirectories
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_base",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_blur",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_challenge",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_db",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_fn",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_np",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_rotate",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_tilt",
-    Path.home() / ".cache" / "ccpd2019_crops" / "ccpd_weather",
 ]
 
 
