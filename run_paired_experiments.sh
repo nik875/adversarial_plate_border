@@ -40,7 +40,7 @@ FASTERRCNN_WEIGHTS="weights/model.pt"
 RTDETR_WEIGHTS="weights/rtdetr-v2-license-plates"
 RTDETR_WEIGHTS_FALLBACK="weights/rtdetr-v2-license-plate"
 YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
-CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
+CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
 
 TROCR_WEIGHTS="none"
 LPRNET_WEIGHTS="us_lprnet_patched.onnx"
