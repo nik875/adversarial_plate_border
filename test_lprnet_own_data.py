@@ -10,8 +10,14 @@ Usage:
     python test_lprnet_own_data.py \
         --model weights/lprnet_deployable_onnx_v1.1/us_lprnet_baseline18_deployable.onnx
 
+    # Convert ONNX → PyTorch via onnx2torch before inference:
+    python test_lprnet_own_data.py \
+        --model weights/lprnet_deployable_onnx_v1.1/us_lprnet_baseline18_deployable.onnx \
+        --use-onnx2torch
+
 Requires:
     pip install onnxruntime pillow numpy pandas tqdm pillow-heif
+    pip install onnx onnx2torch torch  # only needed with --use-onnx2torch
 """
 
 from __future__ import annotations
@@ -48,10 +54,38 @@ def corners_to_bbox(row, padding: int = 4):
             max(xs) + padding, max(ys) + padding)
 
 
+def load_onnx2torch(model_path: str):
+    """Convert an ONNX model to a PyTorch nn.Module via onnx2torch."""
+    try:
+        import onnx
+        import onnx2torch
+        import torch
+    except ImportError as e:
+        print(f"ERROR: {e}\n  pip install onnx onnx2torch torch")
+        sys.exit(1)
+
+    print("  [onnx2torch] Loading ONNX model …")
+    onnx_model = onnx.load(model_path)
+    torch_model = onnx2torch.convert(onnx_model)
+    torch_model.eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_model = torch_model.to(device)
+    print(f"  [onnx2torch] Converted — running on {device}")
+    return torch_model
+
+
 def run_inference(session, input_name, output_name, outputs_probs,
-                  pil_img: Image.Image) -> str:
+                  pil_img: Image.Image, torch_model=None) -> str:
+    import numpy as np
     inp = preprocess(pil_img)
-    out = session.run([output_name], {input_name: inp})[0]
+    if torch_model is not None:
+        import torch
+        device = next(torch_model.parameters()).device
+        with torch.no_grad():
+            t = torch.from_numpy(inp).to(device)
+            out = torch_model(t).cpu().numpy()
+    else:
+        out = session.run([output_name], {input_name: inp})[0]
     indices = out[0].argmax(axis=-1) if outputs_probs else out[0].flatten()
     return ctc_decode(indices)
 
@@ -65,6 +99,8 @@ def main():
     parser.add_argument("--labels", default="preproc_labels.csv")
     parser.add_argument("--padding", type=int, default=4,
                         help="Pixels of padding around bbox (default: 4)")
+    parser.add_argument("--use-onnx2torch", action="store_true",
+                        help="Convert ONNX model to PyTorch via onnx2torch before inference")
     args = parser.parse_args()
 
     df = pd.read_csv(args.labels)
@@ -75,8 +111,13 @@ def main():
     print(f"  GT text : '{GT}' (all images)")
     print(f"  Alphabet: '{ALPHABET}'  (blank_id={BLANK_IDX})")
 
+    torch_model = None
     print(f"\n[Model]")
-    session, input_name, output_name, outputs_probs = load_model(args.model)
+    if args.use_onnx2torch:
+        torch_model = load_onnx2torch(args.model)
+        session = input_name = output_name = outputs_probs = None
+    else:
+        session, input_name, output_name, outputs_probs = load_model(args.model)
 
     exact_correct = 0
     char_correct  = 0
@@ -102,7 +143,8 @@ def main():
             x2, y2 = min(iw, int(x2)), min(ih, int(y2))
             plate_crop = pil_full.crop((x1, y1, x2, y2))
             pred = run_inference(session, input_name, output_name,
-                                 outputs_probs, plate_crop)
+                                 outputs_probs, plate_crop,
+                                 torch_model=torch_model)
         except Exception as e:
             skipped += 1
             continue
