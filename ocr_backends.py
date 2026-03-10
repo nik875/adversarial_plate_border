@@ -1457,14 +1457,115 @@ class CCTOCRBackend(OCRBackend):
 
 
 # ---------------------------------------------------------------------------
+# DoctrViTSTR backend
+# ---------------------------------------------------------------------------
+
+class DoctrViTSTRBackend(OCRBackend):
+    """
+    Differentiable doctr vitstr_small backend.
+
+    Loads fine-tuned weights from weights/vitstr_small_finetuned.pt by default.
+    Gradients flow through the attention decoder into the adversarial patch via
+    doctr's built-in cross-entropy loss (model called in train mode with target).
+
+    Input crop: [C, H, W] float32 [0, 1] — resized internally to [3, 32, 128].
+    """
+
+    name          = "doctr-vitstr"
+    is_trainable  = True
+    ocr_crop_size = (32, 128)   # (H, W)
+
+    DEFAULT_WEIGHTS = "weights/vitstr_small_finetuned.pt"
+
+    def __init__(self, model_path: str = "none", device: str = "cpu"):
+        # If no explicit path given, use the fine-tuned checkpoint
+        if model_path == "none":
+            model_path = self.DEFAULT_WEIGHTS
+        super().__init__(model_path, device)
+        self._model = None
+
+    def load(self) -> None:
+        try:
+            from doctr.models import vitstr_small
+        except ImportError:
+            raise ImportError("[doctr-vitstr] pip install python-doctr[torch]")
+
+        weights = Path(self.model_path)
+        if weights.exists():
+            self._model = vitstr_small(pretrained=False)
+            self._model.load_state_dict(
+                torch.load(str(weights), map_location=self.device)
+            )
+            print(f"[{self.name}] Loaded fine-tuned weights: {weights}")
+        else:
+            print(f"[{self.name}] WARNING: {weights} not found — using pretrained weights")
+            self._model = vitstr_small(pretrained=True)
+
+        self._model.to(self.device).eval()
+
+    def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        """[C, H, W] float32 [0,1] → [1, C, 32, 128] on device."""
+        x = image.unsqueeze(0).to(self.device)
+        return F.interpolate(x, size=(32, 128), mode="bilinear", align_corners=False)
+
+    def predict(self, image: torch.Tensor) -> OCRResult:
+        self.ensure_loaded()
+        with torch.no_grad():
+            inp = self._preprocess(image)
+            out = self._model(inp, return_preds=True)
+
+        text, conf = out["preds"][0]
+        text = text.upper().replace("-", "") or None
+        return OCRResult(logits=None, text=text, confidence=conf)
+
+    def differentiable_loss(self, crop: torch.Tensor, target_text: str,
+                             impersonation: bool = False) -> torch.Tensor:
+        """
+        Cross-entropy loss via doctr's built-in compute_loss.
+        Gradients flow through the ViT into the patch.
+        target_text is lowercased to match the doctr vocab.
+        """
+        self.ensure_loaded()
+        inp = self._preprocess(crop)
+        self._model.train()
+        # doctr vocab is lowercase; ViTSTR was trained on lowercase text
+        target = [target_text.lower()]
+        out = self._model(inp, target=target)
+        self._model.eval()
+        loss = out["loss"]
+        return loss if impersonation else -loss
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "DoctrViTSTRBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def train(self) -> "DoctrViTSTRBackend":
+        if self._model is not None:
+            self._model.train()
+        return self
+
+    def to(self, device: str) -> "DoctrViTSTRBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 TRAINABLE_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
-    "crnn":   CRNNBackend,     # ~8 MB  |  pass local crnn_synth90k.pt
-    "trocr":  TrOCROCRBackend, # HF VisionEncoderDecoder (trainable loss)
-    "dtrb":   DeepTextRecognitionBenchmarkOCRBackend, # CTC mode is differentiable
-    "cct":    CCTOCRBackend,   # onnx2torch, fixed-length CE loss, auto-downloaded
+    "crnn":         CRNNBackend,
+    "trocr":        TrOCROCRBackend,
+    "dtrb":         DeepTextRecognitionBenchmarkOCRBackend,
+    "cct":          CCTOCRBackend,
+    "doctr-vitstr": DoctrViTSTRBackend,
 }
 
 EVAL_ONLY_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
