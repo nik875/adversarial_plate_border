@@ -87,6 +87,8 @@ def main():
     parser.add_argument("--labels",  default="preproc_labels.csv")
     parser.add_argument("--padding", type=int,  default=4)
     parser.add_argument("--device",  default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--weights", default="weights/vitstr_small_finetuned.pt",
+                        help="Path to fine-tuned weights (default: weights/vitstr_small_finetuned.pt)")
     args = parser.parse_args()
 
     try:
@@ -103,7 +105,15 @@ def main():
     print(f"  Device : {args.device}")
 
     print("\n[Loading model]")
-    model = vitstr_small(pretrained=True).to(args.device).eval()
+    model = vitstr_small(pretrained=False).to(args.device)
+    weights_path = Path(args.weights)
+    if weights_path.exists():
+        model.load_state_dict(torch.load(weights_path, map_location=args.device))
+        print(f"  Loaded fine-tuned weights: {weights_path}")
+    else:
+        print(f"  WARNING: {weights_path} not found — falling back to pretrained weights")
+        model = vitstr_small(pretrained=True).to(args.device)
+    model.eval()
 
     # doctr recognition models expose their vocabulary
     vocab = model.vocab if hasattr(model, "vocab") else None
