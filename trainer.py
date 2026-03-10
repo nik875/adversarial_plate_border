@@ -987,7 +987,7 @@ def main():
     parser.add_argument("--csv", default="preproc_labels.csv")
 
     TRAINABLE_DET = ["yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
-    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr"]
+    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)
     parser.add_argument("--model-path",   default="license_plate_detector.pt")
