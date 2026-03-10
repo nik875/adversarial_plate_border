@@ -125,6 +125,7 @@ def main():
     skipped       = 0
     evaluated     = 0
     examples      = []
+    first_errors  = []
 
     pbar = tqdm(df.itertuples(index=False), total=len(df),
                 desc="Evaluating", unit="img")
@@ -132,6 +133,8 @@ def main():
     for row in pbar:
         img_path = Path(row.filename)
         if not img_path.exists():
+            if len(first_errors) < 3:
+                first_errors.append(f"File not found: {img_path}")
             skipped += 1
             continue
 
@@ -146,6 +149,8 @@ def main():
                                  outputs_probs, plate_crop,
                                  torch_model=torch_model)
         except Exception as e:
+            if len(first_errors) < 3:
+                first_errors.append(f"{type(e).__name__}: {e}")
             skipped += 1
             continue
 
@@ -163,6 +168,11 @@ def main():
                           "skip": skipped})
 
     pbar.close()
+
+    if first_errors:
+        print(f"\n  [First skip reasons]")
+        for msg in first_errors:
+            print(f"    {msg}")
 
     exact_acc = exact_correct / evaluated if evaluated else 0.0
     char_acc  = char_correct  / char_total if char_total else 0.0
