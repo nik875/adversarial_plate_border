@@ -116,8 +116,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Images per inference batch (default: 128)")
-    parser.add_argument("--samples", type=int, default=25,
-                        help="Number of sample images to save (default: 25)")
+    parser.add_argument("--samples", type=int, default=20,
+                        help="Sample images to save per dataset (default: 20)")
     parser.add_argument("--samples-dir", default="foundationmodel/dataset/samples",
                         help="Directory for sample images (default: foundationmodel/dataset/samples)")
     args = parser.parse_args()
@@ -135,16 +135,23 @@ def main() -> None:
     print(f"  Batch  : {args.batch_size}")
 
     # -----------------------------------------------------------------------
-    # Collect all image paths
+    # Collect all image paths, grouped by dataset
     # -----------------------------------------------------------------------
     all_paths: list[Path] = []
+    # Map global index → dataset name (parent dir name)
+    index_to_dataset: dict[int, str] = {}
+
     for d in CROP_DIRS:
         if not d.exists():
             print(f"  [skip] {d} — not found")
             continue
         found = sorted(d.glob("*.png")) + sorted(d.glob("*.jpg"))
         print(f"  {d.name}: {len(found)} images")
+        ds_name = d.name
+        start_idx = len(all_paths)
         all_paths.extend(found)
+        for i in range(len(found)):
+            index_to_dataset[start_idx + i] = ds_name
 
     print(f"\n  Total images: {len(all_paths)}")
     if not all_paths:
@@ -170,10 +177,16 @@ def main() -> None:
     filtered = 0
     bs       = args.batch_size
 
-    # Which indices to save as sample images (evenly spaced across all paths)
-    n_samples    = min(args.samples, len(all_paths))
-    sample_step  = max(1, len(all_paths) // n_samples)
-    sample_indices = set(range(0, len(all_paths), sample_step)[:n_samples])
+    # Pick evenly-spaced sample indices per dataset
+    n_per_ds = args.samples
+    sample_indices: set[int] = set()
+    ds_to_indices: dict[str, list[int]] = {}
+    for idx, ds in index_to_dataset.items():
+        ds_to_indices.setdefault(ds, []).append(idx)
+    for ds, idxs in ds_to_indices.items():
+        n = min(n_per_ds, len(idxs))
+        step = max(1, len(idxs) // n)
+        sample_indices.update(idxs[::step][:n])
 
     samples_dir = Path(args.samples_dir)
     samples_dir.mkdir(parents=True, exist_ok=True)
