@@ -2,18 +2,28 @@
 """
 test_cct_own_data.py
 
-Tests the CCT-XS-V1 Global plate OCR model (from fast-plate-ocr) on our own
-dataset (preproc_labels.csv). Ground truth is always "VRJ7774". Crops a
-rectangular bounding box from the 4 plate corners in the CSV.
+Tests the CCT-XS-V1 Global plate OCR model on our own dataset
+(preproc_labels.csv). Ground truth is always "VRJ7774". Crops a rectangular
+bounding box from the 4 plate corners in the CSV.
 
-The CCT model is the primary OCR target in the foundationmodel training pipeline.
+Loads the model directly from the fast-plate-ocr cache via onnx2torch,
+exactly as done in offensive_patch.py.
+
+Preprocessing:
+  PIL crop → [1, 3, H, W] float32 [0,1]
+           → permute to [1, H, W, 3] (NHWC) × 255
+           → resize to [1, 64, 128, 3]
+
+Decoding:
+  softmax → argmax over 37-class alphabet per 9 fixed slots
+  alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'  (_ = blank/pad)
 
 Usage:
     python test_cct_own_data.py
-    python test_cct_own_data.py --labels preproc_labels.csv --padding 4
+    python test_cct_own_data.py --device cuda
 
 Requires:
-    pip install fast-plate-ocr pillow numpy pandas tqdm pillow-heif
+    pip install onnx onnx2torch torch pillow numpy pandas tqdm pillow-heif
 """
 
 from __future__ import annotations
@@ -23,6 +33,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -32,7 +44,11 @@ try:
 except ImportError:
     pass
 
-GT = "VRJ7774"
+ALPHABET       = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
+BLANK          = '_'
+OCR_H, OCR_W   = 64, 128
+OCR_PATH       = Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
+GT             = "VRJ7774"
 
 
 def corners_to_bbox(row, padding: int = 4):
@@ -42,30 +58,57 @@ def corners_to_bbox(row, padding: int = 4):
             max(xs) + padding, max(ys) + padding)
 
 
+def preprocess(pil_crop: Image.Image, device: torch.device) -> torch.Tensor:
+    """PIL crop → [1, 64, 128, 3] float32 [0, 255] NHWC on device."""
+    rgb    = pil_crop.convert("RGB")
+    arr    = np.array(rgb, dtype=np.float32) / 255.0          # [H, W, 3]
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+    tensor = F.interpolate(tensor, size=(OCR_H, OCR_W),
+                           mode='bilinear', align_corners=False)
+    return tensor.permute(0, 2, 3, 1) * 255                   # [1, 64, 128, 3]
+
+
+def decode(logits: torch.Tensor) -> str:
+    """[1, 9, 37] logits → text string (skip blank '_')."""
+    probs     = torch.softmax(logits, dim=-1)
+    indices   = probs.argmax(dim=-1).squeeze(0)   # [9]
+    return "".join(
+        ALPHABET[i] for i in indices.tolist()
+        if ALPHABET[i] != BLANK
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test CCT-XS-V1 plate OCR on our own dataset"
     )
-    parser.add_argument("--labels", default="preproc_labels.csv")
+    parser.add_argument("--labels",  default="preproc_labels.csv")
     parser.add_argument("--padding", type=int, default=4)
+    parser.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--model",   default=str(OCR_PATH),
+                        help=f"Path to cct_xs_v1_global.onnx (default: {OCR_PATH})")
     args = parser.parse_args()
 
     try:
-        from fast_plate_ocr import ONNXPlateRecognizer
+        import onnx, onnx2torch
     except ImportError:
-        print("ERROR: fast-plate-ocr not found.  pip install fast-plate-ocr")
+        print("ERROR: pip install onnx onnx2torch")
         raise SystemExit(1)
 
     print("\n[CCT-XS-V1 Global — Own Dataset]")
-    print("  Model  : cct-xs-v1-global-model (fast-plate-ocr)")
+    print(f"  Model  : {args.model}")
+    print(f"  Input  : NHWC [{OCR_H}×{OCR_W}×3] [0,255]")
     print(f"  Labels : {args.labels}")
     print(f"  GT     : '{GT}' (all images)")
+    print(f"  Device : {args.device}")
 
     print("\n[Loading model]")
-    model = ONNXPlateRecognizer("cct-xs-v1-global-model")
+    ocr_model = onnx.load(args.model)
+    model     = onnx2torch.convert(ocr_model).to(args.device).eval()
     print("  OK")
 
-    df = pd.read_csv(args.labels)
+    device = torch.device(args.device)
+    df     = pd.read_csv(args.labels)
     print(f"  {len(df)} rows")
 
     exact_correct = 0
@@ -89,16 +132,20 @@ def main():
 
         try:
             pil_full = Image.open(img_path).convert("RGB")
-            iw, ih = pil_full.size
+            iw, ih   = pil_full.size
             x1, y1, x2, y2 = corners_to_bbox(row, args.padding)
             x1, y1 = max(0, int(x1)), max(0, int(y1))
             x2, y2 = min(iw, int(x2)), min(ih, int(y2))
-            crop_np = np.array(pil_full.crop((x1, y1, x2, y2)))   # uint8 RGB
-            preds = model.run(crop_np)
-            pred = preds[0].strip().upper() if preds else ""
+            inp = preprocess(pil_full.crop((x1, y1, x2, y2)), device)
+
+            with torch.no_grad():
+                logits = model(inp)   # [1, 9, 37]
+
+            pred = decode(logits)
+
         except Exception as e:
             if len(first_errors) < 3:
-                first_errors.append(f"{type(e).__name__}: {e}")
+                import traceback; first_errors.append(traceback.format_exc())
             skipped += 1
             continue
 
