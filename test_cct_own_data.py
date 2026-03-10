@@ -65,7 +65,7 @@ def preprocess(pil_crop: Image.Image, device: torch.device) -> torch.Tensor:
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
     tensor = F.interpolate(tensor, size=(OCR_H, OCR_W),
                            mode='bilinear', align_corners=False)
-    return tensor.permute(0, 2, 3, 1) * 255                   # [1, 64, 128, 3]
+    return (tensor.permute(0, 2, 3, 1) * 255).to(device)     # [1, 64, 128, 3]
 
 
 def decode(logits: torch.Tensor) -> str:
@@ -109,9 +109,9 @@ def main():
     # onnx2torch stores some ONNX initializers as plain tensor attributes
     # (not registered buffers), so .to(device) misses them — move manually.
     for module in model.modules():
-        for attr, val in vars(module).items():
+        for attr, val in list(vars(module).items()):
             if isinstance(val, torch.Tensor) and not isinstance(val, torch.nn.Parameter):
-                setattr(module, attr, val.to(args.device))
+                object.__setattr__(module, attr, val.to(args.device))
     print("  OK")
 
     device = torch.device(args.device)
