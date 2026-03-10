@@ -185,8 +185,7 @@ def main() -> None:
         ds_to_indices.setdefault(ds, []).append(idx)
     for ds, idxs in ds_to_indices.items():
         n = min(n_per_ds, len(idxs))
-        step = max(1, len(idxs) // n)
-        sample_indices.update(idxs[::step][:n])
+        sample_indices.update(random.sample(idxs, n))
 
     samples_dir = Path(args.samples_dir)
     if samples_dir.exists():
