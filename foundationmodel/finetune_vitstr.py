@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+finetune_vitstr.py
+
+Fine-tunes doctr's vitstr_small on the CCT-S-labeled license plate crops
+produced by foundationmodel/dataset/generate_cct_labels.py.
+
+Input CSV: foundationmodel/dataset/cct_labels.csv  (image_path, label)
+
+Output:    weights/vitstr_small_finetuned.pt  (state_dict)
+
+Usage:
+    python foundationmodel/finetune_vitstr.py
+    python foundationmodel/finetune_vitstr.py \
+        --csv foundationmodel/dataset/cct_labels.csv \
+        --output weights/vitstr_small_finetuned.pt \
+        --epochs 10 --batch-size 64 --lr 1e-4 --device cuda
+
+Requires:
+    pip install python-doctr[torch] torch pillow numpy pandas tqdm
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+INPUT_H = 32
+INPUT_W = 128
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class PlateDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, vocab: str):
+        # Keep only rows whose label contains only vocab characters
+        valid = df["label"].apply(
+            lambda s: isinstance(s, str) and len(s) > 0
+                      and all(c in vocab for c in s)
+        )
+        self.df   = df[valid].reset_index(drop=True)
+        self.vocab = vocab
+        dropped = len(df) - len(self.df)
+        if dropped:
+            print(f"  Dropped {dropped} rows with out-of-vocab characters")
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row   = self.df.iloc[idx]
+        label = row["label"]
+        try:
+            img = Image.open(row["image_path"]).convert("RGB")
+            img = img.resize((INPUT_W, INPUT_H), resample=Image.BILINEAR)
+            arr = np.array(img, dtype=np.float32) / 255.0   # [32, 128, 3]
+            tensor = torch.from_numpy(arr).permute(2, 0, 1)  # [3, 32, 128]
+        except Exception:
+            # Return a blank image with label on failure
+            tensor = torch.zeros(3, INPUT_H, INPUT_W)
+        return tensor, label
+
+
+def collate_fn(batch):
+    imgs, labels = zip(*batch)
+    return torch.stack(imgs), list(labels)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fine-tune vitstr_small on CCT-labeled plate crops"
+    )
+    parser.add_argument("--csv",    default="foundationmodel/dataset/cct_labels.csv")
+    parser.add_argument("--output", default="weights/vitstr_small_finetuned.pt")
+    parser.add_argument("--epochs",     type=int,   default=10)
+    parser.add_argument("--batch-size", type=int,   default=64)
+    parser.add_argument("--lr",         type=float, default=1e-4)
+    parser.add_argument("--workers",    type=int,   default=4)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+
+    try:
+        from doctr.models import vitstr_small
+    except ImportError:
+        print("ERROR: pip install python-doctr[torch]")
+        raise SystemExit(1)
+
+    # -----------------------------------------------------------------------
+    # Load model
+    # -----------------------------------------------------------------------
+    print("[Loading pretrained vitstr_small]")
+    model = vitstr_small(pretrained=True).to(args.device)
+    vocab = model.vocab
+    print(f"  Vocab : {len(vocab)} chars")
+    print(f"  Device: {args.device}")
+
+    # -----------------------------------------------------------------------
+    # Dataset
+    # -----------------------------------------------------------------------
+    print(f"\n[Loading dataset: {args.csv}]")
+    df = pd.read_csv(args.csv)
+    print(f"  {len(df)} rows in CSV")
+
+    dataset = PlateDataset(df, vocab)
+    print(f"  {len(dataset)} usable samples")
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        collate_fn=collate_fn,
+        pin_memory=(args.device == "cuda"),
+        drop_last=False,
+    )
+
+    # -----------------------------------------------------------------------
+    # Optimizer + cosine LR schedule
+    # -----------------------------------------------------------------------
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    total_steps = args.epochs * len(loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=args.lr / 100
+    )
+
+    # -----------------------------------------------------------------------
+    # Training loop
+    # -----------------------------------------------------------------------
+    print(f"\n[Training — {args.epochs} epochs, batch={args.batch_size}, lr={args.lr}]")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_loss = math.inf
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        n_batches  = 0
+
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch",
+                    dynamic_ncols=True)
+        for imgs, labels in pbar:
+            imgs = imgs.to(args.device)
+
+            optimizer.zero_grad()
+            out  = model(imgs, target=labels)
+            loss = out["loss"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+            n_batches  += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}",
+                              "lr":   f"{scheduler.get_last_lr()[0]:.2e}"})
+
+        avg_loss = epoch_loss / max(n_batches, 1)
+        print(f"  Epoch {epoch}: avg_loss={avg_loss:.4f}")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), output_path)
+            print(f"  Saved → {output_path}  (best so far)")
+
+    print(f"\nDone. Best loss: {best_loss:.4f}")
+    print(f"Weights saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
