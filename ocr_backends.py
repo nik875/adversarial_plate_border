@@ -1577,6 +1577,7 @@ TRAINABLE_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
     "dtrb":         DeepTextRecognitionBenchmarkOCRBackend,
     "cct":          CCTOCRBackend,
     "doctr-vitstr": DoctrViTSTRBackend,
+    "lprnet":       LPRNetOCRBackend,
 }
 
 EVAL_ONLY_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
