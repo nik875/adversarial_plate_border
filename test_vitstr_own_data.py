@@ -122,7 +122,8 @@ def main():
     skipped       = 0
     evaluated     = 0
     examples      = []
-    first_errors  = []   # collect first 3 unique error messages for diagnosis
+    first_errors  = []   # collect first 3 tracebacks for diagnosis
+    import traceback
 
     pbar = tqdm(df.itertuples(index=False), total=len(df),
                 desc="Evaluating", unit="img")
@@ -160,7 +161,7 @@ def main():
 
         except Exception as e:
             if len(first_errors) < 3:
-                first_errors.append(f"{type(e).__name__}: {e}")
+                first_errors.append(traceback.format_exc())
             skipped += 1
             continue
 
