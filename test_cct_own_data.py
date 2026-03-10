@@ -105,6 +105,13 @@ def main():
     print("\n[Loading model]")
     ocr_model = onnx.load(args.model)
     model     = onnx2torch.convert(ocr_model).to(args.device).eval()
+
+    # onnx2torch stores some ONNX initializers as plain tensor attributes
+    # (not registered buffers), so .to(device) misses them — move manually.
+    for module in model.modules():
+        for attr, val in vars(module).items():
+            if isinstance(val, torch.Tensor) and not isinstance(val, torch.nn.Parameter):
+                setattr(module, attr, val.to(args.device))
     print("  OK")
 
     device = torch.device(args.device)
