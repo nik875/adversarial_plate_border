@@ -607,268 +607,112 @@ class CRNNBackend(OCRBackend):
 
 
 # ---------------------------------------------------------------------------
-# LPRNet backend  — inlined sirius-ai/LPRNet_Pytorch architecture (trainable, ~1 MB)
+# LPRNet backend  — NVIDIA TAO US LPRNet (lprnet_torch.py), differentiable
 # ---------------------------------------------------------------------------
 #
-# LPRNet is purpose-built for licence plate OCR — no RNN, no CTC beam search,
-# just a small all-CNN backbone with a global context module.  It's the
-# lightest differentiable OCR option here (~1 MB vs CRNN's ~8 MB).
+# Wraps the native PyTorch reconstruction of the NVIDIA TAO US LPRNet ONNX
+# model.  Weights are loaded directly from the .onnx file via
+# load_weights_from_onnx(); the full ResNet+LSTM graph is differentiable.
 #
-# Architecture: small CNN + Global Context (GC) blocks → per-position
-#               class logits → CTC-greedy decode
-# Input:  [B, 3, 24, 94]  RGB, values in [0, 1] (model normalises internally)
-# Output: [T, B, num_classes]  raw logits (no softmax)
+# Architecture: ResNet backbone (res2–res5) + forward LSTM(3600→512) + Dense
+# Input:  [B, 3, 48, 96]  RGB, values in [0, 1]
+# Output: [B, 24, 36]     softmax probabilities (CTC blank = index 35)
 #
 # Weights
 # -------
-#   Pre-trained checkpoint (Chinese plates, 68-char alphabet):
-#     https://github.com/sirius-ai/LPRNet_Pytorch/blob/master/weights/
-#     Final_LPRNet_model.pth
-#
-#   No repo clone required — pass the local .pth path directly.
-#
-#   For other alphabets retrain with your own data — the architecture is
-#   configured at init time via num_chars and lpr_max_len.
-#
-# Alphabet note
-# -------------
-#   Default uses the official 68-char Chinese CHARS list from sirius-ai,
-#   matching Final_LPRNet_model.pth.  For Western-only checkpoints pass
-#   alphabet=LPRNetBackend.WESTERN_ALPHABET.
+#   Pass the path to the .onnx file (e.g. us_lprnet_patched.onnx).
+#   Pass "none" to use random weights (for architecture testing only).
 
-
-class _LPRNetSmallBasicBlock(nn.Module):
-    """Inlined from sirius-ai/LPRNet_Pytorch/model/LPRNet.py."""
-
-    def __init__(self, ch_in: int, ch_out: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(ch_in, ch_out // 4, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv2d(ch_out // 4, ch_out // 4, kernel_size=(3, 1), padding=(1, 0)),
-            nn.ReLU(),
-            nn.Conv2d(ch_out // 4, ch_out // 4, kernel_size=(1, 3), padding=(0, 1)),
-            nn.ReLU(),
-            nn.Conv2d(ch_out // 4, ch_out, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class _LPRNet(nn.Module):
-    """
-    Inlined LPRNet architecture.
-
-    This mirrors the upstream sirius-ai implementation so local
-    Final_LPRNet_model.pth checkpoints can be loaded without cloning the repo.
-    """
-
-    def __init__(self, lpr_max_len: int, class_num: int, dropout_rate: float):
-        super().__init__()
-        self.lpr_max_len = lpr_max_len
-        self.class_num = class_num
-
-        self.backbone = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, stride=1),
-            nn.BatchNorm2d(num_features=64),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 1, 1)),
-            _LPRNetSmallBasicBlock(ch_in=64, ch_out=128),
-            nn.BatchNorm2d(num_features=128),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(2, 1, 2)),
-            _LPRNetSmallBasicBlock(ch_in=64, ch_out=256),
-            nn.BatchNorm2d(num_features=256),
-            nn.ReLU(),
-            _LPRNetSmallBasicBlock(ch_in=256, ch_out=256),
-            nn.BatchNorm2d(num_features=256),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(4, 1, 2)),
-            nn.Dropout(dropout_rate),
-            nn.Conv2d(in_channels=64, out_channels=256, kernel_size=(1, 4), stride=1),
-            nn.BatchNorm2d(num_features=256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Conv2d(in_channels=256, out_channels=class_num, kernel_size=(13, 1), stride=1),
-            nn.BatchNorm2d(num_features=class_num),
-            nn.ReLU(),
-        )
-
-        self.container = nn.Sequential(
-            nn.Conv2d(
-                in_channels=448 + self.class_num,
-                out_channels=self.class_num,
-                kernel_size=(1, 1),
-                stride=(1, 1),
-            ),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        keep_features = []
-        for i, layer in enumerate(self.backbone.children()):
-            x = layer(x)
-            if i in [2, 6, 13, 22]:
-                keep_features.append(x)
-
-        global_context = []
-        for i, f in enumerate(keep_features):
-            if i in [0, 1]:
-                f = nn.AvgPool2d(kernel_size=5, stride=5)(f)
-            if i in [2]:
-                f = nn.AvgPool2d(kernel_size=(4, 10), stride=(4, 2))(f)
-            f_pow = torch.pow(f, 2)
-            f_mean = torch.mean(f_pow)
-            f = torch.div(f, f_mean)
-            global_context.append(f)
-
-        x = torch.cat(global_context, 1)
-        x = self.container(x)
-        logits = torch.mean(x, dim=2)
-        return logits
 
 class LPRNetBackend(OCRBackend):
     """
-    Trainable LPRNet OCR backend.
+    Trainable NVIDIA TAO US LPRNet OCR backend.
 
-    Smaller and faster than CRNN (~1 MB vs ~8 MB), no LSTM — pure CNN.
-    Fully differentiable; CTC loss flows back into the patch.
+    Wraps LPRNetTorch (lprnet_torch.py) — a native PyTorch reconstruction of
+    the NVIDIA TAO us_lprnet_baseline18_deployable ONNX model.  The full
+    ResNet+LSTM graph is differentiable, so CTC loss flows back into the patch.
 
     Parameters
     ----------
     model_path : str
-        Path to .pth checkpoint.  Pass "none" to use random weights.
+        Path to the ONNX file (e.g. us_lprnet_patched.onnx).
+        Pass "none" to skip weight loading (random weights — for testing only).
     device : str
-        Torch device.
-    alphabet : str
-        Characters in index order, with CTC blank as the last symbol.
-        Default: official 68-char sirius-ai CHARS list (includes '-' blank).
-        For Western-only checkpoints use WESTERN_ALPHABET.
-    lpr_max_len : int
-        Maximum plate length the model was trained for.  LPRNet default is 8.
+        Torch device string ("cpu", "cuda", "cuda:0", …).
     """
 
-    name         = "lprnet"
+    name          = "lprnet"
     is_trainable  = True
-    ocr_crop_size = (24, 94)   # (H, W) — native LPRNet input size
+    ocr_crop_size = (48, 96)   # (H, W) — NVIDIA TAO LPRNet input size
 
-    # Official sirius-ai CHARS list (68 symbols) used by Final_LPRNet_model.pth.
-    DEFAULT_ALPHABET = (
-        "京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新"
-        "0123456789"
-        "ABCDEFGHJKLMNPQRSTUVWXYZIO-"
-    )
-    WESTERN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ALPHABET  = "0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+    BLANK_IDX = 35   # last index; matches NVIDIA TAO convention
 
-    def __init__(self, model_path: str = "none", device: str = "cpu",
-                 alphabet: str = DEFAULT_ALPHABET, lpr_max_len: int = 8):
+    def __init__(self, model_path: str = "none", device: str = "cpu"):
         super().__init__(model_path, device)
-        self.alphabet    = alphabet
-        self.lpr_max_len = lpr_max_len
-        # Official LPRNet checkpoints already include blank as the last class
-        # in CHARS ("-"). Do not append an extra blank class.
-        self.num_classes = len(alphabet)
         self._model: Optional[nn.Module] = None
 
     def load(self) -> None:
-        """Build inlined LPRNet and optionally restore a checkpoint."""
-        self._model = _LPRNet(
-            lpr_max_len=self.lpr_max_len,
-            class_num=self.num_classes,
-            dropout_rate=0.5,
-        )
-
+        from lprnet_torch import LPRNetTorch, load_weights_from_onnx
+        self._model = LPRNetTorch()
         if str(self.model_path) != "none":
             if not self.model_path.exists():
                 raise FileNotFoundError(
-                    f"LPRNet checkpoint not found: {self.model_path}"
+                    f"LPRNet ONNX file not found: {self.model_path}"
                 )
-            state = torch.load(str(self.model_path), map_location="cpu")
-            state = state.get("state_dict", state)
-
-            # Guardrail: mismatched alphabet/checkpoint sizes produce opaque
-            # shape errors; provide a direct hint instead.
-            head_key = "backbone.20.weight"
-            if head_key in state:
-                ckpt_num_classes = int(state[head_key].shape[0])
-                if ckpt_num_classes != self.num_classes:
-                    raise ValueError(
-                        "LPRNet alphabet/checkpoint mismatch: "
-                        f"checkpoint has {ckpt_num_classes} classes, "
-                        f"backend configured for {self.num_classes}.\n"
-                        f"Checkpoint: {self.model_path}\n"
-                        "Use an alphabet matching the checkpoint. "
-                        "For Final_LPRNet_model.pth, use the default alphabet. "
-                        "For Western-only checkpoints, pass "
-                        "alphabet=LPRNetBackend.WESTERN_ALPHABET."
-                    )
-            self._model.load_state_dict(state, strict=False)
+            load_weights_from_onnx(self._model, str(self.model_path))
             print(f"[{self.name}] Loaded weights from {self.model_path}")
         else:
             print(f"[{self.name}] No checkpoint — using random weights")
-
         self._model.to(self.device)
         self._model.eval()
 
     def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        CHW float32 RGB [0,1]  →  [1, 3, 24, 94] float32
-        LPRNet was trained on images normalised to [0, 1] at this fixed size.
-        """
-        resized = F.interpolate(
-            image.unsqueeze(0), size=(24, 94),
+        """CHW float32 [0,1] → [1, 3, 48, 96]."""
+        return F.interpolate(
+            image.unsqueeze(0), size=(48, 96),
             mode="bilinear", align_corners=False,
-        )   # [1, 3, 24, 94]
-        return resized.to(self.device)
+        ).to(self.device)
 
     def predict(self, image: torch.Tensor) -> OCRResult:
         self.ensure_loaded()
-        inp    = self._preprocess(image)          # [1, 3, 24, 94]
-        logits = self._model(inp)                 # [1, num_classes, T]
-
-        # Rearrange to [T, 1, num_classes] to match CTC convention
-        logits_ctc = logits.permute(2, 0, 1)     # [T, B, C]
-
-        text, confidence = self._greedy_decode(
-            logits_ctc.detach().cpu()
-        )
-
+        inp   = self._preprocess(image)          # [1, 3, 48, 96]
+        probs = self._model(inp)                 # [1, 24, 36]  softmax probs
+        text, confidence = self._greedy_decode(probs[0].detach().cpu())
+        # expose log-probs as [T, C] for any external CTC use
+        log_probs = torch.log(probs[0].clamp(min=1e-8))   # [24, 36]
         return OCRResult(
-            logits=logits_ctc.squeeze(1),         # [T, num_classes]  grad-connected
+            logits=log_probs,
             text=text,
             confidence=confidence,
         )
 
-    def _greedy_decode(self, logits: torch.Tensor) -> tuple:
-        """Greedy CTC: argmax → collapse repeats → strip blank."""
-        blank_id = self.num_classes - 1
-        pred     = logits.argmax(dim=2).squeeze(1)   # [T]
-        chars, confs, prev = [], [], blank_id
-
+    def _greedy_decode(self, probs: torch.Tensor) -> tuple:
+        """Greedy CTC decode on [T, C] softmax probabilities."""
+        pred = probs.argmax(dim=-1)   # [T]
+        chars, confs, prev = [], [], self.BLANK_IDX
         for t, idx in enumerate(pred.tolist()):
-            if idx != prev and idx != blank_id:
-                prob = torch.softmax(logits[t, 0], dim=0)[idx].item()
-                chars.append(self.alphabet[idx])
-                confs.append(prob)
+            if idx != prev and idx != self.BLANK_IDX:
+                chars.append(self.ALPHABET[idx])
+                confs.append(probs[t, idx].item())
             prev = idx
-
         if not chars:
             return None, 0.0
         return "".join(chars), float(sum(confs) / len(confs))
 
-    def ctc_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
-        """CTC loss between [T, num_classes] logits and a target string."""
-        log_probs  = F.log_softmax(logits.unsqueeze(1), dim=2)  # [T, 1, C]
+    def ctc_loss(self, log_probs: torch.Tensor, target_text: str) -> torch.Tensor:
+        """CTC loss on [T, C] log-probabilities."""
+        lp = log_probs.unsqueeze(1)   # [T, 1, C]
         target_ids = torch.tensor(
-            [self.alphabet.index(c) for c in target_text if c in self.alphabet],
+            [self.ALPHABET.index(c) for c in target_text if c in self.ALPHABET],
             dtype=torch.long,
         )
-        input_len  = torch.tensor([log_probs.shape[0]], dtype=torch.long)
-        target_len = torch.tensor([len(target_ids)],    dtype=torch.long)
+        input_len  = torch.tensor([lp.shape[0]], dtype=torch.long)
+        target_len = torch.tensor([len(target_ids)], dtype=torch.long)
         return F.ctc_loss(
-            log_probs, target_ids.unsqueeze(0),
+            lp, target_ids.unsqueeze(0),
             input_len, target_len,
-            blank=self.num_classes - 1,
+            blank=self.BLANK_IDX,
             reduction="mean", zero_infinity=True,
         )
 
@@ -876,10 +720,9 @@ class LPRNetBackend(OCRBackend):
                              impersonation: bool = False) -> torch.Tensor:
         """Differentiable CTC loss on a [1, 3, H, W] crop tensor."""
         self.ensure_loaded()
-        preprocessed = self._preprocess(crop)             # [1, 3, 24, 94]
-        logits = self._model(preprocessed)                # [1, C, T]
-        logits_ctc = logits.permute(2, 0, 1).squeeze(1)  # [T, C]
-        base = self.ctc_loss(logits_ctc, target_text)
+        probs     = self._model(self._preprocess(crop))       # [1, 24, 36]
+        log_probs = torch.log(probs[0].clamp(min=1e-8))      # [24, 36]
+        base = self.ctc_loss(log_probs, target_text)
         return base if impersonation else -base
 
     def parameters(self) -> Iterator[nn.Parameter]:
