@@ -364,23 +364,6 @@ class AdversarialPatchTrainer:
                             corners[:, 0].max(), corners[:, 1].max()])
 
     @staticmethod
-    def _plate_text_variants(text: str) -> List[str]:
-        """
-        Generate spelling variants of a plate string by inserting common
-        separators at the letter→digit (or digit→letter) boundary.
-
-        E.g. "VRJ7774" → ["VRJ-7774", "VRJ 7774", "VRJ+7774"]
-        The normalised base form is NOT included — callers pass it as target_text.
-        Returns [] if no boundary is found (purely letters or purely digits).
-        """
-        clean = re.sub(r"[^A-Za-z0-9]", "", text).upper()
-        m = re.search(r"(?<=[A-Z])(?=[0-9])|(?<=[0-9])(?=[A-Z])", clean)
-        if not m:
-            return []
-        pre, suf = clean[:m.start()], clean[m.start():]
-        return [f"{pre}{sep}{suf}" for sep in ("-", " ", "+")]
-
-    @staticmethod
     def _plate_text_matches(text: str, expected: str) -> bool:
         """
         Fuzzy match for sanity-check categorisation only (not the training objective).
@@ -528,10 +511,8 @@ class AdversarialPatchTrainer:
         crop = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
         if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
-            variants = self._plate_text_variants(target_text)
             ocr_loss = self.ocr.differentiable_loss(
                 crop, target_text, impersonation=bool(self.impersonation_target),
-                variants=variants,
             )
         else:
             with torch.no_grad():
@@ -811,14 +792,10 @@ class AdversarialPatchTrainer:
 
             if hasattr(self.ocr, "_sequence_log_prob"):
                 target_text = self.expected_plate_text
-                variants    = self._plate_text_variants(target_text)
-                all_texts   = [target_text] + variants
                 with torch.no_grad():
                     pixel_values = (crop - 0.5) / 0.5
-                    log_probs    = torch.stack([
-                        self.ocr._sequence_log_prob(pixel_values, t) for t in all_texts
-                    ])
-                row["log_prob"] = f"{torch.logsumexp(log_probs, dim=0).item():.4f}"
+                    log_prob     = self.ocr._sequence_log_prob(pixel_values, target_text)
+                row["log_prob"] = f"{log_prob.item():.4f}"
 
             summary_rows.append(row)
 
