@@ -47,7 +47,7 @@ except ImportError:
 ALPHABET       = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'
 BLANK          = '_'
 OCR_H, OCR_W   = 64, 128
-OCR_PATH       = Path.home() / ".cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
+OCR_PATH       = Path.home() / ".cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
 GT             = "VRJ7774"
 
 
@@ -95,7 +95,7 @@ def main():
         print("ERROR: pip install onnx onnx2torch")
         raise SystemExit(1)
 
-    print("\n[CCT-XS-V1 Global — Own Dataset]")
+    print("\n[CCT-S-V1 Global — Own Dataset]")
     print(f"  Model  : {args.model}")
     print(f"  Input  : NHWC [{OCR_H}×{OCR_W}×3] [0,255]")
     print(f"  Labels : {args.labels}")
@@ -173,7 +173,7 @@ def main():
     char_acc  = char_correct  / char_total if char_total else 0.0
 
     print(f"\n{'='*60}")
-    print(f"  RESULTS — CCT-XS-V1 Global  [Own Dataset]")
+    print(f"  RESULTS — CCT-S-V1 Global  [Own Dataset]")
     print(f"{'='*60}")
     print(f"  GT plate text        : '{GT}'")
     print(f"  Evaluated            : {evaluated}")
