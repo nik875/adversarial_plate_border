@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -92,6 +92,10 @@ def main():
     parser.add_argument("--lr",         type=float, default=1e-4)
     parser.add_argument("--workers",    type=int,   default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--samples", type=int, default=25,
+                        help="Val sample images to save after training (default: 25)")
+    parser.add_argument("--samples-dir", default="weights/vitstr_samples",
+                        help="Directory for val sample images (default: weights/vitstr_samples)")
     args = parser.parse_args()
 
     try:
@@ -210,6 +214,51 @@ def main():
 
     print(f"\nDone. Best val loss: {best_loss:.4f}")
     print(f"Weights saved to: {output_path}")
+
+    # -----------------------------------------------------------------------
+    # Sample outputs from val set
+    # -----------------------------------------------------------------------
+    print(f"\n[Saving {args.samples} val sample images → {args.samples_dir}/]")
+    samples_dir = Path(args.samples_dir)
+    if samples_dir.exists():
+        for f in samples_dir.iterdir():
+            f.unlink()
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    model.eval()
+    saved = 0
+    with torch.no_grad():
+        for imgs, labels in DataLoader(val_ds, batch_size=args.batch_size,
+                                       shuffle=True, collate_fn=collate_fn):
+            imgs_dev = imgs.to(args.device)
+            out = model(imgs_dev, return_preds=True)
+            preds = [p[0].upper() for p in out["preds"]]
+
+            for img_t, gt, pred in zip(imgs, labels, preds):
+                if saved >= args.samples:
+                    break
+                # img_t is [3, 32, 128] float32 [0,1] — convert back to PIL
+                arr = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                vis = Image.fromarray(arr).resize(
+                    (INPUT_W * 4, INPUT_H * 4), resample=Image.NEAREST
+                )
+                draw = ImageDraw.Draw(vis)
+                text = f"GT:{gt}  PR:{pred}"
+                draw.text((3, 3), text, fill=(0, 0, 0),       font=font)
+                draw.text((2, 2), text, fill=(255, 255, 255), font=font)
+                match = "ok" if pred == gt.upper() else "xx"
+                vis.save(samples_dir / f"{saved:03d}_{match}.png")
+                saved += 1
+
+            if saved >= args.samples:
+                break
+
+    print(f"  Saved {saved} samples.")
 
 
 if __name__ == "__main__":
