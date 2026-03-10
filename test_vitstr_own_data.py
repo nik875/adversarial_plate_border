@@ -162,6 +162,8 @@ def main():
             else:
                 pred = decode_output(out.cpu(), vocab).upper()
 
+            pred = pred.replace('-', '')
+
         except Exception as e:
             if len(first_errors) < 3:
                 first_errors.append(traceback.format_exc())
