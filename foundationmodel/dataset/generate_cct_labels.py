@@ -49,7 +49,6 @@ OCR_PATH  = Path.home() / ".cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_
 CROP_DIRS: list[Path] = [
     Path.home() / ".cache" / "roboflow_lpr_crops",
     Path.home() / ".cache" / "kaggle_lp_crops",
-    Path.home() / ".cache" / "indian_plates_kaggle_crops",
     Path.home() / ".cache" / "mercosur_crops",
 ]
 
