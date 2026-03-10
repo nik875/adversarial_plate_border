@@ -1515,8 +1515,10 @@ class DoctrViTSTRBackend(OCRBackend):
         self._model.to(self.device).eval()
 
     def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
-        """[C, H, W] float32 [0,1] → [1, C, 32, 128] on device."""
-        x = image.unsqueeze(0).to(self.device)
+        """[C, H, W] or [1, C, H, W] float32 [0,1] → [1, C, 32, 128] on device."""
+        x = image.to(self.device)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
         return F.interpolate(x, size=(32, 128), mode="bilinear", align_corners=False)
 
     def predict(self, image: torch.Tensor) -> OCRResult:
