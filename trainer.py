@@ -910,15 +910,15 @@ class AdversarialPatchTrainer:
         warmup_epochs = 10
         eta_min       = 1e-4
 
-        # Start optimizer at eta_min; warmup will ramp up to learning_rate
+        # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         optimizer = optim.AdamW(
-            self._trainable_params(), lr=eta_min, weight_decay=1e-4
+            self._trainable_params(), lr=learning_rate, weight_decay=1e-4
         )
         cosine_epochs = num_epochs - warmup_epochs
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             optimizer,
-            start_factor=1.0,
-            end_factor=learning_rate / eta_min,
+            start_factor=eta_min / learning_rate,
+            end_factor=1.0,
             total_iters=warmup_epochs,
         )
         cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
