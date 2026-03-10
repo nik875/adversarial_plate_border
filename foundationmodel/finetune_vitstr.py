@@ -156,7 +156,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     total_steps = args.epochs * len(loader)  # based on train batches only
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=args.lr / 100
+        optimizer, T_max=total_steps, eta_min=args.lr * 0.1
     )
 
     # -----------------------------------------------------------------------
