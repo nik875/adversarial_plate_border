@@ -168,6 +168,7 @@ def main() -> None:
 
     written  = 0
     skipped  = 0
+    filtered = 0
     bs       = args.batch_size
 
     # Which indices to save as sample images (evenly spaced across all paths)
@@ -197,7 +198,12 @@ def main() -> None:
 
             for i, p in enumerate(batch_paths):
                 try:
-                    pil_imgs.append(Image.open(p).convert("RGB"))
+                    img = Image.open(p).convert("RGB")
+                    if img.height < 32:
+                        filtered += 1
+                        img.close()
+                        continue
+                    pil_imgs.append(img)
                     valid_paths.append(p)
                     valid_indices.append(start + i)
                 except Exception:
@@ -236,8 +242,15 @@ def main() -> None:
             written += len(valid_paths)
             pbar.set_postfix({"written": written, "skipped": skipped})
 
-    print(f"\nDone. Wrote {written} rows → {output_path}  (skipped {skipped})")
-    print(f"Sample images → {samples_dir}/")
+    total = len(all_paths)
+    print(f"\n{'='*50}")
+    print(f"  Total images   : {total}")
+    print(f"  Kept (>=32px)  : {written}")
+    print(f"  Filtered (<32px): {filtered}")
+    print(f"  Skipped (error): {skipped}")
+    print(f"{'='*50}")
+    print(f"  CSV    → {output_path}")
+    print(f"  Samples → {samples_dir}/")
 
 
 if __name__ == "__main__":
