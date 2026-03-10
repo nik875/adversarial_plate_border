@@ -43,7 +43,7 @@ YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2e
 CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
 
 TROCR_WEIGHTS="none"
-LPRNET_WEIGHTS="us_lprnet_patched.onnx"
+LPRNET_WEIGHTS="weights/lprnet_deployable_onnx_v1.1/us_lprnet_patched.onnx"
 DOCTR_VITSTR_WEIGHTS="weights/vitstr_small_finetuned.pt"
 
 while [[ $# -gt 0 ]]; do
