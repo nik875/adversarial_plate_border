@@ -22,7 +22,7 @@ set -euo pipefail
 # Defaults
 DEVICE="cuda"
 CSV="preproc_labels.csv"
-EPOCHS=150
+EPOCHS=100
 LR=1e-3
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
@@ -30,6 +30,7 @@ PIN_MEMORY=false
 PRELOAD_IMAGES=false
 LIMIT=0
 DRY_RUN=false
+SKIP_SANITY=false
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --preload-images)  PRELOAD_IMAGES=true; shift ;;
         --limit)           LIMIT="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true; shift ;;
+        --skip-sanity)     SKIP_SANITY=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -136,6 +138,9 @@ if $PRELOAD_IMAGES; then
 fi
 if [[ "$LIMIT" -gt 0 ]]; then
     BASE_ARGS+=(--limit "$LIMIT")
+fi
+if $SKIP_SANITY; then
+    BASE_ARGS+=(--skip-sanity)
 fi
 
 # Pair rows:

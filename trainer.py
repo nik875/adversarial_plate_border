@@ -895,9 +895,11 @@ class AdversarialPatchTrainer:
         learning_rate: float = 0.01,
         save_interval: int   = 10,
         dry_run:       bool  = False,
+        skip_sanity:   bool  = False,
     ) -> dict:
-        self.save_debug_images()
-        self.validate_pipeline()
+        if not skip_sanity:
+            self.save_debug_images()
+            self.validate_pipeline()
 
         if dry_run:
             print("\nDry run complete.")
@@ -1013,7 +1015,9 @@ def main():
     parser.add_argument("--expected-plate", default="VRJ7774")
     parser.add_argument("--disable-homography", action="store_true")
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--dry-run",  action="store_true")
+    parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--skip-sanity", action="store_true",
+                        help="Skip pre-training sanity check and debug image generation.")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1053,6 +1057,7 @@ def main():
         learning_rate = args.lr,
         save_interval = 10,
         dry_run       = args.dry_run,
+        skip_sanity   = args.skip_sanity,
     )
 
 
