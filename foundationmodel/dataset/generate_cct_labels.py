@@ -25,10 +25,12 @@ import argparse
 import csv
 from pathlib import Path
 
+import random
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,10 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Images per inference batch (default: 128)")
+    parser.add_argument("--samples", type=int, default=25,
+                        help="Number of sample images to save (default: 25)")
+    parser.add_argument("--samples-dir", default="foundationmodel/dataset/samples",
+                        help="Directory for sample images (default: foundationmodel/dataset/samples)")
     args = parser.parse_args()
 
     try:
@@ -164,6 +170,19 @@ def main() -> None:
     skipped  = 0
     bs       = args.batch_size
 
+    # Which indices to save as sample images (evenly spaced across all paths)
+    n_samples    = min(args.samples, len(all_paths))
+    sample_step  = max(1, len(all_paths) // n_samples)
+    sample_indices = set(range(0, len(all_paths), sample_step)[:n_samples])
+
+    samples_dir = Path(args.samples_dir)
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["image_path", "label"])
@@ -174,11 +193,13 @@ def main() -> None:
 
             pil_imgs: list[Image.Image] = []
             valid_paths: list[Path]     = []
+            valid_indices: list[int]    = []
 
-            for p in batch_paths:
+            for i, p in enumerate(batch_paths):
                 try:
-                    pil_imgs.append(Image.open(p))
+                    pil_imgs.append(Image.open(p).convert("RGB"))
                     valid_paths.append(p)
+                    valid_indices.append(start + i)
                 except Exception:
                     skipped += 1
 
@@ -193,18 +214,30 @@ def main() -> None:
             except Exception as e:
                 tqdm.write(f"  Warning: batch {start}-{start+bs} failed: {e}")
                 skipped += len(pil_imgs)
-                continue
-            finally:
                 for img in pil_imgs:
                     img.close()
+                continue
 
-            for path, label in zip(valid_paths, labels):
+            for img, path, label, idx in zip(pil_imgs, valid_paths, labels, valid_indices):
                 writer.writerow([str(path), label])
-            written += len(valid_paths)
 
+                if idx in sample_indices:
+                    vis = img.copy()
+                    draw = ImageDraw.Draw(vis)
+                    text = label if label else "(empty)"
+                    # Black shadow + white text for legibility on any background
+                    draw.text((3, 3), text, fill=(0, 0, 0),       font=font)
+                    draw.text((2, 2), text, fill=(255, 255, 255), font=font)
+                    out_name = f"{idx:06d}_{path.stem}.png"
+                    vis.save(samples_dir / out_name)
+
+                img.close()
+
+            written += len(valid_paths)
             pbar.set_postfix({"written": written, "skipped": skipped})
 
     print(f"\nDone. Wrote {written} rows → {output_path}  (skipped {skipped})")
+    print(f"Sample images → {samples_dir}/")
 
 
 if __name__ == "__main__":
