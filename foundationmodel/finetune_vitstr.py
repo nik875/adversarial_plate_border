@@ -119,10 +119,27 @@ def main():
     dataset = PlateDataset(df, vocab)
     print(f"  {len(dataset)} usable samples")
 
+    n_val   = max(1, int(len(dataset) * 0.1))
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = torch.utils.data.random_split(
+        dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42),
+    )
+    print(f"  Train: {n_train}  Val: {n_val}")
+
     loader = DataLoader(
-        dataset,
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.workers,
+        collate_fn=collate_fn,
+        pin_memory=(args.device == "cuda"),
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.workers,
         collate_fn=collate_fn,
         pin_memory=(args.device == "cuda"),
@@ -133,7 +150,7 @@ def main():
     # Optimizer + cosine LR schedule
     # -----------------------------------------------------------------------
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    total_steps = args.epochs * len(loader)
+    total_steps = args.epochs * len(loader)  # based on train batches only
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=args.lr / 100
     )
@@ -170,15 +187,28 @@ def main():
             pbar.set_postfix({"loss": f"{loss.item():.4f}",
                               "lr":   f"{scheduler.get_last_lr()[0]:.2e}"})
 
-        avg_loss = epoch_loss / max(n_batches, 1)
-        print(f"  Epoch {epoch}: avg_loss={avg_loss:.4f}")
+        train_loss = epoch_loss / max(n_batches, 1)
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # Validation
+        model.eval()
+        val_loss  = 0.0
+        n_val_batches = 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs = imgs.to(args.device)
+                out  = model(imgs, target=labels)
+                val_loss += out["loss"].item()
+                n_val_batches += 1
+        val_loss /= max(n_val_batches, 1)
+
+        print(f"  Epoch {epoch}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+
+        if val_loss < best_loss:
+            best_loss = val_loss
             torch.save(model.state_dict(), output_path)
-            print(f"  Saved → {output_path}  (best so far)")
+            print(f"  Saved → {output_path}  (best val so far)")
 
-    print(f"\nDone. Best loss: {best_loss:.4f}")
+    print(f"\nDone. Best val loss: {best_loss:.4f}")
     print(f"Weights saved to: {output_path}")
 
 
