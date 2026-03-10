@@ -27,7 +27,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* CosineAnnealingLR, 150 epochs, no early stopping.
+* CosineAnnealingLR (start 1e-3 → eta_min 1e-4), 150 epochs, no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
