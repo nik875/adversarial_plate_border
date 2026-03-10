@@ -811,8 +811,12 @@ class TrOCROCRBackend(OCRBackend):
     ocr_crop_size = (384, 384)   # (H, W) — TrOCR expects 384×384
     DEFAULT_MODEL_ID = "microsoft/trocr-small-printed"
 
+    DEFAULT_WEIGHTS = "weights/trocr_small_finetuned.pt"
+
     def __init__(self, model_path: str = "none", device: str = "cpu",
                  max_new_tokens: int = 16):
+        if model_path == "none":
+            model_path = self.DEFAULT_WEIGHTS
         super().__init__(model_path, device)
         self.max_new_tokens = max_new_tokens
         self._processor = None
@@ -827,21 +831,28 @@ class TrOCROCRBackend(OCRBackend):
                 "Install with: pip install transformers"
             ) from exc
 
-        source = (str(self.model_path)
-                  if str(self.model_path) not in {"", "none"}
-                  else self.DEFAULT_MODEL_ID)
+        self._processor = TrOCRProcessor.from_pretrained(self.DEFAULT_MODEL_ID)
+        self._model     = VisionEncoderDecoderModel.from_pretrained(self.DEFAULT_MODEL_ID)
 
-        self._processor = TrOCRProcessor.from_pretrained(source)
-        self._model = VisionEncoderDecoderModel.from_pretrained(source)
-        
         # Configure model for training with labels
         # VisionEncoderDecoderConfig needs pad_token_id and decoder_start_token_id
         self._model.config.decoder_start_token_id = self._processor.tokenizer.bos_token_id
-        self._model.config.pad_token_id = self._processor.tokenizer.pad_token_id
-        
+        self._model.config.pad_token_id           = self._processor.tokenizer.pad_token_id
+
+        weights_path = Path(str(self.model_path))
+        if str(self.model_path) not in {"", "none"} and weights_path.exists():
+            import torch as _torch
+            self._model.load_state_dict(
+                _torch.load(str(weights_path), map_location=self.device)
+            )
+            print(f"[{self.name}] Loaded fine-tuned weights: {weights_path}")
+        else:
+            if str(self.model_path) not in {"", "none"}:
+                print(f"[{self.name}] WARNING: {self.model_path} not found — using pretrained weights")
+            print(f"[{self.name}] Loaded pretrained model from {self.DEFAULT_MODEL_ID}")
+
         self._model.to(self.device)
         self._model.eval()
-        print(f"[{self.name}] Loaded model from {source}")
 
     def _to_pil(self, image: torch.Tensor):
         from PIL import Image
