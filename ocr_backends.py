@@ -1312,7 +1312,7 @@ class MockOCRBackend(OCRBackend):
 # ---------------------------------------------------------------------------
 #
 # Model path (auto-downloaded by fast-plate-ocr on first use):
-#   ~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx
+#   ~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx
 #
 # Input convention:
 #   NHWC float32 [0, 255], shape [batch, 64, 128, 3]
@@ -1328,7 +1328,7 @@ class CCTOCRBackend(OCRBackend):
     """
     Differentiable CCT (fast-plate-ocr) backend via onnx2torch.
 
-    Wraps the cct-xs-v1-global ONNX model.  onnx2torch exposes the full
+    Wraps the cct-s-v1-global ONNX model.  onnx2torch exposes the full
     forward pass as a PyTorch nn.Module so gradients flow from the per-slot
     cross-entropy loss back through the model into the adversarial patch.
 
@@ -1341,7 +1341,7 @@ class CCTOCRBackend(OCRBackend):
     ocr_crop_size = (64, 128)   # (H, W)
 
     ONNX_PATH = ("~/.cache/fast-plate-ocr/"
-                 "cct-xs-v1-global-model/cct_xs_v1_global.onnx")
+                 "cct-s-v1-global-model/cct_s_v1_global.onnx")
     ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
     def __init__(self, model_path: str = "none", device: str = "cpu"):
