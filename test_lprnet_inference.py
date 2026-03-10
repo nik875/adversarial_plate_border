@@ -45,7 +45,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # NVIDIA TAO US LPRNet constants
 # ---------------------------------------------------------------------------
-ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXY"  # 35 chars — TAO US LPRNet has no 'Z' class
+ALPHABET  = "0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"  # 35 chars — 'O' omitted (confused with '0')
 BLANK_IDX = len(ALPHABET)   # 35 — blank is LAST (TAO convention)
 
 INPUT_H = 48
@@ -192,7 +192,7 @@ def load_model(model_path: str):
                      and dummy_out.shape[-1] > 10
                      and "int" not in out_dtype)
     print(f"  Format : {'softmax probs' if outputs_probs else 'argmax indices (baked in graph)'}")
-    print(f"  blank_id = {BLANK_IDX}  (last=35 — TAO US LPRNet convention, no Z class)")
+    print(f"  blank_id = {BLANK_IDX}  (last=35 — TAO US LPRNet; 'O' omitted from alphabet)")
     return session, input_name, output_name, outputs_probs
 
 
@@ -313,7 +313,7 @@ def main():
 
     print(f"\n  Reference: NVIDIA NGC reports 97.49% on their internal eval set.")
     print(f"  OpenALPR benchmark is a different public US plate set — gap is expected.")
-    print(f"  Note: TAO US LPRNet has no 'Z' output class (blank_id=35); plates with Z will fail.")
+    print(f"  Note: TAO US LPRNet omits 'O' from alphabet (35 chars); 'Z' is decodable.")
 
 
 if __name__ == "__main__":
