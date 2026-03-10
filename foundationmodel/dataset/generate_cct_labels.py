@@ -214,7 +214,7 @@ def main() -> None:
             for i, p in enumerate(batch_paths):
                 try:
                     img = Image.open(p).convert("RGB")
-                    if img.height < 32:
+                    if img.height < 32 or img.width < 50:
                         filtered += 1
                         img.close()
                         continue
@@ -261,7 +261,7 @@ def main() -> None:
     print(f"\n{'='*50}")
     print(f"  Total images   : {total}")
     print(f"  Kept (>=32px)  : {written}")
-    print(f"  Filtered (<32px): {filtered}")
+    print(f"  Filtered (<32h or <50w): {filtered}")
     print(f"  Skipped (error): {skipped}")
     print(f"{'='*50}")
     print(f"  CSV    → {output_path}")
