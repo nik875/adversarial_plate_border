@@ -9,6 +9,7 @@
 #   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
 #   3) fasterrcnn + dtrb (ViTSTR checkpoint)
 #   4) yolov8     + crnn
+#   5) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
 #
 # Usage:
 #   chmod +x run_paired_experiments.sh
@@ -47,6 +48,7 @@ DTRB_WEIGHTS="weights/vitstr_small_patch16_224.pth"
 DTRB_ROOT="/home/ubuntu/deep-text-recognition-benchmark"
 TROCR_WEIGHTS="none"
 LPRNET_WEIGHTS="us_lprnet_patched.onnx"
+DOCTR_VITSTR_WEIGHTS="weights/vitstr_small_finetuned.pt"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -148,6 +150,7 @@ PAIRS=(
     "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
     "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS|false"
+    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS|false"
 )
 
 log "━━━━  Paired Training  ━━━━"
