@@ -2,121 +2,158 @@
 """
 test_lprnet_inference.py
 
-Tests the NVIDIA TAO US LPRNet deployable ONNX model on synthetic
-license plate images with known ground truth.
+Tests the NVIDIA TAO US LPRNet ONNX model on the OpenALPR end-to-end US
+benchmark dataset — the same data NVIDIA uses in their TAO tutorial for this
+exact model.
 
-Sourced from NVIDIA TAO TF1 backend  (nvidia_tao_tf1/cv/lprnet/):
-  img_utils.py : preprocess() = cv2.resize((W,H)) / 255.0  NHWC→NCHW
-  inference.py : blank_id = len(classes)  (blank is LAST, not first)
-  ctc_decoder  : CTC greedy — collapse repeats, strip blank
+Dataset: github.com/openalpr/benchmarks  endtoend/us/
+  ~220 full car images, each paired with a .txt label:
+      filename  xmin  ymin  width  height  plate_text
+  Script downloads via GitHub API + raw URLs, crops the plate bbox,
+  and feeds each crop directly to LPRNet.
 
-Model:
-  Input  : [B, 3, 48, 96]  float32  [0, 1]
-  Output : [B, T]  int64   per-timestep argmax  (already in ONNX graph)
-  Alphabet : 0-9 A-Z (36 chars, 0-indexed), blank at index 36
+Preprocessing (NVIDIA TAO TF1 backend, img_utils.py):
+  cv2.resize((96, 48)) / 255.0  →  NCHW float32  [0, 1]
+
+Decoding:
+  blank_id = len(alphabet) = 36  (LAST index — TAO convention)
+  CTC greedy: collapse repeats, strip blank
 
 Usage:
     python test_lprnet_inference.py \\
         --model weights/lprnet_deployable_onnx_v1.1/us_lprnet_baseline18_deployable.onnx
-    python test_lprnet_inference.py --model <path> --crop plate.png
+    python test_lprnet_inference.py --model <path> --cache openalpr_us/
 
 Requires:
-    pip install onnxruntime pillow numpy
+    pip install onnxruntime pillow numpy requests tqdm
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+import requests
+from PIL import Image
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # NVIDIA TAO US LPRNet constants
 # ---------------------------------------------------------------------------
-ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # 36 chars, 0-indexed
-BLANK_IDX = len(ALPHABET)                             # 36 — blank is LAST
+ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+BLANK_IDX = len(ALPHABET)   # 36 — blank is LAST (TAO convention)
 
 INPUT_H = 48
 INPUT_W = 96
 
-# Test plates: cover digits-only, letters-only, mixed, and the target plate
-TEST_PLATES = [
-    "VRJ7774",    # target plate (uppercase)
-    "ABC1234",
-    "XYZ9999",
-    "7ABC234",
-    "ABC",
-    "12345",
-    "123456",
-    "1234567",
-    "ABCDEFG",
-    "CA12345",
-    "NY7ABC4",
-]
-
-FONT_PATHS = [
-    "/usr/share/fonts/liberation/LiberationMono-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSansMono-Bold.ttf",
-]
+GITHUB_API_URL  = "https://api.github.com/repos/openalpr/benchmarks/contents/endtoend/us"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/openalpr/benchmarks/master/endtoend/us"
 
 
 # ---------------------------------------------------------------------------
-# Synthetic plate renderer
+# Dataset download
 # ---------------------------------------------------------------------------
 
-def _find_font(size: int):
-    for path in FONT_PATHS:
+def list_dataset_files(cache_dir: Path) -> list[str]:
+    """Return sorted list of base names (no extension) from the GitHub API."""
+    cache_file = cache_dir / "_filelist.json"
+    if cache_file.exists():
+        return json.loads(cache_file.read_text())
+
+    print("  Fetching file list from GitHub API...")
+    resp = requests.get(GITHUB_API_URL, timeout=30,
+                        headers={"Accept": "application/vnd.github.v3+json"})
+    resp.raise_for_status()
+    entries = resp.json()
+
+    txt_names = {e["name"].rsplit(".", 1)[0]
+                 for e in entries if e["name"].endswith(".txt")}
+    img_names = {e["name"].rsplit(".", 1)[0]
+                 for e in entries if e["name"].endswith(".jpg")}
+    bases = sorted(txt_names & img_names)
+
+    cache_file.write_text(json.dumps(bases))
+    print(f"  Found {len(bases)} image+label pairs")
+    return bases
+
+
+def fetch_bytes(url: str, retries: int = 3) -> bytes:
+    for attempt in range(retries):
         try:
-            return ImageFont.truetype(path, size=size)
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            return r.content
         except Exception:
-            pass
-    return ImageFont.load_default()
+            if attempt == retries - 1:
+                raise
+            time.sleep(1.5 ** attempt)
 
 
-def render_plate(text: str,
-                 width: int = 300, height: int = 80,
-                 bg: tuple = (240, 240, 200),
-                 fg: tuple = (10, 10, 10),
-                 font_size: int = 52) -> Image.Image:
+def load_sample(base: str, cache_dir: Path) -> tuple[Image.Image, str, tuple] | None:
     """
-    Render a US-style plate: light yellow background, bold dark text.
-    Returns a PIL RGB Image.
+    Download (or load from cache) one image+label pair.
+    Returns (full_car_image, plate_text, (xmin, ymin, w, h)) or None.
+    Label format:  filename<TAB>xmin<TAB>ymin<TAB>width<TAB>height<TAB>plate_text
     """
-    img  = Image.new("RGB", (width, height), color=bg)
-    draw = ImageDraw.Draw(img)
-    font = _find_font(font_size)
+    img_path = cache_dir / f"{base}.jpg"
+    txt_path = cache_dir / f"{base}.txt"
 
-    # Center the text
-    bbox   = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (width  - tw) // 2
-    y = (height - th) // 2
-    draw.text((x, y), text, fill=fg, font=font)
-    return img
+    if not txt_path.exists():
+        txt_path.write_bytes(fetch_bytes(f"{GITHUB_RAW_BASE}/{base}.txt"))
+    if not img_path.exists():
+        img_path.write_bytes(fetch_bytes(f"{GITHUB_RAW_BASE}/{base}.jpg"))
+
+    fields = txt_path.read_text().strip().split("\t")
+    if len(fields) < 6:
+        return None
+    try:
+        xmin, ymin, w, h = int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4])
+    except ValueError:
+        return None
+    plate_text = fields[5].strip().upper()
+
+    # Skip plates with chars outside the model alphabet (e.g. spaces, dashes)
+    if not plate_text or not all(c in ALPHABET for c in plate_text):
+        return None
+
+    pil_img = Image.open(img_path).convert("RGB")
+    return pil_img, plate_text, (xmin, ymin, w, h)
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing  (img_utils.py — /255.0, NCHW)
+# Plate crop
+# ---------------------------------------------------------------------------
+
+def crop_plate(pil_img: Image.Image, bbox: tuple, padding: int = 4) -> Image.Image:
+    """Crop the plate region from a full car image with a small padding."""
+    xmin, ymin, w, h = bbox
+    iw, ih = pil_img.size
+    x1 = max(0, xmin - padding)
+    y1 = max(0, ymin - padding)
+    x2 = min(iw, xmin + w + padding)
+    y2 = min(ih, ymin + h + padding)
+    return pil_img.crop((x1, y1, x2, y2))
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing + decode
 # ---------------------------------------------------------------------------
 
 def preprocess(pil_image: Image.Image) -> np.ndarray:
+    """RGB PIL → [1, 3, 48, 96] float32 [0,1]  (NVIDIA TAO img_utils.py)."""
     rgb     = pil_image.convert("RGB")
     resized = rgb.resize((INPUT_W, INPUT_H), resample=Image.BILINEAR)
     arr     = np.array(resized, dtype=np.float32) / 255.0
-    arr     = arr.transpose(2, 0, 1)        # HWC → CHW
-    return arr[np.newaxis]                  # [1, 3, 48, 96]
+    return arr.transpose(2, 0, 1)[np.newaxis]   # [1, 3, 48, 96]
 
-
-# ---------------------------------------------------------------------------
-# CTC greedy decode  (blank_id = last index — TAO convention)
-# ---------------------------------------------------------------------------
 
 def ctc_decode(indices: np.ndarray) -> str:
+    """CTC greedy decode — blank_id = LAST (NVIDIA TAO convention)."""
     chars, prev = [], -1
     for idx in map(int, indices):
         if idx != prev:
@@ -127,7 +164,7 @@ def ctc_decode(indices: np.ndarray) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model loader and inspector
+# Model
 # ---------------------------------------------------------------------------
 
 def load_model(model_path: str):
@@ -141,46 +178,33 @@ def load_model(model_path: str):
         model_path,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
-
     input_name  = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
-    out_shape   = session.get_outputs()[0].shape
     out_dtype   = session.get_outputs()[0].type
 
-    print(f"  Input  '{input_name}': {session.get_inputs()[0].shape}  {session.get_inputs()[0].type}")
-    print(f"  Output '{output_name}': {out_shape}  {out_dtype}")
-
-    # Probe with dummy to get runtime shape and detect probs vs indices
     dummy     = np.zeros((1, 3, INPUT_H, INPUT_W), dtype=np.float32)
     dummy_out = session.run([output_name], {input_name: dummy})[0]
-    print(f"  Dummy output: shape={dummy_out.shape}  dtype={dummy_out.dtype}")
 
-    outputs_probs = dummy_out.ndim >= 2 and dummy_out.shape[-1] > 10 and "int" not in out_dtype
-    if outputs_probs:
-        num_classes = dummy_out.shape[-1]
-        print(f"  → raw softmax probs  (num_classes={num_classes}, blank_id={num_classes-1})")
-    else:
-        print(f"  → argmax indices already applied in graph  (blank_id={BLANK_IDX})")
+    print(f"  Input  : {session.get_inputs()[0].shape}  {session.get_inputs()[0].type}")
+    print(f"  Output : {dummy_out.shape}  {dummy_out.dtype}")
 
+    outputs_probs = (dummy_out.ndim >= 2
+                     and dummy_out.shape[-1] > 10
+                     and "int" not in out_dtype)
+    print(f"  Format : {'softmax probs' if outputs_probs else 'argmax indices (baked in graph)'}")
+    print(f"  blank_id = {BLANK_IDX}  (last — TAO convention)")
     return session, input_name, output_name, outputs_probs
 
 
-# ---------------------------------------------------------------------------
-# Run one plate image through the model
-# ---------------------------------------------------------------------------
-
-def run_plate(session, input_name: str, output_name: str,
-              outputs_probs: bool, pil_img: Image.Image) -> tuple[str, np.ndarray]:
-    inp  = preprocess(pil_img)
-    outs = session.run([output_name], {input_name: inp})[0]  # [1, T] or [1, T, C]
-
+def run_inference(session, input_name, output_name, outputs_probs,
+                  pil_img: Image.Image) -> str:
+    inp = preprocess(pil_img)
+    out = session.run([output_name], {input_name: inp})[0]
     if outputs_probs:
-        indices = outs[0].argmax(axis=-1)
+        indices = out[0].argmax(axis=-1)
     else:
-        indices = outs[0].flatten()
-
-    pred = ctc_decode(indices)
-    return pred, indices
+        indices = out[0].flatten()
+    return ctc_decode(indices)
 
 
 # ---------------------------------------------------------------------------
@@ -189,100 +213,106 @@ def run_plate(session, input_name: str, output_name: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test NVIDIA TAO US LPRNet on synthetic plate images"
+        description="Test NVIDIA TAO US LPRNet on OpenALPR end-to-end US benchmark"
     )
     parser.add_argument("--model", required=True,
                         help="Path to us_lprnet_baseline18_deployable.onnx")
-    parser.add_argument("--crop", default=None,
-                        help="Path to an additional real plate crop to test")
+    parser.add_argument("--cache", default="openalpr_us_cache",
+                        help="Directory to cache downloaded images (default: openalpr_us_cache/)")
+    parser.add_argument("--n", type=int, default=0,
+                        help="Max samples to evaluate (0 = all ~220, default: all)")
     args = parser.parse_args()
 
-    print(f"\n[NVIDIA TAO US LPRNet — synthetic plate test]")
-    print(f"  Model      : {args.model}")
-    print(f"  Alphabet   : '{ALPHABET}'  ({len(ALPHABET)} chars, 0-indexed)")
-    print(f"  blank_id   : {BLANK_IDX}  (LAST — TAO convention)")
-    print(f"  Input size : {INPUT_H} × {INPUT_W}")
-    print(f"  Preprocess : RGB  /255.0  →  [0,1]  NCHW\n")
+    cache_dir = Path(args.cache)
+    cache_dir.mkdir(exist_ok=True)
 
+    print(f"\n[NVIDIA TAO US LPRNet — OpenALPR benchmark]")
+    print(f"  Model   : {args.model}")
+    print(f"  Cache   : {cache_dir}/  (images cached after first download)")
+    print(f"  Dataset : openalpr/benchmarks endtoend/us  (~220 real US plate images)")
+
+    # ── Load model ────────────────────────────────────────────────────────────
+    print(f"\n[Model]")
     session, input_name, output_name, outputs_probs = load_model(args.model)
 
-    # ── Synthetic plates ──────────────────────────────────────────────────────
+    # ── File list ─────────────────────────────────────────────────────────────
+    print(f"\n[Dataset]")
+    bases = list_dataset_files(cache_dir)
+    if args.n > 0:
+        bases = bases[:args.n]
+
+    # ── Evaluate ──────────────────────────────────────────────────────────────
+    exact_correct  = 0
+    char_correct   = 0
+    char_total     = 0
+    skipped        = 0
+    evaluated      = 0
+    examples       = []
+    length_buckets = defaultdict(lambda: [0, 0])
+
+    pbar = tqdm(bases, desc="Downloading & evaluating", unit="plate")
+
+    for base in pbar:
+        try:
+            result = load_sample(base, cache_dir)
+        except Exception:
+            skipped += 1
+            continue
+
+        if result is None:
+            skipped += 1
+            continue
+
+        pil_full, gt, bbox = result
+        plate_crop = crop_plate(pil_full, bbox)
+
+        try:
+            pred = run_inference(session, input_name, output_name,
+                                 outputs_probs, plate_crop)
+        except Exception:
+            skipped += 1
+            continue
+
+        evaluated += 1
+        match = pred == gt
+        exact_correct += int(match)
+        n_right = sum(a == b for a, b in zip(pred, gt))
+        char_correct += n_right
+        char_total   += len(gt)
+        length_buckets[len(gt)][0] += int(match)
+        length_buckets[len(gt)][1] += 1
+
+        if len(examples) < 30:
+            examples.append((gt, pred, match))
+
+        pbar.set_postfix({"exact_acc": f"{exact_correct/evaluated:.1%}", "skip": skipped})
+
+    pbar.close()
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    exact_acc = exact_correct / evaluated if evaluated else 0.0
+    char_acc  = char_correct  / char_total if char_total else 0.0
+
     print(f"\n{'='*60}")
-    print(f"  SYNTHETIC PLATE RESULTS")
+    print(f"  RESULTS — OpenALPR US benchmark  [NVIDIA TAO LPRNet]")
     print(f"{'='*60}")
-    print(f"  {'GT':>10}   {'Pred':>12}   {'Match':>5}   raw indices")
-    print(f"  {'-'*55}")
+    print(f"  Evaluated            : {evaluated}")
+    print(f"  Skipped              : {skipped}  (download errors / non-alphanumeric GT)")
+    print(f"  Exact match accuracy : {exact_acc:.1%}  ({exact_correct}/{evaluated})")
+    print(f"  Character accuracy   : {char_acc:.1%}  ({char_correct}/{char_total})")
 
-    correct = 0
-    for text in TEST_PLATES:
-        pil_img = render_plate(text)
-        pred, indices = run_plate(session, input_name, output_name,
-                                  outputs_probs, pil_img)
-        match = pred == text
-        correct += int(match)
-        mark = "✓" if match else "✗"
-        idx_str = " ".join(str(i) for i in indices[:12])
-        print(f"  {mark} {text:>10}  →  {pred:>12}   [{idx_str}]")
+    print(f"\n  Accuracy by plate length:")
+    for length in sorted(length_buckets):
+        ok, tot = length_buckets[length]
+        print(f"    len={length:>2}  {ok/tot:.1%}  ({ok}/{tot})")
 
-    acc = correct / len(TEST_PLATES)
-    print(f"\n  Exact match: {correct}/{len(TEST_PLATES)}  ({acc:.0%})")
+    print(f"\n  Examples  (gt → pred  [✓/✗]):")
+    for gt, pred, match in examples:
+        status = "✓" if match else "✗"
+        print(f"    {status}  gt='{gt}'  →  pred='{pred}'")
 
-    # ── Per-style variants for VRJ7774 ────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  STYLE VARIANTS — 'VRJ7774'")
-    print(f"{'='*60}")
-    variants = [
-        ("Yellow bg, dark text (standard US)", (240, 240, 200), (10, 10, 10)),
-        ("White bg, dark text",                (255, 255, 255), (20, 20, 20)),
-        ("White bg, black text, larger",       (255, 255, 255), (0,  0,   0)),
-        ("Dark bg, white text (inverted)",     (30,  30,  30),  (240, 240, 240)),
-    ]
-    for desc, bg, fg in variants:
-        pil_img = render_plate("VRJ7774", bg=bg, fg=fg)
-        pred, _ = run_plate(session, input_name, output_name, outputs_probs, pil_img)
-        mark = "✓" if pred == "VRJ7774" else "✗"
-        print(f"  {mark}  {desc}")
-        print(f"     pred='{pred}'")
-
-    # ── Preprocessing variant: BGR instead of RGB ─────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  BGR vs RGB TEST (model trained with OpenCV BGR)")
-    print(f"{'='*60}")
-    pil_rgb = render_plate("VRJ7774")
-    # BGR version: swap R and B channels
-    arr_rgb  = np.array(pil_rgb)
-    arr_bgr  = arr_rgb[..., ::-1].copy()
-    pil_bgr  = Image.fromarray(arr_bgr)
-
-    pred_rgb, _ = run_plate(session, input_name, output_name, outputs_probs, pil_rgb)
-    pred_bgr, _ = run_plate(session, input_name, output_name, outputs_probs, pil_bgr)
-    print(f"  RGB input  →  '{pred_rgb}'")
-    print(f"  BGR input  →  '{pred_bgr}'")
-    better = "BGR" if pred_bgr == "VRJ7774" else ("RGB" if pred_rgb == "VRJ7774" else "neither")
-    print(f"  → {'Both wrong; plate text just out of model distribution' if better == 'neither' else better + ' matches ground truth'}")
-
-    # ── Real crop if provided ─────────────────────────────────────────────────
-    if args.crop:
-        print(f"\n{'='*60}")
-        print(f"  REAL CROP: {args.crop}")
-        print(f"{'='*60}")
-        real = Image.open(args.crop).convert("RGB")
-        print(f"  Image size: {real.size}")
-        pred_real, indices_real = run_plate(session, input_name, output_name,
-                                            outputs_probs, real)
-        print(f"  Prediction : '{pred_real}'")
-        idx_str = " ".join(str(i) for i in indices_real[:18])
-        print(f"  Raw indices: [{idx_str}]")
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  WHAT TO LOOK FOR")
-    print(f"{'='*60}")
-    print(f"  • Are any predictions correct? → model is loading and decoding")
-    print(f"  • All predictions empty?       → blank_id wrong; try blank_id=0")
-    print(f"  • Predictions all same char?   → softmax collapsed; check normalization")
-    print(f"  • BGR better than RGB?         → model expects BGR (OpenCV convention)")
-    print(f"  • No digits in predictions?    → alphabet mapping is off")
+    print(f"\n  Reference: NVIDIA NGC reports 97.49% on their internal eval set.")
+    print(f"  OpenALPR benchmark is a different public US plate set — gap is expected.")
 
 
 if __name__ == "__main__":
