@@ -22,8 +22,8 @@ set -euo pipefail
 # Defaults
 DEVICE="cuda"
 CSV="preproc_labels.csv"
-EPOCHS=100
-LR=1e-3
+EPOCHS=150
+LR=5e-3
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false

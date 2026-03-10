@@ -27,7 +27,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* CosineAnnealingLR (start 1e-3 → eta_min 1e-4), 150 epochs, no early stopping.
+* LR schedule: 10-epoch linear warmup (1e-4→5e-3) + CosineAnnealingLR (→1e-4), 150 epochs, no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
@@ -162,8 +162,8 @@ class PatchDecoder(nn.Module):
         super().__init__()
         c = seed_channels
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True), nn.Dropout2d(0.1),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True), nn.Dropout2d(0.1),
             nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
@@ -198,10 +198,8 @@ class AdversarialPatchTrainer:
         training:             bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
-        tv_weight:            float          = 2.5,
     ):
         self.training             = training
-        self.tv_weight            = tv_weight
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -527,14 +525,6 @@ class AdversarialPatchTrainer:
 
         return det_loss, ocr_loss
 
-    def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
-        """Total variation loss on [C, H, W] or [1, C, H, W] patch for spatial smoothness."""
-        if patch.dim() == 3:
-            patch = patch.unsqueeze(0)
-        diff_h = torch.abs(patch[:, :, :, 1:] - patch[:, :, :, :-1])
-        diff_v = torch.abs(patch[:, :, 1:, :] - patch[:, :, :-1, :])
-        return diff_h.sum() + diff_v.sum()
-
     def compute_loss(self, batch: dict) -> torch.Tensor:
         orig_tensor     = batch["orig_image"][0].to(self.device)
         orig_corners_np = batch["orig_corners"][0].numpy()
@@ -555,17 +545,18 @@ class AdversarialPatchTrainer:
             patched_prep.unsqueeze(0), new_corners,
             patched_orig,              orig_corners,
         )
-        tv_loss = self.total_variation_loss(patch_norm)
-        return (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
+        return (det_loss + ocr_loss) / 2
 
     # ====================================================================
     # Patch persistence
     # ====================================================================
 
-    def save_patch(self, epoch: int, subdir: str = "patches") -> None:
+    def save_patch(self, epoch: int, subdir: str = "patches",
+                   stem: Optional[str] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+        if stem is None:
+            stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
@@ -916,11 +907,27 @@ class AdversarialPatchTrainer:
             print("\nDry run complete.")
             return {}
 
+        warmup_epochs = 10
+        eta_min       = 1e-4
+
+        # Start optimizer at eta_min; warmup will ramp up to learning_rate
         optimizer = optim.AdamW(
-            self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+            self._trainable_params(), lr=eta_min, weight_decay=1e-4
         )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=num_epochs, eta_min=1e-4,
+        cosine_epochs = num_epochs - warmup_epochs
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=learning_rate / eta_min,
+            total_iters=warmup_epochs,
+        )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cosine_epochs, eta_min=eta_min,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
         )
 
         history    = {"loss": [], "val_score": [], "learning_rate": []}
@@ -936,7 +943,8 @@ class AdversarialPatchTrainer:
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Epochs    : {num_epochs}  |  LR: {learning_rate}")
+        print(f"  Epochs    : {num_epochs}  |  Warmup: {warmup_epochs}  |  "
+              f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         print(f"  Mode      : "
               f"{'impersonation → ' + self.impersonation_target if self.impersonation_target else 'disruption'}")
         print(f"  Run dir   : {self.run_dir}")
@@ -964,7 +972,7 @@ class AdversarialPatchTrainer:
             if val_loss < best_loss:
                 best_loss  = val_loss
                 best_epoch = epoch
-                self.save_patch(epoch, "patches")
+                self.save_patch(epoch, "patches", stem=f"patch_{self.detector.name}_best")
                 best_marker = "  ★ best"
 
             line = (f"Epoch {epoch+1:3d}/{num_epochs} | "
@@ -1029,8 +1037,6 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check and debug image generation.")
-    parser.add_argument("--tv-weight", type=float, default=2.5,
-                        help="Weight for total variation loss (default: 2.5).")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1063,7 +1069,6 @@ def main():
         training             = True,
         use_homography       = not args.disable_homography,
         run_name             = args.run_name,
-        tv_weight            = args.tv_weight,
     )
 
     trainer.train(
