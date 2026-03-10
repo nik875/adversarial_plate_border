@@ -147,17 +147,20 @@ def main():
             with torch.no_grad():
                 out = model(inp)
 
-            # doctr models may return (logits,) or logits directly
-            if isinstance(out, (tuple, list)):
+            # doctr returns a dict: {'out_map': logits, 'preds': [(str, conf)]}
+            if isinstance(out, dict):
+                if 'preds' in out:
+                    pred = out['preds'][0][0].upper()
+                else:
+                    pred = decode_output(out['out_map'].cpu(), vocab).upper()
+            elif isinstance(out, (tuple, list)):
                 logits = out[0]
+                if isinstance(logits, list) and isinstance(logits[0], tuple):
+                    pred = logits[0][0].upper()
+                else:
+                    pred = decode_output(logits.cpu(), vocab).upper()
             else:
-                logits = out
-
-            # If already decoded to strings by the postprocessor
-            if isinstance(logits, list) and isinstance(logits[0], tuple):
-                pred = logits[0][0].upper()
-            else:
-                pred = decode_output(logits.cpu(), vocab).upper()
+                pred = decode_output(out.cpu(), vocab).upper()
 
         except Exception as e:
             if len(first_errors) < 3:
