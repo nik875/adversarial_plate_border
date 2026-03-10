@@ -7,9 +7,8 @@
 # Pairings configured by default:
 #   1) rtdetr     + trocr
 #   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
-#   3) fasterrcnn + dtrb (ViTSTR checkpoint)
-#   4) yolov8     + crnn
-#   5) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
+#   3) yolov8     + crnn
+#   4) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
 #
 # Usage:
 #   chmod +x run_paired_experiments.sh
@@ -44,8 +43,6 @@ YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2e
 CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
 
 CRNN_WEIGHTS="weights/crnn_synth90k.pt"
-DTRB_WEIGHTS="weights/vitstr_small_patch16_224.pth"
-DTRB_ROOT="/home/ubuntu/deep-text-recognition-benchmark"
 TROCR_WEIGHTS="none"
 LPRNET_WEIGHTS="us_lprnet_patched.onnx"
 DOCTR_VITSTR_WEIGHTS="weights/vitstr_small_finetuned.pt"
@@ -61,7 +58,6 @@ while [[ $# -gt 0 ]]; do
         --pin-memory)      PIN_MEMORY=true; shift ;;
         --preload-images)  PRELOAD_IMAGES=true; shift ;;
         --limit)           LIMIT="$2"; shift 2 ;;
-        --dtrb-root)       DTRB_ROOT="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -144,19 +140,21 @@ if [[ "$LIMIT" -gt 0 ]]; then
 fi
 
 # Pair rows:
-# label|detector|det_weights|ocr|ocr_weights|needs_dtrb
+# label|detector|det_weights|ocr|ocr_weights
 PAIRS=(
-    "pair_fasterrcnn_crnn|fasterrcnn|$FASTERRCNN_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
-    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
-    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
-    "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS|false"
-    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS|false"
+    "pair_fasterrcnn_crnn|fasterrcnn|$FASTERRCNN_WEIGHTS|crnn|$CRNN_WEIGHTS"
+    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS"
+    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
+    "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS"
+    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"
 )
+
+# Removed: pair_fasterrcnn_dtrb (dtrb/ViTSTR checkpoint backend has not worked)
 
 log "━━━━  Paired Training  ━━━━"
 
 for row in "${PAIRS[@]}"; do
-    IFS='|' read -r label det det_w ocr ocr_w needs_dtrb <<< "$row"
+    IFS='|' read -r label det det_w ocr ocr_w <<< "$row"
 
     if [[ "$det_w" != "none" && ! -e "$det_w" ]]; then
         log "SKIP   $label — detector weights not found: $det_w"
@@ -165,14 +163,6 @@ for row in "${PAIRS[@]}"; do
     if [[ "$ocr_w" != "none" && ! -e "$ocr_w" ]]; then
         log "SKIP   $label — OCR weights not found: $ocr_w"
         continue
-    fi
-
-    EXTRA_ARGS=()
-    if [[ "$needs_dtrb" == "true" ]]; then
-        EXTRA_ARGS+=(--ocr-repo-root "$DTRB_ROOT")
-        EXTRA_ARGS+=(--dtrb-feature-extraction "vitstr_small_patch16_224")
-        EXTRA_ARGS+=(--dtrb-sequence-modeling "None")
-        EXTRA_ARGS+=(--dtrb-transformation "None")
     fi
 
     run "$label" \
