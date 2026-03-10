@@ -198,8 +198,10 @@ class AdversarialPatchTrainer:
         training:             bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
+        tv_weight:            float          = 2.5,
     ):
         self.training             = training
+        self.tv_weight            = tv_weight
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -525,6 +527,14 @@ class AdversarialPatchTrainer:
 
         return det_loss, ocr_loss
 
+    def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
+        """Total variation loss on [C, H, W] or [1, C, H, W] patch for spatial smoothness."""
+        if patch.dim() == 3:
+            patch = patch.unsqueeze(0)
+        diff_h = torch.abs(patch[:, :, :, 1:] - patch[:, :, :, :-1])
+        diff_v = torch.abs(patch[:, :, 1:, :] - patch[:, :, :-1, :])
+        return diff_h.sum() + diff_v.sum()
+
     def compute_loss(self, batch: dict) -> torch.Tensor:
         orig_tensor     = batch["orig_image"][0].to(self.device)
         orig_corners_np = batch["orig_corners"][0].numpy()
@@ -545,7 +555,8 @@ class AdversarialPatchTrainer:
             patched_prep.unsqueeze(0), new_corners,
             patched_orig,              orig_corners,
         )
-        return (det_loss + ocr_loss) / 2
+        tv_loss = self.total_variation_loss(patch_norm)
+        return (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
 
     # ====================================================================
     # Patch persistence
@@ -1018,6 +1029,8 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check and debug image generation.")
+    parser.add_argument("--tv-weight", type=float, default=2.5,
+                        help="Weight for total variation loss (default: 2.5).")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1050,6 +1063,7 @@ def main():
         training             = True,
         use_homography       = not args.disable_homography,
         run_name             = args.run_name,
+        tv_weight            = args.tv_weight,
     )
 
     trainer.train(
