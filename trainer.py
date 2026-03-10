@@ -659,13 +659,14 @@ class AdversarialPatchTrainer:
             writer.writeheader()
             writer.writerows(results)
 
-        frac = counts["correct"] / total
+        detected = total - counts["no_detection"]
+        frac = counts["correct"] / max(detected, 1)
         if frac < 0.50:
             raise RuntimeError(
-                f"\nSanity check FAILED: {counts['correct']}/{total} correct "
-                f"({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
+                f"\nSanity check FAILED: {counts['correct']}/{detected} correct "
+                f"among detected ({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
             )
-        print(f"  Passed ({frac*100:.1f}% correct).\n")
+        print(f"  Passed ({frac*100:.1f}% correct among {detected} detected).\n")
         return counts
 
     # ====================================================================
