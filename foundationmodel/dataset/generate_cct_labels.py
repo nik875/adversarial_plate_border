@@ -189,6 +189,9 @@ def main() -> None:
         sample_indices.update(idxs[::step][:n])
 
     samples_dir = Path(args.samples_dir)
+    if samples_dir.exists():
+        for f in samples_dir.iterdir():
+            f.unlink()
     samples_dir.mkdir(parents=True, exist_ok=True)
 
     try:
