@@ -127,7 +127,7 @@ def main():
 
             pred = processor.batch_decode(
                 generated, skip_special_tokens=True
-            )[0].strip().upper()
+            )[0].upper()
 
         except Exception as e:
             if len(first_errors) < 3:
