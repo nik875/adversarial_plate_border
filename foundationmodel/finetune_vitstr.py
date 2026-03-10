@@ -184,7 +184,7 @@ def main():
 
             epoch_loss += loss.item()
             n_batches  += 1
-            pbar.set_postfix({"loss": f"{loss.item():.4f}",
+            pbar.set_postfix({"loss": f"{epoch_loss / n_batches:.4f}",
                               "lr":   f"{scheduler.get_last_lr()[0]:.2e}"})
 
         train_loss = epoch_loss / max(n_batches, 1)
