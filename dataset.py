@@ -223,13 +223,14 @@ class AdversarialPatchDataset(Dataset):
 
         if gpu_device is not None:
             assert self.preload, "gpu_device requires preload=True"
-            self._gpu_cache = []
+            gpu_cache = []
             for idx in tqdm(range(len(self.df)), desc=f"Transferring dataset to {gpu_device}"):
                 item = self[idx]  # CPU tensors via normal __getitem__
-                self._gpu_cache.append({
+                gpu_cache.append({
                     k: (v.to(gpu_device) if isinstance(v, torch.Tensor) else v)
                     for k, v in item.items()
                 })
+            self._gpu_cache = gpu_cache
 
     def __len__(self):
         return len(self.df)
