@@ -111,6 +111,70 @@ def _corners_resize(corners: np.ndarray, sx: float, sy: float) -> np.ndarray:
 PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
+# Probability that each augmentation transform is applied on a given call.
+AUG_PROB = 0.5
+
+
+def augment_plate(image: torch.Tensor, device: str) -> torch.Tensor:
+    """
+    Differentiable photometric augmentation for the canonical plate+border region.
+
+    Each transform is applied independently with probability AUG_PROB so that
+    the number and type of transforms varies per sample.  All ops are pure
+    tensor arithmetic — the autograd graph from loss to patch decoder is fully
+    preserved.
+
+    Transforms (each applied with probability AUG_PROB):
+      1. Brightness       — U(0.5, 1.5) multiplicative scale
+      2. Contrast         — U(0.7, 1.3) scale around channel mean
+      3. Saturation       — U(0.5, 1.5) via kornia
+      4. Color temperature — U(-0.2, 0.2) shift; warm (+) boosts R/reduces B,
+                             cool (-) does the opposite
+      5. Directional shadow — angle U(0°, 360°), intensity U(0.1, 0.4),
+                              linear gradient mask
+
+    Parameters
+    ----------
+    image  : [1, C, H, W] float32 in [0, 1]
+    device : torch device string (must match image.device)
+    """
+    if random.random() < AUG_PROB:
+        factor = random.uniform(0.5, 1.5)
+        image  = image * factor
+
+    if random.random() < AUG_PROB:
+        factor = random.uniform(0.7, 1.3)
+        mean   = image.mean()
+        image  = (image - mean) * factor + mean
+
+    if random.random() < AUG_PROB:
+        factor = random.uniform(0.5, 1.5)
+        image  = kornia.enhance.adjust_saturation(image, factor)
+
+    if random.random() < AUG_PROB:
+        shift      = random.uniform(-0.2, 0.2)
+        temp_scale = torch.tensor(
+            [1.0 + shift * 0.3, 1.0, 1.0 - shift * 0.3],
+            dtype=image.dtype, device=device,
+        ).view(1, 3, 1, 1)
+        image = image * temp_scale
+
+    if random.random() < AUG_PROB:
+        angle_deg = random.uniform(0.0, 360.0)
+        intensity = random.uniform(0.1, 0.4)
+        H, W      = image.shape[-2], image.shape[-1]
+        xs        = torch.linspace(0.0, 1.0, W, device=device)
+        ys        = torch.linspace(0.0, 1.0, H, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        cos_a     = float(np.cos(np.radians(angle_deg)))
+        sin_a     = float(np.sin(np.radians(angle_deg)))
+        gradient  = grid_x * cos_a + grid_y * sin_a
+        gradient  = (gradient - gradient.min()) / (gradient.max() - gradient.min() + 1e-6)
+        shadow    = 1.0 - gradient * intensity
+        image     = image * shadow.unsqueeze(0).unsqueeze(0)
+
+    return torch.clamp(image, 0.0, 1.0)
+
 
 def _bbox_ocr_crop(
     img: torch.Tensor,                      # [1, C, H, W]
@@ -673,56 +737,7 @@ class AdversarialPatchTrainer:
         return (tv_h + tv_v) / num_comparisons
 
     def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
-        """
-        Differentiable photometric augmentation on a [1, C, H, W] image in [0, 1].
-        Applied after patch compositing so the patch must be robust to all transforms.
-        Autograd graph is fully preserved — gradients still flow back to the decoder.
-
-        Transforms applied every call with independently resampled parameters:
-          1. Brightness       — U(0.5, 1.5) multiplicative scale
-          2. Contrast         — U(0.7, 1.3) scale around channel mean
-          3. Saturation       — U(0.5, 1.5) via kornia
-          4. Color temperature — U(-0.2, 0.2) shift: warm (+) boosts R, reduces B;
-                                 cool (-) does the opposite
-          5. Directional shadow — random angle U(0, 360°), intensity U(0.1, 0.4),
-                                  linear gradient mask across the image
-        """
-        # Brightness
-        factor = random.uniform(0.5, 1.5)
-        image = image * factor
-
-        # Contrast
-        factor = random.uniform(0.7, 1.3)
-        mean   = image.mean()
-        image  = (image - mean) * factor + mean
-
-        # Saturation
-        factor = random.uniform(0.5, 1.5)
-        image  = kornia.enhance.adjust_saturation(image, factor)
-
-        # Color temperature: single shift drives R and B in opposite directions
-        shift      = random.uniform(-0.2, 0.2)
-        temp_scale = torch.tensor(
-            [1.0 + shift * 0.3, 1.0, 1.0 - shift * 0.3],
-            dtype=image.dtype, device=self.device,
-        ).view(1, 3, 1, 1)
-        image = image * temp_scale
-
-        # Directional shadow: linear gradient at a random angle
-        angle_deg = random.uniform(0.0, 360.0)
-        intensity = random.uniform(0.1, 0.4)
-        H, W      = image.shape[-2], image.shape[-1]
-        xs        = torch.linspace(0.0, 1.0, W, device=self.device)
-        ys        = torch.linspace(0.0, 1.0, H, device=self.device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # [H, W]
-        cos_a     = float(np.cos(np.radians(angle_deg)))
-        sin_a     = float(np.sin(np.radians(angle_deg)))
-        gradient  = grid_x * cos_a + grid_y * sin_a               # [H, W]
-        gradient  = (gradient - gradient.min()) / (gradient.max() - gradient.min() + 1e-6)
-        shadow    = 1.0 - gradient * intensity                     # [H, W]
-        image     = image * shadow.unsqueeze(0).unsqueeze(0)
-
-        return torch.clamp(image, 0.0, 1.0)
+        return augment_plate(image, self.device)
 
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
