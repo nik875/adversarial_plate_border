@@ -857,10 +857,14 @@ class AdversarialPatchTrainer:
                     image_losses.append((det_i + ocr_i) / 2)
                     ocr_l_list.append(ocr_i.detach())
                 else:
-                    # No detection — conf_loss is already near 0; gradient
-                    # continues to push confidence down.
-                    image_losses.append(det_i)
-                    ocr_l_list.append(torch.zeros(1, device=self.device).squeeze())
+                    # No valid predicted box: fall back to GT crop for OCR so
+                    # the OCR attack still receives gradient signal.
+                    ocr_i = self.ocr.differentiable_loss_batch(
+                        [items[i]["ocr_crop"]], target_text,
+                        impersonation=bool(self.impersonation_target),
+                    )[0] * self.ocr_loss_scale
+                    image_losses.append((det_i + ocr_i) / 2)
+                    ocr_l_list.append(ocr_i.detach())
                 det_l_list.append(det_i.detach())
 
             total = torch.stack(image_losses).mean() + self.tv_weight * tv_l
