@@ -53,6 +53,7 @@ GPU_PRELOAD=false
 EVAL_BATCH_SIZE=1
 COMPILE=true
 IMPERSONATION_TARGET=""
+SKIP_PAIRS=()
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -100,6 +101,7 @@ while [[ $# -gt 0 ]]; do
         --compile)         COMPILE=true; shift ;;
         --no-compile)      COMPILE=false; shift ;;
         --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
+        --skip)            SKIP_PAIRS+=("$2"); shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -211,6 +213,13 @@ log "━━━━  Paired Training  ━━━━"
 
 for row in "${PAIRS[@]}"; do
     IFS='|' read -r label det det_w ocr ocr_w <<< "$row"
+
+    for skip in "${SKIP_PAIRS[@]}"; do
+        if [[ "$label" == "$skip" ]]; then
+            log "SKIP   $label — explicitly skipped"
+            continue 2
+        fi
+    done
 
     if [[ "$det_w" != "none" && ! -e "$det_w" ]]; then
         log "SKIP   $label — detector weights not found: $det_w"
