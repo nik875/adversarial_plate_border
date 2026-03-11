@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import csv
 import re
+import time
 import warnings
 import argparse
 from datetime import datetime
@@ -975,12 +976,14 @@ class AdversarialPatchTrainer:
         log_file = open(log_path, "w")
 
         for epoch in range(num_epochs):
+            epoch_start    = time.time()
             self.training  = True
             train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
             self.training  = False
             val_loss       = self.validate()
             scheduler.step()
             lr = optimizer.param_groups[0]["lr"]
+            epoch_time     = time.time() - epoch_start
 
             history["loss"].append(train_loss)
             history["val_score"].append(val_loss)
@@ -1001,7 +1004,8 @@ class AdversarialPatchTrainer:
                     f"loss: {train_loss:.4f}  det: {train_det:.4f}  "
                     f"ocr: {train_ocr:.4f}  tv: {train_tv:.4f} | "
                     f"val: {val_loss:.4f} Δ{change:+.1f}% | "
-                    f"lr: {lr:.2e}{best_marker}")
+                    f"lr: {lr:.2e} | "
+                    f"time: {epoch_time:.1f}s{best_marker}")
             print(line)
             log_file.write(line + "\n")
             log_file.flush()
