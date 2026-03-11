@@ -52,6 +52,7 @@ GPU_PRELOAD=false
 
 EVAL_BATCH_SIZE=1
 COMPILE=true
+IMPERSONATION_TARGET="VJJ7744"
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -98,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --eval-batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
         --compile)         COMPILE=true; shift ;;
         --no-compile)      COMPILE=false; shift ;;
+        --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -168,6 +170,7 @@ BASE_ARGS=(
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
     --eval-batch-size "$EVAL_BATCH_SIZE"
+    --impersonation-target "$IMPERSONATION_TARGET"
 )
 
 if $PIN_MEMORY; then
