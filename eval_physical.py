@@ -466,9 +466,17 @@ def main() -> None:
         backend.ensure_loaded()
         backend.freeze()
 
+        # Use the first OCR backend paired with this detector for the clean baseline
+        paired = patches_by_det.get(det_key, [])
+        clean_ocr_key = paired[0][2] if paired else None
+        clean_ocr = seen_ocr.get(clean_ocr_key) if clean_ocr_key else None
+
         print(f"\n══ Backend: {det_key[0]} ══")
         m = evaluate_one(backend, samples, None, "clean",
-                         device=args.device, iou_threshold=args.iou_threshold)
+                         device=args.device, iou_threshold=args.iou_threshold,
+                         ocr_backend=clean_ocr,
+                         expected_plate=args.expected_plate,
+                         impersonation_target=args.impersonation_target)
         all_results.append(m)
         print(f"  {m.summary()}")
 
