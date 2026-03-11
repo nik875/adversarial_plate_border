@@ -143,46 +143,42 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Trainable ConvTranspose2d decoder that maps a compact seed tensor
-    [1, seed_channels, 4, 8] → [1, 3, 256, 512].
+    Residual-stream decoder that maps [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Six stride-2 layers double the spatial dimensions at each step:
+    Six stages, each doubling spatial size:
         4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
-    Each transposed conv is followed by a 7×7 same-padded conv (padding=3)
-    that refines features at the new resolution without changing spatial size,
-    matching standard generator architectures (e.g. pix2pix, BigGAN).
+    All intermediate feature maps are kept at seed_channels (128) throughout,
+    forming a flat residual stream. Each stage contributes two additive deltas:
+      1. ConvTranspose2d: nearest-neighbour upsample of stream + deconv delta
+      2. Conv2d 7×7:      stream + conv delta (same spatial size)
 
-    Channel schedule halves from seed_channels→256→128→64→32→16→3,
-    so the expensive (many-channel) work is done at small spatial grids.
+    This gives every layer — including those close to the seed — a short gradient
+    path back to the loss, since gradients flow through the addition operations
+    without passing through earlier transposed convs.
+
+    A final 1×1 conv projects the 128-channel stream to 3 channels (RGB).
     Output is passed through tanh and scaled to [0, 1].
-
-    Both the seed and the decoder weights are optimised during training —
-    the seed controls global structure while the decoder weights determine
-    how that structure is elaborated into pixel-level detail.
     """
 
     def __init__(self, seed_channels: int = 128):
         super().__init__()
-        c = seed_channels
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 256, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 128, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d( 64,  64, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d( 32,  32, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d( 16,  16, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
-            nn.Conv2d(  3,   3, 7, padding=3),
-        )
+        C = seed_channels
+        self.deconvs = nn.ModuleList([
+            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
+        ])
+        self.convs = nn.ModuleList([
+            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
+        ])
+        self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
         """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
-        return torch.tanh(self.net(seed)) * 0.5 + 0.5
+        x = seed
+        for deconv, conv in zip(self.deconvs, self.convs):
+            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
+            x = x + F.leaky_relu(conv(x), 0.2)
+        return torch.tanh(self.final(x)) * 0.5 + 0.5
 
 
 # ---------------------------------------------------------------------------
