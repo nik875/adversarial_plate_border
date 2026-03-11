@@ -209,14 +209,12 @@ class AdversarialPatchTrainer:
         tv_weight:            float          = 10.0,
         ocr_loss_scale:       float          = 1.0,
         det_loss_scale:       float          = 1.0,
-        disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
         self.ocr_loss_scale       = ocr_loss_scale
         self.det_loss_scale       = det_loss_scale
-        self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.print_blur           = print_blur
         self.use_homography       = use_homography
@@ -581,10 +579,7 @@ class AdversarialPatchTrainer:
         det_l = torch.stack(det_losses).mean() * self.det_loss_scale
         ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
         tv_l  = self.total_variation_loss(patch_norm)
-        if self.disable_disruption:
-            total = ocr_l + self.tv_weight * tv_l
-        else:
-            total = (det_l + ocr_l) / 2 + self.tv_weight * tv_l
+        total = (det_l + ocr_l) / 2 + self.tv_weight * tv_l
         return total, det_l.detach(), ocr_l.detach(), (self.tv_weight * tv_l).detach()
 
     def compute_loss(self, batch: dict) -> tuple:
@@ -1034,10 +1029,8 @@ class AdversarialPatchTrainer:
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
         print(f"  Epochs    : {num_epochs}  |  Warmup: {warmup_epochs}  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
-        _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
-        if self.disable_disruption:
-            _mode += '  [detection loss disabled]'
-        print(f"  Mode      : {_mode}")
+        print(f"  Mode      : "
+              f"{'impersonation → ' + self.impersonation_target if self.impersonation_target else 'disruption'}")
         print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
 
@@ -1149,10 +1142,6 @@ def main():
                         help="Scalar multiplier on OCR loss (default: 1.0).")
     parser.add_argument("--det-loss-scale", type=float, default=1.0,
                         help="Scalar multiplier on detection loss (default: 1.0).")
-    parser.add_argument("--no-disruption", action="store_true",
-                        help="Disable the detection (disruption) loss component entirely. "
-                             "Detection is still computed for pipeline purposes but contributes "
-                             "zero gradient to the total loss.")
     parser.add_argument("--eval-batch-size", type=int, default=1,
                         help="Number of images to batch for detector/OCR evaluation (default 1).")
     parser.add_argument("--compile", action="store_true",
@@ -1202,7 +1191,6 @@ def main():
         tv_weight            = args.tv_weight,
         ocr_loss_scale       = args.ocr_loss_scale,
         det_loss_scale       = args.det_loss_scale,
-        disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
     )
 

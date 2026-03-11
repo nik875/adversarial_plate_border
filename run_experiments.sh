@@ -62,7 +62,6 @@ DEFAULT_DET_WEIGHTS="$YOLOV8_WEIGHTS"
 SKIP_OCR=false
 SKIP_TRAIN=false    # set true to jump straight to evaluation (re-use existing patches)
 DRY_RUN=false
-IMPERSONATION_TARGET=""   # when non-empty, passes --impersonation-target + --no-disruption
 
 # ── Parse CLI args ─────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -76,10 +75,9 @@ while [[ $# -gt 0 ]]; do
         --preload-images) PRELOAD_IMAGES=true; shift ;;
         --limit)        LIMIT="$2";        shift 2 ;;
         --dtrb-root)    DTRB_ROOT="$2";    shift 2 ;;
-        --skip-ocr)             SKIP_OCR=true;                 shift   ;;
-        --skip-train)           SKIP_TRAIN=true;               shift   ;;
-        --dry-run)              DRY_RUN=true;                  shift   ;;
-        --impersonation-target) IMPERSONATION_TARGET="$2";     shift 2 ;;
+        --skip-ocr)     SKIP_OCR=true;     shift   ;;
+        --skip-train)   SKIP_TRAIN=true;   shift   ;;
+        --dry-run)      DRY_RUN=true;      shift   ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -157,9 +155,6 @@ if $PRELOAD_IMAGES; then
 fi
 if [[ "$LIMIT" -gt 0 ]]; then
     BASE_TRAIN_ARGS+=(--limit "$LIMIT")
-fi
-if [[ -n "$IMPERSONATION_TARGET" ]]; then
-    BASE_TRAIN_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET" --no-disruption)
 fi
 
 # =============================================================================
