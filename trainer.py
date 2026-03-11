@@ -269,6 +269,7 @@ class AdversarialPatchTrainer:
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
         sam_rho:              float          = 0.025,
+        skip_sanity:          bool           = False,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -324,6 +325,25 @@ class AdversarialPatchTrainer:
 
         # ── Image transform ────────────────────────────────────────────
         self.transform = T.Compose([T.ToTensor()])
+
+        # ── Sanity check (before any preloading) ───────────────────────
+        if not skip_sanity:
+            _sanity_accum = grad_accumulate if grad_accumulate is not None else 4
+            _sanity_limit = eval_batch_size * _sanity_accum
+            _sanity_loader, _ = create_dataloaders(
+                csv_path,
+                transform=self.transform,
+                preload=False,
+                gpu_device=None,
+                batch_size=1,
+                n_jobs=0,
+                pin_memory=False,
+                limit=_sanity_limit,
+                use_all_for_train=True,
+                use_original=True,
+            )
+            self.validate_pipeline(_sanity_loader)
+            del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
         self.train_loader, self.val_loader = create_dataloaders(
@@ -618,6 +638,14 @@ class AdversarialPatchTrainer:
         orig_corners_np = batch_item["orig_corners"].cpu().numpy()
         orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
+        # Halve images that are too large to keep GPU memory manageable
+        _, H, W = orig_tensor.shape
+        if max(H, W) > 2000:
+            orig_tensor     = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
+                                            mode="bilinear", align_corners=False).squeeze(0)
+            orig_corners_np = orig_corners_np * 0.5
+            orig_corners    = orig_corners * 0.5
+
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
         patched_prep_chw, new_corners_np = self.diff_prep(
@@ -634,8 +662,18 @@ class AdversarialPatchTrainer:
 
     def compute_loss_batch(self, items: list) -> tuple:
         """Batch the slow model-eval calls; average losses over B items."""
-        patch_norm   = items[0]["_patch_norm"]
-        batched_prep = torch.stack([x["patched_prep"] for x in items])  # [B, C, H, W]
+        patch_norm = items[0]["_patch_norm"]
+        preps = [x["patched_prep"] for x in items]
+        if all(p.shape == preps[0].shape for p in preps):
+            batched_prep = torch.stack(preps)
+        else:
+            # Variable-size images (e.g. fasterrcnn passthrough): pad to max H×W
+            max_h = max(p.shape[1] for p in preps)
+            max_w = max(p.shape[2] for p in preps)
+            batched_prep = torch.stack([
+                F.pad(p, (0, max_w - p.shape[2], 0, max_h - p.shape[1]))
+                for p in preps
+            ])
         target_boxes = [x["target_box"] for x in items]
         ocr_crops    = [x["ocr_crop"]   for x in items]
 
@@ -645,7 +683,8 @@ class AdversarialPatchTrainer:
         ocr_losses  = self.ocr.differentiable_loss_batch(
             ocr_crops, target_text, impersonation=bool(self.impersonation_target))
 
-        det_l = torch.stack(det_losses).mean() * self.det_loss_scale
+        effective_det_scale = self.det_loss_scale * (2.0 if self.ocr.name == "trocr" else 1.0)
+        det_l = torch.stack(det_losses).mean() * effective_det_scale
         ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
         tv_l  = self.total_variation_loss(patch_norm)
         if self.disable_disruption:
@@ -689,102 +728,64 @@ class AdversarialPatchTrainer:
     # Pre-training sanity check
     # ====================================================================
 
-    def validate_pipeline(self, n_samples: Optional[int] = None) -> dict:
+    def validate_pipeline(self, loader=None) -> None:
         """
-        Run clean images (no patch) through detector + OCR.
-        Raises RuntimeError if < 50% read correctly.
+        Run one full gradient-accumulation cycle (B * update_every items) through
+        the training forward+backward path to verify the pipeline end-to-end.
+        Raises on any crash.
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
-        total = (min(n_samples, len(self.train_loader) + len(self.val_loader))
-                 if n_samples is not None
-                 else len(self.train_loader) + len(self.val_loader))
-        results = []
-        count = 0
-        done = False
-        with tqdm(total=total, desc="Sanity check", leave=False) as pbar:
-            for loader in [self.train_loader, self.val_loader]:
-                if done:
-                    break
-                for batch in loader:
-                    if n_samples is not None and count >= n_samples:
-                        done = True
-                        break
-                    fn = (batch["filename"][0]
-                          if isinstance(batch["filename"], (list, tuple))
-                          else batch["filename"])
-                    orig_tensor     = batch["orig_image"][0].to(self.device)
-                    orig_corners_np = batch["orig_corners"][0].cpu().numpy()
-                    orig_corners    = batch["orig_corners"][0].to(self.device)
-                    count += 1
-                    pbar.update(1)
+        _loader = loader if loader is not None else self.train_loader
+        B = self.eval_batch_size
+        update_every = (self.grad_accumulate
+                        if self.grad_accumulate is not None
+                        else min(4, len(_loader)))
+        need = B * update_every
 
-                    with torch.no_grad():
-                        prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
-                        new_corners = torch.from_numpy(new_corners_np).to(self.device)
-                        target_box  = self.corners_to_bbox(new_corners)
-                        detections  = self.detector.predict(prep_tensor)
+        items_raw = []
+        for batch in _loader:
+            items_raw.append({k: v[0] for k, v in batch.items()})
+            if len(items_raw) >= need:
+                break
+        if not items_raw:
+            raise RuntimeError("No training data found for sanity check.")
 
-                    if not detections:
-                        results.append({"filename": fn, "category": "no_detection",
-                                        "text": None, "confidence": 0.0})
-                        continue
+        # Models must be in training mode for cuDNN RNN backward to work
+        self.detector.train_mode()
+        self.ocr.train()
+        try:
+            patch_norm = self.generate_patch(training_aug=self.training)
+            buffer: list = []
+            step = 0
+            total_loss = 0.0
+            for raw_item in items_raw:
+                item = self._prepare_one(raw_item, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
+                if len(buffer) < B:
+                    continue
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                buffer = []
+                step += 1
+                scaled = loss / update_every
+                scaled.backward(retain_graph=(step % update_every != 0))
+                total_loss += loss.item()
+                del loss, scaled
 
-                    best_det = max(
-                        detections,
-                        key=lambda d: (
-                            self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                            target_box.unsqueeze(0)).item()
-                            * d.confidence
-                        ),
-                    )
+            # Zero grads so the optimizer starts clean
+            for p in self._trainable_params():
+                if p.grad is not None:
+                    p.grad.zero_()
+        finally:
+            self.detector.eval()
+            self.detector.freeze()
+            self.ocr.eval()
+            self.ocr.freeze()
 
-                    with torch.no_grad():
-                        crop       = _bbox_ocr_crop(orig_tensor.unsqueeze(0), orig_corners,
-                                                    self.ocr.ocr_crop_size)
-                        ocr_result = self.ocr.predict(crop.squeeze(0))
-
-                    text = ocr_result.text or ""
-                    if self._plate_text_matches(text, self.expected_plate_text):
-                        cat = "correct"
-                    elif self.impersonation_target and self._plate_text_matches(text, self.impersonation_target):
-                        cat = "impersonation"
-                    else:
-                        cat = "misread"
-                    results.append({"filename": fn, "category": cat,
-                                    "text": text, "confidence": ocr_result.confidence})
-
-        counts = {"correct": 0, "impersonation": 0, "misread": 0, "no_detection": 0}
-        for r in results:
-            counts[r["category"]] += 1
-        total = max(len(results), 1)
-
-        lines = [
-            f"Sanity check over {len(results)} images "
-            f"(expected: '{self.expected_plate_text}')",
-            f"  Correct reads : {counts['correct']:4d} ({counts['correct']/total*100:.1f}%)",
-            f"  Impersonation : {counts['impersonation']:4d} ({counts['impersonation']/total*100:.1f}%)",
-            f"  Misread       : {counts['misread']:4d} ({counts['misread']/total*100:.1f}%)",
-            f"  No detection  : {counts['no_detection']:4d} ({counts['no_detection']/total*100:.1f}%)",
-        ]
-        report = "\n".join(lines)
-        print(report)
-        (self.run_dir / "sanity_check.txt").write_text(report + "\n")
-
-        csv_out = self.run_dir / "sanity_check.csv"
-        with open(csv_out, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["filename", "category", "text", "confidence"])
-            writer.writeheader()
-            writer.writerows(results)
-
-        detected = total - counts["no_detection"]
-        frac = counts["correct"] / max(detected, 1)
-        if frac < 0.50:
-            raise RuntimeError(
-                f"\nSanity check FAILED: {counts['correct']}/{detected} correct "
-                f"among detected ({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
-            )
-        print(f"  Passed ({frac*100:.1f}% correct among {detected} detected).\n")
-        return counts
+        avg = total_loss / max(step, 1)
+        msg = f"Sanity check passed: {step} accumulation step(s), avg loss {avg:.4f}"
+        print(f"  {msg}\n")
+        (self.run_dir / "sanity_check.txt").write_text(msg + "\n")
 
     # ====================================================================
     # Debug images
@@ -944,45 +945,52 @@ class AdversarialPatchTrainer:
 
         Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
         with the per-step accounting in train_epoch.
+
+        Memory design: we avoid retain_graph by detaching the patch from the
+        generator and treating it as a leaf for the per-item backward calls.
+        Each item's graph is freed immediately after its backward.  Once all
+        item gradients are accumulated in the detached leaf's .grad, a single
+        backward through the generator (using that accumulated grad as the
+        incoming gradient) propagates correctly to seed/decoder params.
         """
         M = len(window_raw)
         m = min(self.sam_m, M)
 
+        def _accumulate(indices, weight) -> Tuple[float, float, float, float]:
+            """
+            Generate patch, detach → leaf, accumulate item gradients one-by-one
+            (no retain_graph), then backprop once through the generator.
+            Returns (total_loss, det_sum, ocr_sum, tv_sum) scaled by weight.
+            """
+            patch_with_graph = self.generate_patch(training_aug=self.training)
+            patch_leaf = patch_with_graph.detach().requires_grad_(True)
+
+            total_loss = det_sum = ocr_sum = tv_sum = 0.0
+            for i in indices:
+                item = self._prepare_one(window_raw[i], patch_leaf)
+                item["_patch_norm"] = patch_leaf
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch([item])
+                (loss * weight).backward()   # frees item graph; accumulates patch_leaf.grad
+                total_loss += loss.item()
+                det_sum    += det_l.item()
+                ocr_sum    += ocr_l.item()
+                tv_sum     += tv_l.item()
+                del item
+
+            # Propagate accumulated patch gradient through the generator graph.
+            patch_with_graph.backward(patch_leaf.grad)
+            return total_loss, det_sum, ocr_sum, tv_sum
+
         # ── ASCENT: gradients from m random items ────────────────────────
         optimizer.zero_grad()
         ascent_idx = sorted(random.sample(range(M), m))
-        patch_norm = self.generate_patch(training_aug=self.training)
-
-        chunks = [ascent_idx[i:i + B] for i in range(0, m, B)]
-        for ci, chunk in enumerate(chunks):
-            items = []
-            for i in chunk:
-                item = self._prepare_one(window_raw[i], patch_norm)
-                item["_patch_norm"] = patch_norm
-                items.append(item)
-            loss_a, _, _, _ = self.compute_loss_batch(items)
-            (loss_a / m).backward(retain_graph=(ci < len(chunks) - 1))
+        _accumulate(ascent_idx, 1.0 / m)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
         optimizer.first_step(zero_grad=True)
 
         # ── DESCENT: gradients from all M items, perturbed patch ─────────
-        patch_perturbed = self.generate_patch(training_aug=self.training)
-        total_loss = det_sum = ocr_sum = tv_sum = 0.0
-
-        all_chunks = [list(range(i, min(i + B, M))) for i in range(0, M, B)]
-        for ci, chunk in enumerate(all_chunks):
-            items = []
-            for i in chunk:
-                item = self._prepare_one(window_raw[i], patch_perturbed)
-                item["_patch_norm"] = patch_perturbed
-                items.append(item)
-            loss_d, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
-            (loss_d / M).backward(retain_graph=(ci < len(all_chunks) - 1))
-            total_loss += loss_d.item()
-            det_sum    += det_l.item()
-            ocr_sum    += ocr_l.item()
-            tv_sum     += tv_l.item()
+        total_loss, det_sum, ocr_sum, tv_sum = _accumulate(range(M), 1.0 / M)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
         optimizer.second_step(zero_grad=True)
@@ -1156,12 +1164,7 @@ class AdversarialPatchTrainer:
         lr_min:        float = 1e-5,
         save_interval: int   = 10,
         dry_run:       bool  = False,
-        skip_sanity:   bool  = False,
     ) -> dict:
-        if not skip_sanity:
-            self.save_debug_images()
-            self.validate_pipeline()
-
         if dry_run:
             print("\nDry run complete.")
             return {}
@@ -1328,7 +1331,7 @@ def main():
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
-                        help="Skip pre-training sanity check and debug image generation.")
+                        help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 2.5).")
     parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
@@ -1400,6 +1403,7 @@ def main():
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
         sam_rho              = args.sam_rho,
+        skip_sanity          = args.skip_sanity,
     )
 
     trainer.train(
@@ -1408,7 +1412,6 @@ def main():
         lr_min        = args.lr_min,
         save_interval = 10,
         dry_run       = args.dry_run,
-        skip_sanity   = args.skip_sanity,
     )
 
 

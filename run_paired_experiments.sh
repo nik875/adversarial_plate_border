@@ -33,10 +33,10 @@ LR_CCT=2e-4
 LR_LPRNET=2e-4
 LR_VITSTR=2e-4
 # Per-OCR TV weight (tweak per model as needed)
-TV_TROCR=10
-TV_CCT=10
-TV_LPRNET=10
-TV_VITSTR=10
+TV_TROCR=100
+TV_CCT=100
+TV_LPRNET=100
+TV_VITSTR=100
 # Per-OCR loss scale (tweak per model as needed)
 OCR_SCALE_TROCR=0.5
 OCR_SCALE_CCT=0.7
@@ -52,7 +52,10 @@ DRY_RUN=false
 SKIP_SANITY=false
 GPU_PRELOAD=false
 
-EVAL_BATCH_SIZE=1
+EVAL_BATCH_SIZE_TROCR=1
+EVAL_BATCH_SIZE_CCT=1
+EVAL_BATCH_SIZE_LPRNET=1
+EVAL_BATCH_SIZE_VITSTR=1
 COMPILE=true
 IMPERSONATION_TARGET=""
 SKIP_PAIRS=()
@@ -101,7 +104,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)         DRY_RUN=true; shift ;;
         --skip-sanity)     SKIP_SANITY=true; shift ;;
         --gpu-preload)     GPU_PRELOAD=true; shift ;;
-        --eval-batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
+        --eval-batch-size) EVAL_BATCH_SIZE_TROCR="$2"; EVAL_BATCH_SIZE_CCT="$2"; EVAL_BATCH_SIZE_LPRNET="$2"; EVAL_BATCH_SIZE_VITSTR="$2"; shift 2 ;;
         --compile)         COMPILE=true; shift ;;
         --no-compile)      COMPILE=false; shift ;;
         --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
@@ -178,7 +181,6 @@ BASE_ARGS=(
     --det-loss-scale "$DET_SCALE"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
-    --eval-batch-size "$EVAL_BATCH_SIZE"
 )
 
 if $PIN_MEMORY; then
@@ -241,10 +243,10 @@ for row in "${PAIRS[@]}"; do
     fi
 
     case "$ocr" in
-        trocr)        pair_lr="$LR_TROCR";  pair_tv="$TV_TROCR";  pair_ocr_scale="$OCR_SCALE_TROCR" ;;
-        cct)          pair_lr="$LR_CCT";    pair_tv="$TV_CCT";    pair_ocr_scale="$OCR_SCALE_CCT" ;;
-        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET"; pair_ocr_scale="$OCR_SCALE_LPRNET" ;;
-        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR"; pair_ocr_scale="$OCR_SCALE_VITSTR" ;;
+        trocr)        pair_lr="$LR_TROCR";  pair_tv="$TV_TROCR";  pair_ocr_scale="$OCR_SCALE_TROCR"; pair_eval_bs="$EVAL_BATCH_SIZE_TROCR" ;;
+        cct)          pair_lr="$LR_CCT";    pair_tv="$TV_CCT";    pair_ocr_scale="$OCR_SCALE_CCT";   pair_eval_bs="$EVAL_BATCH_SIZE_CCT" ;;
+        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET"; pair_ocr_scale="$OCR_SCALE_LPRNET"; pair_eval_bs="$EVAL_BATCH_SIZE_LPRNET" ;;
+        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR"; pair_ocr_scale="$OCR_SCALE_VITSTR"; pair_eval_bs="$EVAL_BATCH_SIZE_VITSTR" ;;
     esac
 
     run "$label" \
@@ -253,6 +255,7 @@ for row in "${PAIRS[@]}"; do
             --lr "$pair_lr" \
             --tv-weight "$pair_tv" \
             --ocr-loss-scale "$pair_ocr_scale" \
+            --eval-batch-size "$pair_eval_bs" \
             --backend "$det" \
             --model-path "$det_w" \
             --ocr-backend "$ocr" \

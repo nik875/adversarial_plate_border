@@ -610,6 +610,108 @@ class RTDETRBackend(DetectorBackend):
             self._model.to(device)
         return self
 
+    def _diff_preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Replicate the HF processor's resize + normalize in a differentiable way.
+        image: [C, H, W] float32 [0, 1]
+        Returns: [1, C, target_h, target_w] normalized tensor with grad.
+        """
+        size = self._processor.size  # e.g. {"height": 640, "width": 640}
+        th, tw = size["height"], size["width"]
+        x = F.interpolate(image.unsqueeze(0), size=(th, tw),
+                          mode="bilinear", align_corners=False)
+        mean = torch.tensor(self._processor.image_mean,
+                            dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+        std  = torch.tensor(self._processor.image_std,
+                            dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+        return (x - mean) / std  # [1, 3, th, tw]
+
+    def differentiable_det_loss(self, image: torch.Tensor,
+                                target_box: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable forward: bypass the PIL/numpy processor path so
+        gradients flow from the confidence score back to the input image.
+        """
+        self.ensure_loaded()
+        inp = self._diff_preprocess(image.to(self.device))   # [1, 3, H, W]
+        outputs = self._model(pixel_values=inp)
+
+        # outputs.logits:    [1, num_queries, num_classes]
+        # outputs.pred_boxes:[1, num_queries, 4]  cxcywh  normalised [0,1]
+        logits    = outputs.logits[0]      # [Q, C]
+        pred_boxes = outputs.pred_boxes[0] # [Q, 4]
+
+        # Confidence = max sigmoid score over classes
+        scores = logits.sigmoid().max(dim=-1).values  # [Q]
+
+        # Convert pred_boxes cxcywh→xyxy in pixel coords
+        orig_h, orig_w = image.shape[1], image.shape[2]
+        cx, cy, bw, bh = pred_boxes.unbind(-1)
+        boxes_xyxy = torch.stack([
+            (cx - bw / 2) * orig_w,
+            (cy - bh / 2) * orig_h,
+            (cx + bw / 2) * orig_w,
+            (cy + bh / 2) * orig_h,
+        ], dim=-1)  # [Q, 4]
+
+        if len(scores) == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Select best anchor by IoU × confidence (detached for selection only)
+        box_t = target_box.to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            weights = torch.stack([
+                _box_iou_scalar(boxes_xyxy[i].detach().unsqueeze(0), box_t)
+                * scores[i].detach()
+                for i in range(len(scores))
+            ])
+        best_idx = int(weights.argmax().item())
+        return scores[best_idx]
+
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                      target_boxes: list) -> list:
+        """True batch forward: one model call for all B images."""
+        self.ensure_loaded()
+        B = images.shape[0]
+        # Stack preprocessed images into one batch
+        preprocessed = torch.cat(
+            [self._diff_preprocess(images[i].to(self.device)) for i in range(B)],
+            dim=0,
+        )  # [B, 3, H, W]
+        outputs = self._model(pixel_values=preprocessed)
+
+        losses = []
+        for i in range(B):
+            logits     = outputs.logits[i]      # [Q, C]
+            pred_boxes = outputs.pred_boxes[i]  # [Q, 4]
+
+            scores = logits.sigmoid().max(dim=-1).values  # [Q]
+
+            orig_h, orig_w = images.shape[2], images.shape[3]
+            cx, cy, bw, bh = pred_boxes.unbind(-1)
+            boxes_xyxy = torch.stack([
+                (cx - bw / 2) * orig_w,
+                (cy - bh / 2) * orig_h,
+                (cx + bw / 2) * orig_w,
+                (cy + bh / 2) * orig_h,
+            ], dim=-1)  # [Q, 4]
+
+            if len(scores) == 0:
+                losses.append(torch.tensor(0.0, device=self.device, requires_grad=True))
+                continue
+
+            box_t = target_boxes[i].to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                weights = torch.stack([
+                    _box_iou_scalar(boxes_xyxy[j].detach().unsqueeze(0), box_t)
+                    * scores[j].detach()
+                    for j in range(len(scores))
+                ])
+            best_idx = int(weights.argmax().item())
+            losses.append(scores[best_idx])
+
+        return losses
+
 
 # ---------------------------------------------------------------------------
 # Mock / stub backend  (useful for unit-testing without GPU/weights)
