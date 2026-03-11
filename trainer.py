@@ -542,7 +542,7 @@ class AdversarialPatchTrainer:
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
         orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
-        orig_corners_np = batch_item["orig_corners"].numpy()
+        orig_corners_np = batch_item["orig_corners"].cpu().numpy()
         orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
         patched_orig, _ = self.apply_patch_to_image(
@@ -637,7 +637,7 @@ class AdversarialPatchTrainer:
                           if isinstance(batch["filename"], (list, tuple))
                           else batch["filename"])
                     orig_tensor     = batch["orig_image"][0].to(self.device)
-                    orig_corners_np = batch["orig_corners"][0].numpy()
+                    orig_corners_np = batch["orig_corners"][0].cpu().numpy()
                     orig_corners    = batch["orig_corners"][0].to(self.device)
                     count += 1
                     pbar.update(1)
@@ -762,7 +762,7 @@ class AdversarialPatchTrainer:
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
             orig_tensor     = batch["orig_image"][0].to(self.device)
-            orig_corners_np = batch["orig_corners"][0].numpy()
+            orig_corners_np = batch["orig_corners"][0].cpu().numpy()
             orig_corners    = batch["orig_corners"][0].to(self.device)
 
             with torch.no_grad():
