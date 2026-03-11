@@ -226,14 +226,59 @@ def _parse_pair(spec: str) -> Tuple[str, str, str, dict]:
 # Main
 # ---------------------------------------------------------------------------
 
+# Default weight paths keyed by backend name
+_DEFAULT_WEIGHTS: Dict[str, str] = {
+    "fasterrcnn":   "weights/model.pt",
+    "rtdetr":       "weights/rtdetr-v2-license-plate",
+    "yolov8":       "weights/lp_yolov8.pt",
+    "yolov11":      "weights/yolov11s-license-plate.pt",
+    "yolo-v9-384":  "none",
+}
+
+
+def _infer_backend(patch_path: str) -> Tuple[str, str]:
+    """Infer backend name and default weights from a patch filename.
+
+    Expects filenames like patch_BACKEND_*.png produced by the trainer.
+    Returns (backend_name, weights_path).
+    """
+    stem = Path(patch_path).stem          # e.g. patch_rtdetr_best
+    parts = stem.split("_")
+    if len(parts) < 2 or parts[0] != "patch":
+        raise ValueError(
+            f"Cannot infer backend from '{patch_path}'. "
+            "Use --pairs patch:backend:weights instead."
+        )
+    # Backend name follows the leading 'patch_' and may itself contain '_'
+    # Try progressively longer candidate names against the known-weights table.
+    for end in range(len(parts), 1, -1):
+        candidate = "_".join(parts[1:end])
+        if candidate in _DEFAULT_WEIGHTS:
+            weights = _DEFAULT_WEIGHTS[candidate]
+            return candidate, weights
+    # Fall back to everything between 'patch_' and the last token
+    backend = "_".join(parts[1:-1]) if len(parts) > 2 else parts[1]
+    raise ValueError(
+        f"Unknown backend '{backend}' inferred from '{patch_path}'. "
+        f"Known backends: {list(_DEFAULT_WEIGHTS)}. "
+        "Use --pairs patch:backend:weights to specify explicitly."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate patches on physical-world images at original resolution",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "--pairs", nargs="+", required=True,
+        "--pairs", nargs="+", default=[],
         metavar="patch:backend:path[:opts]",
+        help="Explicit patch/backend/weights triplets.",
+    )
+    parser.add_argument(
+        "--patches", nargs="+", default=[],
+        metavar="patch.png",
+        help="Bare patch paths; backend and weights are inferred from the filename.",
     )
     parser.add_argument(
         "--csv", default="control_plate_corners.csv",
@@ -245,6 +290,9 @@ def main() -> None:
                         help="Output directory (default: results/)")
     args = parser.parse_args()
 
+    if not args.pairs and not args.patches:
+        parser.error("Provide at least one of --pairs or --patches.")
+
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[eval_physical] device={args.device}  csv={args.csv}")
@@ -253,6 +301,11 @@ def main() -> None:
     print(f"[eval_physical] {len(df)} images loaded from {args.csv}")
 
     pairs: List[Tuple[str, str, str, dict]] = [_parse_pair(s) for s in args.pairs]
+    for patch_path in args.patches:
+        backend_name, weights_path = _infer_backend(patch_path)
+        print(f"[eval_physical] Inferred backend '{backend_name}' "
+              f"(weights: {weights_path}) for {patch_path}")
+        pairs.append((patch_path, backend_name, weights_path, {}))
 
     # Build unique backends
     seen: Dict[tuple, DetectorBackend] = {}
