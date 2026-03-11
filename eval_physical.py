@@ -453,34 +453,37 @@ def main() -> None:
 
     samples = preload_images(df, args.device, args.scale, args.num_workers)
 
-    # Evaluate: for clean run all detectors; for each patch use its paired detector
+    # Group patch entries by detector so we do clean+patches per backend in one shot
+    from collections import defaultdict
+    patches_by_det: Dict[Tuple, List] = defaultdict(list)
+    for patch_name, patch_tensor, det_key, ocr_key in patch_entries:
+        if patch_name != "clean":
+            patches_by_det[det_key].append((patch_name, patch_tensor, ocr_key))
+
     all_results: List[BackendMetrics] = []
 
-    # Clean baseline — run every detector, no OCR
     for det_key, backend in seen_det.items():
         backend.ensure_loaded()
         backend.freeze()
+
+        print(f"\n══ Backend: {det_key[0]} ══")
         m = evaluate_one(backend, samples, None, "clean",
                          device=args.device, iou_threshold=args.iou_threshold)
         all_results.append(m)
         print(f"  {m.summary()}")
 
-    # Patch evaluations — use paired detector and OCR
-    for patch_name, patch_tensor, det_key, ocr_key in patch_entries:
-        if patch_name == "clean":
-            continue
-        backend = seen_det[det_key]
-        ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
-        print(f"\n── Patch: {patch_name} | det={det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
-        m = evaluate_one(
-            backend, samples, patch_tensor, patch_name,
-            device=args.device, iou_threshold=args.iou_threshold,
-            ocr_backend=ocr_backend,
-            expected_plate=args.expected_plate,
-            impersonation_target=args.impersonation_target,
-        )
-        all_results.append(m)
-        print(f"  {m.summary()}")
+        for patch_name, patch_tensor, ocr_key in patches_by_det.get(det_key, []):
+            ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
+            print(f"\n── Patch: {patch_name} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+            m = evaluate_one(
+                backend, samples, patch_tensor, patch_name,
+                device=args.device, iou_threshold=args.iou_threshold,
+                ocr_backend=ocr_backend,
+                expected_plate=args.expected_plate,
+                impersonation_target=args.impersonation_target,
+            )
+            all_results.append(m)
+            print(f"  {m.summary()}")
 
     # Save outputs via evaluator helpers
     from evaluator import DetectorEvaluator
