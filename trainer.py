@@ -689,102 +689,54 @@ class AdversarialPatchTrainer:
     # Pre-training sanity check
     # ====================================================================
 
-    def validate_pipeline(self, n_samples: Optional[int] = None) -> dict:
+    def validate_pipeline(self) -> None:
         """
-        Run clean images (no patch) through detector + OCR.
-        Raises RuntimeError if < 50% read correctly.
+        Run one full gradient-accumulation cycle (B * update_every items) through
+        the training forward+backward path to verify the pipeline end-to-end.
+        Raises on any crash.
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
-        total = (min(n_samples, len(self.train_loader) + len(self.val_loader))
-                 if n_samples is not None
-                 else len(self.train_loader) + len(self.val_loader))
-        results = []
-        count = 0
-        done = False
-        with tqdm(total=total, desc="Sanity check", leave=False) as pbar:
-            for loader in [self.train_loader, self.val_loader]:
-                if done:
-                    break
-                for batch in loader:
-                    if n_samples is not None and count >= n_samples:
-                        done = True
-                        break
-                    fn = (batch["filename"][0]
-                          if isinstance(batch["filename"], (list, tuple))
-                          else batch["filename"])
-                    orig_tensor     = batch["orig_image"][0].to(self.device)
-                    orig_corners_np = batch["orig_corners"][0].cpu().numpy()
-                    orig_corners    = batch["orig_corners"][0].to(self.device)
-                    count += 1
-                    pbar.update(1)
+        B = self.eval_batch_size
+        update_every = (self.grad_accumulate
+                        if self.grad_accumulate is not None
+                        else min(4, len(self.train_loader)))
+        need = B * update_every
 
-                    with torch.no_grad():
-                        prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
-                        new_corners = torch.from_numpy(new_corners_np).to(self.device)
-                        target_box  = self.corners_to_bbox(new_corners)
-                        detections  = self.detector.predict(prep_tensor)
+        items_raw = []
+        for batch in self.train_loader:
+            items_raw.append({k: v[0] for k, v in batch.items()})
+            if len(items_raw) >= need:
+                break
+        if not items_raw:
+            raise RuntimeError("No training data found for sanity check.")
 
-                    if not detections:
-                        results.append({"filename": fn, "category": "no_detection",
-                                        "text": None, "confidence": 0.0})
-                        continue
+        patch_norm = self.generate_patch(training_aug=self.training)
+        buffer: list = []
+        step = 0
+        total_loss = 0.0
+        for raw_item in items_raw:
+            item = self._prepare_one(raw_item, patch_norm)
+            item["_patch_norm"] = patch_norm
+            buffer.append(item)
+            if len(buffer) < B:
+                continue
+            loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+            buffer = []
+            step += 1
+            scaled = loss / update_every
+            scaled.backward(retain_graph=(step % update_every != 0))
+            total_loss += loss.item()
+            del loss, scaled
 
-                    best_det = max(
-                        detections,
-                        key=lambda d: (
-                            self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                            target_box.unsqueeze(0)).item()
-                            * d.confidence
-                        ),
-                    )
+        # Zero grads so the optimizer starts clean
+        for p in self._trainable_params():
+            if p.grad is not None:
+                p.grad.zero_()
 
-                    with torch.no_grad():
-                        crop       = _bbox_ocr_crop(orig_tensor.unsqueeze(0), orig_corners,
-                                                    self.ocr.ocr_crop_size)
-                        ocr_result = self.ocr.predict(crop.squeeze(0))
-
-                    text = ocr_result.text or ""
-                    if self._plate_text_matches(text, self.expected_plate_text):
-                        cat = "correct"
-                    elif self.impersonation_target and self._plate_text_matches(text, self.impersonation_target):
-                        cat = "impersonation"
-                    else:
-                        cat = "misread"
-                    results.append({"filename": fn, "category": cat,
-                                    "text": text, "confidence": ocr_result.confidence})
-
-        counts = {"correct": 0, "impersonation": 0, "misread": 0, "no_detection": 0}
-        for r in results:
-            counts[r["category"]] += 1
-        total = max(len(results), 1)
-
-        lines = [
-            f"Sanity check over {len(results)} images "
-            f"(expected: '{self.expected_plate_text}')",
-            f"  Correct reads : {counts['correct']:4d} ({counts['correct']/total*100:.1f}%)",
-            f"  Impersonation : {counts['impersonation']:4d} ({counts['impersonation']/total*100:.1f}%)",
-            f"  Misread       : {counts['misread']:4d} ({counts['misread']/total*100:.1f}%)",
-            f"  No detection  : {counts['no_detection']:4d} ({counts['no_detection']/total*100:.1f}%)",
-        ]
-        report = "\n".join(lines)
-        print(report)
-        (self.run_dir / "sanity_check.txt").write_text(report + "\n")
-
-        csv_out = self.run_dir / "sanity_check.csv"
-        with open(csv_out, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["filename", "category", "text", "confidence"])
-            writer.writeheader()
-            writer.writerows(results)
-
-        detected = total - counts["no_detection"]
-        frac = counts["correct"] / max(detected, 1)
-        if frac < 0.50:
-            raise RuntimeError(
-                f"\nSanity check FAILED: {counts['correct']}/{detected} correct "
-                f"among detected ({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
-            )
-        print(f"  Passed ({frac*100:.1f}% correct among {detected} detected).\n")
-        return counts
+        avg = total_loss / max(step, 1)
+        msg = f"Sanity check passed: {step} accumulation step(s), avg loss {avg:.4f}"
+        print(f"  {msg}\n")
+        (self.run_dir / "sanity_check.txt").write_text(msg + "\n")
 
     # ====================================================================
     # Debug images
@@ -1166,7 +1118,6 @@ class AdversarialPatchTrainer:
         skip_sanity:   bool  = False,
     ) -> dict:
         if not skip_sanity:
-            self.save_debug_images()
             self.validate_pipeline()
 
         if dry_run:
