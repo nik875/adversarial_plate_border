@@ -149,6 +149,10 @@ class PatchDecoder(nn.Module):
     Six stride-2 layers double the spatial dimensions at each step:
         4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
+    Each transposed conv is followed by a 7×7 same-padded conv (padding=3)
+    that refines features at the new resolution without changing spatial size,
+    matching standard generator architectures (e.g. pix2pix, BigGAN).
+
     Channel schedule halves from seed_channels→256→128→64→32→16→3,
     so the expensive (many-channel) work is done at small spatial grids.
     Output is passed through tanh and scaled to [0, 1].
@@ -163,11 +167,17 @@ class PatchDecoder(nn.Module):
         c = seed_channels
         self.net = nn.Sequential(
             nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 256, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 128, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d( 64,  64, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d( 32,  32, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d( 16,  16, 7, padding=3),                     nn.LeakyReLU(0.2, inplace=True),
             nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
+            nn.Conv2d(  3,   3, 7, padding=3),
         )
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
