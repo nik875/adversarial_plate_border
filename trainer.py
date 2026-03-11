@@ -936,45 +936,52 @@ class AdversarialPatchTrainer:
 
         Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
         with the per-step accounting in train_epoch.
+
+        Memory design: we avoid retain_graph by detaching the patch from the
+        generator and treating it as a leaf for the per-item backward calls.
+        Each item's graph is freed immediately after its backward.  Once all
+        item gradients are accumulated in the detached leaf's .grad, a single
+        backward through the generator (using that accumulated grad as the
+        incoming gradient) propagates correctly to seed/decoder params.
         """
         M = len(window_raw)
         m = min(self.sam_m, M)
 
+        def _accumulate(indices, weight) -> Tuple[float, float, float, float]:
+            """
+            Generate patch, detach → leaf, accumulate item gradients one-by-one
+            (no retain_graph), then backprop once through the generator.
+            Returns (total_loss, det_sum, ocr_sum, tv_sum) scaled by weight.
+            """
+            patch_with_graph = self.generate_patch(training_aug=self.training)
+            patch_leaf = patch_with_graph.detach().requires_grad_(True)
+
+            total_loss = det_sum = ocr_sum = tv_sum = 0.0
+            for i in indices:
+                item = self._prepare_one(window_raw[i], patch_leaf)
+                item["_patch_norm"] = patch_leaf
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch([item])
+                (loss * weight).backward()   # frees item graph; accumulates patch_leaf.grad
+                total_loss += loss.item()
+                det_sum    += det_l.item()
+                ocr_sum    += ocr_l.item()
+                tv_sum     += tv_l.item()
+                del item
+
+            # Propagate accumulated patch gradient through the generator graph.
+            patch_with_graph.backward(patch_leaf.grad)
+            return total_loss, det_sum, ocr_sum, tv_sum
+
         # ── ASCENT: gradients from m random items ────────────────────────
         optimizer.zero_grad()
         ascent_idx = sorted(random.sample(range(M), m))
-        patch_norm = self.generate_patch(training_aug=self.training)
-
-        chunks = [ascent_idx[i:i + B] for i in range(0, m, B)]
-        for ci, chunk in enumerate(chunks):
-            items = []
-            for i in chunk:
-                item = self._prepare_one(window_raw[i], patch_norm)
-                item["_patch_norm"] = patch_norm
-                items.append(item)
-            loss_a, _, _, _ = self.compute_loss_batch(items)
-            (loss_a / m).backward(retain_graph=(ci < len(chunks) - 1))
+        _accumulate(ascent_idx, 1.0 / m)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
         optimizer.first_step(zero_grad=True)
 
         # ── DESCENT: gradients from all M items, perturbed patch ─────────
-        patch_perturbed = self.generate_patch(training_aug=self.training)
-        total_loss = det_sum = ocr_sum = tv_sum = 0.0
-
-        all_chunks = [list(range(i, min(i + B, M))) for i in range(0, M, B)]
-        for ci, chunk in enumerate(all_chunks):
-            items = []
-            for i in chunk:
-                item = self._prepare_one(window_raw[i], patch_perturbed)
-                item["_patch_norm"] = patch_perturbed
-                items.append(item)
-            loss_d, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
-            (loss_d / M).backward(retain_graph=(ci < len(all_chunks) - 1))
-            total_loss += loss_d.item()
-            det_sum    += det_l.item()
-            ocr_sum    += ocr_l.item()
-            tv_sum     += tv_l.item()
+        total_loss, det_sum, ocr_sum, tv_sum = _accumulate(range(M), 1.0 / M)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
         optimizer.second_step(zero_grad=True)
