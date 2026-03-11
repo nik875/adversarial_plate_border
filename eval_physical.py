@@ -386,8 +386,6 @@ def main() -> None:
         help="Corners CSV (default: control_plate_corners.csv)",
     )
     parser.add_argument("--device", default=None)
-    parser.add_argument("--gpu-preload", action="store_true",
-                        help="Preload all images to GPU memory once before evaluation.")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Threads for parallel image loading (default: nproc).")
     parser.add_argument("--scale", type=float, default=0.5,
@@ -453,17 +451,16 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = preload_images(df, args.device, args.scale, args.num_workers) if args.gpu_preload else None
+    samples = preload_images(df, args.device, args.scale, args.num_workers)
 
     # Evaluate: for clean run all detectors; for each patch use its paired detector
     all_results: List[BackendMetrics] = []
 
     # Clean baseline — run every detector, no OCR
-    eval_data = samples if samples is not None else preload_images(df, args.device, args.scale, args.num_workers)
     for det_key, backend in seen_det.items():
         backend.ensure_loaded()
         backend.freeze()
-        m = evaluate_one(backend, eval_data, None, "clean",
+        m = evaluate_one(backend, samples, None, "clean",
                          device=args.device, iou_threshold=args.iou_threshold)
         all_results.append(m)
         print(f"  {m.summary()}")
@@ -474,10 +471,9 @@ def main() -> None:
             continue
         backend = seen_det[det_key]
         ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
-        eval_data = samples if samples is not None else preload_images(df, args.device, args.scale, args.num_workers)
         print(f"\n── Patch: {patch_name} | det={det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
         m = evaluate_one(
-            backend, eval_data, patch_tensor, patch_name,
+            backend, samples, patch_tensor, patch_name,
             device=args.device, iou_threshold=args.iou_threshold,
             ocr_backend=ocr_backend,
             expected_plate=args.expected_plate,
