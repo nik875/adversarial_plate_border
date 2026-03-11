@@ -675,7 +675,8 @@ class AdversarialPatchTrainer:
         ocr_losses  = self.ocr.differentiable_loss_batch(
             ocr_crops, target_text, impersonation=bool(self.impersonation_target))
 
-        det_l = torch.stack(det_losses).mean() * self.det_loss_scale
+        effective_det_scale = self.det_loss_scale * (2.0 if self.ocr.name == "trocr" else 1.0)
+        det_l = torch.stack(det_losses).mean() * effective_det_scale
         ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
         tv_l  = self.total_variation_loss(patch_norm)
         if self.disable_disruption:
