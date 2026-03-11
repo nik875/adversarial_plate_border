@@ -37,26 +37,19 @@ def transform_path_for_user(filepath):
 
 
 def load_image(filepath):
-    """Load image with support for HEIC files"""
-    # Transform path based on current user
+    """Load image with support for HEIC files. Returns RGB HWC uint8."""
     filepath = transform_path_for_user(filepath)
     file_ext = os.path.splitext(filepath)[1].lower()
 
     if file_ext in ['.heic', '.heif']:
-        # Use PIL for HEIC files
         pil_image = Image.open(filepath)
-        # Convert to RGB if necessary
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
-        # Convert PIL image to numpy array and BGR format (to match cv2)
-        img_array = np.array(pil_image)
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        return img_bgr
-    # Use cv2 for other formats
+        return np.array(pil_image)  # already RGB
     img = cv2.imread(filepath)
     if img is None:
         raise FileNotFoundError(f"Could not load image: {filepath}")
-    return img
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 # ---------------------------------------------------------------------------
