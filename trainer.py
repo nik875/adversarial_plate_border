@@ -35,6 +35,7 @@ Other design decisions
 from __future__ import annotations
 
 import csv
+import random
 import re
 import time
 import warnings
@@ -183,6 +184,60 @@ class PatchDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# m-SAM optimizer wrapper
+# ---------------------------------------------------------------------------
+
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization wrapper.
+
+    Implements the two-step SAM update (Foret et al. 2021).  Used by
+    AdversarialPatchTrainer when sam_m > 0: the ascent step runs on a random
+    mini-batch of size sam_m while the descent step uses the full window.
+    """
+
+    def __init__(self, params, base_optimizer_cls, rho: float = 0.025, **base_kwargs):
+        defaults = dict(rho=rho)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **base_kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad: bool = False) -> None:
+        """Perturb weights toward the local sharpness maximum."""
+        grad_norm = torch.norm(torch.stack([
+            p.grad.norm(p=2)
+            for group in self.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        ]), p=2)
+        scale = self.param_groups[0]["rho"] / (grad_norm + 1e-12)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad: bool = False) -> None:
+        """Restore original weights, then apply the base optimizer step."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if "e_w" in self.state[p]:
+                    p.sub_(self.state[p]["e_w"])
+        self.base_optimizer.step()
+        if zero_grad:
+            self.zero_grad()
+
+    # Required by SequentialLR / other schedulers that call optimizer.step()
+    def step(self, closure=None):
+        raise RuntimeError("Call first_step / second_step explicitly.")
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
@@ -211,6 +266,8 @@ class AdversarialPatchTrainer:
         det_loss_scale:       float          = 1.0,
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
+        sam_m:                Optional[int]  = None,
+        sam_rho:              float          = 0.025,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -218,6 +275,8 @@ class AdversarialPatchTrainer:
         self.det_loss_scale       = det_loss_scale
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
+        self.sam_m                = sam_m
+        self.sam_rho              = sam_rho
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -866,6 +925,62 @@ class AdversarialPatchTrainer:
     # Training loop
     # ====================================================================
 
+    def _msam_step(
+        self,
+        optimizer: SAM,
+        window_raw: list,
+        B: int,
+        update_every: int,
+    ) -> Tuple[float, float, float, float]:
+        """One m-SAM update: ascent on sam_m random items, descent on all items.
+
+        Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
+        with the per-step accounting in train_epoch.
+        """
+        M = len(window_raw)
+        m = min(self.sam_m, M)
+
+        # ── ASCENT: gradients from m random items ────────────────────────
+        optimizer.zero_grad()
+        ascent_idx = sorted(random.sample(range(M), m))
+        patch_norm = self.generate_patch(training_aug=self.training)
+
+        chunks = [ascent_idx[i:i + B] for i in range(0, m, B)]
+        for ci, chunk in enumerate(chunks):
+            items = []
+            for i in chunk:
+                item = self._prepare_one(window_raw[i], patch_norm)
+                item["_patch_norm"] = patch_norm
+                items.append(item)
+            loss_a, _, _, _ = self.compute_loss_batch(items)
+            (loss_a / m).backward(retain_graph=(ci < len(chunks) - 1))
+
+        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+        optimizer.first_step(zero_grad=True)
+
+        # ── DESCENT: gradients from all M items, perturbed patch ─────────
+        patch_perturbed = self.generate_patch(training_aug=self.training)
+        total_loss = det_sum = ocr_sum = tv_sum = 0.0
+
+        all_chunks = [list(range(i, min(i + B, M))) for i in range(0, M, B)]
+        for ci, chunk in enumerate(all_chunks):
+            items = []
+            for i in chunk:
+                item = self._prepare_one(window_raw[i], patch_perturbed)
+                item["_patch_norm"] = patch_perturbed
+                items.append(item)
+            loss_d, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
+            (loss_d / M).backward(retain_graph=(ci < len(all_chunks) - 1))
+            total_loss += loss_d.item()
+            det_sum    += det_l.item()
+            ocr_sum    += ocr_l.item()
+            tv_sum     += tv_l.item()
+
+        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+        optimizer.second_step(zero_grad=True)
+
+        return total_loss, det_sum, ocr_sum, tv_sum
+
     def train_epoch(self, optimizer, epoch: int) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
@@ -878,6 +993,8 @@ class AdversarialPatchTrainer:
         total_det  = total_ocr  = total_tv = 0.0
         step = num_updates = 0
         buffer: list = []
+        use_sam = isinstance(optimizer, SAM)
+        window_raw: list = []   # SAM: raw batch items for the current update window
 
         patch_norm = self.generate_patch(training_aug=self.training)
 
@@ -885,8 +1002,38 @@ class AdversarialPatchTrainer:
                   desc=f"Epoch {epoch+1}",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
-                item = self._prepare_one(
-                    {k: v[0] for k, v in batch.items()}, patch_norm)
+                raw_item = {k: v[0] for k, v in batch.items()}
+
+                if use_sam:
+                    window_raw.append(raw_item)
+                    window_full = len(window_raw) == B * update_every
+                    if not window_full:
+                        continue
+
+                    loss_t, det_t, ocr_t, tv_t = self._msam_step(
+                        optimizer, window_raw, B, update_every)
+                    window_raw = []
+                    step       += update_every
+                    num_updates += 1
+                    total_loss += loss_t
+                    total_det  += det_t
+                    total_ocr  += ocr_t
+                    total_tv   += tv_t
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    elif self.device == "mps":
+                        torch.mps.empty_cache()
+                    pbar.set_postfix({
+                        "loss": f"{total_loss/step:.4f}",
+                        "det":  f"{total_det/step:.4f}",
+                        "ocr":  f"{total_ocr/step:.4f}",
+                        "tv":   f"{total_tv/step:.4f}",
+                    })
+                    patch_norm = self.generate_patch(training_aug=self.training)
+                    continue
+
+                # ── Standard (non-SAM) accumulation path ─────────────────
+                item = self._prepare_one(raw_item, patch_norm)
                 item["_patch_norm"] = patch_norm
                 buffer.append(item)
 
@@ -929,25 +1076,38 @@ class AdversarialPatchTrainer:
                 else:
                     del loss, scaled_loss
 
-            # Flush remainder buffer (< B images left at end of epoch)
-            if buffer:
-                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
-                buffer = []
-                scaled_loss = loss / update_every
-                scaled_loss.backward()
-                accum_loss += loss.item()
-                total_det  += det_l.item()
-                total_ocr  += ocr_l.item()
-                total_tv   += tv_l.item()
-                step       += 1
-                del loss, scaled_loss
-
-            if step % update_every != 0 and self.grad_accumulate is not None:
-                torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                total_loss  += accum_loss
+            # ── Flush remainder at end of epoch ──────────────────────────
+            if use_sam and len(window_raw) >= B:
+                # Partial window: trim to a multiple of B, then do m-SAM update
+                n_complete = (len(window_raw) // B) * B
+                loss_t, det_t, ocr_t, tv_t = self._msam_step(
+                    optimizer, window_raw[:n_complete], B, n_complete // B)
+                step       += n_complete // B
                 num_updates += 1
+                total_loss += loss_t
+                total_det  += det_t
+                total_ocr  += ocr_t
+                total_tv   += tv_t
+            elif not use_sam:
+                # Flush remainder buffer (< B images left at end of epoch)
+                if buffer:
+                    loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                    buffer = []
+                    scaled_loss = loss / update_every
+                    scaled_loss.backward()
+                    accum_loss += loss.item()
+                    total_det  += det_l.item()
+                    total_ocr  += ocr_l.item()
+                    total_tv   += tv_l.item()
+                    step       += 1
+                    del loss, scaled_loss
+
+                if step % update_every != 0 and self.grad_accumulate is not None:
+                    torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    total_loss  += accum_loss
+                    num_updates += 1
 
         n = max(step, 1)
         return (total_loss / n, total_det / n, total_ocr / n, total_tv / n)
@@ -1002,21 +1162,33 @@ class AdversarialPatchTrainer:
         eta_min       = lr_min
 
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
-        optimizer = optim.AdamW(
-            self._trainable_params(), lr=learning_rate, weight_decay=1e-4
-        )
+        if self.sam_m is not None:
+            optimizer = SAM(
+                self._trainable_params(),
+                base_optimizer_cls=optim.AdamW,
+                rho=self.sam_rho,
+                lr=learning_rate,
+                weight_decay=1e-4,
+            )
+            # Schedulers operate on the base optimizer's param groups (shared via SAM)
+            sched_optimizer = optimizer.base_optimizer
+        else:
+            optimizer = optim.AdamW(
+                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+            )
+            sched_optimizer = optimizer
         cosine_epochs = num_epochs - warmup_epochs
         warmup_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer,
+            sched_optimizer,
             start_factor=eta_min / learning_rate,
             end_factor=1.0,
             total_iters=warmup_epochs,
         )
         cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cosine_epochs, eta_min=eta_min,
+            sched_optimizer, T_max=cosine_epochs, eta_min=eta_min,
         )
         scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer,
+            sched_optimizer,
             schedulers=[warmup_scheduler, cosine_scheduler],
             milestones=[warmup_epochs],
         )
@@ -1036,6 +1208,8 @@ class AdversarialPatchTrainer:
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
         print(f"  Epochs    : {num_epochs}  |  Warmup: {warmup_epochs}  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        if self.sam_m is not None:
+            print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
         _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
         if self.disable_disruption:
             _mode += '  [detection loss disabled]'
@@ -1157,6 +1331,13 @@ def main():
                              "zero gradient to the total loss.")
     parser.add_argument("--eval-batch-size", type=int, default=1,
                         help="Number of images to batch for detector/OCR evaluation (default 1).")
+    parser.add_argument("--sam-m", type=int, default=None,
+                        help="Enable m-SAM: number of images for the ascent step. "
+                             "Recommended: ~25%% of --grad-accumulate (e.g. 8 for accum=32). "
+                             "Disabled by default.")
+    parser.add_argument("--sam-rho", type=float, default=0.025,
+                        help="SAM perturbation radius rho (default 0.025). "
+                             "Only used when --sam-m is set.")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the detector and OCR models (PyTorch 2.0+, "
                              "gradients still flow through compiled models).")
@@ -1206,6 +1387,8 @@ def main():
         det_loss_scale       = args.det_loss_scale,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
+        sam_m                = args.sam_m,
+        sam_rho              = args.sam_rho,
     )
 
     trainer.train(

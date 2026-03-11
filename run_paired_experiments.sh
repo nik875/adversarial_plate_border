@@ -16,6 +16,8 @@
 #   ./run_paired_experiments.sh --epochs 20 --device cuda --limit 64
 #   ./run_paired_experiments.sh --eval-batch-size 8 --compile   # batch GPU evals + compiled models
 #   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
+#   ./run_paired_experiments.sh --sam        # enable m-SAM (m=8, rho=0.025 by default)
+#   ./run_paired_experiments.sh --sam --sam-rho 0.05  # custom rho
 # =============================================================================
 
 set -euo pipefail
@@ -54,6 +56,8 @@ EVAL_BATCH_SIZE=1
 COMPILE=true
 IMPERSONATION_TARGET=""
 SKIP_PAIRS=()
+SAM_M=""
+SAM_RHO=0.025
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -102,6 +106,9 @@ while [[ $# -gt 0 ]]; do
         --no-compile)      COMPILE=false; shift ;;
         --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
         --skip)            shift; while [[ $# -gt 0 && "$1" != --* ]]; do SKIP_PAIRS+=("$1"); shift; done ;;
+        --sam)             SAM_M=8; shift ;;
+        --sam-m)           SAM_M="$2"; shift 2 ;;
+        --sam-rho)         SAM_RHO="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -194,6 +201,9 @@ if $COMPILE; then
 fi
 if [[ -n "$IMPERSONATION_TARGET" ]]; then
     BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET" --no-disruption)
+fi
+if [[ -n "$SAM_M" ]]; then
+    BASE_ARGS+=(--sam-m "$SAM_M" --sam-rho "$SAM_RHO")
 fi
 
 # Pair rows:
