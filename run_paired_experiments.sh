@@ -35,7 +35,7 @@ SKIP_SANITY=false
 GPU_PRELOAD=false
 
 EVAL_BATCH_SIZE=1
-COMPILE=false
+COMPILE=true
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -68,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-preload)     GPU_PRELOAD=true; shift ;;
         --eval-batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
         --compile)         COMPILE=true; shift ;;
+        --no-compile)      COMPILE=false; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
