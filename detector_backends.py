@@ -23,7 +23,9 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
+
+import torch.nn.functional as F
 
 import numpy as np
 import torch
@@ -1297,19 +1299,44 @@ class Yolov9TorchBackend(DetectorBackend):
 
         print(f"[{self.name}] Loaded from {onnx_path}")
 
+    # Fixed input size this model was trained on.
+    INPUT_SIZE: int = 384
+
+    @staticmethod
+    def _letterbox(image: torch.Tensor, size: int) -> Tuple[torch.Tensor, float, int, int]:
+        """
+        Letterbox a CHW float32 [0,1] tensor to (size × size).
+        Returns (padded_tensor, scale, pad_left, pad_top).
+        Detections produced on the padded tensor can be mapped back to
+        original coordinates with:  x_orig = (x_padded - pad_left) / scale
+        """
+        c, h, w = image.shape
+        scale   = size / max(h, w)
+        new_h   = round(h * scale)
+        new_w   = round(w * scale)
+        resized = F.interpolate(image.unsqueeze(0), size=(new_h, new_w),
+                                mode="bilinear", align_corners=False).squeeze(0)
+        pad_top  = (size - new_h) // 2
+        pad_left = (size - new_w) // 2
+        padded   = F.pad(resized,
+                         (pad_left, size - new_w - pad_left,
+                          pad_top,  size - new_h - pad_top),
+                         value=0.5)
+        return padded, scale, pad_left, pad_top
+
     def predict(self, image: torch.Tensor) -> List[Detection]:
         """
-        Run detection.  Gradients flow through the raw confidence scores
-        because the model parameters are frozen but the computation graph
-        (image → conv → scores) is intact.
+        Run detection.  Input is letterboxed to INPUT_SIZE×INPUT_SIZE so the
+        model always receives a stride-aligned tensor regardless of the original
+        image dimensions.  Detections are returned in original image coordinates.
 
-        The ultralytics Detect head returns [1, 5, num_anchors] in eval mode
-        (xywh + sigmoid class score for nc=1).  We apply torchvision NMS on
-        detached coordinates and attach the live score tensor to each Detection
-        for differentiable adversarial training.
+        Gradients flow through the raw confidence scores because the model
+        parameters are frozen but the computation graph (image → conv → scores)
+        is intact.
         """
         self.ensure_loaded()
-        batch  = image.unsqueeze(0).to(self.device)   # [1, 3, 384, 384]
+        lb, scale, pad_left, pad_top = self._letterbox(image, self.INPUT_SIZE)
+        batch = lb.unsqueeze(0).to(self.device)   # [1, 3, INPUT_SIZE, INPUT_SIZE]
 
         # Run model — do NOT use no_grad so the autograd graph is intact.
         output = self._model(batch)
@@ -1318,9 +1345,12 @@ class Yolov9TorchBackend(DetectorBackend):
 
         pred = output[0]         # [5, num_anchors]
 
-        # Boxes are in xywh pixel space; scores are sigmoid'd class confs.
-        bx, by, bw, bh = pred[0], pred[1], pred[2], pred[3]
-        scores = pred[4]                                   # [num_anchors]
+        # Boxes are in letterboxed pixel space; unscale to original image space.
+        bx = (pred[0] - pad_left) / scale
+        by = (pred[1] - pad_top)  / scale
+        bw = pred[2] / scale
+        bh = pred[3] / scale
+        scores = pred[4]         # [num_anchors]
 
         # Detach coordinates for NMS (non-differentiable op).
         x1 = (bx - bw / 2).detach()
@@ -1346,7 +1376,6 @@ class Yolov9TorchBackend(DetectorBackend):
             b    = boxes_f[idx]
             conf = scores_f[idx].item()
             x1v, y1v, x2v, y2v = b[0].item(), b[1].item(), b[2].item(), b[3].item()
-            # Build a 7-element raw tensor whose [6] slot is the live score.
             raw = torch.cat([
                 torch.tensor([0.0, x1v, y1v, x2v, y2v, 0.0],
                              dtype=torch.float32, device=self.device),
