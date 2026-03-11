@@ -138,7 +138,7 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
                    num_workers: int = 0) -> List[Tuple]:
     """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
     import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
     to_tensor = T.ToTensor()
     if num_workers == 0:
         num_workers = os.cpu_count() or 1
@@ -166,25 +166,26 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
         ], dtype=torch.float32) * scale
         return idx, (image, corners)
 
-    results = [None] * len(rows)
+    samples = []
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = {pool.submit(_load_one, r): r[0] for r in rows}
-        for f in tqdm(as_completed(futures), total=len(futures),
+        futures = [pool.submit(_load_one, r) for r in rows]
+        for i in tqdm(range(len(futures)),
                       desc=f"Preloading images to GPU ({num_workers} threads)"):
-            idx, data = f.result()
+            idx, data = futures[i].result()
+            futures[i] = None          # free Future + its cached result
             if data is None:
                 continue
             image, corners = data
-            # Transfer to GPU immediately and discard CPU tensors
+            del data
             image   = image.to(device)
             corners = corners.to(device)
             gt_box  = torch.stack([
                 corners[:, 0].min(), corners[:, 1].min(),
                 corners[:, 0].max(), corners[:, 1].max(),
             ])
-            results[idx] = (image, corners, gt_box)
+            samples.append((image, corners, gt_box))
 
-    return [s for s in results if s is not None]
+    return samples
 
 
 def evaluate_one(backend: DetectorBackend,
