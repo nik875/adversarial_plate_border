@@ -740,7 +740,8 @@ class AdversarialPatchTrainer:
     def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
         return augment_plate(image, self.device)
 
-    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
+    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
+                     augment: Optional[bool] = None) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
         orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
         orig_corners_np = batch_item["orig_corners"].cpu().numpy()
@@ -756,7 +757,8 @@ class AdversarialPatchTrainer:
 
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
-            patch_norm=patch_norm, augment=self.augment)
+            patch_norm=patch_norm,
+            augment=self.augment if augment is None else augment)
 
         patched_prep_chw, new_corners_np = self.diff_prep(
             patched_orig.squeeze(0), orig_corners_np)
@@ -1261,7 +1263,7 @@ class AdversarialPatchTrainer:
             for batch in self.val_loader:
                 patch_norm = self.generate_patch(training_aug=False)
                 item = self._prepare_one(
-                    {k: v[0] for k, v in batch.items()}, patch_norm)
+                    {k: v[0] for k, v in batch.items()}, patch_norm, augment=False)
                 item["_patch_norm"] = patch_norm
                 buffer.append(item)
 
