@@ -191,7 +191,7 @@ if $COMPILE; then
     BASE_ARGS+=(--compile)
 fi
 if [[ -n "$IMPERSONATION_TARGET" ]]; then
-    BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET")
+    BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET" --no-disruption)
 fi
 
 # Pair rows:
