@@ -25,6 +25,7 @@ DEVICE="cuda"
 CSV="preproc_labels.csv"
 EPOCHS=100
 LR=5e-4
+LR_MIN=1e-5
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --csv)             CSV="$2"; shift 2 ;;
         --epochs)          EPOCHS="$2"; shift 2 ;;
         --lr)              LR="$2"; shift 2 ;;
+        --lr-min)          LR_MIN="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
         --pin-memory)      PIN_MEMORY=true; shift ;;
@@ -135,6 +137,7 @@ BASE_ARGS=(
     --device "$DEVICE"
     --epochs "$EPOCHS"
     --lr "$LR"
+    --lr-min "$LR_MIN"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
     --eval-batch-size "$EVAL_BATCH_SIZE"

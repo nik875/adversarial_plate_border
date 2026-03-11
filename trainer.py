@@ -974,6 +974,7 @@ class AdversarialPatchTrainer:
         self,
         num_epochs:    int   = 100,
         learning_rate: float = 5e-4,
+        lr_min:        float = 1e-5,
         save_interval: int   = 10,
         dry_run:       bool  = False,
         skip_sanity:   bool  = False,
@@ -987,7 +988,7 @@ class AdversarialPatchTrainer:
             return {}
 
         warmup_epochs = 5
-        eta_min       = 1e-4
+        eta_min       = lr_min
 
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         optimizer = optim.AdamW(
@@ -1109,6 +1110,8 @@ def main():
     parser.add_argument("--device",   default="cuda")
     parser.add_argument("--epochs",   type=int,   default=100)
     parser.add_argument("--lr",       type=float, default=5e-4)
+    parser.add_argument("--lr-min",   type=float, default=1e-5,
+                        help="Minimum LR for cosine annealing (and warmup start). Default: 1e-5.")
     parser.add_argument("--grad-accumulate", type=int, default=64)
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
@@ -1179,6 +1182,7 @@ def main():
     trainer.train(
         num_epochs    = args.epochs,
         learning_rate = args.lr,
+        lr_min        = args.lr_min,
         save_interval = 10,
         dry_run       = args.dry_run,
         skip_sanity   = args.skip_sanity,
