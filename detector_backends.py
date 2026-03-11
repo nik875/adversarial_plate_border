@@ -246,6 +246,43 @@ class DetectorBackend(abc.ABC):
             for i in range(images.shape[0])
         ]
 
+    def differentiable_predict_box(
+        self,
+        image: torch.Tensor,
+        target_box: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Like differentiable_det_loss but also returns the best predicted box.
+
+        Returns (conf_loss, pred_box) where pred_box is [x1, y1, x2, y2] in
+        image pixel coords, or (conf_loss, None) if no plate is detected above
+        conf_threshold.  Gradients flow through conf_loss; box coords carry
+        gradients only in backends that override this method.
+        """
+        dets = self.predict(image)
+        if not dets:
+            return torch.tensor(0.0, device=self.device), None
+        box_t = target_box.to(self.device).unsqueeze(0)
+        best = max(dets, key=lambda d: (
+            _box_iou_scalar(d.box.to(self.device).unsqueeze(0), box_t)
+            * d.confidence
+        ))
+        thresh = getattr(self, "conf_threshold", 0.25)
+        if best.confidence < thresh:
+            return best.conf.to(self.device), None
+        return best.conf.to(self.device), best.box.to(self.device)
+
+    def differentiable_predict_box_batch(
+        self,
+        images: torch.Tensor,
+        target_boxes: list,
+    ) -> list:
+        """Default: sequential loop. Override for true batch GPU inference."""
+        return [
+            self.differentiable_predict_box(images[i], target_boxes[i])
+            for i in range(images.shape[0])
+        ]
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, path={self.model_path})"
 
@@ -712,6 +749,52 @@ class RTDETRBackend(DetectorBackend):
 
         return losses
 
+    def differentiable_predict_box_batch(self, images: torch.Tensor,
+                                          target_boxes: list) -> list:
+        """Batch forward returning (conf_loss, pred_box_or_None) per image."""
+        self.ensure_loaded()
+        B = images.shape[0]
+        preprocessed = torch.cat(
+            [self._diff_preprocess(images[i].to(self.device)) for i in range(B)],
+            dim=0,
+        )
+        outputs = self._model(pixel_values=preprocessed)
+
+        results = []
+        for i in range(B):
+            logits     = outputs.logits[i]
+            pred_boxes = outputs.pred_boxes[i]
+            scores = logits.sigmoid().max(dim=-1).values
+
+            orig_h, orig_w = images.shape[2], images.shape[3]
+            cx, cy, bw, bh = pred_boxes.unbind(-1)
+            boxes_xyxy = torch.stack([
+                (cx - bw / 2) * orig_w,
+                (cy - bh / 2) * orig_h,
+                (cx + bw / 2) * orig_w,
+                (cy + bh / 2) * orig_h,
+            ], dim=-1)
+
+            if len(scores) == 0:
+                results.append((torch.tensor(0.0, device=self.device,
+                                             requires_grad=True), None))
+                continue
+
+            box_t = target_boxes[i].to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                weights = torch.stack([
+                    _box_iou_scalar(boxes_xyxy[j].detach().unsqueeze(0), box_t)
+                    * scores[j].detach()
+                    for j in range(len(scores))
+                ])
+            best_idx = int(weights.argmax().item())
+            if scores[best_idx].detach().item() < self.conf_threshold:
+                results.append((scores[best_idx], None))
+            else:
+                results.append((scores[best_idx], boxes_xyxy[best_idx]))
+
+        return results
+
 
 # ---------------------------------------------------------------------------
 # Mock / stub backend  (useful for unit-testing without GPU/weights)
@@ -1075,6 +1158,36 @@ class FasterRCNNBackend(DetectorBackend):
                 best_idx = int(weights.argmax().item())
             losses.append(scores[best_idx])
         return losses
+
+    def differentiable_predict_box_batch(self, images: torch.Tensor,
+                                          target_boxes: list) -> list:
+        """Batch forward returning (conf_loss, pred_box_or_None) per image."""
+        self.ensure_loaded()
+        images_list = [images[i] for i in range(images.shape[0])]
+        outputs = self._model(images_list)
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+
+        results = []
+        for i, out in enumerate(outputs):
+            scores = out.get("scores")
+            boxes  = out.get("boxes")
+            tb = target_boxes[i].to(self.device)
+            if scores is None or len(scores) == 0:
+                results.append((torch.tensor(0.0, device=self.device), None))
+                continue
+            with torch.no_grad():
+                weights = torch.tensor([
+                    _box_iou_scalar(boxes[j].unsqueeze(0), tb.unsqueeze(0))
+                    * scores[j].item()
+                    for j in range(len(scores))
+                ])
+                best_idx = int(weights.argmax().item())
+            if scores[best_idx].detach().item() < self.conf_threshold:
+                results.append((scores[best_idx], None))
+            else:
+                results.append((scores[best_idx], boxes[best_idx]))
+        return results
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -1549,6 +1662,31 @@ class YOLOv11Backend(DetectorBackend):
             losses.append(scores[i][best_idx])
         return losses
 
+    def differentiable_predict_box_batch(self, images: torch.Tensor,
+                                          target_boxes: list) -> list:
+        """Batch forward returning (conf_loss, pred_box_or_None) per image."""
+        self.ensure_loaded()
+        raw = self._model(images)
+        preds = raw[0].permute(0, 2, 1)    # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        results = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            if scores[i][best_idx].detach().item() < self.conf_threshold:
+                results.append((scores[i][best_idx], None))
+            else:
+                results.append((scores[i][best_idx], boxes_xyxy[i][best_idx]))
+        return results
+
     def to(self, device: str) -> "YOLOv11Backend":
         self.device = device
         if self._model is not None:
@@ -1735,6 +1873,32 @@ class Yolov9TorchBackend(DetectorBackend):
                 best_idx = int((ious * scores[i].detach()).argmax().item())
             losses.append(scores[i][best_idx])
         return losses
+
+    def differentiable_predict_box_batch(self, images: torch.Tensor,
+                                          target_boxes: list) -> list:
+        """Batch forward returning (conf_loss, pred_box_or_None) per image."""
+        self.ensure_loaded()
+        batch  = images.to(self.device)
+        output = self._model(batch)
+        if isinstance(output, (list, tuple)):
+            output = output[0]            # [B, 5, A]
+
+        bx, by, bw, bh = output[:, 0], output[:, 1], output[:, 2], output[:, 3]
+        scores = output[:, 4]             # [B, A]
+        boxes  = torch.stack([bx - bw / 2, by - bh / 2,
+                               bx + bw / 2, by + bh / 2], dim=-1)  # [B, A, 4]
+
+        results = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious     = _box_iou_vectorized(tb, boxes[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            if scores[i][best_idx].detach().item() < self.conf_threshold:
+                results.append((scores[i][best_idx], None))
+            else:
+                results.append((scores[i][best_idx], boxes[i][best_idx]))
+        return results
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
