@@ -163,7 +163,7 @@ class AdversarialPatchDataset(Dataset):
                  use_original: bool = False, gpu_device=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
-        self.preload = preload or (gpu_device is not None)
+        self.preload = preload and (gpu_device is None)
         self.target_size = target_size
         self.use_original = use_original
         self.gpu_device = gpu_device
@@ -222,10 +222,9 @@ class AdversarialPatchDataset(Dataset):
             self.preloaded_images = None
 
         if gpu_device is not None:
-            assert self.preload, "gpu_device requires preload=True"
             gpu_cache = []
-            for idx in tqdm(range(len(self.df)), desc=f"Transferring dataset to {gpu_device}"):
-                item = self[idx]  # CPU tensors via normal __getitem__
+            for idx in tqdm(range(len(self.df)), desc=f"Loading dataset to {gpu_device}"):
+                item = self[idx]  # loads from disk, no RAM cache
                 gpu_cache.append({
                     k: (v.to(gpu_device) if isinstance(v, torch.Tensor) else v)
                     for k, v in item.items()
