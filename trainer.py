@@ -610,6 +610,14 @@ class AdversarialPatchTrainer:
         orig_corners_np = batch_item["orig_corners"].cpu().numpy()
         orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
+        # Halve images that are too large to keep GPU memory manageable
+        _, H, W = orig_tensor.shape
+        if max(H, W) > 2000:
+            orig_tensor     = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
+                                            mode="bilinear", align_corners=False).squeeze(0)
+            orig_corners_np = orig_corners_np * 0.5
+            orig_corners    = orig_corners * 0.5
+
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
         patched_prep_chw, new_corners_np = self.diff_prep(
