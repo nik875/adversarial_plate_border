@@ -171,21 +171,19 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
         for f in tqdm(as_completed(futures), total=len(futures),
                       desc=f"Preloading images to GPU ({num_workers} threads)"):
             idx, data = f.result()
-            results[idx] = data
+            if data is None:
+                continue
+            image, corners = data
+            # Transfer to GPU immediately and discard CPU tensors
+            image   = image.to(device)
+            corners = corners.to(device)
+            gt_box  = torch.stack([
+                corners[:, 0].min(), corners[:, 1].min(),
+                corners[:, 0].max(), corners[:, 1].max(),
+            ])
+            results[idx] = (image, corners, gt_box)
 
-    samples = []
-    for data in results:
-        if data is None:
-            continue
-        image, corners = data
-        image   = image.to(device)
-        corners = corners.to(device)
-        gt_box  = torch.stack([
-            corners[:, 0].min(), corners[:, 1].min(),
-            corners[:, 0].max(), corners[:, 1].max(),
-        ])
-        samples.append((image, corners, gt_box))
-    return samples
+    return [s for s in results if s is not None]
 
 
 def evaluate_one(backend: DetectorBackend,
