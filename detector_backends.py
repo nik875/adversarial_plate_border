@@ -41,6 +41,18 @@ def _box_iou_scalar(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
     return (inter / (area_a + area_b - inter + 1e-6)).item()
 
 
+def _box_iou_vectorized(box: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+    """IoU between a single [4] xyxy box and N [N, 4] xyxy boxes; returns [N]."""
+    x1 = torch.max(box[0], boxes[:, 0])
+    y1 = torch.max(box[1], boxes[:, 1])
+    x2 = torch.min(box[2], boxes[:, 2])
+    y2 = torch.min(box[3], boxes[:, 3])
+    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    area_box  = (box[2] - box[0]) * (box[3] - box[1])
+    area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / (area_box + area_boxes - inter + 1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Detection result container
 # ---------------------------------------------------------------------------
@@ -188,6 +200,17 @@ class DetectorBackend(abc.ABC):
         ))
         return best.conf.to(self.device)
 
+    def differentiable_det_loss_batch(
+        self,
+        images: torch.Tensor,           # [B, C, H, W]
+        target_boxes: list,             # B × [x1, y1, x2, y2]
+    ) -> list:
+        """Default: sequential loop. Override for true batch GPU inference."""
+        return [
+            self.differentiable_det_loss(images[i], target_boxes[i])
+            for i in range(images.shape[0])
+        ]
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, path={self.model_path})"
 
@@ -316,6 +339,28 @@ class YOLOv8Backend(DetectorBackend):
         if self._model is not None:
             self._model.train()
         return self
+
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one GPU call for B images."""
+        self.ensure_loaded()
+        raw = self._model(images)           # tuple; raw[0] shape [B, 4+C, A]
+        preds = raw[0].permute(0, 2, 1)    # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)                          # [B, A, 4]
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
 
     def to(self, device: str) -> "YOLOv8Backend":
         self.device = device
@@ -866,6 +911,33 @@ class FasterRCNNBackend(DetectorBackend):
 
         return scores[best_idx]
 
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: pass all B images in one model call."""
+        self.ensure_loaded()
+        images_list = [images[i] for i in range(images.shape[0])]
+        outputs = self._model(images_list)
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+
+        losses = []
+        for i, out in enumerate(outputs):
+            scores = out.get("scores")
+            boxes  = out.get("boxes")
+            tb = target_boxes[i].to(self.device)
+            if scores is None or len(scores) == 0:
+                losses.append(torch.tensor(0.0, device=self.device))
+                continue
+            with torch.no_grad():
+                weights = torch.tensor([
+                    _box_iou_scalar(boxes[j].unsqueeze(0), tb.unsqueeze(0))
+                    * scores[j].item()
+                    for j in range(len(scores))
+                ])
+                best_idx = int(weights.argmax().item())
+            losses.append(scores[best_idx])
+        return losses
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -1094,6 +1166,28 @@ class YOLOv11Backend(DetectorBackend):
         if self._model is not None:
             self._model.train()
         return self
+
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one GPU call for B images."""
+        self.ensure_loaded()
+        raw = self._model(images)           # tuple; raw[0] shape [B, 4+C, A]
+        preds = raw[0].permute(0, 2, 1)    # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)                          # [B, A, 4]
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
 
     def to(self, device: str) -> "YOLOv11Backend":
         self.device = device

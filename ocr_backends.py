@@ -132,6 +132,28 @@ class OCRBackend(abc.ABC):
         for p in self.parameters():
             p.requires_grad_(False)
 
+    def differentiable_loss_batch(
+        self,
+        crops: list,           # B × [1, 3, H_c, W_c]
+        target_text: str,
+        impersonation: bool = False,
+    ) -> list:
+        """Default: sequential loop. Override for batch GPU inference."""
+        losses = []
+        for crop in crops:
+            if self.is_trainable and hasattr(self, "differentiable_loss"):
+                losses.append(self.differentiable_loss(
+                    crop, target_text, impersonation=impersonation))
+            else:
+                with torch.no_grad():
+                    result = self.predict(crop.squeeze(0))
+                acc = result.char_accuracy(target_text)
+                losses.append(torch.tensor(
+                    (1.0 - acc) if impersonation else acc,
+                    device=self.device,
+                ))
+        return losses
+
     def eval(self) -> "OCRBackend":
         return self
 
@@ -724,6 +746,19 @@ class LPRNetBackend(OCRBackend):
         log_probs = torch.log(probs[0].clamp(min=1e-8))      # [24, 36]
         base = self.ctc_loss(log_probs, target_text)
         return base if impersonation else -base
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """True batch forward: preprocess all crops, one model call."""
+        self.ensure_loaded()
+        inp = torch.cat([self._preprocess(c) for c in crops], dim=0)  # [B, 3, 48, 96]
+        probs = self._model(inp)   # [B, 24, 36]
+        losses = []
+        for i in range(len(crops)):
+            log_probs = torch.log(probs[i].clamp(min=1e-8))  # [24, 36]
+            base = self.ctc_loss(log_probs, target_text)
+            losses.append(base if impersonation else -base)
+        return losses
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -1547,6 +1582,21 @@ class DoctrViTSTRBackend(OCRBackend):
         self._model.eval()
         loss = out["loss"]
         return loss if impersonation else -loss
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """Batch preprocessing + sequential model calls (doctr targets per-sample)."""
+        self.ensure_loaded()
+        self._model.train()
+        target = [target_text.lower()]
+        losses = []
+        for crop in crops:
+            inp = self._preprocess(crop)
+            out = self._model(inp, target=target)
+            loss = out["loss"]
+            losses.append(loss if impersonation else -loss)
+        self._model.eval()
+        return losses
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:

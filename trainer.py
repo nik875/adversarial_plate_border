@@ -207,9 +207,11 @@ class AdversarialPatchTrainer:
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
+        eval_batch_size:      int            = 1,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
+        self.eval_batch_size      = eval_batch_size
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -537,29 +539,52 @@ class AdversarialPatchTrainer:
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         return (tv_h + tv_v) / num_comparisons
 
-    def compute_loss(self, batch: dict) -> torch.Tensor:
-        orig_tensor     = batch["orig_image"][0].to(self.device)
-        orig_corners_np = batch["orig_corners"][0].numpy()
-        orig_corners    = batch["orig_corners"][0].to(self.device)
+    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
+        """Fast per-image ops: patch application + preprocessing. No model calls."""
+        orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
+        orig_corners_np = batch_item["orig_corners"].numpy()
+        orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
-        patch_norm = self.generate_patch(training_aug=self.training)
-
-        # Apply patch once at full resolution
         patched_orig, _ = self.apply_patch_to_image(
-            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
-        )
-
-        # Differentiable preprocessing for detector (gradients intact)
-        patched_prep, new_corners_np = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
+            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
+        patched_prep_chw, new_corners_np = self.diff_prep(
+            patched_orig.squeeze(0), orig_corners_np)
         new_corners = torch.from_numpy(new_corners_np).to(self.device)
+        target_box  = self.corners_to_bbox(new_corners)
+        ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
-        det_loss, ocr_loss = self.partial_loss(
-            patched_prep.unsqueeze(0), new_corners,
-            patched_orig,              orig_corners,
-        )
-        tv_loss   = self.total_variation_loss(patch_norm)
-        total     = (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
-        return total, det_loss.detach(), ocr_loss.detach(), (self.tv_weight * tv_loss).detach()
+        return {
+            "patched_prep": patched_prep_chw,   # [C, H_p, W_p]
+            "target_box":   target_box,          # [4]
+            "ocr_crop":     ocr_crop,            # [1, 3, H_c, W_c]
+        }
+
+    def compute_loss_batch(self, items: list) -> tuple:
+        """Batch the slow model-eval calls; average losses over B items."""
+        patch_norm   = items[0]["_patch_norm"]
+        batched_prep = torch.stack([x["patched_prep"] for x in items])  # [B, C, H, W]
+        target_boxes = [x["target_box"] for x in items]
+        ocr_crops    = [x["ocr_crop"]   for x in items]
+
+        det_losses = self.detector.differentiable_det_loss_batch(batched_prep, target_boxes)
+
+        target_text = self.impersonation_target or self.expected_plate_text
+        ocr_losses  = self.ocr.differentiable_loss_batch(
+            ocr_crops, target_text, impersonation=bool(self.impersonation_target))
+
+        det_l = torch.stack(det_losses).mean()
+        ocr_l = torch.stack(ocr_losses).mean()
+        tv_l  = self.total_variation_loss(patch_norm)
+        total = (det_l + ocr_l) / 2 + self.tv_weight * tv_l
+        return total, det_l.detach(), ocr_l.detach(), (self.tv_weight * tv_l).detach()
+
+    def compute_loss(self, batch: dict) -> tuple:
+        """Thin wrapper: B=1 case, for backward compatibility."""
+        patch_norm = self.generate_patch(training_aug=self.training)
+        item = self._prepare_one(
+            {k: v[0] for k, v in batch.items()}, patch_norm)
+        item["_patch_norm"] = patch_norm
+        return self.compute_loss_batch([item])
 
     # ====================================================================
     # Patch persistence
@@ -836,18 +861,30 @@ class AdversarialPatchTrainer:
         if self.ocr.is_trainable:
             self.ocr.train()
 
+        B = self.eval_batch_size
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
         total_loss = accum_loss = 0.0
         total_det  = total_ocr  = total_tv = 0.0
         step = num_updates = 0
+        buffer: list = []
 
         with tqdm(enumerate(self.train_loader),
                   desc=f"Epoch {epoch+1}",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
-                loss, det_l, ocr_l, tv_l = self.compute_loss(batch)
+                patch_norm = self.generate_patch(training_aug=self.training)
+                item = self._prepare_one(
+                    {k: v[0] for k, v in batch.items()}, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
+
+                if len(buffer) < B:
+                    continue
+
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                buffer = []
                 scaled_loss = loss / update_every
                 scaled_loss.backward()
 
@@ -878,6 +915,19 @@ class AdversarialPatchTrainer:
                 else:
                     del loss, scaled_loss
 
+            # Flush remainder buffer (< B images left at end of epoch)
+            if buffer:
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                buffer = []
+                scaled_loss = loss / update_every
+                scaled_loss.backward()
+                accum_loss += loss.item()
+                total_det  += det_l.item()
+                total_ocr  += ocr_l.item()
+                total_tv   += tv_l.item()
+                step       += 1
+                del loss, scaled_loss
+
             if step % update_every != 0 and self.grad_accumulate is not None:
                 torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                 optimizer.step()
@@ -891,26 +941,28 @@ class AdversarialPatchTrainer:
     def validate(self) -> float:
         if self.ocr.is_trainable:
             self.ocr.eval()
+        B = self.eval_batch_size
         losses = []
+        buffer: list = []
         with torch.no_grad():
             for batch in self.val_loader:
-                orig_tensor     = batch["orig_image"][0].to(self.device)
-                orig_corners_np = batch["orig_corners"][0].numpy()
-                orig_corners    = batch["orig_corners"][0].to(self.device)
-                patch_norm      = self.generate_patch(training_aug=False)
+                patch_norm = self.generate_patch(training_aug=False)
+                item = self._prepare_one(
+                    {k: v[0] for k, v in batch.items()}, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
 
-                patched_orig, _ = self.apply_patch_to_image(
-                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
-                )
-                patched_prep, new_corners_np = self.diff_prep(
-                    patched_orig.squeeze(0), orig_corners_np)
-                new_corners = torch.from_numpy(new_corners_np).to(self.device)
+                if len(buffer) < B:
+                    continue
 
-                det_loss, ocr_loss = self.partial_loss(
-                    patched_prep.unsqueeze(0), new_corners,
-                    patched_orig,              orig_corners,
-                )
-                losses.append(((det_loss + ocr_loss) / 2).item())
+                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
+                losses.append(((det_l + ocr_l) / 2).item())
+                buffer = []
+
+            if buffer:
+                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
+                losses.append(((det_l + ocr_l) / 2).item())
+
         return float(np.mean(losses)) if losses else 0.0
 
     def train(
@@ -1069,6 +1121,8 @@ def main():
                         help="Skip pre-training sanity check and debug image generation.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 2.5).")
+    parser.add_argument("--eval-batch-size", type=int, default=1,
+                        help="Number of images to batch for detector/OCR evaluation (default 1).")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1103,6 +1157,7 @@ def main():
         use_homography       = not args.disable_homography,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
+        eval_batch_size      = args.eval_batch_size,
     )
 
     trainer.train(
