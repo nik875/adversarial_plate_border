@@ -268,6 +268,7 @@ class AdversarialPatchTrainer:
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
         sam_rho:              float          = 0.025,
+        skip_sanity:          bool           = False,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -319,6 +320,23 @@ class AdversarialPatchTrainer:
 
         # ── Image transform ────────────────────────────────────────────
         self.transform = T.Compose([T.ToTensor()])
+
+        # ── Sanity check (before any preloading) ───────────────────────
+        if not skip_sanity:
+            _sanity_loader, _ = create_dataloaders(
+                csv_path,
+                transform=self.transform,
+                preload=False,
+                gpu_device=None,
+                batch_size=1,
+                n_jobs=0,
+                pin_memory=False,
+                limit=limit,
+                use_all_for_train=use_all_for_train,
+                use_original=True,
+            )
+            self.validate_pipeline(_sanity_loader)
+            del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
         self.train_loader, self.val_loader = create_dataloaders(
@@ -689,21 +707,22 @@ class AdversarialPatchTrainer:
     # Pre-training sanity check
     # ====================================================================
 
-    def validate_pipeline(self) -> None:
+    def validate_pipeline(self, loader=None) -> None:
         """
         Run one full gradient-accumulation cycle (B * update_every items) through
         the training forward+backward path to verify the pipeline end-to-end.
         Raises on any crash.
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
+        _loader = loader if loader is not None else self.train_loader
         B = self.eval_batch_size
         update_every = (self.grad_accumulate
                         if self.grad_accumulate is not None
-                        else min(4, len(self.train_loader)))
+                        else min(4, len(_loader)))
         need = B * update_every
 
         items_raw = []
-        for batch in self.train_loader:
+        for batch in _loader:
             items_raw.append({k: v[0] for k, v in batch.items()})
             if len(items_raw) >= need:
                 break
@@ -1115,11 +1134,7 @@ class AdversarialPatchTrainer:
         lr_min:        float = 1e-5,
         save_interval: int   = 10,
         dry_run:       bool  = False,
-        skip_sanity:   bool  = False,
     ) -> dict:
-        if not skip_sanity:
-            self.validate_pipeline()
-
         if dry_run:
             print("\nDry run complete.")
             return {}
@@ -1284,7 +1299,7 @@ def main():
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
-                        help="Skip pre-training sanity check and debug image generation.")
+                        help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 2.5).")
     parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
@@ -1355,6 +1370,7 @@ def main():
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
         sam_rho              = args.sam_rho,
+        skip_sanity          = args.skip_sanity,
     )
 
     trainer.train(
@@ -1363,7 +1379,6 @@ def main():
         lr_min        = args.lr_min,
         save_interval = 10,
         dry_run       = args.dry_run,
-        skip_sanity   = args.skip_sanity,
     )
 
 
