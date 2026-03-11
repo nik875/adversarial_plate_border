@@ -208,11 +208,13 @@ class AdversarialPatchTrainer:
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
         ocr_loss_scale:       float          = 1.0,
+        det_loss_scale:       float          = 1.0,
         eval_batch_size:      int            = 1,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
         self.ocr_loss_scale       = ocr_loss_scale
+        self.det_loss_scale       = det_loss_scale
         self.eval_batch_size      = eval_batch_size
         self.print_blur           = print_blur
         self.use_homography       = use_homography
@@ -574,7 +576,7 @@ class AdversarialPatchTrainer:
         ocr_losses  = self.ocr.differentiable_loss_batch(
             ocr_crops, target_text, impersonation=bool(self.impersonation_target))
 
-        det_l = torch.stack(det_losses).mean()
+        det_l = torch.stack(det_losses).mean() * self.det_loss_scale
         ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
         tv_l  = self.total_variation_loss(patch_norm)
         total = (det_l + ocr_l) / 2 + self.tv_weight * tv_l
@@ -1138,6 +1140,8 @@ def main():
                         help="Weight for total variation loss (default: 2.5).")
     parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
                         help="Scalar multiplier on OCR loss (default: 1.0).")
+    parser.add_argument("--det-loss-scale", type=float, default=1.0,
+                        help="Scalar multiplier on detection loss (default: 1.0).")
     parser.add_argument("--eval-batch-size", type=int, default=1,
                         help="Number of images to batch for detector/OCR evaluation (default 1).")
     parser.add_argument("--compile", action="store_true",
@@ -1186,6 +1190,7 @@ def main():
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
         ocr_loss_scale       = args.ocr_loss_scale,
+        det_loss_scale       = args.det_loss_scale,
         eval_batch_size      = args.eval_batch_size,
     )
 

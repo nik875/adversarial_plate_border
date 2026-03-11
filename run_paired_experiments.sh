@@ -40,6 +40,7 @@ OCR_SCALE_TROCR=0.5
 OCR_SCALE_CCT=1.0
 OCR_SCALE_LPRNET=1.0
 OCR_SCALE_VITSTR=1.0
+DET_SCALE=2
 GRAD_ACCUM=32
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -85,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --ocr-scale-cct)    OCR_SCALE_CCT="$2"; shift 2 ;;
         --ocr-scale-lprnet) OCR_SCALE_LPRNET="$2"; shift 2 ;;
         --ocr-scale-vitstr) OCR_SCALE_VITSTR="$2"; shift 2 ;;
+        --det-scale)        DET_SCALE="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
         --pin-memory)      PIN_MEMORY=true; shift ;;
@@ -162,6 +164,7 @@ BASE_ARGS=(
     --device "$DEVICE"
     --epochs "$EPOCHS"
     --lr-min "$LR_MIN"
+    --det-loss-scale "$DET_SCALE"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
     --eval-batch-size "$EVAL_BATCH_SIZE"
