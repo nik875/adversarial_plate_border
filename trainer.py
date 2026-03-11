@@ -861,7 +861,7 @@ class AdversarialPatchTrainer:
                     elif self.device == "mps":
                         torch.mps.empty_cache()
                     pbar.set_postfix({
-                        "loss": f"{total_loss/(num_updates*update_every):.4f}",
+                        "loss": f"{total_loss/step:.4f}",
                         "det":  f"{total_det/step:.4f}",
                         "ocr":  f"{total_ocr/step:.4f}",
                         "tv":   f"{total_tv/step:.4f}",
@@ -876,11 +876,8 @@ class AdversarialPatchTrainer:
                 total_loss  += accum_loss
                 num_updates += 1
 
-        total_steps = (num_updates * update_every
-                       if self.grad_accumulate else len(self.train_loader))
         n = max(step, 1)
-        return (total_loss / max(total_steps, 1),
-                total_det / n, total_ocr / n, total_tv / n)
+        return (total_loss / n, total_det / n, total_ocr / n, total_tv / n)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
