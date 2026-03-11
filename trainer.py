@@ -528,12 +528,12 @@ class AdversarialPatchTrainer:
         return det_loss, ocr_loss
 
     def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
-        """Total variation loss on [C, H, W] or [1, C, H, W] patch for spatial smoothness."""
+        """Isotropic L2 total variation loss on [C, H, W] or [1, C, H, W] patch."""
         if patch.dim() == 3:
             patch = patch.unsqueeze(0)
-        diff_h = torch.abs(patch[:, :, :, 1:] - patch[:, :, :, :-1])
-        diff_v = torch.abs(patch[:, :, 1:, :] - patch[:, :, :-1, :])
-        return diff_h.sum() + diff_v.sum()
+        diff_h = patch[:, :, :, 1:] - patch[:, :, :, :-1]
+        diff_v = patch[:, :, 1:, :] - patch[:, :, :-1, :]
+        return (diff_h[:, :, :-1, :] ** 2 + diff_v[:, :, :, :-1] ** 2).sqrt().sum()
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         orig_tensor     = batch["orig_image"][0].to(self.device)
@@ -1048,7 +1048,7 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check and debug image generation.")
-    parser.add_argument("--tv-weight", type=float, default=2.5,
+    parser.add_argument("--tv-weight", type=float, default=1.0,
                         help="Weight for total variation loss (default: 2.5).")
     args = parser.parse_args()
 
