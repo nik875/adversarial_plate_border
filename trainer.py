@@ -112,7 +112,7 @@ PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
 # Probability that each augmentation transform is applied on a given call.
-AUG_PROB = 0.2
+AUG_PROB = 1 / 3
 
 
 def augment_plate(image: torch.Tensor, device: str) -> torch.Tensor:
