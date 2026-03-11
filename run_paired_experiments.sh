@@ -27,9 +27,9 @@ EPOCHS=120
 LR_MIN=1e-5
 # Per-OCR peak LR (tweak per model as needed)
 LR_TROCR=2e-4
-LR_CCT=5e-4
-LR_LPRNET=5e-4
-LR_VITSTR=5e-4
+LR_CCT=2e-4
+LR_LPRNET=2e-4
+LR_VITSTR=2e-4
 # Per-OCR TV weight (tweak per model as needed)
 TV_TROCR=10
 TV_CCT=10
