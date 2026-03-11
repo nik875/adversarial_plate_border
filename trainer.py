@@ -654,8 +654,18 @@ class AdversarialPatchTrainer:
 
     def compute_loss_batch(self, items: list) -> tuple:
         """Batch the slow model-eval calls; average losses over B items."""
-        patch_norm   = items[0]["_patch_norm"]
-        batched_prep = torch.stack([x["patched_prep"] for x in items])  # [B, C, H, W]
+        patch_norm = items[0]["_patch_norm"]
+        preps = [x["patched_prep"] for x in items]
+        if all(p.shape == preps[0].shape for p in preps):
+            batched_prep = torch.stack(preps)
+        else:
+            # Variable-size images (e.g. fasterrcnn passthrough): pad to max H×W
+            max_h = max(p.shape[1] for p in preps)
+            max_w = max(p.shape[2] for p in preps)
+            batched_prep = torch.stack([
+                F.pad(p, (0, max_w - p.shape[2], 0, max_h - p.shape[1]))
+                for p in preps
+            ])
         target_boxes = [x["target_box"] for x in items]
         ocr_crops    = [x["ocr_crop"]   for x in items]
 
