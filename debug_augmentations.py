@@ -249,47 +249,50 @@ def main() -> None:
     with torch.no_grad():
         save("00_base_patch_only.png", render())
 
-    # ── Brightness sweep ──────────────────────────────────────────────────
+    # Sweep values are sampled uniformly within the exact training bounds so the
+    # debug images reflect what the model will actually see during training.
+
+    # ── Brightness sweep  [0.5, 1.5] ─────────────────────────────────────
     print("\nBrightness")
-    for i, factor in enumerate([0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6]):
+    for i, factor in enumerate([0.5, 0.7, 0.9, 1.0, 1.1, 1.3, 1.5]):
         with torch.no_grad():
             save(f"01_brightness_{i+1:02d}_factor{factor:.1f}.png",
                  render(lambda img, f=factor: aug_brightness(img, f)))
 
-    # ── Contrast sweep ────────────────────────────────────────────────────
+    # ── Contrast sweep  [0.7, 1.3] ───────────────────────────────────────
     print("\nContrast")
-    for i, factor in enumerate([0.5, 0.7, 0.9, 1.1, 1.3, 1.5]):
+    for i, factor in enumerate([0.7, 0.85, 1.0, 1.15, 1.3]):
         with torch.no_grad():
-            save(f"02_contrast_{i+1:02d}_factor{factor:.1f}.png",
+            save(f"02_contrast_{i+1:02d}_factor{factor:.2f}.png",
                  render(lambda img, f=factor: aug_contrast(img, f)))
 
-    # ── Saturation sweep ──────────────────────────────────────────────────
+    # ── Saturation sweep  [0.5, 1.5] ─────────────────────────────────────
     print("\nSaturation")
-    for i, factor in enumerate([0.0, 0.3, 0.6, 1.0, 1.3, 1.6, 2.0]):
+    for i, factor in enumerate([0.5, 0.75, 1.0, 1.25, 1.5]):
         with torch.no_grad():
-            save(f"03_saturation_{i+1:02d}_factor{factor:.1f}.png",
+            save(f"03_saturation_{i+1:02d}_factor{factor:.2f}.png",
                  render(lambda img, f=factor: aug_saturation(img, f)))
 
-    # ── Color temperature sweep ───────────────────────────────────────────
+    # ── Color temperature sweep  [-0.2, 0.2] ─────────────────────────────
     print("\nColor temperature")
-    for i, shift in enumerate([-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3]):
+    for i, shift in enumerate([-0.2, -0.1, 0.0, 0.1, 0.2]):
         label = "cool" if shift < 0 else ("neutral" if shift == 0 else "warm")
         with torch.no_grad():
             save(f"04_colortemp_{i+1:02d}_{label}_shift{shift:+.1f}.png",
                  render(lambda img, s=shift: aug_color_temperature(img, s)))
 
-    # ── Shadow angle sweep (fixed intensity 0.35) ─────────────────────────
+    # ── Shadow angle sweep  [0°, 360°], intensity mid-point 0.25 ─────────
     print("\nDirectional shadow — angle sweep")
     for i, angle in enumerate([0, 45, 90, 135, 180, 225, 270, 315]):
         with torch.no_grad():
             save(f"05_shadow_angle_{i+1:02d}_{angle:03d}deg.png",
-                 render(lambda img, a=angle: aug_shadow(img, a, intensity=0.35)))
+                 render(lambda img, a=angle: aug_shadow(img, a, intensity=0.25)))
 
-    # ── Shadow intensity sweep (fixed angle 90°) ──────────────────────────
+    # ── Shadow intensity sweep  [0.1, 0.4], angle fixed 90° ──────────────
     print("\nDirectional shadow — intensity sweep")
-    for i, intensity in enumerate([0.05, 0.15, 0.25, 0.35, 0.50, 0.70]):
+    for i, intensity in enumerate([0.1, 0.175, 0.25, 0.325, 0.4]):
         with torch.no_grad():
-            save(f"06_shadow_intensity_{i+1:02d}_int{intensity:.2f}.png",
+            save(f"06_shadow_intensity_{i+1:02d}_int{intensity:.3f}.png",
                  render(lambda img, v=intensity: aug_shadow(img, angle_deg=90.0, intensity=v)))
 
     # ── Random combined samples ───────────────────────────────────────────
