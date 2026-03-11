@@ -31,7 +31,7 @@ LR_CCT=5e-4
 LR_LPRNET=5e-4
 LR_VITSTR=5e-4
 # Per-OCR TV weight (tweak per model as needed)
-TV_TROCR=2
+TV_TROCR=1
 TV_CCT=10
 TV_LPRNET=10
 TV_VITSTR=10
