@@ -196,10 +196,12 @@ class AdversarialPatchTrainer:
         expected_plate_text:  str            = "VRJ7774",
         print_blur:           float          = 0.0,
         training:             bool           = False,
+        train_detector:       bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
     ):
         self.training             = training
+        self.train_detector       = train_detector
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -209,8 +211,11 @@ class AdversarialPatchTrainer:
         # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
         self.device   = detector.device
-        self.detector.eval()
-        self.detector.freeze()
+        if self.train_detector:
+            self.detector.train_mode()
+        else:
+            self.detector.eval()
+            self.detector.freeze()
         self.diff_prep    = self._make_differentiable_prep()
         self._cv2_prep    = self._make_cv2_prep()
 
@@ -264,7 +269,10 @@ class AdversarialPatchTrainer:
 
     def _trainable_params(self):
         """All parameters that the optimiser should update."""
-        return [self.seed] + list(self.decoder.parameters())
+        params = [self.seed] + list(self.decoder.parameters())
+        if self.train_detector:
+            params.extend(list(self.detector.parameters()))
+        return params
 
     def generate_patch(self, training_aug: bool = False) -> torch.Tensor:
         """
@@ -1009,7 +1017,7 @@ def main():
     )
     parser.add_argument("--csv", default="preproc_labels.csv")
 
-    TRAINABLE_DET = ["yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
+    TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
     TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)
@@ -1034,6 +1042,8 @@ def main():
     parser.add_argument("--impersonation-target", default="SHX8459")
     parser.add_argument("--expected-plate", default="VRJ7774")
     parser.add_argument("--disable-homography", action="store_true")
+    parser.add_argument("--train-detector", action="store_true",
+                        help="Allow detector backend weights to update during training.")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dry-run",  action="store_true")
     args = parser.parse_args()
@@ -1066,6 +1076,7 @@ def main():
         impersonation_target = args.impersonation_target,
         expected_plate_text  = args.expected_plate,
         training             = True,
+        train_detector       = args.train_detector,
         use_homography       = not args.disable_homography,
         run_name             = args.run_name,
     )

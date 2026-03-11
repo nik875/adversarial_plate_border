@@ -15,4 +15,5 @@ pillow_heif
 seaborn
 python-Levenshtein
 transformers
+git+https://github.com/facebookresearch/segment-anything.git
 timm==0.4.5  # Required for DTRB ViTSTR backend

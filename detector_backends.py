@@ -27,6 +27,7 @@ from typing import Iterator, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +935,227 @@ class YOLONASBackend(DetectorBackend):
         return self
 
 
+# ---------------------------------------------------------------------------
+# SAM backend  (segment-anything, differentiable prompt-to-mask path)
+# ---------------------------------------------------------------------------
+
+class SAMBackend(DetectorBackend):
+    """
+    Wraps Meta's Segment Anything Model as a detector-like backend.
+
+    This backend keeps the forward path differentiable by avoiding numpy,
+    argmax-based mask selection, and OpenCV contour extraction. Instead it:
+
+    1. encodes the image with SAM,
+    2. queries a small bank of fixed box prompts,
+    3. converts mask logits to soft probabilities,
+    4. extracts a soft bounding box from mask moments.
+
+    The resulting boxes are heuristic rather than a purpose-built detection
+    head, but gradients flow from the returned confidence tensor back to the
+    input image through SAM.
+    """
+
+    name = "sam"
+
+    def __init__(self, model_path: str, device: str = "cpu",
+                 conf_threshold: float = 0.20, model_type: Optional[str] = None,
+                 multimask_output: bool = True):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self.multimask_output = multimask_output
+        self.model_type = model_type or self._infer_model_type(model_path)
+        self._model: Optional[nn.Module] = None
+
+    @staticmethod
+    def _infer_model_type(model_path: str) -> str:
+        name = Path(model_path).name.lower()
+        if "vit_h" in name:
+            return "vit_h"
+        if "vit_l" in name:
+            return "vit_l"
+        if "vit_b" in name:
+            return "vit_b"
+        return "vit_b"
+
+    @staticmethod
+    def _resize_longest_side(image: torch.Tensor, target_length: int) -> torch.Tensor:
+        _, _, h, w = image.shape
+        scale = float(target_length) / float(max(h, w))
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        return F.interpolate(image, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
+    @staticmethod
+    def _scale_boxes(boxes: torch.Tensor, original_size: tuple[int, int], resized_size: tuple[int, int]) -> torch.Tensor:
+        orig_h, orig_w = original_size
+        resized_h, resized_w = resized_size
+        scaled = boxes.clone()
+        scaled[:, [0, 2]] = scaled[:, [0, 2]] * (float(resized_w) / float(orig_w))
+        scaled[:, [1, 3]] = scaled[:, [1, 3]] * (float(resized_h) / float(orig_h))
+        return scaled
+
+    @staticmethod
+    def _prompt_bank(width: int, height: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        w = float(width)
+        h = float(height)
+        boxes = [
+            [0.00 * w, 0.00 * h, 1.00 * w, 1.00 * h],
+            [0.05 * w, 0.25 * h, 0.95 * w, 0.80 * h],
+            [0.10 * w, 0.35 * h, 0.90 * w, 0.75 * h],
+            [0.15 * w, 0.42 * h, 0.85 * w, 0.70 * h],
+            [0.20 * w, 0.45 * h, 0.80 * w, 0.68 * h],
+            [0.00 * w, 0.40 * h, 1.00 * w, 0.72 * h],
+        ]
+        return torch.tensor(boxes, device=device, dtype=dtype)
+
+    @staticmethod
+    def _soft_box_from_mask(mask_probs: torch.Tensor) -> torch.Tensor:
+        h, w = mask_probs.shape
+        rows = mask_probs.sum(dim=1)
+        cols = mask_probs.sum(dim=0)
+        row_total = rows.sum().clamp_min(1e-6)
+        col_total = cols.sum().clamp_min(1e-6)
+
+        y_coords = torch.arange(h, device=mask_probs.device, dtype=mask_probs.dtype)
+        x_coords = torch.arange(w, device=mask_probs.device, dtype=mask_probs.dtype)
+
+        y_mean = (rows * y_coords).sum() / row_total
+        x_mean = (cols * x_coords).sum() / col_total
+        y_var = (rows * (y_coords - y_mean).square()).sum() / row_total
+        x_var = (cols * (x_coords - x_mean).square()).sum() / col_total
+
+        height = (4.0 * torch.sqrt(y_var + 1e-6)).clamp(8.0, float(h))
+        width = (4.0 * torch.sqrt(x_var + 1e-6)).clamp(16.0, float(w))
+
+        x1 = (x_mean - width / 2.0).clamp(0.0, float(w - 1))
+        y1 = (y_mean - height / 2.0).clamp(0.0, float(h - 1))
+        x2 = (x_mean + width / 2.0).clamp(0.0, float(w - 1))
+        y2 = (y_mean + height / 2.0).clamp(0.0, float(h - 1))
+        return torch.stack([x1, y1, x2, y2])
+
+    @staticmethod
+    def _confidence_from_mask(mask_probs: torch.Tensor, iou_prediction: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
+        h, w = mask_probs.shape
+        mask_mass = mask_probs.mean().clamp(0.0, 1.0)
+        box_w = (box[2] - box[0]).clamp_min(1.0)
+        box_h = (box[3] - box[1]).clamp_min(1.0)
+        aspect = box_w / box_h
+        aspect_score = torch.exp(-torch.abs(aspect - 3.0) / 2.5)
+        rectangularity = (mask_probs.sum() / (box_w * box_h).clamp_min(1.0)).clamp(0.0, 1.0)
+        spatial_prior = (box_h / float(h)).clamp(0.0, 1.0) * (box_w / float(w)).clamp(0.0, 1.0)
+        iou_score = iou_prediction.clamp(0.0, 1.0)
+        return (0.50 * iou_score + 0.20 * mask_mass + 0.20 * aspect_score + 0.10 * rectangularity * spatial_prior).clamp(0.0, 1.0)
+
+    def load(self) -> None:
+        try:
+            from segment_anything import sam_model_registry
+        except ImportError as exc:
+            raise ImportError(
+                "segment-anything is required for the SAM backend. "
+                "Install with: pip install git+https://github.com/facebookresearch/segment-anything.git"
+            ) from exc
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"SAM checkpoint not found: {self.model_path}")
+
+        self._model = sam_model_registry[self.model_type](checkpoint=str(self.model_path))
+        self._model.to(self.device)
+        self._model.eval()
+        print(f"[{self.name}] Loaded {self.model_type} from {self.model_path}")
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        assert self._model is not None
+
+        image = image.to(self.device).clamp(0.0, 1.0)
+        if image.dim() != 3:
+            raise ValueError(f"SAM backend expects CHW tensor, got shape {tuple(image.shape)}")
+
+        _, orig_h, orig_w = image.shape
+        rgb = image.unsqueeze(0) * 255.0
+        resized = self._resize_longest_side(rgb, self._model.image_encoder.img_size)
+        input_image = self._model.preprocess(resized)
+        resized_h, resized_w = resized.shape[-2:]
+
+        image_embeddings = self._model.image_encoder(input_image)
+
+        prompt_boxes = self._prompt_bank(orig_w, orig_h, image.device, image.dtype)
+        prompt_boxes = self._scale_boxes(prompt_boxes, (orig_h, orig_w), (resized_h, resized_w))
+
+        sparse_embeddings, dense_embeddings = self._model.prompt_encoder(
+            points=None,
+            boxes=prompt_boxes,
+            masks=None,
+        )
+
+        n_prompts = prompt_boxes.shape[0]
+        low_res_masks, iou_predictions = self._model.mask_decoder(
+            image_embeddings=image_embeddings.repeat_interleave(n_prompts, dim=0),
+            image_pe=self._model.prompt_encoder.get_dense_pe().repeat_interleave(n_prompts, dim=0),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=self.multimask_output,
+        )
+
+        masks = self._model.postprocess_masks(
+            low_res_masks,
+            input_size=(resized_h, resized_w),
+            original_size=(orig_h, orig_w),
+        ).sigmoid()
+
+        detections: List[Detection] = []
+        zero = image.new_tensor(0.0)
+
+        for prompt_idx in range(masks.shape[0]):
+            for mask_idx in range(masks.shape[1]):
+                mask_probs = masks[prompt_idx, mask_idx]
+                box = self._soft_box_from_mask(mask_probs)
+                conf = self._confidence_from_mask(mask_probs, iou_predictions[prompt_idx, mask_idx], box)
+                conf_value = float(conf.detach().item())
+                if conf_value < self.conf_threshold:
+                    continue
+
+                raw = torch.stack([
+                    zero,
+                    box[0], box[1], box[2], box[3],
+                    zero,
+                    conf,
+                ])
+                detections.append(Detection(
+                    x1=float(box[0].detach().item()),
+                    y1=float(box[1].detach().item()),
+                    x2=float(box[2].detach().item()),
+                    y2=float(box[3].detach().item()),
+                    confidence=conf_value,
+                    class_id=0,
+                    raw=raw,
+                ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "SAMBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def train_mode(self) -> "SAMBackend":
+        if self._model is not None:
+            self._model.train()
+        return self
+
+    def to(self, device: str) -> "SAMBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        return self
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1369,7 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
 
 # Backends where gradients flow through the detector — usable for adversarial training.
 TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
+    "sam":         SAMBackend,               # pip install segment-anything | weights: sam_vit_*.pth
     "yolov8":      YOLOv8Backend,            # pip install ultralytics  |  weights: your fine-tuned .pt
     "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
     "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
