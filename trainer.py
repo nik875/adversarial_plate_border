@@ -729,28 +729,37 @@ class AdversarialPatchTrainer:
         if not items_raw:
             raise RuntimeError("No training data found for sanity check.")
 
-        patch_norm = self.generate_patch(training_aug=self.training)
-        buffer: list = []
-        step = 0
-        total_loss = 0.0
-        for raw_item in items_raw:
-            item = self._prepare_one(raw_item, patch_norm)
-            item["_patch_norm"] = patch_norm
-            buffer.append(item)
-            if len(buffer) < B:
-                continue
-            loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
-            buffer = []
-            step += 1
-            scaled = loss / update_every
-            scaled.backward(retain_graph=(step % update_every != 0))
-            total_loss += loss.item()
-            del loss, scaled
+        # Models must be in training mode for cuDNN RNN backward to work
+        self.detector.train()
+        self.ocr.train()
+        try:
+            patch_norm = self.generate_patch(training_aug=self.training)
+            buffer: list = []
+            step = 0
+            total_loss = 0.0
+            for raw_item in items_raw:
+                item = self._prepare_one(raw_item, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
+                if len(buffer) < B:
+                    continue
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                buffer = []
+                step += 1
+                scaled = loss / update_every
+                scaled.backward(retain_graph=(step % update_every != 0))
+                total_loss += loss.item()
+                del loss, scaled
 
-        # Zero grads so the optimizer starts clean
-        for p in self._trainable_params():
-            if p.grad is not None:
-                p.grad.zero_()
+            # Zero grads so the optimizer starts clean
+            for p in self._trainable_params():
+                if p.grad is not None:
+                    p.grad.zero_()
+        finally:
+            self.detector.eval()
+            self.detector.freeze()
+            self.ocr.eval()
+            self.ocr.freeze()
 
         avg = total_loss / max(step, 1)
         msg = f"Sanity check passed: {step} accumulation step(s), avg loss {avg:.4f}"
