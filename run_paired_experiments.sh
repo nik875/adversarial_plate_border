@@ -35,6 +35,11 @@ TV_TROCR=10
 TV_CCT=10
 TV_LPRNET=10
 TV_VITSTR=10
+# Per-OCR loss scale (tweak per model as needed)
+OCR_SCALE_TROCR=0.5
+OCR_SCALE_CCT=1.0
+OCR_SCALE_LPRNET=1.0
+OCR_SCALE_VITSTR=1.0
 GRAD_ACCUM=32
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -76,6 +81,10 @@ while [[ $# -gt 0 ]]; do
         --tv-cct)          TV_CCT="$2"; shift 2 ;;
         --tv-lprnet)       TV_LPRNET="$2"; shift 2 ;;
         --tv-vitstr)       TV_VITSTR="$2"; shift 2 ;;
+        --ocr-scale-trocr)  OCR_SCALE_TROCR="$2"; shift 2 ;;
+        --ocr-scale-cct)    OCR_SCALE_CCT="$2"; shift 2 ;;
+        --ocr-scale-lprnet) OCR_SCALE_LPRNET="$2"; shift 2 ;;
+        --ocr-scale-vitstr) OCR_SCALE_VITSTR="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
         --pin-memory)      PIN_MEMORY=true; shift ;;
@@ -205,10 +214,10 @@ for row in "${PAIRS[@]}"; do
     fi
 
     case "$ocr" in
-        trocr)        pair_lr="$LR_TROCR"; pair_tv="$TV_TROCR" ;;
-        cct)          pair_lr="$LR_CCT";   pair_tv="$TV_CCT" ;;
-        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET" ;;
-        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR" ;;
+        trocr)        pair_lr="$LR_TROCR";  pair_tv="$TV_TROCR";  pair_ocr_scale="$OCR_SCALE_TROCR" ;;
+        cct)          pair_lr="$LR_CCT";    pair_tv="$TV_CCT";    pair_ocr_scale="$OCR_SCALE_CCT" ;;
+        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET"; pair_ocr_scale="$OCR_SCALE_LPRNET" ;;
+        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR"; pair_ocr_scale="$OCR_SCALE_VITSTR" ;;
     esac
 
     run "$label" \
@@ -216,6 +225,7 @@ for row in "${PAIRS[@]}"; do
             "${BASE_ARGS[@]}" \
             --lr "$pair_lr" \
             --tv-weight "$pair_tv" \
+            --ocr-loss-scale "$pair_ocr_scale" \
             --backend "$det" \
             --model-path "$det_w" \
             --ocr-backend "$ocr" \
