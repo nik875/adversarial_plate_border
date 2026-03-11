@@ -535,15 +535,28 @@ class AdversarialPatchTrainer:
         corners:        torch.Tensor,
         patch_norm:     Optional[torch.Tensor] = None,
         border_scale:   float = 1.4,
+        augment:        bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Warp the patch onto the image using the plate corners.
+
+        When augment=True the pipeline works in canonical (flat) space:
+          1. Warp the border+plate region of the image into patch canvas space.
+          2. Composite: patch fills the border ring, original plate pixels fill
+             the center.
+          3. Apply photometric augmentation to the composite in canonical space.
+          4. Warp the augmented canonical back to the full image.
+        This keeps augmentation physically localised to the plate+border area
+        and lets it interact realistically with the patch texture before
+        reprojection.
 
         Parameters
         ----------
         patch_norm : torch.Tensor or None
             Pre-generated [3, H, W] patch in [0, 1].  If None, calls
             generate_patch(training_aug=self.training) internally.
+        augment : bool
+            Run _augment_image() in canonical space before reprojection.
         """
         if patch_norm is None:
             patch_norm = self.generate_patch(training_aug=self.training)
@@ -558,31 +571,56 @@ class AdversarialPatchTrainer:
         cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
         center = torch.tensor([cx, cy], device=self.device)
         border = (center.unsqueeze(0) +
-                  (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)
+                  (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
 
         ph, pw = self.patch_height, self.patch_width
         src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
-                               dtype=torch.float32, device=self.device).unsqueeze(0)
+                               dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 4, 2]
 
-        M_border = K.get_perspective_transform(src, border)
-        M_plate  = K.get_perspective_transform(src, corners)
+        # src → border region in image space (used for final reprojection)
+        M_border       = K.get_perspective_transform(src, border)
+        # border region in image space → patch canvas (inverse direction)
+        M_to_canonical = K.get_perspective_transform(border, src)
 
+        ones = torch.ones(B, 1, ph, pw, device=self.device)
+
+        # ── Step 1: extract canonical view of the border+plate region ────
+        canonical = K.warp_perspective(image, M_to_canonical, (ph, pw),
+                                       mode="bilinear", padding_mode="zeros",
+                                       align_corners=True)   # [B, 3, ph, pw]
+
+        # ── Step 2: plate mask in canonical space ─────────────────────────
+        # Transform the 4 plate corners through M_to_canonical to find where
+        # the plate lands inside the patch canvas.
+        M_c  = M_to_canonical[0]                                    # [3, 3]
+        ph4  = torch.cat([plate, plate.new_ones(4, 1)], dim=1).T   # [3, 4]
+        pc_h = M_c @ ph4                                            # [3, 4]
+        plate_canonical = (pc_h[:2] / pc_h[2:3]).T.unsqueeze(0)    # [1, 4, 2]
+
+        M_plate_in_canonical = K.get_perspective_transform(src, plate_canonical)
+        plate_mask = K.warp_perspective(ones, M_plate_in_canonical, (ph, pw),
+                                        mode="bilinear", padding_mode="zeros",
+                                        align_corners=True)          # [B, 1, ph, pw]
+        plate_mask_3 = plate_mask.expand(-1, 3, -1, -1)
+
+        # ── Step 3: composite — patch ring + original plate pixels ────────
         patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
-        ones        = torch.ones(B, 1, ph, pw, device=self.device)
+        composite   = patch_batch * (1 - plate_mask_3) + canonical * plate_mask_3
 
-        warped  = K.warp_perspective(patch_batch, M_border, (H, W),
-                                     mode="bilinear", padding_mode="zeros",
-                                     align_corners=True)
-        w_bord  = K.warp_perspective(ones, M_border, (H, W),
-                                     mode="bilinear", padding_mode="zeros",
-                                     align_corners=True)
-        w_plate = K.warp_perspective(ones, M_plate, (H, W),
-                                     mode="bilinear", padding_mode="zeros",
-                                     align_corners=True)
+        # ── Step 4: optional augmentation in canonical space ──────────────
+        if augment:
+            composite = self._augment_image(composite)
 
-        mask   = torch.clamp(w_bord - w_plate, 0, 1).expand(-1, 3, -1, -1)
-        result = image * (1 - mask) + warped * mask
-        return torch.clamp(result, 0, 1), mask
+        # ── Step 5: warp augmented canonical back to image space ──────────
+        warped_back = K.warp_perspective(composite, M_border, (H, W),
+                                         mode="bilinear", padding_mode="zeros",
+                                         align_corners=True)
+        border_mask = K.warp_perspective(ones, M_border, (H, W),
+                                         mode="bilinear", padding_mode="zeros",
+                                         align_corners=True).expand(-1, 3, -1, -1)
+
+        result = image * (1 - border_mask) + warped_back * border_mask
+        return torch.clamp(result, 0, 1), border_mask
 
     # ====================================================================
     # Loss
@@ -701,10 +739,8 @@ class AdversarialPatchTrainer:
             orig_corners    = orig_corners * 0.5
 
         patched_orig, _ = self.apply_patch_to_image(
-            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
-
-        if self.augment:
-            patched_orig = self._augment_image(patched_orig)
+            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
+            patch_norm=patch_norm, augment=self.augment)
 
         patched_prep_chw, new_corners_np = self.diff_prep(
             patched_orig.squeeze(0), orig_corners_np)
