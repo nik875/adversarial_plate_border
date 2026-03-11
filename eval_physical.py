@@ -134,29 +134,53 @@ def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
-def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0) -> List[Tuple]:
+def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
+                   num_workers: int = 0) -> List[Tuple]:
     """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
+    import os
     import torch.nn.functional as F
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     to_tensor = T.ToTensor()
-    samples = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Preloading images to GPU"):
+    if num_workers == 0:
+        num_workers = os.cpu_count() or 1
+
+    rows = list(df.iterrows())
+
+    def _load_one(args):
+        idx, row = args
         try:
             pil_img = Image.open(row["filename"]).convert("RGB")
         except Exception as e:
             print(f"  [warn] could not load {row['filename']}: {e}")
-            continue
+            return idx, None
         image = to_tensor(pil_img)
         if scale != 1.0:
             image = F.interpolate(image.unsqueeze(0), scale_factor=scale,
                                   mode="bilinear", align_corners=False).squeeze(0)
-        image = image.to(device)
         corners = torch.tensor([
             [row["p1_x"], row["p1_y"]],
             [row["p2_x"], row["p2_y"]],
             [row["p3_x"], row["p3_y"]],
             [row["p4_x"], row["p4_y"]],
-        ], dtype=torch.float32, device=device) * scale
-        gt_box = torch.stack([
+        ], dtype=torch.float32) * scale
+        return idx, (image, corners)
+
+    results = [None] * len(rows)
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {pool.submit(_load_one, r): r[0] for r in rows}
+        for f in tqdm(as_completed(futures), total=len(futures),
+                      desc=f"Preloading images to GPU ({num_workers} threads)"):
+            idx, data = f.result()
+            results[idx] = data
+
+    samples = []
+    for data in results:
+        if data is None:
+            continue
+        image, corners = data
+        image   = image.to(device)
+        corners = corners.to(device)
+        gt_box  = torch.stack([
             corners[:, 0].min(), corners[:, 1].min(),
             corners[:, 0].max(), corners[:, 1].max(),
         ])
@@ -293,6 +317,8 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--gpu-preload", action="store_true",
                         help="Preload all images to GPU memory once before evaluation.")
+    parser.add_argument("--num-workers", type=int, default=0,
+                        help="Threads for parallel image loading (default: nproc).")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Resize images by this factor before evaluation (e.g. 0.5 to halve resolution).")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
@@ -335,7 +361,7 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = preload_images(df, args.device, args.scale) if args.gpu_preload else None
+    samples = preload_images(df, args.device, args.scale, args.num_workers) if args.gpu_preload else None
 
     # Evaluate: every backend × (clean + all patches)
     all_results: List[BackendMetrics] = []
@@ -343,7 +369,7 @@ def main() -> None:
         backend.ensure_loaded()
         backend.freeze()
         print(f"\n── Backend: {bname} ──")
-        eval_data = samples if samples is not None else preload_images(df, args.device, args.scale)
+        eval_data = samples if samples is not None else preload_images(df, args.device, args.scale, args.num_workers)
         for patch_name, patch_tensor in patch_tensors:
             m = evaluate_one(
                 backend, eval_data, patch_tensor, patch_name,
