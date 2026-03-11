@@ -970,12 +970,14 @@ class AdversarialPatchTrainer:
                     continue
 
                 _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
-                losses.append(((det_l + ocr_l) / 2).item())
+                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
+                losses.append(val_loss.item())
                 buffer = []
 
             if buffer:
                 _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
-                losses.append(((det_l + ocr_l) / 2).item())
+                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
+                losses.append(val_loss.item())
 
         return float(np.mean(losses)) if losses else 0.0
 
