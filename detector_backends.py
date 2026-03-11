@@ -1347,6 +1347,29 @@ class Yolov9TorchBackend(DetectorBackend):
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
 
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one model call for all B images."""
+        self.ensure_loaded()
+        batch  = images.to(self.device)   # [B, 3, 384, 384]
+        output = self._model(batch)
+        if isinstance(output, (list, tuple)):
+            output = output[0]            # [B, 5, A]
+
+        bx, by, bw, bh = output[:, 0], output[:, 1], output[:, 2], output[:, 3]
+        scores = output[:, 4]             # [B, A]
+        boxes  = torch.stack([bx - bw / 2, by - bh / 2,
+                               bx + bw / 2, by + bh / 2], dim=-1)  # [B, A, 4]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious     = _box_iou_vectorized(tb, boxes[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()

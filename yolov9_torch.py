@@ -110,7 +110,7 @@ def load_yolov9t_from_onnx(onnx_path: str, nc: int = 1) -> DetectionModel:
 
     # ── 1. Build the ultralytics model ──────────────────────────────────────
     yaml = _YAML_PATH if os.path.exists(_YAML_PATH) else _YAML_FALLBACK
-    model = DetectionModel(yaml, nc=nc)
+    model = DetectionModel(yaml, nc=nc, verbose=False)
 
     # Fix Detect head cv2 groups BEFORE fusing (Conv modules still have BN)
     _fix_detect_cv2_groups(model)

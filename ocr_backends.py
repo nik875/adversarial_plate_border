@@ -1442,44 +1442,70 @@ class CCTOCRBackend(OCRBackend):
         chars = [self.ALPHABET[i] for i in pred_ids if i < len(self.ALPHABET)]
         text = "".join(c for c in chars if c != "_").strip() or None
 
-        probs = torch.softmax(logits, dim=1)
-        confidence = float(probs.max(dim=1).values.mean().item())
+        # logits are already softmax probabilities from the model
+        confidence = float(logits.max(dim=1).values.mean().item())
 
         return OCRResult(logits=logits.detach(), text=text, confidence=confidence)
 
-    def ce_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ce_loss(self, probs: torch.Tensor, target_text: str) -> torch.Tensor:
         """
-        Per-slot cross-entropy loss.
+        Per-slot NLL loss.  Expects softmax *probabilities* [1/T, vocab] as
+        output by CCTOCRTorch (which returns softmax, not raw logits).
 
         Parameters
         ----------
-        logits : torch.Tensor
-            Shape [1, T, vocab] or [T, vocab].
+        probs : torch.Tensor
+            Shape [1, T, vocab] or [T, vocab] — softmax probabilities.
         target_text : str
             Plate string, e.g. "VRJ7774".  Padded/trimmed to T slots with '_'.
         """
-        if logits.dim() == 3:
-            logits = logits.squeeze(0)   # [T, vocab]
-        T = logits.shape[0]
+        if probs.dim() == 3:
+            probs = probs.squeeze(0)   # [T, vocab]
+        T = probs.shape[0]
         padded = (target_text + "_" * T)[:T]
         target_ids = torch.tensor(
             [self.ALPHABET.index(c) if c in self.ALPHABET else len(self.ALPHABET) - 1
              for c in padded],
-            dtype=torch.long, device=logits.device,
+            dtype=torch.long, device=probs.device,
         )
-        return F.cross_entropy(logits, target_ids)
+        # CCTOCRTorch returns softmax probs — use NLL loss directly to avoid double-softmax
+        return F.nll_loss(torch.log(probs.clamp(min=1e-8)), target_ids)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False) -> torch.Tensor:
         """
-        Differentiable CE loss on a [1, 3, H, W] crop tensor.
+        Differentiable NLL loss on a [1, 3, H, W] crop tensor.
         Gradients flow through CCTOCRTorch model → crop → patch.
         """
         self.ensure_loaded()
-        preprocessed = self._preprocess(crop)         # [1, 64, 128, 3]
-        output = self._model(preprocessed)            # [1, 9, 37]
+        preprocessed = self._preprocess(crop.to(self.device))   # [1, 64, 128, 3]
+        output = self._model(preprocessed)                       # [1, 9, 37]
         base = self.ce_loss(output, target_text)
         return base if impersonation else -base
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """
+        True batch forward: one model call for all crops.
+
+        crops : list of [1, 3, H, W] tensors (may vary in H/W; resized in preprocess)
+        """
+        self.ensure_loaded()
+        # Stack + preprocess all crops in one F.interpolate call
+        batched = torch.cat([c.to(self.device) for c in crops], dim=0)  # [B, 3, H, W]
+        preprocessed = self._preprocess(batched)                         # [B, 64, 128, 3]
+        output = self._model(preprocessed)                               # [B, 9, 37]
+
+        T = output.shape[1]
+        padded = (target_text + "_" * T)[:T]
+        target_ids = torch.tensor(
+            [self.ALPHABET.index(c) if c in self.ALPHABET else len(self.ALPHABET) - 1
+             for c in padded],
+            dtype=torch.long, device=output.device,
+        )
+        log_probs = torch.log(output.clamp(min=1e-8))   # [B, T, V]
+        losses = [F.nll_loss(log_probs[i], target_ids) for i in range(output.shape[0])]
+        return [l if impersonation else -l for l in losses]
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
