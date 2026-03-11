@@ -887,13 +887,15 @@ class AdversarialPatchTrainer:
                 loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
                 buffer = []
                 scaled_loss = loss / update_every
-                scaled_loss.backward()
+                step += 1
+                # retain_graph until the last backward in this accumulation window;
+                # the shared patch_norm decoder graph must survive all update_every calls
+                scaled_loss.backward(retain_graph=(step % update_every != 0))
 
                 accum_loss += loss.item()
                 total_det  += det_l.item()
                 total_ocr  += ocr_l.item()
                 total_tv   += tv_l.item()
-                step       += 1
 
                 if step % update_every == 0:
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
