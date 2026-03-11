@@ -971,7 +971,7 @@ class TrOCROCRBackend(OCRBackend):
                                 decoder_input_ids=decoder_input_ids)
         log_probs = F.log_softmax(outputs.logits, dim=-1)   # [1, L-1, vocab]
         token_lp  = log_probs.gather(2, label_ids.unsqueeze(-1)).squeeze(-1)
-        return token_lp.sum()   # scalar log P(sequence)
+        return token_lp.mean()   # mean per-token log P (normalised by length)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
