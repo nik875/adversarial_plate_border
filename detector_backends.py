@@ -267,6 +267,8 @@ class DetectorBackend(abc.ABC):
             _box_iou_scalar(d.box.to(self.device).unsqueeze(0), box_t)
             * d.confidence
         ))
+        if _box_iou_scalar(best.box.to(self.device).unsqueeze(0), box_t).item() < 1e-6:
+            return torch.tensor(0.0, device=self.device), None
         thresh = getattr(self, "conf_threshold", 0.25)
         if best.confidence < thresh:
             return best.conf.to(self.device), None
@@ -787,6 +789,9 @@ class RTDETRBackend(DetectorBackend):
                     * scores[j].detach()
                     for j in range(len(scores))
                 ])
+            if weights.max().item() < 1e-6:
+                results.append((torch.tensor(0.0, device=self.device), None))
+                continue
             best_idx = int(weights.argmax().item())
             if scores[best_idx].detach().item() < self.conf_threshold:
                 results.append((scores[best_idx], None))
@@ -1182,6 +1187,10 @@ class FasterRCNNBackend(DetectorBackend):
                     * scores[j].item()
                     for j in range(len(scores))
                 ])
+            if weights.max().item() < 1e-6:
+                results.append((torch.tensor(0.0, device=self.device), None))
+                continue
+            with torch.no_grad():
                 best_idx = int(weights.argmax().item())
             if scores[best_idx].detach().item() < self.conf_threshold:
                 results.append((scores[best_idx], None))
@@ -1680,6 +1689,9 @@ class YOLOv11Backend(DetectorBackend):
             tb = target_boxes[i].to(self.device)
             with torch.no_grad():
                 ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                if ious.max().item() < 1e-6:
+                    results.append((torch.tensor(0.0, device=self.device), None))
+                    continue
                 best_idx = int((ious * scores[i].detach()).argmax().item())
             if scores[i][best_idx].detach().item() < self.conf_threshold:
                 results.append((scores[i][best_idx], None))
@@ -1893,6 +1905,9 @@ class Yolov9TorchBackend(DetectorBackend):
             tb = target_boxes[i].to(self.device)
             with torch.no_grad():
                 ious     = _box_iou_vectorized(tb, boxes[i].detach())
+                if ious.max().item() < 1e-6:
+                    results.append((torch.tensor(0.0, device=self.device), None))
+                    continue
                 best_idx = int((ious * scores[i].detach()).argmax().item())
             if scores[i][best_idx].detach().item() < self.conf_threshold:
                 results.append((scores[i][best_idx], None))
