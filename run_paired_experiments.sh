@@ -52,7 +52,7 @@ GPU_PRELOAD=false
 
 EVAL_BATCH_SIZE=1
 COMPILE=true
-IMPERSONATION_TARGET="VJJ7744"
+IMPERSONATION_TARGET=""
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -170,7 +170,6 @@ BASE_ARGS=(
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
     --eval-batch-size "$EVAL_BATCH_SIZE"
-    --impersonation-target "$IMPERSONATION_TARGET"
 )
 
 if $PIN_MEMORY; then
@@ -190,6 +189,9 @@ if $GPU_PRELOAD; then
 fi
 if $COMPILE; then
     BASE_ARGS+=(--compile)
+fi
+if [[ -n "$IMPERSONATION_TARGET" ]]; then
+    BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET")
 fi
 
 # Pair rows:
