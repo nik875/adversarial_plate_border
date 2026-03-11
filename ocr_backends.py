@@ -1345,7 +1345,7 @@ class MockOCRBackend(OCRBackend):
 
 
 # ---------------------------------------------------------------------------
-# CCT (Compact Character Transcription) backend  — onnx2torch, differentiable
+# CCT (Compact Character Transcription) backend  — native PyTorch via cct_ocr_torch.py
 # ---------------------------------------------------------------------------
 #
 # Model path (auto-downloaded by fast-plate-ocr on first use):
@@ -1355,19 +1355,17 @@ class MockOCRBackend(OCRBackend):
 #   NHWC float32 [0, 255], shape [batch, 64, 128, 3]
 #
 # Output convention:
-#   [batch, seq_len=9, vocab_size=37]  — one logit vector per plate slot
+#   [batch, seq_len=9, vocab_size=37]  — one softmax probability per plate slot
 #
 # Alphabet: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'  (_ = pad/blank)
-#
-# Confirmed from offensive_patch.py: ocr_input_shape=(64,128,3), NHWC, ×255.
 
 class CCTOCRBackend(OCRBackend):
     """
-    Differentiable CCT (fast-plate-ocr) backend via onnx2torch.
+    Differentiable CCT (fast-plate-ocr) backend via native PyTorch.
 
-    Wraps the cct-s-v1-global ONNX model.  onnx2torch exposes the full
-    forward pass as a PyTorch nn.Module so gradients flow from the per-slot
-    cross-entropy loss back through the model into the adversarial patch.
+    Uses CCTOCRTorch from cct_ocr_torch.py — a pure PyTorch reconstruction
+    of the cct-s-v1-global ONNX model with weights loaded directly from the
+    ONNX file.  No onnx2torch required.
 
     Unlike CTC-based backends, CCT classifies each plate character position
     directly (fixed-length output), so cross-entropy (not CTC) is used.
@@ -1386,8 +1384,9 @@ class CCTOCRBackend(OCRBackend):
         self._model: Optional[nn.Module] = None
 
     def load(self) -> None:
-        import onnx
-        import onnx2torch
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from cct_ocr_torch import CCTOCRTorch
 
         onnx_path = Path(self.ONNX_PATH).expanduser()
 
@@ -1406,8 +1405,7 @@ class CCTOCRBackend(OCRBackend):
                 "ONNXPlateRecognizer; ONNXPlateRecognizer('global-plates-mobile-vit-v2-model')\"`"
             )
 
-        onnx_model = onnx.load(str(onnx_path))
-        self._model = onnx2torch.convert(onnx_model)
+        self._model = CCTOCRTorch.from_onnx(str(onnx_path))
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
@@ -1475,7 +1473,7 @@ class CCTOCRBackend(OCRBackend):
                              impersonation: bool = False) -> torch.Tensor:
         """
         Differentiable CE loss on a [1, 3, H, W] crop tensor.
-        Gradients flow through onnx2torch model → crop → patch.
+        Gradients flow through CCTOCRTorch model → crop → patch.
         """
         self.ensure_loaded()
         preprocessed = self._preprocess(crop)         # [1, 64, 128, 3]

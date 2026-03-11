@@ -29,6 +29,27 @@ import torch
 import torch.nn as nn
 
 
+def _nms(boxes: torch.Tensor, scores: torch.Tensor,
+         iou_threshold: float) -> torch.Tensor:
+    """
+    Pure-PyTorch greedy NMS.  Returns indices of kept boxes (sorted by score).
+
+    boxes  : [N, 4]  xyxy, detached float32
+    scores : [N]     detached float32
+    """
+    order = scores.argsort(descending=True)
+    keep  = []
+    while order.numel() > 0:
+        i = order[0].item()
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        iou  = _box_iou_vectorized(boxes[i], boxes[rest])
+        order = rest[iou <= iou_threshold]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
 def _box_iou_scalar(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
     """IoU between two [1,4] xyxy boxes; returns a plain float."""
     x1 = torch.max(box_a[:, 0], box_b[:, 0])
@@ -1197,33 +1218,32 @@ class YOLOv11Backend(DetectorBackend):
 
 
 # ---------------------------------------------------------------------------
-# YOLOv9 384 onnx2torch backend  — differentiable via onnx2torch
+# YOLOv9 384 native-PyTorch backend  — differentiable via yolov9_torch.py
 # ---------------------------------------------------------------------------
 
-class Yolov9Onnx2TorchBackend(DetectorBackend):
+class Yolov9TorchBackend(DetectorBackend):
     """
-    Wraps the YOLOv9-t-384 licence-plate ONNX model via onnx2torch.
+    Wraps the YOLOv9-t-384 licence-plate model via the native PyTorch
+    reconstruction in yolov9_torch.py (ultralytics DetectionModel + ONNX
+    weights).  No onnx2torch required.
 
-    The ONNX model is downloaded automatically on first use by instantiating
-    LicensePlateDetector from open-image-models.  After that, onnx2torch
-    converts it to a native PyTorch nn.Module whose forward pass is fully
-    differentiable — gradients flow from the detection outputs back through
-    the input image into the adversarial patch.
+    The model is built from the ultralytics YOLOv9-t YAML with nc=1, BN
+    fused, and all Conv weights loaded directly from the ONNX file.
 
-    Model path
-    ----------
+    Model path (auto-downloaded by open-image-models on first use)
+    --------------------------------------------------------------
     ~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/
         yolo-v9-t-384-license-plates-end2end.onnx
 
     Input convention
     ----------------
-    CHW float32 [0, 1], letterboxed to 384×384, BGR channel order.
+    CHW float32 [0, 1], letterboxed to 384×384.
 
-    Output convention (after onnx2torch)
-    -------------------------------------
-    The model returns a list of 7-element tensors, one per detection:
-        [batch_idx, x1, y1, x2, y2, class_id, confidence]
-    NMS is embedded ("end2end"), so no post-processing is needed.
+    Output convention (after NMS)
+    ------------------------------
+    Returns a list of Detection objects whose ``raw`` tensor carries a
+    grad-tracked confidence score — gradients flow from conf back through
+    the model into the input image / adversarial patch.
     """
 
     name = "yolo-v9-384"
@@ -1233,19 +1253,20 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
                  "yolo-v9-t-384-license-plates-end2end.onnx")
 
     def __init__(self, model_path: str = "none", device: str = "cpu",
-                 conf_threshold: float = 0.25):
+                 conf_threshold: float = 0.25, iou_threshold: float = 0.45):
         super().__init__(model_path, device)
         self.conf_threshold = conf_threshold
+        self.iou_threshold  = iou_threshold
         self._model: Optional[nn.Module] = None
 
     def load(self) -> None:
-        import onnx
-        import onnx2torch
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from yolov9_torch import load_yolov9t_from_onnx
 
         onnx_path = Path(self.ONNX_PATH).expanduser()
 
         if not onnx_path.exists():
-            # Trigger download via open-image-models cache
             print(f"[{self.name}] ONNX model not found — downloading via open-image-models…")
             from open_image_models import LicensePlateDetector
             LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
@@ -1255,8 +1276,7 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
                 f"[{self.name}] ONNX model still not found after download attempt: {onnx_path}"
             )
 
-        onnx_model = onnx.load(str(onnx_path))
-        self._model = onnx2torch.convert(onnx_model)
+        self._model = load_yolov9t_from_onnx(str(onnx_path), nc=1)
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
@@ -1266,28 +1286,62 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
 
     def predict(self, image: torch.Tensor) -> List[Detection]:
         """
-        Run detection.  Gradients flow through the output tensors because the
-        model parameters are frozen but the computation graph is intact.
+        Run detection.  Gradients flow through the raw confidence scores
+        because the model parameters are frozen but the computation graph
+        (image → conv → scores) is intact.
+
+        The ultralytics Detect head returns [1, 5, num_anchors] in eval mode
+        (xywh + sigmoid class score for nc=1).  We apply torchvision NMS on
+        detached coordinates and attach the live score tensor to each Detection
+        for differentiable adversarial training.
         """
         self.ensure_loaded()
-        # image: CHW float32 [0,1] at 384×384
-        batch = image.unsqueeze(0).to(self.device)   # [1, 3, 384, 384]
-        # Do NOT wrap in no_grad — we need the autograd graph for adversarial training.
+        batch  = image.unsqueeze(0).to(self.device)   # [1, 3, 384, 384]
+
+        # Run model — do NOT use no_grad so the autograd graph is intact.
         output = self._model(batch)
+        if isinstance(output, (list, tuple)):
+            output = output[0]   # [1, 5, num_anchors]
+
+        pred = output[0]         # [5, num_anchors]
+
+        # Boxes are in xywh pixel space; scores are sigmoid'd class confs.
+        bx, by, bw, bh = pred[0], pred[1], pred[2], pred[3]
+        scores = pred[4]                                   # [num_anchors]
+
+        # Detach coordinates for NMS (non-differentiable op).
+        x1 = (bx - bw / 2).detach()
+        y1 = (by - bh / 2).detach()
+        x2 = (bx + bw / 2).detach()
+        y2 = (by + bh / 2).detach()
+        boxes_xyxy  = torch.stack([x1, y1, x2, y2], dim=1)   # [A, 4]
+        scores_det  = scores.detach()                          # [A]
+
+        # Confidence filter
+        mask = scores_det > self.conf_threshold
+        if not mask.any():
+            return []
+
+        boxes_f  = boxes_xyxy[mask]
+        scores_f = scores_det[mask]
+        scores_g = scores[mask]     # grad-tracked conf for kept anchors
+
+        kept = _nms(boxes_f, scores_f, self.iou_threshold)
 
         detections: List[Detection] = []
-        for det in output:
-            if det.numel() < 7:
-                continue
-            conf = det[6].item()
-            if conf < self.conf_threshold:
-                continue
-            x1, y1, x2, y2 = det[1].item(), det[2].item(), det[3].item(), det[4].item()
+        for idx in kept:
+            b    = boxes_f[idx]
+            conf = scores_f[idx].item()
+            x1v, y1v, x2v, y2v = b[0].item(), b[1].item(), b[2].item(), b[3].item()
+            # Build a 7-element raw tensor whose [6] slot is the live score.
+            raw = torch.cat([
+                torch.tensor([0.0, x1v, y1v, x2v, y2v, 0.0],
+                             dtype=torch.float32, device=self.device),
+                scores_g[idx].unsqueeze(0),
+            ])
             detections.append(Detection(
-                x1=x1, y1=y1, x2=x2, y2=y2,
-                confidence=conf,
-                class_id=int(det[5].item()),
-                raw=det,   # keep the live tensor so gradients can flow
+                x1=x1v, y1=y1v, x2=x2v, y2=y2v,
+                confidence=conf, class_id=0, raw=raw,
             ))
 
         detections.sort(key=lambda d: d.confidence, reverse=True)
@@ -1297,12 +1351,12 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
         if self._model is not None:
             yield from self._model.parameters()
 
-    def eval(self) -> "Yolov9Onnx2TorchBackend":
+    def eval(self) -> "Yolov9TorchBackend":
         if self._model is not None:
             self._model.eval()
         return self
 
-    def to(self, device: str) -> "Yolov9Onnx2TorchBackend":
+    def to(self, device: str) -> "Yolov9TorchBackend":
         self.device = device
         if self._model is not None:
             self._model.to(device)
@@ -1315,7 +1369,7 @@ TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
     "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
     "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
     "rtdetr":      RTDETRBackend,            # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
-    "yolo-v9-384": Yolov9Onnx2TorchBackend, # pip install onnx onnx2torch open-image-models  |  auto-downloaded
+    "yolo-v9-384": Yolov9TorchBackend,       # pip install onnx open-image-models  |  auto-downloaded
 }
 
 # Backends that run through ONNX / external C++ / numpy — no autograd.
