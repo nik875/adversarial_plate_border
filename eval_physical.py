@@ -170,10 +170,11 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
         pbar = tqdm(total=len(rows),
                     desc=f"Preloading images to GPU ({num_workers} threads)")
-        # Submit and consume in small batches so at most num_workers
+        # Submit and consume in small batches so at most BATCH
         # CPU tensors exist at any time.
-        for batch_start in range(0, len(rows), num_workers):
-            batch = rows[batch_start:batch_start + num_workers]
+        BATCH = max(num_workers, 64)
+        for batch_start in range(0, len(rows), BATCH):
+            batch = rows[batch_start:batch_start + BATCH]
             futs = [pool.submit(_load_one, r) for r in batch]
             for f in futs:
                 idx, data = f.result()
