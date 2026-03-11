@@ -669,6 +669,17 @@ class AdversarialPatchTrainer:
 
         # ── Step 3: composite — patch ring + original plate pixels ────────
         patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
+
+        # Scale patch brightness to match the plate region before compositing.
+        # Computed under no_grad: the scale is a normalising constant, not a
+        # gradient pathway we want the optimiser to exploit.
+        with torch.no_grad():
+            plate_brightness = ((canonical * plate_mask_3).sum()
+                                / plate_mask_3.sum().clamp(min=1e-6))
+            patch_brightness = patch_batch.mean().clamp(min=1e-6)
+            brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+        patch_batch = patch_batch * brightness_scale
+
         composite   = patch_batch * (1 - plate_mask_3) + canonical * plate_mask_3
 
         # ── Step 4: optional augmentation in canonical space ──────────────

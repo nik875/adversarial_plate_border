@@ -212,6 +212,16 @@ class DetectorEvaluator:
         M_p  = K.get_perspective_transform(src, corners)
         ones = torch.ones(1, 1, patch_h, patch_w, device=self.device)
 
+        # Scale patch brightness to match the plate region.
+        M_plate_to_canon = K.get_perspective_transform(corners, src)
+        plate_region     = K.warp_perspective(batch, M_plate_to_canon,
+                                              (patch_h, patch_w), mode="bilinear",
+                                              padding_mode="zeros", align_corners=True)
+        plate_brightness = plate_region.mean().clamp(min=1e-6)
+        patch_brightness = patch_norm.mean().clamp(min=1e-6)
+        brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+        patch_norm       = patch_norm * brightness_scale
+
         warped   = K.warp_perspective(patch_norm.unsqueeze(0), M_b,
                                       (img_h, img_w), mode="bilinear",
                                       padding_mode="zeros", align_corners=True)

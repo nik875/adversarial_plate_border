@@ -104,7 +104,15 @@ def apply_patch(
                                      mode="bilinear", padding_mode="zeros",
                                      align_corners=True).expand(-1, 3, -1, -1)
 
-    patch_b   = patch.unsqueeze(0).to(device)
+    # Scale patch brightness to match the plate region before compositing.
+    patch_b = patch.unsqueeze(0).to(device)
+    with torch.no_grad():
+        plate_brightness = ((canonical * plate_mask).sum()
+                            / plate_mask.sum().clamp(min=1e-6))
+        patch_brightness = patch_b.mean().clamp(min=1e-6)
+        brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+    patch_b = patch_b * brightness_scale
+
     composite = patch_b * (1 - plate_mask) + canonical * plate_mask
 
     if canonical_aug_fn is not None:
