@@ -198,11 +198,10 @@ class AdversarialPatchTrainer:
         training:             bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
-        tv_weight:            float          = 2.5,
+        tv_weight:            float          = 1000.0,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
-        self._tv_active           = False   # enabled after LR warmup completes
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -549,10 +548,9 @@ class AdversarialPatchTrainer:
             patched_prep.unsqueeze(0), new_corners,
             patched_orig,              orig_corners,
         )
-        tv_loss       = self.total_variation_loss(patch_norm)
-        eff_tv_weight = self.tv_weight if self._tv_active else 0.0
-        total         = (det_loss + ocr_loss) / 2 + eff_tv_weight * tv_loss
-        return total, det_loss.detach(), ocr_loss.detach(), (eff_tv_weight * tv_loss).detach()
+        tv_loss   = self.total_variation_loss(patch_norm)
+        total     = (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
+        return total, det_loss.detach(), ocr_loss.detach(), (self.tv_weight * tv_loss).detach()
 
     # ====================================================================
     # Patch persistence
@@ -972,8 +970,7 @@ class AdversarialPatchTrainer:
         log_file = open(log_path, "w")
 
         for epoch in range(num_epochs):
-            self._tv_active = epoch >= warmup_epochs
-            self.training   = True
+            self.training  = True
             train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
             self.training  = False
             val_loss       = self.validate()
@@ -1059,7 +1056,7 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check and debug image generation.")
-    parser.add_argument("--tv-weight", type=float, default=1.0,
+    parser.add_argument("--tv-weight", type=float, default=1000.0,
                         help="Weight for total variation loss (default: 2.5).")
     args = parser.parse_args()
 
