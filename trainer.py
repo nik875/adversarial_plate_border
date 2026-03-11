@@ -528,12 +528,15 @@ class AdversarialPatchTrainer:
         return det_loss, ocr_loss
 
     def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
-        """Isotropic L2 total variation loss on [C, H, W] or [1, C, H, W] patch."""
-        if patch.dim() == 3:
-            patch = patch.unsqueeze(0)
-        diff_h = patch[:, :, :, 1:] - patch[:, :, :, :-1]
-        diff_v = patch[:, :, 1:, :] - patch[:, :, :-1, :]
-        return (diff_h[:, :, :-1, :] ** 2 + diff_v[:, :, :, :-1] ** 2).sqrt().sum()
+        """Isotropic L2 total variation loss on [C, H, W] or [1, C, H, W] patch,
+        normalized by number of pixel comparisons."""
+        if patch.dim() == 4:
+            patch = patch.squeeze(0)
+        C, H, W = patch.shape
+        tv_h = (patch[:, :, 1:] - patch[:, :, :-1]).pow(2).sum()
+        tv_v = (patch[:, 1:, :] - patch[:, :-1, :]).pow(2).sum()
+        num_comparisons = C * (H * (W - 1) + (H - 1) * W)
+        return (tv_h + tv_v) / num_comparisons
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         orig_tensor     = batch["orig_image"][0].to(self.device)
