@@ -145,10 +145,11 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0) -> List[Tu
         except Exception as e:
             print(f"  [warn] could not load {row['filename']}: {e}")
             continue
-        image = to_tensor(pil_img).to(device)
+        image = to_tensor(pil_img)
         if scale != 1.0:
             image = F.interpolate(image.unsqueeze(0), scale_factor=scale,
                                   mode="bilinear", align_corners=False).squeeze(0)
+        image = image.to(device)
         corners = torch.tensor([
             [row["p1_x"], row["p1_y"]],
             [row["p2_x"], row["p2_y"]],
