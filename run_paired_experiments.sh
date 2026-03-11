@@ -101,7 +101,7 @@ while [[ $# -gt 0 ]]; do
         --compile)         COMPILE=true; shift ;;
         --no-compile)      COMPILE=false; shift ;;
         --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
-        --skip)            SKIP_PAIRS+=("$2"); shift 2 ;;
+        --skip)            shift; while [[ $# -gt 0 && "$1" != --* ]]; do SKIP_PAIRS+=("$1"); shift; done ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
