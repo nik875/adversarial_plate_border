@@ -327,7 +327,7 @@ class AdversarialPatchTrainer:
         if name in ("yolov8", "yolov11"):
             imgsz = 640
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.imgsz
+                raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
             def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, imgsz)
@@ -355,7 +355,7 @@ class AdversarialPatchTrainer:
         if name in ("yolov8", "yolov11"):
             imgsz = 640
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.imgsz
+                raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
             return make_letterbox_prep(imgsz)
         elif name == "rtdetr":
