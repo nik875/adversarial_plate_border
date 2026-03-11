@@ -112,7 +112,7 @@ PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
 # Probability that each augmentation transform is applied on a given call.
-AUG_PROB = 0.5
+AUG_PROB = 0.2
 
 
 def augment_plate(image: torch.Tensor, device: str) -> torch.Tensor:
@@ -659,7 +659,7 @@ class AdversarialPatchTrainer:
         M_c  = M_to_canonical[0]                                    # [3, 3]
         ph4  = torch.cat([plate, plate.new_ones(4, 1)], dim=1).T   # [3, 4]
         pc_h = M_c @ ph4                                            # [3, 4]
-        plate_canonical = (pc_h[:2] / pc_h[2:3]).T.unsqueeze(0)    # [1, 4, 2]
+        plate_canonical = (pc_h[:2] / pc_h[2:3]).T.contiguous().unsqueeze(0)    # [1, 4, 2]
 
         M_plate_in_canonical = K.get_perspective_transform(src, plate_canonical)
         plate_mask = K.warp_perspective(ones, M_plate_in_canonical, (ph, pw),

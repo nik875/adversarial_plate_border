@@ -98,7 +98,7 @@ def apply_patch(
     M_c  = M_to_canonical[0]
     ph4  = torch.cat([plate, plate.new_ones(4, 1)], dim=1).T
     pc_h = M_c @ ph4
-    plate_canonical = (pc_h[:2] / pc_h[2:3]).T.unsqueeze(0)
+    plate_canonical = (pc_h[:2] / pc_h[2:3]).T.contiguous().unsqueeze(0)
     M_plate_in_canonical = KG.get_perspective_transform(src, plate_canonical)
     plate_mask = KG.warp_perspective(ones, M_plate_in_canonical, (ph, pw),
                                      mode="bilinear", padding_mode="zeros",
