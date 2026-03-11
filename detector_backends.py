@@ -25,8 +25,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, List, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
+
+
+def _pad_to_stride(img_np: "np.ndarray", stride: int = 32) -> "np.ndarray":
+    """Pad HWC uint8 image so H and W are multiples of stride (right/bottom pad)."""
+    h, w = img_np.shape[:2]
+    pad_h = (stride - h % stride) % stride
+    pad_w = (stride - w % stride) % stride
+    if pad_h == 0 and pad_w == 0:
+        return img_np
+    return np.pad(img_np, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant", constant_values=0)
 
 
 def _nms(boxes: torch.Tensor, scores: torch.Tensor,
@@ -334,6 +345,7 @@ class YOLOv8Backend(DetectorBackend):
         self.ensure_loaded()
         # Convert CHW float32 [0,1] tensor → HWC uint8 numpy for ultralytics
         img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        img_np = _pad_to_stride(img_np)   # ensure H,W divisible by 32
         results = self._yolo.predict(img_np, conf=self.conf_threshold,
                                      iou=self.iou_threshold, verbose=False)
         return _results_to_detections(results, self.conf_threshold, image)
@@ -1167,6 +1179,7 @@ class YOLOv11Backend(DetectorBackend):
     def predict(self, image: torch.Tensor) -> List[Detection]:
         self.ensure_loaded()
         img_np  = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        img_np  = _pad_to_stride(img_np)   # ensure H,W divisible by 32
         results = self._yolo.predict(img_np, conf=self.conf_threshold, verbose=False)
         return _results_to_detections(results, self.conf_threshold, image)
 
