@@ -27,7 +27,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* CosineAnnealingLR, 150 epochs, no early stopping.
+* LR schedule: 5-epoch linear warmup (1e-4→5e-4) + CosineAnnealingLR (→1e-4), 100 epochs, no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
@@ -35,7 +35,9 @@ Other design decisions
 from __future__ import annotations
 
 import csv
+import random
 import re
+import time
 import warnings
 import argparse
 from datetime import datetime
@@ -143,36 +145,96 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Trainable ConvTranspose2d decoder that maps a compact seed tensor
-    [1, seed_channels, 4, 8] → [1, 3, 256, 512].
+    Residual-stream decoder that maps [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Six stride-2 layers double the spatial dimensions at each step:
+    Six stages, each doubling spatial size:
         4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
-    Channel schedule halves from seed_channels→256→128→64→32→16→3,
-    so the expensive (many-channel) work is done at small spatial grids.
-    Output is passed through tanh and scaled to [0, 1].
+    All intermediate feature maps are kept at seed_channels (128) throughout,
+    forming a flat residual stream. Each stage contributes two additive deltas:
+      1. ConvTranspose2d: nearest-neighbour upsample of stream + deconv delta
+      2. Conv2d 7×7:      stream + conv delta (same spatial size)
 
-    Both the seed and the decoder weights are optimised during training —
-    the seed controls global structure while the decoder weights determine
-    how that structure is elaborated into pixel-level detail.
+    This gives every layer — including those close to the seed — a short gradient
+    path back to the loss, since gradients flow through the addition operations
+    without passing through earlier transposed convs.
+
+    A final 1×1 conv projects the 128-channel stream to 3 channels (RGB).
+    Output is passed through tanh and scaled to [0, 1].
     """
 
     def __init__(self, seed_channels: int = 128):
         super().__init__()
-        c = seed_channels
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
-        )
+        C = seed_channels
+        self.deconvs = nn.ModuleList([
+            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
+        ])
+        self.convs = nn.ModuleList([
+            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
+        ])
+        self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
         """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
-        return torch.tanh(self.net(seed)) * 0.5 + 0.5
+        x = seed
+        for deconv, conv in zip(self.deconvs, self.convs):
+            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
+            x = x + F.leaky_relu(conv(x), 0.2)
+        return torch.tanh(self.final(x)) * 0.5 + 0.5
+
+
+# ---------------------------------------------------------------------------
+# m-SAM optimizer wrapper
+# ---------------------------------------------------------------------------
+
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization wrapper.
+
+    Implements the two-step SAM update (Foret et al. 2021).  Used by
+    AdversarialPatchTrainer when sam_m > 0: the ascent step runs on a random
+    mini-batch of size sam_m while the descent step uses the full window.
+    """
+
+    def __init__(self, params, base_optimizer_cls, rho: float = 0.025, **base_kwargs):
+        defaults = dict(rho=rho)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **base_kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad: bool = False) -> None:
+        """Perturb weights toward the local sharpness maximum."""
+        grad_norm = torch.norm(torch.stack([
+            p.grad.norm(p=2)
+            for group in self.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        ]), p=2)
+        scale = self.param_groups[0]["rho"] / (grad_norm + 1e-12)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad: bool = False) -> None:
+        """Restore original weights, then apply the base optimizer step."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if "e_w" in self.state[p]:
+                    p.sub_(self.state[p]["e_w"])
+        self.base_optimizer.step()
+        if zero_grad:
+            self.zero_grad()
+
+    # Required by SequentialLR / other schedulers that call optimizer.step()
+    def step(self, closure=None):
+        raise RuntimeError("Call first_step / second_step explicitly.")
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +249,7 @@ class AdversarialPatchTrainer:
         csv_path:             str            = "preproc_labels.csv",
         seed_channels:        int            = 128,
         preload_images:       bool           = False,
+        gpu_preload:          bool           = False,
         num_workers:          int            = 0,
         pin_memory:           bool           = False,
         limit:                int            = 0,
@@ -199,14 +262,28 @@ class AdversarialPatchTrainer:
         train_detector:       bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
+        tv_weight:            float          = 10.0,
+        ocr_loss_scale:       float          = 1.0,
+        det_loss_scale:       float          = 1.0,
+        disable_disruption:   bool           = False,
+        eval_batch_size:      int            = 1,
+        sam_m:                Optional[int]  = None,
+        sam_rho:              float          = 0.025,
     ):
         self.training             = training
-        self.train_detector       = train_detector
+        self.tv_weight            = tv_weight
+        self.ocr_loss_scale       = ocr_loss_scale
+        self.det_loss_scale       = det_loss_scale
+        self.disable_disruption   = disable_disruption
+        self.eval_batch_size      = eval_batch_size
+        self.sam_m                = sam_m
+        self.sam_rho              = sam_rho
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
         self.impersonation_target = impersonation_target
         self.expected_plate_text  = expected_plate_text
+        self.train_detector       = train_detector
 
         # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
@@ -253,9 +330,10 @@ class AdversarialPatchTrainer:
             csv_path,
             transform=self.transform,
             preload=preload_images,
+            gpu_device=self.device if gpu_preload else None,
             batch_size=1,
-            n_jobs=num_workers,
-            pin_memory=pin_memory,
+            n_jobs=0 if (gpu_preload or preload_images) else num_workers,
+            pin_memory=False if (gpu_preload or preload_images) else pin_memory,
             limit=limit,
             use_all_for_train=use_all_for_train,
             use_original=True,
@@ -318,7 +396,7 @@ class AdversarialPatchTrainer:
         if name in ("yolov8", "yolov11"):
             imgsz = 640
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.imgsz
+                raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
             def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, imgsz)
@@ -346,7 +424,7 @@ class AdversarialPatchTrainer:
         if name in ("yolov8", "yolov11"):
             imgsz = 640
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.imgsz
+                raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
             return make_letterbox_prep(imgsz)
         elif name == "rtdetr":
@@ -370,23 +448,6 @@ class AdversarialPatchTrainer:
     def corners_to_bbox(self, corners: torch.Tensor) -> torch.Tensor:
         return torch.stack([corners[:, 0].min(), corners[:, 1].min(),
                             corners[:, 0].max(), corners[:, 1].max()])
-
-    @staticmethod
-    def _plate_text_variants(text: str) -> List[str]:
-        """
-        Generate spelling variants of a plate string by inserting common
-        separators at the letter→digit (or digit→letter) boundary.
-
-        E.g. "VRJ7774" → ["VRJ-7774", "VRJ 7774", "VRJ+7774"]
-        The normalised base form is NOT included — callers pass it as target_text.
-        Returns [] if no boundary is found (purely letters or purely digits).
-        """
-        clean = re.sub(r"[^A-Za-z0-9]", "", text).upper()
-        m = re.search(r"(?<=[A-Z])(?=[0-9])|(?<=[0-9])(?=[A-Z])", clean)
-        if not m:
-            return []
-        pre, suf = clean[:m.start()], clean[m.start():]
-        return [f"{pre}{sep}{suf}" for sep in ("-", " ", "+")]
 
     @staticmethod
     def _plate_text_matches(text: str, expected: str) -> bool:
@@ -515,19 +576,9 @@ class AdversarialPatchTrainer:
         target_box = self.corners_to_bbox(new_corners)
 
         # ── Detection (preprocessed resolution) ────────────────────────
-        detections = self.detector.predict(patched_prep.squeeze(0))
-        det_loss   = torch.tensor(0.0, device=self.device)
-
-        if detections:
-            best_det = max(
-                detections,
-                key=lambda d: (
-                    self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                    target_box.unsqueeze(0)).item()
-                    * d.confidence
-                ),
-            )
-            det_loss = best_det.conf.to(self.device).squeeze()
+        det_loss = self.detector.differentiable_det_loss(
+            patched_prep.squeeze(0), target_box
+        )
 
         # ── OCR (full-res crop for maximum detail) ──────────────────────
         target_text = self.impersonation_target or self.expected_plate_text
@@ -536,10 +587,8 @@ class AdversarialPatchTrainer:
         crop = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
         if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
-            variants = self._plate_text_variants(target_text)
             ocr_loss = self.ocr.differentiable_loss(
                 crop, target_text, impersonation=bool(self.impersonation_target),
-                variants=variants,
             )
         else:
             with torch.no_grad():
@@ -552,36 +601,77 @@ class AdversarialPatchTrainer:
 
         return det_loss, ocr_loss
 
-    def compute_loss(self, batch: dict) -> torch.Tensor:
-        orig_tensor     = batch["orig_image"][0].to(self.device)
-        orig_corners_np = batch["orig_corners"][0].numpy()
-        orig_corners    = batch["orig_corners"][0].to(self.device)
+    def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
+        """Isotropic L2 total variation loss on [C, H, W] or [1, C, H, W] patch,
+        normalized by number of pixel comparisons."""
+        if patch.dim() == 4:
+            patch = patch.squeeze(0)
+        C, H, W = patch.shape
+        tv_h = (patch[:, :, 1:] - patch[:, :, :-1]).pow(2).sum()
+        tv_v = (patch[:, 1:, :] - patch[:, :-1, :]).pow(2).sum()
+        num_comparisons = C * (H * (W - 1) + (H - 1) * W)
+        return (tv_h + tv_v) / num_comparisons
 
-        patch_norm = self.generate_patch(training_aug=self.training)
+    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
+        """Fast per-image ops: patch application + preprocessing. No model calls."""
+        orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
+        orig_corners_np = batch_item["orig_corners"].cpu().numpy()
+        orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
-        # Apply patch once at full resolution
         patched_orig, _ = self.apply_patch_to_image(
-            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
-        )
-
-        # Differentiable preprocessing for detector (gradients intact)
-        patched_prep, new_corners_np = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
+            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
+        patched_prep_chw, new_corners_np = self.diff_prep(
+            patched_orig.squeeze(0), orig_corners_np)
         new_corners = torch.from_numpy(new_corners_np).to(self.device)
+        target_box  = self.corners_to_bbox(new_corners)
+        ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
-        det_loss, ocr_loss = self.partial_loss(
-            patched_prep.unsqueeze(0), new_corners,
-            patched_orig,              orig_corners,
-        )
-        return (det_loss + ocr_loss) / 2
+        return {
+            "patched_prep": patched_prep_chw,   # [C, H_p, W_p]
+            "target_box":   target_box,          # [4]
+            "ocr_crop":     ocr_crop,            # [1, 3, H_c, W_c]
+        }
+
+    def compute_loss_batch(self, items: list) -> tuple:
+        """Batch the slow model-eval calls; average losses over B items."""
+        patch_norm   = items[0]["_patch_norm"]
+        batched_prep = torch.stack([x["patched_prep"] for x in items])  # [B, C, H, W]
+        target_boxes = [x["target_box"] for x in items]
+        ocr_crops    = [x["ocr_crop"]   for x in items]
+
+        det_losses = self.detector.differentiable_det_loss_batch(batched_prep, target_boxes)
+
+        target_text = self.impersonation_target or self.expected_plate_text
+        ocr_losses  = self.ocr.differentiable_loss_batch(
+            ocr_crops, target_text, impersonation=bool(self.impersonation_target))
+
+        det_l = torch.stack(det_losses).mean() * self.det_loss_scale
+        ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
+        tv_l  = self.total_variation_loss(patch_norm)
+        if self.disable_disruption:
+            total = ocr_l + self.tv_weight * tv_l
+        else:
+            total = (det_l + ocr_l) / 2 + self.tv_weight * tv_l
+        return total, det_l.detach(), ocr_l.detach(), (self.tv_weight * tv_l).detach()
+
+    def compute_loss(self, batch: dict) -> tuple:
+        """Thin wrapper: B=1 case, for backward compatibility."""
+        patch_norm = self.generate_patch(training_aug=self.training)
+        item = self._prepare_one(
+            {k: v[0] for k, v in batch.items()}, patch_norm)
+        item["_patch_norm"] = patch_norm
+        return self.compute_loss_batch([item])
 
     # ====================================================================
     # Patch persistence
     # ====================================================================
 
-    def save_patch(self, epoch: int, subdir: str = "patches") -> None:
+    def save_patch(self, epoch: int, subdir: str = "patches",
+                   stem: Optional[str] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+        if stem is None:
+            stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
@@ -623,7 +713,7 @@ class AdversarialPatchTrainer:
                           if isinstance(batch["filename"], (list, tuple))
                           else batch["filename"])
                     orig_tensor     = batch["orig_image"][0].to(self.device)
-                    orig_corners_np = batch["orig_corners"][0].numpy()
+                    orig_corners_np = batch["orig_corners"][0].cpu().numpy()
                     orig_corners    = batch["orig_corners"][0].to(self.device)
                     count += 1
                     pbar.update(1)
@@ -686,13 +776,14 @@ class AdversarialPatchTrainer:
             writer.writeheader()
             writer.writerows(results)
 
-        frac = counts["correct"] / total
+        detected = total - counts["no_detection"]
+        frac = counts["correct"] / max(detected, 1)
         if frac < 0.50:
             raise RuntimeError(
-                f"\nSanity check FAILED: {counts['correct']}/{total} correct "
-                f"({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
+                f"\nSanity check FAILED: {counts['correct']}/{detected} correct "
+                f"among detected ({frac*100:.1f}%). Check CSV, expected_plate_text, and model paths."
             )
-        print(f"  Passed ({frac*100:.1f}% correct).\n")
+        print(f"  Passed ({frac*100:.1f}% correct among {detected} detected).\n")
         return counts
 
     # ====================================================================
@@ -747,7 +838,7 @@ class AdversarialPatchTrainer:
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
             orig_tensor     = batch["orig_image"][0].to(self.device)
-            orig_corners_np = batch["orig_corners"][0].numpy()
+            orig_corners_np = batch["orig_corners"][0].cpu().numpy()
             orig_corners    = batch["orig_corners"][0].to(self.device)
 
             with torch.no_grad():
@@ -819,14 +910,10 @@ class AdversarialPatchTrainer:
 
             if hasattr(self.ocr, "_sequence_log_prob"):
                 target_text = self.expected_plate_text
-                variants    = self._plate_text_variants(target_text)
-                all_texts   = [target_text] + variants
                 with torch.no_grad():
                     pixel_values = (crop - 0.5) / 0.5
-                    log_probs    = torch.stack([
-                        self.ocr._sequence_log_prob(pixel_values, t) for t in all_texts
-                    ])
-                row["log_prob"] = f"{torch.logsumexp(log_probs, dim=0).item():.4f}"
+                    log_prob     = self.ocr._sequence_log_prob(pixel_values, target_text)
+                row["log_prob"] = f"{log_prob.item():.4f}"
 
             summary_rows.append(row)
 
@@ -846,26 +933,133 @@ class AdversarialPatchTrainer:
     # Training loop
     # ====================================================================
 
-    def train_epoch(self, optimizer, epoch: int) -> float:
+    def _msam_step(
+        self,
+        optimizer: SAM,
+        window_raw: list,
+        B: int,
+        update_every: int,
+    ) -> Tuple[float, float, float, float]:
+        """One m-SAM update: ascent on sam_m random items, descent on all items.
+
+        Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
+        with the per-step accounting in train_epoch.
+        """
+        M = len(window_raw)
+        m = min(self.sam_m, M)
+
+        # ── ASCENT: gradients from m random items ────────────────────────
+        optimizer.zero_grad()
+        ascent_idx = sorted(random.sample(range(M), m))
+        patch_norm = self.generate_patch(training_aug=self.training)
+
+        chunks = [ascent_idx[i:i + B] for i in range(0, m, B)]
+        for ci, chunk in enumerate(chunks):
+            items = []
+            for i in chunk:
+                item = self._prepare_one(window_raw[i], patch_norm)
+                item["_patch_norm"] = patch_norm
+                items.append(item)
+            loss_a, _, _, _ = self.compute_loss_batch(items)
+            (loss_a / m).backward(retain_graph=(ci < len(chunks) - 1))
+
+        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+        optimizer.first_step(zero_grad=True)
+
+        # ── DESCENT: gradients from all M items, perturbed patch ─────────
+        patch_perturbed = self.generate_patch(training_aug=self.training)
+        total_loss = det_sum = ocr_sum = tv_sum = 0.0
+
+        all_chunks = [list(range(i, min(i + B, M))) for i in range(0, M, B)]
+        for ci, chunk in enumerate(all_chunks):
+            items = []
+            for i in chunk:
+                item = self._prepare_one(window_raw[i], patch_perturbed)
+                item["_patch_norm"] = patch_perturbed
+                items.append(item)
+            loss_d, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
+            (loss_d / M).backward(retain_graph=(ci < len(all_chunks) - 1))
+            total_loss += loss_d.item()
+            det_sum    += det_l.item()
+            ocr_sum    += ocr_l.item()
+            tv_sum     += tv_l.item()
+
+        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+        optimizer.second_step(zero_grad=True)
+
+        return total_loss, det_sum, ocr_sum, tv_sum
+
+    def train_epoch(self, optimizer, epoch: int) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
+        B = self.eval_batch_size
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
         total_loss = accum_loss = 0.0
+        total_det  = total_ocr  = total_tv = 0.0
         step = num_updates = 0
+        buffer: list = []
+        use_sam = isinstance(optimizer, SAM)
+        window_raw: list = []   # SAM: raw batch items for the current update window
+
+        patch_norm = self.generate_patch(training_aug=self.training)
 
         with tqdm(enumerate(self.train_loader),
-                  desc=f"Epoch {epoch+1} [{self.detector.name}/{self.ocr.name}]",
+                  desc=f"Epoch {epoch+1}",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
-                loss        = self.compute_loss(batch)
+                raw_item = {k: v[0] for k, v in batch.items()}
+
+                if use_sam:
+                    window_raw.append(raw_item)
+                    window_full = len(window_raw) == B * update_every
+                    if not window_full:
+                        continue
+
+                    loss_t, det_t, ocr_t, tv_t = self._msam_step(
+                        optimizer, window_raw, B, update_every)
+                    window_raw = []
+                    step       += update_every
+                    num_updates += 1
+                    total_loss += loss_t
+                    total_det  += det_t
+                    total_ocr  += ocr_t
+                    total_tv   += tv_t
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    elif self.device == "mps":
+                        torch.mps.empty_cache()
+                    pbar.set_postfix({
+                        "loss": f"{total_loss/step:.4f}",
+                        "det":  f"{total_det/step:.4f}",
+                        "ocr":  f"{total_ocr/step:.4f}",
+                        "tv":   f"{total_tv/step:.4f}",
+                    })
+                    patch_norm = self.generate_patch(training_aug=self.training)
+                    continue
+
+                # ── Standard (non-SAM) accumulation path ─────────────────
+                item = self._prepare_one(raw_item, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
+
+                if len(buffer) < B:
+                    continue
+
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                buffer = []
                 scaled_loss = loss / update_every
-                scaled_loss.backward()
+                step += 1
+                # retain_graph until the last backward in this accumulation window;
+                # the shared patch_norm decoder graph must survive all update_every calls
+                scaled_loss.backward(retain_graph=(step % update_every != 0))
 
                 accum_loss += loss.item()
-                step       += 1
+                total_det  += det_l.item()
+                total_ocr  += ocr_l.item()
+                total_tv   += tv_l.item()
 
                 if step % update_every == 0:
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
@@ -879,65 +1073,132 @@ class AdversarialPatchTrainer:
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
                         torch.mps.empty_cache()
-                    pbar.set_postfix({"loss": f"{total_loss/(num_updates*update_every):.4f}"})
+                    pbar.set_postfix({
+                        "loss": f"{total_loss/step:.4f}",
+                        "det":  f"{total_det/step:.4f}",
+                        "ocr":  f"{total_ocr/step:.4f}",
+                        "tv":   f"{total_tv/step:.4f}",
+                    })
+                    # New patch for next accumulation window
+                    patch_norm = self.generate_patch(training_aug=self.training)
                 else:
                     del loss, scaled_loss
 
-            if step % update_every != 0 and self.grad_accumulate is not None:
-                torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                total_loss  += accum_loss
+            # ── Flush remainder at end of epoch ──────────────────────────
+            if use_sam and len(window_raw) >= B:
+                # Partial window: trim to a multiple of B, then do m-SAM update
+                n_complete = (len(window_raw) // B) * B
+                loss_t, det_t, ocr_t, tv_t = self._msam_step(
+                    optimizer, window_raw[:n_complete], B, n_complete // B)
+                step       += n_complete // B
                 num_updates += 1
+                total_loss += loss_t
+                total_det  += det_t
+                total_ocr  += ocr_t
+                total_tv   += tv_t
+            elif not use_sam:
+                # Flush remainder buffer (< B images left at end of epoch)
+                if buffer:
+                    loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                    buffer = []
+                    scaled_loss = loss / update_every
+                    scaled_loss.backward()
+                    accum_loss += loss.item()
+                    total_det  += det_l.item()
+                    total_ocr  += ocr_l.item()
+                    total_tv   += tv_l.item()
+                    step       += 1
+                    del loss, scaled_loss
 
-        total_steps = (num_updates * update_every
-                       if self.grad_accumulate else len(self.train_loader))
-        return total_loss / max(total_steps, 1)
+                if step % update_every != 0 and self.grad_accumulate is not None:
+                    torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    total_loss  += accum_loss
+                    num_updates += 1
+
+        n = max(step, 1)
+        return (total_loss / n, total_det / n, total_ocr / n, total_tv / n)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
             self.ocr.eval()
+        B = self.eval_batch_size
         losses = []
+        buffer: list = []
         with torch.no_grad():
             for batch in self.val_loader:
-                orig_tensor     = batch["orig_image"][0].to(self.device)
-                orig_corners_np = batch["orig_corners"][0].numpy()
-                orig_corners    = batch["orig_corners"][0].to(self.device)
-                patch_norm      = self.generate_patch(training_aug=False)
+                patch_norm = self.generate_patch(training_aug=False)
+                item = self._prepare_one(
+                    {k: v[0] for k, v in batch.items()}, patch_norm)
+                item["_patch_norm"] = patch_norm
+                buffer.append(item)
 
-                patched_orig, _ = self.apply_patch_to_image(
-                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm,
-                )
-                patched_prep, new_corners_np = self.diff_prep(
-                    patched_orig.squeeze(0), orig_corners_np)
-                new_corners = torch.from_numpy(new_corners_np).to(self.device)
+                if len(buffer) < B:
+                    continue
 
-                det_loss, ocr_loss = self.partial_loss(
-                    patched_prep.unsqueeze(0), new_corners,
-                    patched_orig,              orig_corners,
-                )
-                losses.append(((det_loss + ocr_loss) / 2).item())
+                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
+                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
+                losses.append(val_loss.item())
+                buffer = []
+
+            if buffer:
+                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
+                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
+                losses.append(val_loss.item())
+
         return float(np.mean(losses)) if losses else 0.0
 
     def train(
         self,
-        num_epochs:    int   = 150,
-        learning_rate: float = 0.01,
+        num_epochs:    int   = 100,
+        learning_rate: float = 5e-4,
+        lr_min:        float = 1e-5,
         save_interval: int   = 10,
         dry_run:       bool  = False,
+        skip_sanity:   bool  = False,
     ) -> dict:
-        self.save_debug_images()
-        self.validate_pipeline()
+        if not skip_sanity:
+            self.save_debug_images()
+            self.validate_pipeline()
 
         if dry_run:
             print("\nDry run complete.")
             return {}
 
-        optimizer = optim.AdamW(
-            self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+        warmup_epochs = 10
+        eta_min       = lr_min
+
+        # Optimizer starts at learning_rate; warmup scales from eta_min up to it
+        if self.sam_m is not None:
+            optimizer = SAM(
+                self._trainable_params(),
+                base_optimizer_cls=optim.AdamW,
+                rho=self.sam_rho,
+                lr=learning_rate,
+                weight_decay=1e-4,
+            )
+            # Schedulers operate on the base optimizer's param groups (shared via SAM)
+            sched_optimizer = optimizer.base_optimizer
+        else:
+            optimizer = optim.AdamW(
+                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+            )
+            sched_optimizer = optimizer
+        cosine_epochs = num_epochs - warmup_epochs
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            sched_optimizer,
+            start_factor=eta_min / learning_rate,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
         )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=num_epochs, eta_min=1e-4,
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            sched_optimizer, T_max=cosine_epochs, eta_min=eta_min,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            sched_optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
         )
 
         history    = {"loss": [], "val_score": [], "learning_rate": []}
@@ -953,9 +1214,14 @@ class AdversarialPatchTrainer:
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Epochs    : {num_epochs}  |  LR: {learning_rate}")
-        print(f"  Mode      : "
-              f"{'impersonation → ' + self.impersonation_target if self.impersonation_target else 'disruption'}")
+        print(f"  Epochs    : {num_epochs}  |  Warmup: {warmup_epochs}  |  "
+              f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        if self.sam_m is not None:
+            print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
+        _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
+        if self.disable_disruption:
+            _mode += '  [detection loss disabled]'
+        print(f"  Mode      : {_mode}")
         print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
 
@@ -963,12 +1229,19 @@ class AdversarialPatchTrainer:
         log_file = open(log_path, "w")
 
         for epoch in range(num_epochs):
+            epoch_start    = time.time()
             self.training  = True
-            train_loss     = self.train_epoch(optimizer, epoch)
+            # Disable TV loss during warmup so the patch can move freely early on
+            saved_tv = self.tv_weight
+            if epoch < warmup_epochs:
+                self.tv_weight = 0.0
+            train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
+            self.tv_weight = saved_tv
             self.training  = False
             val_loss       = self.validate()
             scheduler.step()
             lr = optimizer.param_groups[0]["lr"]
+            epoch_time     = time.time() - epoch_start
 
             history["loss"].append(train_loss)
             history["val_score"].append(val_loss)
@@ -981,12 +1254,16 @@ class AdversarialPatchTrainer:
             if val_loss < best_loss:
                 best_loss  = val_loss
                 best_epoch = epoch
-                self.save_patch(epoch, "patches")
+                self.save_patch(epoch, "patches", stem=f"patch_{self.detector.name}_best")
                 best_marker = "  ★ best"
 
-            line = (f"Epoch {epoch+1:3d}/{num_epochs} | "
-                    f"Loss: {train_loss:.4f} | Val: {val_loss:.4f} | "
-                    f"Δ: {change:+.1f}% | LR: {lr:.2e}{best_marker}")
+            line = (f"Epoch {epoch+1:3d}/{num_epochs} "
+                    f"[{self.detector.name}/{self.ocr.name}] | "
+                    f"loss: {train_loss:.4f}  det: {train_det:.4f}  "
+                    f"ocr: {train_ocr:.4f}  tv: {train_tv:.4f} | "
+                    f"val: {val_loss:.4f} Δ{change:+.1f}% | "
+                    f"lr: {lr:.2e} | "
+                    f"time: {epoch_time:.1f}s{best_marker}")
             print(line)
             log_file.write(line + "\n")
             log_file.flush()
@@ -1018,7 +1295,7 @@ def main():
     parser.add_argument("--csv", default="preproc_labels.csv")
 
     TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
-    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr"]
+    TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)
     parser.add_argument("--model-path",   default="license_plate_detector.pt")
@@ -1031,10 +1308,14 @@ def main():
     parser.add_argument("--seed-channels", type=int, default=128,
                         help="Number of channels in the decoder seed (default 128 → 4096 seed params).")
     parser.add_argument("--device",   default="cuda")
-    parser.add_argument("--epochs",   type=int,   default=150)
-    parser.add_argument("--lr",       type=float, default=0.01)
+    parser.add_argument("--epochs",   type=int,   default=100)
+    parser.add_argument("--lr",       type=float, default=5e-4)
+    parser.add_argument("--lr-min",   type=float, default=1e-5,
+                        help="Minimum LR for cosine annealing (and warmup start). Default: 1e-5.")
     parser.add_argument("--grad-accumulate", type=int, default=64)
     parser.add_argument("--preload-images",  action="store_true")
+    parser.add_argument("--gpu-preload",     action="store_true",
+                        help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
     parser.add_argument("--num-workers",     type=int, default=0)
     parser.add_argument("--pin-memory",      action="store_true")
     parser.add_argument("--limit",           type=int, default=0)
@@ -1045,7 +1326,31 @@ def main():
     parser.add_argument("--train-detector", action="store_true",
                         help="Allow detector backend weights to update during training.")
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--dry-run",  action="store_true")
+    parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--skip-sanity", action="store_true",
+                        help="Skip pre-training sanity check and debug image generation.")
+    parser.add_argument("--tv-weight", type=float, default=10.0,
+                        help="Weight for total variation loss (default: 2.5).")
+    parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
+                        help="Scalar multiplier on OCR loss (default: 1.0).")
+    parser.add_argument("--det-loss-scale", type=float, default=1.0,
+                        help="Scalar multiplier on detection loss (default: 1.0).")
+    parser.add_argument("--no-disruption", action="store_true",
+                        help="Disable the detection (disruption) loss component entirely. "
+                             "Detection is still computed for pipeline purposes but contributes "
+                             "zero gradient to the total loss.")
+    parser.add_argument("--eval-batch-size", type=int, default=1,
+                        help="Number of images to batch for detector/OCR evaluation (default 1).")
+    parser.add_argument("--sam-m", type=int, default=None,
+                        help="Enable m-SAM: number of images for the ascent step. "
+                             "Recommended: ~25%% of --grad-accumulate (e.g. 8 for accum=32). "
+                             "Disabled by default.")
+    parser.add_argument("--sam-rho", type=float, default=0.025,
+                        help="SAM perturbation radius rho (default 0.025). "
+                             "Only used when --sam-m is set.")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the detector and OCR models (PyTorch 2.0+, "
+                             "gradients still flow through compiled models).")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1062,12 +1367,21 @@ def main():
                              device=args.device, **ocr_kwargs)
     ocr.load()
 
+    if args.compile:
+        if hasattr(backend, "_model") and backend._model is not None:
+            print(f"[compile] Compiling detector ({backend.name})...")
+            backend._model = torch.compile(backend._model)
+        if hasattr(ocr, "_model") and ocr._model is not None:
+            print(f"[compile] Compiling OCR ({ocr.name})...")
+            ocr._model = torch.compile(ocr._model)
+
     trainer = AdversarialPatchTrainer(
         detector             = backend,
         ocr                  = ocr,
         csv_path             = args.csv,
         seed_channels        = args.seed_channels,
         preload_images       = args.preload_images,
+        gpu_preload          = args.gpu_preload,
         num_workers          = args.num_workers,
         pin_memory           = args.pin_memory,
         limit                = args.limit,
@@ -1079,13 +1393,22 @@ def main():
         train_detector       = args.train_detector,
         use_homography       = not args.disable_homography,
         run_name             = args.run_name,
+        tv_weight            = args.tv_weight,
+        ocr_loss_scale       = args.ocr_loss_scale,
+        det_loss_scale       = args.det_loss_scale,
+        disable_disruption   = args.no_disruption,
+        eval_batch_size      = args.eval_batch_size,
+        sam_m                = args.sam_m,
+        sam_rho              = args.sam_rho,
     )
 
     trainer.train(
         num_epochs    = args.epochs,
         learning_rate = args.lr,
+        lr_min        = args.lr_min,
         save_interval = 10,
         dry_run       = args.dry_run,
+        skip_sanity   = args.skip_sanity,
     )
 
 

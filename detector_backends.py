@@ -23,11 +23,69 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
+import torch.nn.functional as F
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _pad_to_stride(img_np: "np.ndarray", stride: int = 32) -> "np.ndarray":
+    """Pad HWC uint8 image so H and W are multiples of stride (right/bottom pad)."""
+    h, w = img_np.shape[:2]
+    pad_h = (stride - h % stride) % stride
+    pad_w = (stride - w % stride) % stride
+    if pad_h == 0 and pad_w == 0:
+        return img_np
+    return np.pad(img_np, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant", constant_values=0)
+
+
+def _nms(boxes: torch.Tensor, scores: torch.Tensor,
+         iou_threshold: float) -> torch.Tensor:
+    """
+    Pure-PyTorch greedy NMS.  Returns indices of kept boxes (sorted by score).
+
+    boxes  : [N, 4]  xyxy, detached float32
+    scores : [N]     detached float32
+    """
+    order = scores.argsort(descending=True)
+    keep  = []
+    while order.numel() > 0:
+        i = order[0].item()
+        keep.append(i)
+        if order.numel() == 1:
+            break
+        rest = order[1:]
+        iou  = _box_iou_vectorized(boxes[i], boxes[rest])
+        order = rest[iou <= iou_threshold]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def _box_iou_scalar(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
+    """IoU between two [1,4] xyxy boxes; returns a plain float."""
+    x1 = torch.max(box_a[:, 0], box_b[:, 0])
+    y1 = torch.max(box_a[:, 1], box_b[:, 1])
+    x2 = torch.min(box_a[:, 2], box_b[:, 2])
+    y2 = torch.min(box_a[:, 3], box_b[:, 3])
+    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    area_a = (box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1])
+    area_b = (box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1])
+    return (inter / (area_a + area_b - inter + 1e-6)).item()
+
+
+def _box_iou_vectorized(box: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+    """IoU between a single [4] xyxy box and N [N, 4] xyxy boxes; returns [N]."""
+    x1 = torch.max(box[0], boxes[:, 0])
+    y1 = torch.max(box[1], boxes[:, 1])
+    x2 = torch.min(box[2], boxes[:, 2])
+    y2 = torch.min(box[3], boxes[:, 3])
+    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    area_box  = (box[2] - box[0]) * (box[3] - box[1])
+    area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    return inter / (area_box + area_boxes - inter + 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +210,42 @@ class DetectorBackend(abc.ABC):
         for p in self.parameters():
             p.requires_grad_(False)
 
+    def differentiable_det_loss(self, image: torch.Tensor,
+                                 target_box: torch.Tensor) -> torch.Tensor:
+        """
+        Return a scalar confidence score for the best-matching detection,
+        with gradients flowing back to ``image``.
+
+        The default falls back to ``predict()`` — gradients only flow if the
+        backend's ``predict()`` already keeps the autograd graph (e.g. Yolov9).
+        Override in backends where ``predict()`` runs under ``no_grad``.
+
+        Parameters
+        ----------
+        image      : [C, H, W] float32 on any device
+        target_box : [x1, y1, x2, y2] float32 — selects the best-IoU detection
+        """
+        dets = self.predict(image)
+        if not dets:
+            return torch.tensor(0.0, device=self.device)
+        box_t = target_box.to(self.device).unsqueeze(0)
+        best = max(dets, key=lambda d: (
+            _box_iou_scalar(d.box.to(self.device).unsqueeze(0), box_t)
+            * d.confidence
+        ))
+        return best.conf.to(self.device)
+
+    def differentiable_det_loss_batch(
+        self,
+        images: torch.Tensor,           # [B, C, H, W]
+        target_boxes: list,             # B × [x1, y1, x2, y2]
+    ) -> list:
+        """Default: sequential loop. Override for true batch GPU inference."""
+        return [
+            self.differentiable_det_loss(images[i], target_boxes[i])
+            for i in range(images.shape[0])
+        ]
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, path={self.model_path})"
 
@@ -254,6 +348,7 @@ class YOLOv8Backend(DetectorBackend):
         self.ensure_loaded()
         # Convert CHW float32 [0,1] tensor → HWC uint8 numpy for ultralytics
         img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        img_np = _pad_to_stride(img_np)   # ensure H,W divisible by 32
         results = self._yolo.predict(img_np, conf=self.conf_threshold,
                                      iou=self.iou_threshold, verbose=False)
         return _results_to_detections(results, self.conf_threshold, image)
@@ -280,6 +375,28 @@ class YOLOv8Backend(DetectorBackend):
         if self._model is not None:
             self._model.train()
         return self
+
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one GPU call for B images."""
+        self.ensure_loaded()
+        raw = self._model(images)           # tuple; raw[0] shape [B, 4+C, A]
+        preds = raw[0].permute(0, 2, 1)    # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)                          # [B, A, 4]
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
 
     def to(self, device: str) -> "YOLOv8Backend":
         self.device = device
@@ -797,6 +914,66 @@ class FasterRCNNBackend(DetectorBackend):
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
 
+    def differentiable_det_loss(self, image: torch.Tensor,
+                                 target_box: torch.Tensor) -> torch.Tensor:
+        """Run forward without no_grad so the returned score has a gradient."""
+        self.ensure_loaded()
+        inp = image.to(self.device)
+        if inp.dim() == 4:
+            inp = inp.squeeze(0)
+
+        # eval-mode forward without no_grad — scores stay in the autograd graph
+        outputs = self._model([inp])
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        if not outputs:
+            return torch.tensor(0.0, device=self.device)
+
+        out = outputs[0]
+        scores = out.get("scores")
+        boxes  = out.get("boxes")
+
+        if scores is None or len(scores) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        # Select best box by IoU × conf (non-differentiable selection only)
+        with torch.no_grad():
+            box_t   = target_box.unsqueeze(0).to(self.device)
+            weights = torch.tensor([
+                _box_iou_scalar(boxes[i].unsqueeze(0), box_t) * scores[i].item()
+                for i in range(len(scores))
+            ])
+            best_idx = int(weights.argmax().item())
+
+        return scores[best_idx]
+
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: pass all B images in one model call."""
+        self.ensure_loaded()
+        images_list = [images[i] for i in range(images.shape[0])]
+        outputs = self._model(images_list)
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+
+        losses = []
+        for i, out in enumerate(outputs):
+            scores = out.get("scores")
+            boxes  = out.get("boxes")
+            tb = target_boxes[i].to(self.device)
+            if scores is None or len(scores) == 0:
+                losses.append(torch.tensor(0.0, device=self.device))
+                continue
+            with torch.no_grad():
+                weights = torch.tensor([
+                    _box_iou_scalar(boxes[j].unsqueeze(0), tb.unsqueeze(0))
+                    * scores[j].item()
+                    for j in range(len(scores))
+                ])
+                best_idx = int(weights.argmax().item())
+            losses.append(scores[best_idx])
+        return losses
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -1226,6 +1403,7 @@ class YOLOv11Backend(DetectorBackend):
     def predict(self, image: torch.Tensor) -> List[Detection]:
         self.ensure_loaded()
         img_np  = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        img_np  = _pad_to_stride(img_np)   # ensure H,W divisible by 32
         results = self._yolo.predict(img_np, conf=self.conf_threshold, verbose=False)
         return _results_to_detections(results, self.conf_threshold, image)
 
@@ -1247,6 +1425,28 @@ class YOLOv11Backend(DetectorBackend):
             self._model.train()
         return self
 
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one GPU call for B images."""
+        self.ensure_loaded()
+        raw = self._model(images)           # tuple; raw[0] shape [B, 4+C, A]
+        preds = raw[0].permute(0, 2, 1)    # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)                          # [B, A, 4]
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious = _box_iou_vectorized(tb, boxes_xyxy[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
+
     def to(self, device: str) -> "YOLOv11Backend":
         self.device = device
         if self._model is not None:
@@ -1255,33 +1455,32 @@ class YOLOv11Backend(DetectorBackend):
 
 
 # ---------------------------------------------------------------------------
-# YOLOv9 384 onnx2torch backend  — differentiable via onnx2torch
+# YOLOv9 384 native-PyTorch backend  — differentiable via yolov9_torch.py
 # ---------------------------------------------------------------------------
 
-class Yolov9Onnx2TorchBackend(DetectorBackend):
+class Yolov9TorchBackend(DetectorBackend):
     """
-    Wraps the YOLOv9-t-384 licence-plate ONNX model via onnx2torch.
+    Wraps the YOLOv9-t-384 licence-plate model via the native PyTorch
+    reconstruction in yolov9_torch.py (ultralytics DetectionModel + ONNX
+    weights).  No onnx2torch required.
 
-    The ONNX model is downloaded automatically on first use by instantiating
-    LicensePlateDetector from open-image-models.  After that, onnx2torch
-    converts it to a native PyTorch nn.Module whose forward pass is fully
-    differentiable — gradients flow from the detection outputs back through
-    the input image into the adversarial patch.
+    The model is built from the ultralytics YOLOv9-t YAML with nc=1, BN
+    fused, and all Conv weights loaded directly from the ONNX file.
 
-    Model path
-    ----------
+    Model path (auto-downloaded by open-image-models on first use)
+    --------------------------------------------------------------
     ~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/
         yolo-v9-t-384-license-plates-end2end.onnx
 
     Input convention
     ----------------
-    CHW float32 [0, 1], letterboxed to 384×384, BGR channel order.
+    CHW float32 [0, 1], letterboxed to 384×384.
 
-    Output convention (after onnx2torch)
-    -------------------------------------
-    The model returns a list of 7-element tensors, one per detection:
-        [batch_idx, x1, y1, x2, y2, class_id, confidence]
-    NMS is embedded ("end2end"), so no post-processing is needed.
+    Output convention (after NMS)
+    ------------------------------
+    Returns a list of Detection objects whose ``raw`` tensor carries a
+    grad-tracked confidence score — gradients flow from conf back through
+    the model into the input image / adversarial patch.
     """
 
     name = "yolo-v9-384"
@@ -1291,19 +1490,20 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
                  "yolo-v9-t-384-license-plates-end2end.onnx")
 
     def __init__(self, model_path: str = "none", device: str = "cpu",
-                 conf_threshold: float = 0.25):
+                 conf_threshold: float = 0.25, iou_threshold: float = 0.45):
         super().__init__(model_path, device)
         self.conf_threshold = conf_threshold
+        self.iou_threshold  = iou_threshold
         self._model: Optional[nn.Module] = None
 
     def load(self) -> None:
-        import onnx
-        import onnx2torch
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from yolov9_torch import load_yolov9t_from_onnx
 
         onnx_path = Path(self.ONNX_PATH).expanduser()
 
         if not onnx_path.exists():
-            # Trigger download via open-image-models cache
             print(f"[{self.name}] ONNX model not found — downloading via open-image-models…")
             from open_image_models import LicensePlateDetector
             LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
@@ -1313,8 +1513,7 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
                 f"[{self.name}] ONNX model still not found after download attempt: {onnx_path}"
             )
 
-        onnx_model = onnx.load(str(onnx_path))
-        self._model = onnx2torch.convert(onnx_model)
+        self._model = load_yolov9t_from_onnx(str(onnx_path), nc=1)
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
@@ -1322,45 +1521,129 @@ class Yolov9Onnx2TorchBackend(DetectorBackend):
 
         print(f"[{self.name}] Loaded from {onnx_path}")
 
+    # Fixed input size this model was trained on.
+    INPUT_SIZE: int = 384
+
+    @staticmethod
+    def _letterbox(image: torch.Tensor, size: int) -> Tuple[torch.Tensor, float, int, int]:
+        """
+        Letterbox a CHW float32 [0,1] tensor to (size × size).
+        Returns (padded_tensor, scale, pad_left, pad_top).
+        Detections produced on the padded tensor can be mapped back to
+        original coordinates with:  x_orig = (x_padded - pad_left) / scale
+        """
+        c, h, w = image.shape
+        scale   = size / max(h, w)
+        new_h   = round(h * scale)
+        new_w   = round(w * scale)
+        resized = F.interpolate(image.unsqueeze(0), size=(new_h, new_w),
+                                mode="bilinear", align_corners=False).squeeze(0)
+        pad_top  = (size - new_h) // 2
+        pad_left = (size - new_w) // 2
+        padded   = F.pad(resized,
+                         (pad_left, size - new_w - pad_left,
+                          pad_top,  size - new_h - pad_top),
+                         value=114 / 255)   # standard YOLO letterbox gray
+        return padded, scale, pad_left, pad_top
+
     def predict(self, image: torch.Tensor) -> List[Detection]:
         """
-        Run detection.  Gradients flow through the output tensors because the
-        model parameters are frozen but the computation graph is intact.
+        Run detection.  Input is letterboxed to INPUT_SIZE×INPUT_SIZE so the
+        model always receives a stride-aligned tensor regardless of the original
+        image dimensions.  Detections are returned in original image coordinates.
+
+        Gradients flow through the raw confidence scores because the model
+        parameters are frozen but the computation graph (image → conv → scores)
+        is intact.
         """
         self.ensure_loaded()
-        # image: CHW float32 [0,1] at 384×384
-        batch = image.unsqueeze(0).to(self.device)   # [1, 3, 384, 384]
-        # Do NOT wrap in no_grad — we need the autograd graph for adversarial training.
+        lb, scale, pad_left, pad_top = self._letterbox(image, self.INPUT_SIZE)
+        batch = lb.unsqueeze(0).to(self.device)   # [1, 3, INPUT_SIZE, INPUT_SIZE]
+
+        # Run model — do NOT use no_grad so the autograd graph is intact.
         output = self._model(batch)
+        if isinstance(output, (list, tuple)):
+            output = output[0]   # [1, 5, num_anchors]
+
+        pred = output[0]         # [5, num_anchors]
+
+        # Boxes are in letterboxed pixel space; unscale to original image space.
+        bx = (pred[0] - pad_left) / scale
+        by = (pred[1] - pad_top)  / scale
+        bw = pred[2] / scale
+        bh = pred[3] / scale
+        scores = pred[4]         # [num_anchors]
+
+        # Detach coordinates for NMS (non-differentiable op).
+        x1 = (bx - bw / 2).detach()
+        y1 = (by - bh / 2).detach()
+        x2 = (bx + bw / 2).detach()
+        y2 = (by + bh / 2).detach()
+        boxes_xyxy  = torch.stack([x1, y1, x2, y2], dim=1)   # [A, 4]
+        scores_det  = scores.detach()                          # [A]
+
+        # Confidence filter
+        mask = scores_det > self.conf_threshold
+        if not mask.any():
+            return []
+
+        boxes_f  = boxes_xyxy[mask]
+        scores_f = scores_det[mask]
+        scores_g = scores[mask]     # grad-tracked conf for kept anchors
+
+        kept = _nms(boxes_f, scores_f, self.iou_threshold)
 
         detections: List[Detection] = []
-        for det in output:
-            if det.numel() < 7:
-                continue
-            conf = det[6].item()
-            if conf < self.conf_threshold:
-                continue
-            x1, y1, x2, y2 = det[1].item(), det[2].item(), det[3].item(), det[4].item()
+        for idx in kept:
+            b    = boxes_f[idx]
+            conf = scores_f[idx].item()
+            x1v, y1v, x2v, y2v = b[0].item(), b[1].item(), b[2].item(), b[3].item()
+            raw = torch.cat([
+                torch.tensor([0.0, x1v, y1v, x2v, y2v, 0.0],
+                             dtype=torch.float32, device=self.device),
+                scores_g[idx].unsqueeze(0),
+            ])
             detections.append(Detection(
-                x1=x1, y1=y1, x2=x2, y2=y2,
-                confidence=conf,
-                class_id=int(det[5].item()),
-                raw=det,   # keep the live tensor so gradients can flow
+                x1=x1v, y1=y1v, x2=x2v, y2=y2v,
+                confidence=conf, class_id=0, raw=raw,
             ))
 
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
 
+    def differentiable_det_loss_batch(self, images: torch.Tensor,
+                                       target_boxes: list) -> list:
+        """True batch forward: one model call for all B images."""
+        self.ensure_loaded()
+        batch  = images.to(self.device)   # [B, 3, 384, 384]
+        output = self._model(batch)
+        if isinstance(output, (list, tuple)):
+            output = output[0]            # [B, 5, A]
+
+        bx, by, bw, bh = output[:, 0], output[:, 1], output[:, 2], output[:, 3]
+        scores = output[:, 4]             # [B, A]
+        boxes  = torch.stack([bx - bw / 2, by - bh / 2,
+                               bx + bw / 2, by + bh / 2], dim=-1)  # [B, A, 4]
+
+        losses = []
+        for i in range(images.shape[0]):
+            tb = target_boxes[i].to(self.device)
+            with torch.no_grad():
+                ious     = _box_iou_vectorized(tb, boxes[i].detach())
+                best_idx = int((ious * scores[i].detach()).argmax().item())
+            losses.append(scores[i][best_idx])
+        return losses
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
 
-    def eval(self) -> "Yolov9Onnx2TorchBackend":
+    def eval(self) -> "Yolov9TorchBackend":
         if self._model is not None:
             self._model.eval()
         return self
 
-    def to(self, device: str) -> "Yolov9Onnx2TorchBackend":
+    def to(self, device: str) -> "Yolov9TorchBackend":
         self.device = device
         if self._model is not None:
             self._model.to(device)
@@ -1374,7 +1657,7 @@ TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
     "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
     "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
     "rtdetr":      RTDETRBackend,            # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
-    "yolo-v9-384": Yolov9Onnx2TorchBackend, # pip install onnx onnx2torch open-image-models  |  auto-downloaded
+    "yolo-v9-384": Yolov9TorchBackend,       # pip install onnx open-image-models  |  auto-downloaded
 }
 
 # Backends that run through ONNX / external C++ / numpy — no autograd.

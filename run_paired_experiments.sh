@@ -7,14 +7,17 @@
 # Pairings configured by default:
 #   1) rtdetr     + trocr
 #   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
-#   3) fasterrcnn + dtrb (ViTSTR checkpoint)
-#   4) yolov8     + crnn
+#   3) yolov8     + lprnet
+#   4) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
 #
 # Usage:
 #   chmod +x run_paired_experiments.sh
 #   ./run_paired_experiments.sh
 #   ./run_paired_experiments.sh --epochs 20 --device cuda --limit 64
+#   ./run_paired_experiments.sh --eval-batch-size 8 --compile   # batch GPU evals + compiled models
 #   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
+#   ./run_paired_experiments.sh --sam        # enable m-SAM (m=8, rho=0.025 by default)
+#   ./run_paired_experiments.sh --sam --sam-rho 0.05  # custom rho
 # =============================================================================
 
 set -euo pipefail
@@ -22,14 +25,39 @@ set -euo pipefail
 # Defaults
 DEVICE="cuda"
 CSV="preproc_labels.csv"
-EPOCHS=100
-LR=0.1
-GRAD_ACCUM=64
+EPOCHS=120
+LR_MIN=1e-5
+# Per-OCR peak LR (tweak per model as needed)
+LR_TROCR=2e-4
+LR_CCT=2e-4
+LR_LPRNET=2e-4
+LR_VITSTR=2e-4
+# Per-OCR TV weight (tweak per model as needed)
+TV_TROCR=10
+TV_CCT=10
+TV_LPRNET=10
+TV_VITSTR=10
+# Per-OCR loss scale (tweak per model as needed)
+OCR_SCALE_TROCR=0.5
+OCR_SCALE_CCT=0.7
+OCR_SCALE_LPRNET=1.0
+OCR_SCALE_VITSTR=1.0
+DET_SCALE=2
+GRAD_ACCUM=32
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
 PRELOAD_IMAGES=false
 LIMIT=0
 DRY_RUN=false
+SKIP_SANITY=false
+GPU_PRELOAD=false
+
+EVAL_BATCH_SIZE=1
+COMPILE=true
+IMPERSONATION_TARGET=""
+SKIP_PAIRS=()
+SAM_M=""
+SAM_RHO=0.025
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -39,28 +67,48 @@ YOLOV8_WEIGHTS="weights/lp_yolov8.pt"
 FASTERRCNN_WEIGHTS="weights/model.pt"
 RTDETR_WEIGHTS="weights/rtdetr-v2-license-plates"
 RTDETR_WEIGHTS_FALLBACK="weights/rtdetr-v2-license-plate"
-YOLOV9_384_WEIGHTS="~/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
-CCT_WEIGHTS="~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx"
+YOLOV9_384_WEIGHTS="$HOME/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
+CCT_WEIGHTS="$HOME/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
 
-CRNN_WEIGHTS="weights/crnn_synth90k.pt"
-DTRB_WEIGHTS="weights/vitstr_small_patch16_224.pth"
-DTRB_ROOT="/home/ubuntu/deep-text-recognition-benchmark"
 TROCR_WEIGHTS="none"
-LPRNET_WEIGHTS="us_lprnet_patched.onnx"
+LPRNET_WEIGHTS="weights/lprnet_deployable_onnx_v1.1/us_lprnet_patched.onnx"
+DOCTR_VITSTR_WEIGHTS="weights/vitstr_small_finetuned.pt"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --device)          DEVICE="$2"; shift 2 ;;
         --csv)             CSV="$2"; shift 2 ;;
         --epochs)          EPOCHS="$2"; shift 2 ;;
-        --lr)              LR="$2"; shift 2 ;;
+        --lr-trocr)        LR_TROCR="$2"; shift 2 ;;
+        --lr-cct)          LR_CCT="$2"; shift 2 ;;
+        --lr-lprnet)       LR_LPRNET="$2"; shift 2 ;;
+        --lr-vitstr)       LR_VITSTR="$2"; shift 2 ;;
+        --lr-min)          LR_MIN="$2"; shift 2 ;;
+        --tv-trocr)        TV_TROCR="$2"; shift 2 ;;
+        --tv-cct)          TV_CCT="$2"; shift 2 ;;
+        --tv-lprnet)       TV_LPRNET="$2"; shift 2 ;;
+        --tv-vitstr)       TV_VITSTR="$2"; shift 2 ;;
+        --ocr-scale-trocr)  OCR_SCALE_TROCR="$2"; shift 2 ;;
+        --ocr-scale-cct)    OCR_SCALE_CCT="$2"; shift 2 ;;
+        --ocr-scale-lprnet) OCR_SCALE_LPRNET="$2"; shift 2 ;;
+        --ocr-scale-vitstr) OCR_SCALE_VITSTR="$2"; shift 2 ;;
+        --det-scale)        DET_SCALE="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
         --pin-memory)      PIN_MEMORY=true; shift ;;
         --preload-images)  PRELOAD_IMAGES=true; shift ;;
         --limit)           LIMIT="$2"; shift 2 ;;
-        --dtrb-root)       DTRB_ROOT="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true; shift ;;
+        --skip-sanity)     SKIP_SANITY=true; shift ;;
+        --gpu-preload)     GPU_PRELOAD=true; shift ;;
+        --eval-batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
+        --compile)         COMPILE=true; shift ;;
+        --no-compile)      COMPILE=false; shift ;;
+        --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
+        --skip)            shift; while [[ $# -gt 0 && "$1" != --* ]]; do SKIP_PAIRS+=("$1"); shift; done ;;
+        --sam)             SAM_M=8; shift ;;
+        --sam-m)           SAM_M="$2"; shift 2 ;;
+        --sam-rho)         SAM_RHO="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -126,9 +174,11 @@ BASE_ARGS=(
     --csv "$CSV"
     --device "$DEVICE"
     --epochs "$EPOCHS"
-    --lr "$LR"
+    --lr-min "$LR_MIN"
+    --det-loss-scale "$DET_SCALE"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
+    --eval-batch-size "$EVAL_BATCH_SIZE"
 )
 
 if $PIN_MEMORY; then
@@ -140,20 +190,46 @@ fi
 if [[ "$LIMIT" -gt 0 ]]; then
     BASE_ARGS+=(--limit "$LIMIT")
 fi
+if $SKIP_SANITY; then
+    BASE_ARGS+=(--skip-sanity)
+fi
+if $GPU_PRELOAD; then
+    BASE_ARGS+=(--gpu-preload)
+fi
+if $COMPILE; then
+    BASE_ARGS+=(--compile)
+fi
+if [[ -n "$IMPERSONATION_TARGET" ]]; then
+    BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET" --no-disruption)
+fi
+if [[ -n "$SAM_M" ]]; then
+    BASE_ARGS+=(--sam-m "$SAM_M" --sam-rho "$SAM_RHO")
+fi
 
 # Pair rows:
-# label|detector|det_weights|ocr|ocr_weights|needs_dtrb
+# label|detector|det_weights|ocr|ocr_weights
 PAIRS=(
-    "pair_fasterrcnn_crnn|fasterrcnn|$FASTERRCNN_WEIGHTS|crnn|$CRNN_WEIGHTS|false"
-    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS|false"
-    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS|false"
-    "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS|false"
+    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
+    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS"
+    "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS"
+    "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"
 )
+
+# Removed: pair_fasterrcnn_dtrb (dtrb/ViTSTR checkpoint backend has not worked)
+
+EXTRA_ARGS=()
 
 log "━━━━  Paired Training  ━━━━"
 
 for row in "${PAIRS[@]}"; do
-    IFS='|' read -r label det det_w ocr ocr_w needs_dtrb <<< "$row"
+    IFS='|' read -r label det det_w ocr ocr_w <<< "$row"
+
+    for skip in "${SKIP_PAIRS[@]}"; do
+        if [[ "$label" == "$skip" ]]; then
+            log "SKIP   $label — explicitly skipped"
+            continue 2
+        fi
+    done
 
     if [[ "$det_w" != "none" && ! -e "$det_w" ]]; then
         log "SKIP   $label — detector weights not found: $det_w"
@@ -164,17 +240,19 @@ for row in "${PAIRS[@]}"; do
         continue
     fi
 
-    EXTRA_ARGS=()
-    if [[ "$needs_dtrb" == "true" ]]; then
-        EXTRA_ARGS+=(--ocr-repo-root "$DTRB_ROOT")
-        EXTRA_ARGS+=(--dtrb-feature-extraction "vitstr_small_patch16_224")
-        EXTRA_ARGS+=(--dtrb-sequence-modeling "None")
-        EXTRA_ARGS+=(--dtrb-transformation "None")
-    fi
+    case "$ocr" in
+        trocr)        pair_lr="$LR_TROCR";  pair_tv="$TV_TROCR";  pair_ocr_scale="$OCR_SCALE_TROCR" ;;
+        cct)          pair_lr="$LR_CCT";    pair_tv="$TV_CCT";    pair_ocr_scale="$OCR_SCALE_CCT" ;;
+        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET"; pair_ocr_scale="$OCR_SCALE_LPRNET" ;;
+        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR"; pair_ocr_scale="$OCR_SCALE_VITSTR" ;;
+    esac
 
     run "$label" \
         python trainer.py \
             "${BASE_ARGS[@]}" \
+            --lr "$pair_lr" \
+            --tv-weight "$pair_tv" \
+            --ocr-loss-scale "$pair_ocr_scale" \
             --backend "$det" \
             --model-path "$det_w" \
             --ocr-backend "$ocr" \

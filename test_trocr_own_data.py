@@ -57,6 +57,8 @@ def main():
     parser.add_argument("--device",  default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--model",   default=MODEL_ID,
                         help=f"HuggingFace model ID (default: {MODEL_ID})")
+    parser.add_argument("--weights", default="weights/trocr_small_finetuned.pt",
+                        help="Path to fine-tuned weights (default: weights/trocr_small_finetuned.pt)")
     args = parser.parse_args()
 
     try:
@@ -75,7 +77,15 @@ def main():
 
     print("\n[Loading model]")
     processor = TrOCRProcessor.from_pretrained(args.model)
-    model     = VisionEncoderDecoderModel.from_pretrained(args.model).to(args.device).eval()
+    model     = VisionEncoderDecoderModel.from_pretrained(args.model)
+    weights_path = Path(args.weights)
+    if weights_path.exists():
+        import torch
+        model.load_state_dict(torch.load(str(weights_path), map_location=args.device))
+        print(f"  Loaded fine-tuned weights: {weights_path}")
+    else:
+        print(f"  WARNING: {weights_path} not found — using pretrained weights")
+    model.to(args.device).eval()
     print("  OK")
 
     df = pd.read_csv(args.labels)
@@ -117,7 +127,7 @@ def main():
 
             pred = processor.batch_decode(
                 generated, skip_special_tokens=True
-            )[0].strip().upper()
+            )[0].upper()
 
         except Exception as e:
             if len(first_errors) < 3:

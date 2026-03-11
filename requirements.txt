@@ -16,4 +16,9 @@ seaborn
 python-Levenshtein
 transformers
 git+https://github.com/facebookresearch/segment-anything.git
+b2
+python-doctr[torch]
+opencv-python-headless
 timm==0.4.5  # Required for DTRB ViTSTR backend
+tiktoken
+sentencepiece

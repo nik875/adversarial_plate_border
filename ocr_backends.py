@@ -132,6 +132,28 @@ class OCRBackend(abc.ABC):
         for p in self.parameters():
             p.requires_grad_(False)
 
+    def differentiable_loss_batch(
+        self,
+        crops: list,           # B × [1, 3, H_c, W_c]
+        target_text: str,
+        impersonation: bool = False,
+    ) -> list:
+        """Default: sequential loop. Override for batch GPU inference."""
+        losses = []
+        for crop in crops:
+            if self.is_trainable and hasattr(self, "differentiable_loss"):
+                losses.append(self.differentiable_loss(
+                    crop, target_text, impersonation=impersonation))
+            else:
+                with torch.no_grad():
+                    result = self.predict(crop.squeeze(0))
+                acc = result.char_accuracy(target_text)
+                losses.append(torch.tensor(
+                    (1.0 - acc) if impersonation else acc,
+                    device=self.device,
+                ))
+        return losses
+
     def eval(self) -> "OCRBackend":
         return self
 
@@ -668,9 +690,11 @@ class LPRNetBackend(OCRBackend):
         self._model.eval()
 
     def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
-        """CHW float32 [0,1] → [1, 3, 48, 96]."""
+        """CHW or NCHW float32 [0,1] → [1, 3, 48, 96]."""
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
         return F.interpolate(
-            image.unsqueeze(0), size=(48, 96),
+            image, size=(48, 96),
             mode="bilinear", align_corners=False,
         ).to(self.device)
 
@@ -724,6 +748,19 @@ class LPRNetBackend(OCRBackend):
         log_probs = torch.log(probs[0].clamp(min=1e-8))      # [24, 36]
         base = self.ctc_loss(log_probs, target_text)
         return base if impersonation else -base
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """True batch forward: preprocess all crops, one model call."""
+        self.ensure_loaded()
+        inp = torch.cat([self._preprocess(c) for c in crops], dim=0)  # [B, 3, 48, 96]
+        probs = self._model(inp)   # [B, 24, 36]
+        losses = []
+        for i in range(len(crops)):
+            log_probs = torch.log(probs[i].clamp(min=1e-8))  # [24, 36]
+            base = self.ctc_loss(log_probs, target_text)
+            losses.append(base if impersonation else -base)
+        return losses
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -811,8 +848,12 @@ class TrOCROCRBackend(OCRBackend):
     ocr_crop_size = (384, 384)   # (H, W) — TrOCR expects 384×384
     DEFAULT_MODEL_ID = "microsoft/trocr-small-printed"
 
+    DEFAULT_WEIGHTS = "weights/trocr_small_finetuned.pt"
+
     def __init__(self, model_path: str = "none", device: str = "cpu",
                  max_new_tokens: int = 16):
+        if model_path == "none":
+            model_path = self.DEFAULT_WEIGHTS
         super().__init__(model_path, device)
         self.max_new_tokens = max_new_tokens
         self._processor = None
@@ -827,21 +868,28 @@ class TrOCROCRBackend(OCRBackend):
                 "Install with: pip install transformers"
             ) from exc
 
-        source = (str(self.model_path)
-                  if str(self.model_path) not in {"", "none"}
-                  else self.DEFAULT_MODEL_ID)
+        self._processor = TrOCRProcessor.from_pretrained(self.DEFAULT_MODEL_ID)
+        self._model     = VisionEncoderDecoderModel.from_pretrained(self.DEFAULT_MODEL_ID)
 
-        self._processor = TrOCRProcessor.from_pretrained(source)
-        self._model = VisionEncoderDecoderModel.from_pretrained(source)
-        
         # Configure model for training with labels
         # VisionEncoderDecoderConfig needs pad_token_id and decoder_start_token_id
         self._model.config.decoder_start_token_id = self._processor.tokenizer.bos_token_id
-        self._model.config.pad_token_id = self._processor.tokenizer.pad_token_id
-        
+        self._model.config.pad_token_id           = self._processor.tokenizer.pad_token_id
+
+        weights_path = Path(str(self.model_path))
+        if str(self.model_path) not in {"", "none"} and weights_path.exists():
+            import torch as _torch
+            self._model.load_state_dict(
+                _torch.load(str(weights_path), map_location=self.device)
+            )
+            print(f"[{self.name}] Loaded fine-tuned weights: {weights_path}")
+        else:
+            if str(self.model_path) not in {"", "none"}:
+                print(f"[{self.name}] WARNING: {self.model_path} not found — using pretrained weights")
+            print(f"[{self.name}] Loaded pretrained model from {self.DEFAULT_MODEL_ID}")
+
         self._model.to(self.device)
         self._model.eval()
-        print(f"[{self.name}] Loaded model from {source}")
 
     def _to_pil(self, image: torch.Tensor):
         from PIL import Image
@@ -925,7 +973,7 @@ class TrOCROCRBackend(OCRBackend):
                                 decoder_input_ids=decoder_input_ids)
         log_probs = F.log_softmax(outputs.logits, dim=-1)   # [1, L-1, vocab]
         token_lp  = log_probs.gather(2, label_ids.unsqueeze(-1)).squeeze(-1)
-        return token_lp.sum()   # scalar log P(sequence)
+        return token_lp.mean()   # mean per-token log P (normalised by length)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
@@ -1297,29 +1345,27 @@ class MockOCRBackend(OCRBackend):
 
 
 # ---------------------------------------------------------------------------
-# CCT (Compact Character Transcription) backend  — onnx2torch, differentiable
+# CCT (Compact Character Transcription) backend  — native PyTorch via cct_ocr_torch.py
 # ---------------------------------------------------------------------------
 #
 # Model path (auto-downloaded by fast-plate-ocr on first use):
-#   ~/.cache/fast-plate-ocr/cct-xs-v1-global-model/cct_xs_v1_global.onnx
+#   ~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx
 #
 # Input convention:
 #   NHWC float32 [0, 255], shape [batch, 64, 128, 3]
 #
 # Output convention:
-#   [batch, seq_len=9, vocab_size=37]  — one logit vector per plate slot
+#   [batch, seq_len=9, vocab_size=37]  — one softmax probability per plate slot
 #
 # Alphabet: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_'  (_ = pad/blank)
-#
-# Confirmed from offensive_patch.py: ocr_input_shape=(64,128,3), NHWC, ×255.
 
 class CCTOCRBackend(OCRBackend):
     """
-    Differentiable CCT (fast-plate-ocr) backend via onnx2torch.
+    Differentiable CCT (fast-plate-ocr) backend via native PyTorch.
 
-    Wraps the cct-xs-v1-global ONNX model.  onnx2torch exposes the full
-    forward pass as a PyTorch nn.Module so gradients flow from the per-slot
-    cross-entropy loss back through the model into the adversarial patch.
+    Uses CCTOCRTorch from cct_ocr_torch.py — a pure PyTorch reconstruction
+    of the cct-s-v1-global ONNX model with weights loaded directly from the
+    ONNX file.  No onnx2torch required.
 
     Unlike CTC-based backends, CCT classifies each plate character position
     directly (fixed-length output), so cross-entropy (not CTC) is used.
@@ -1330,7 +1376,7 @@ class CCTOCRBackend(OCRBackend):
     ocr_crop_size = (64, 128)   # (H, W)
 
     ONNX_PATH = ("~/.cache/fast-plate-ocr/"
-                 "cct-xs-v1-global-model/cct_xs_v1_global.onnx")
+                 "cct-s-v1-global-model/cct_s_v1_global.onnx")
     ALPHABET  = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
     def __init__(self, model_path: str = "none", device: str = "cpu"):
@@ -1338,8 +1384,9 @@ class CCTOCRBackend(OCRBackend):
         self._model: Optional[nn.Module] = None
 
     def load(self) -> None:
-        import onnx
-        import onnx2torch
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from cct_ocr_torch import CCTOCRTorch
 
         onnx_path = Path(self.ONNX_PATH).expanduser()
 
@@ -1358,8 +1405,7 @@ class CCTOCRBackend(OCRBackend):
                 "ONNXPlateRecognizer; ONNXPlateRecognizer('global-plates-mobile-vit-v2-model')\"`"
             )
 
-        onnx_model = onnx.load(str(onnx_path))
-        self._model = onnx2torch.convert(onnx_model)
+        self._model = CCTOCRTorch.from_onnx(str(onnx_path))
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
@@ -1396,44 +1442,70 @@ class CCTOCRBackend(OCRBackend):
         chars = [self.ALPHABET[i] for i in pred_ids if i < len(self.ALPHABET)]
         text = "".join(c for c in chars if c != "_").strip() or None
 
-        probs = torch.softmax(logits, dim=1)
-        confidence = float(probs.max(dim=1).values.mean().item())
+        # logits are already softmax probabilities from the model
+        confidence = float(logits.max(dim=1).values.mean().item())
 
         return OCRResult(logits=logits.detach(), text=text, confidence=confidence)
 
-    def ce_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ce_loss(self, probs: torch.Tensor, target_text: str) -> torch.Tensor:
         """
-        Per-slot cross-entropy loss.
+        Per-slot NLL loss.  Expects softmax *probabilities* [1/T, vocab] as
+        output by CCTOCRTorch (which returns softmax, not raw logits).
 
         Parameters
         ----------
-        logits : torch.Tensor
-            Shape [1, T, vocab] or [T, vocab].
+        probs : torch.Tensor
+            Shape [1, T, vocab] or [T, vocab] — softmax probabilities.
         target_text : str
             Plate string, e.g. "VRJ7774".  Padded/trimmed to T slots with '_'.
         """
-        if logits.dim() == 3:
-            logits = logits.squeeze(0)   # [T, vocab]
-        T = logits.shape[0]
+        if probs.dim() == 3:
+            probs = probs.squeeze(0)   # [T, vocab]
+        T = probs.shape[0]
         padded = (target_text + "_" * T)[:T]
         target_ids = torch.tensor(
             [self.ALPHABET.index(c) if c in self.ALPHABET else len(self.ALPHABET) - 1
              for c in padded],
-            dtype=torch.long, device=logits.device,
+            dtype=torch.long, device=probs.device,
         )
-        return F.cross_entropy(logits, target_ids)
+        # CCTOCRTorch returns softmax probs — use NLL loss directly to avoid double-softmax
+        return F.nll_loss(torch.log(probs.clamp(min=1e-8)), target_ids)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False) -> torch.Tensor:
         """
-        Differentiable CE loss on a [1, 3, H, W] crop tensor.
-        Gradients flow through onnx2torch model → crop → patch.
+        Differentiable NLL loss on a [1, 3, H, W] crop tensor.
+        Gradients flow through CCTOCRTorch model → crop → patch.
         """
         self.ensure_loaded()
-        preprocessed = self._preprocess(crop)         # [1, 64, 128, 3]
-        output = self._model(preprocessed)            # [1, 9, 37]
+        preprocessed = self._preprocess(crop.to(self.device))   # [1, 64, 128, 3]
+        output = self._model(preprocessed)                       # [1, 9, 37]
         base = self.ce_loss(output, target_text)
         return base if impersonation else -base
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """
+        True batch forward: one model call for all crops.
+
+        crops : list of [1, 3, H, W] tensors (may vary in H/W; resized in preprocess)
+        """
+        self.ensure_loaded()
+        # Stack + preprocess all crops in one F.interpolate call
+        batched = torch.cat([c.to(self.device) for c in crops], dim=0)  # [B, 3, H, W]
+        preprocessed = self._preprocess(batched)                         # [B, 64, 128, 3]
+        output = self._model(preprocessed)                               # [B, 9, 37]
+
+        T = output.shape[1]
+        padded = (target_text + "_" * T)[:T]
+        target_ids = torch.tensor(
+            [self.ALPHABET.index(c) if c in self.ALPHABET else len(self.ALPHABET) - 1
+             for c in padded],
+            dtype=torch.long, device=output.device,
+        )
+        log_probs = torch.log(output.clamp(min=1e-8))   # [B, T, V]
+        losses = [F.nll_loss(log_probs[i], target_ids) for i in range(output.shape[0])]
+        return [l if impersonation else -l for l in losses]
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -1504,8 +1576,10 @@ class DoctrViTSTRBackend(OCRBackend):
         self._model.to(self.device).eval()
 
     def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
-        """[C, H, W] float32 [0,1] → [1, C, 32, 128] on device."""
-        x = image.unsqueeze(0).to(self.device)
+        """[C, H, W] or [1, C, H, W] float32 [0,1] → [1, C, 32, 128] on device."""
+        x = image.to(self.device)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
         return F.interpolate(x, size=(32, 128), mode="bilinear", align_corners=False)
 
     def predict(self, image: torch.Tensor) -> OCRResult:
@@ -1534,6 +1608,21 @@ class DoctrViTSTRBackend(OCRBackend):
         self._model.eval()
         loss = out["loss"]
         return loss if impersonation else -loss
+
+    def differentiable_loss_batch(self, crops: list, target_text: str,
+                                   impersonation: bool = False) -> list:
+        """Batch preprocessing + sequential model calls (doctr targets per-sample)."""
+        self.ensure_loaded()
+        self._model.train()
+        target = [target_text.lower()]
+        losses = []
+        for crop in crops:
+            inp = self._preprocess(crop)
+            out = self._model(inp, target=target)
+            loss = out["loss"]
+            losses.append(loss if impersonation else -loss)
+        self._model.eval()
+        return losses
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -1566,6 +1655,7 @@ TRAINABLE_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
     "dtrb":         DeepTextRecognitionBenchmarkOCRBackend,
     "cct":          CCTOCRBackend,
     "doctr-vitstr": DoctrViTSTRBackend,
+    "lprnet":       LPRNetBackend,
 }
 
 EVAL_ONLY_OCR_REGISTRY: dict[str, type[OCRBackend]] = {
