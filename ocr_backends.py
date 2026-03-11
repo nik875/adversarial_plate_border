@@ -690,9 +690,11 @@ class LPRNetBackend(OCRBackend):
         self._model.eval()
 
     def _preprocess(self, image: torch.Tensor) -> torch.Tensor:
-        """CHW float32 [0,1] → [1, 3, 48, 96]."""
+        """CHW or NCHW float32 [0,1] → [1, 3, 48, 96]."""
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
         return F.interpolate(
-            image.unsqueeze(0), size=(48, 96),
+            image, size=(48, 96),
             mode="bilinear", align_corners=False,
         ).to(self.device)
 
