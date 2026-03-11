@@ -323,6 +323,8 @@ class AdversarialPatchTrainer:
 
         # ── Sanity check (before any preloading) ───────────────────────
         if not skip_sanity:
+            _sanity_accum = grad_accumulate if grad_accumulate is not None else 4
+            _sanity_limit = eval_batch_size * _sanity_accum
             _sanity_loader, _ = create_dataloaders(
                 csv_path,
                 transform=self.transform,
@@ -331,8 +333,8 @@ class AdversarialPatchTrainer:
                 batch_size=1,
                 n_jobs=0,
                 pin_memory=False,
-                limit=limit,
-                use_all_for_train=use_all_for_train,
+                limit=_sanity_limit,
+                use_all_for_train=True,
                 use_original=True,
             )
             self.validate_pipeline(_sanity_loader)
