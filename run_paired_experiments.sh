@@ -25,10 +25,11 @@ DEVICE="cuda"
 CSV="preproc_labels.csv"
 EPOCHS=100
 LR_MIN=1e-5
-# Per-OCR peak LR defaults (tweak per model as needed)
+# Per-OCR peak LR (tweak per model as needed)
 LR_TROCR=2e-4
+LR_CCT=5e-4
+LR_LPRNET=5e-4
 LR_VITSTR=5e-4
-LR_DEFAULT=5e-4
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -62,8 +63,9 @@ while [[ $# -gt 0 ]]; do
         --csv)             CSV="$2"; shift 2 ;;
         --epochs)          EPOCHS="$2"; shift 2 ;;
         --lr-trocr)        LR_TROCR="$2"; shift 2 ;;
+        --lr-cct)          LR_CCT="$2"; shift 2 ;;
+        --lr-lprnet)       LR_LPRNET="$2"; shift 2 ;;
         --lr-vitstr)       LR_VITSTR="$2"; shift 2 ;;
-        --lr-default)      LR_DEFAULT="$2"; shift 2 ;;
         --lr-min)          LR_MIN="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
@@ -195,8 +197,9 @@ for row in "${PAIRS[@]}"; do
 
     case "$ocr" in
         trocr)        pair_lr="$LR_TROCR" ;;
+        cct)          pair_lr="$LR_CCT" ;;
+        lprnet)       pair_lr="$LR_LPRNET" ;;
         doctr-vitstr) pair_lr="$LR_VITSTR" ;;
-        *)            pair_lr="$LR_DEFAULT" ;;
     esac
 
     run "$label" \
