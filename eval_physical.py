@@ -134,44 +134,45 @@ def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
+def preload_images(df: pd.DataFrame, device: str) -> List[Tuple]:
+    """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
+    to_tensor = T.ToTensor()
+    samples = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Preloading images to GPU"):
+        try:
+            pil_img = Image.open(row["filename"]).convert("RGB")
+        except Exception as e:
+            print(f"  [warn] could not load {row['filename']}: {e}")
+            continue
+        image = to_tensor(pil_img).to(device)
+        corners = torch.tensor([
+            [row["p1_x"], row["p1_y"]],
+            [row["p2_x"], row["p2_y"]],
+            [row["p3_x"], row["p3_y"]],
+            [row["p4_x"], row["p4_y"]],
+        ], dtype=torch.float32, device=device)
+        gt_box = torch.stack([
+            corners[:, 0].min(), corners[:, 1].min(),
+            corners[:, 0].max(), corners[:, 1].max(),
+        ])
+        samples.append((image, corners, gt_box))
+    return samples
+
+
 def evaluate_one(backend: DetectorBackend,
-                 df: pd.DataFrame,
+                 samples: List[Tuple],
                  patch: Optional[torch.Tensor],
                  patch_name: str,
                  device: str,
                  iou_threshold: float = 0.5) -> BackendMetrics:
-    """Evaluate a single backend × patch combo over every row in df."""
+    """Evaluate a single backend × patch combo over preloaded samples."""
     m = BackendMetrics(name=backend.name, patch_name=patch_name)
     backend.eval()
 
-    to_tensor = T.ToTensor()
-
     with torch.no_grad():
-        for _, row in tqdm(df.iterrows(), total=len(df),
-                           desc=f"  {backend.name} | {patch_name}", leave=False):
-            # Load image at original resolution
-            img_path = row["filename"]
-            try:
-                pil_img = Image.open(img_path).convert("RGB")
-            except Exception as e:
-                print(f"  [warn] could not load {img_path}: {e}")
-                continue
-
-            image = to_tensor(pil_img).to(device)   # [3, H, W]
-
-            # Original corners → ground-truth box
-            corners = torch.tensor([
-                [row["p1_x"], row["p1_y"]],
-                [row["p2_x"], row["p2_y"]],
-                [row["p3_x"], row["p3_y"]],
-                [row["p4_x"], row["p4_y"]],
-            ], dtype=torch.float32)
-
-            gt_box = torch.stack([
-                corners[:, 0].min(), corners[:, 1].min(),
-                corners[:, 0].max(), corners[:, 1].max(),
-            ])
-
+        for image, corners, gt_box in tqdm(samples,
+                                           desc=f"  {backend.name} | {patch_name}",
+                                           leave=False):
             if patch is not None:
                 image = _apply_patch(image, corners, patch)
 
@@ -285,6 +286,8 @@ def main() -> None:
         help="Corners CSV (default: control_plate_corners.csv)",
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument("--gpu-preload", action="store_true",
+                        help="Preload all images to GPU memory once before evaluation.")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--output", default="results/",
                         help="Output directory (default: results/)")
@@ -325,15 +328,18 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    samples = preload_images(df, args.device) if args.gpu_preload else None
+
     # Evaluate: every backend × (clean + all patches)
     all_results: List[BackendMetrics] = []
     for (bname, bpath, bkwargs_t), backend in seen.items():
         backend.ensure_loaded()
         backend.freeze()
         print(f"\n── Backend: {bname} ──")
+        eval_data = samples if samples is not None else preload_images(df, args.device)
         for patch_name, patch_tensor in patch_tensors:
             m = evaluate_one(
-                backend, df, patch_tensor, patch_name,
+                backend, eval_data, patch_tensor, patch_name,
                 device=args.device, iou_threshold=args.iou_threshold,
             )
             all_results.append(m)
