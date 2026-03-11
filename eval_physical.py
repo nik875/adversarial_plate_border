@@ -160,7 +160,7 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
             new_w = int(pil_img.width * scale)
             new_h = int(pil_img.height * scale)
             pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
-        image = to_tensor(pil_img)
+        image = to_tensor(pil_img)[[2, 1, 0]]   # RGB→BGR to match training (cv2) pipeline
         del pil_img
         corners = torch.tensor([
             [row["p1_x"], row["p1_y"]],
