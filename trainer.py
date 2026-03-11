@@ -558,8 +558,9 @@ class AdversarialPatchTrainer:
             patched_prep.unsqueeze(0), new_corners,
             patched_orig,              orig_corners,
         )
-        tv_loss = self.total_variation_loss(patch_norm)
-        return (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
+        tv_loss   = self.total_variation_loss(patch_norm)
+        total     = (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
+        return total, det_loss.detach(), ocr_loss.detach(), tv_loss.detach()
 
     # ====================================================================
     # Patch persistence
@@ -832,7 +833,7 @@ class AdversarialPatchTrainer:
     # Training loop
     # ====================================================================
 
-    def train_epoch(self, optimizer, epoch: int) -> float:
+    def train_epoch(self, optimizer, epoch: int) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -840,17 +841,21 @@ class AdversarialPatchTrainer:
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
         total_loss = accum_loss = 0.0
+        total_det  = total_ocr  = total_tv = 0.0
         step = num_updates = 0
 
         with tqdm(enumerate(self.train_loader),
-                  desc=f"Epoch {epoch+1} [{self.detector.name}/{self.ocr.name}]",
+                  desc=f"Epoch {epoch+1}",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
-                loss        = self.compute_loss(batch)
+                loss, det_l, ocr_l, tv_l = self.compute_loss(batch)
                 scaled_loss = loss / update_every
                 scaled_loss.backward()
 
                 accum_loss += loss.item()
+                total_det  += det_l.item()
+                total_ocr  += ocr_l.item()
+                total_tv   += tv_l.item()
                 step       += 1
 
                 if step % update_every == 0:
@@ -865,7 +870,12 @@ class AdversarialPatchTrainer:
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
                         torch.mps.empty_cache()
-                    pbar.set_postfix({"loss": f"{total_loss/(num_updates*update_every):.4f}"})
+                    pbar.set_postfix({
+                        "loss": f"{total_loss/(num_updates*update_every):.4f}",
+                        "det":  f"{total_det/step:.4f}",
+                        "ocr":  f"{total_ocr/step:.4f}",
+                        "tv":   f"{total_tv/step:.4f}",
+                    })
                 else:
                     del loss, scaled_loss
 
@@ -878,7 +888,9 @@ class AdversarialPatchTrainer:
 
         total_steps = (num_updates * update_every
                        if self.grad_accumulate else len(self.train_loader))
-        return total_loss / max(total_steps, 1)
+        n = max(step, 1)
+        return (total_loss / max(total_steps, 1),
+                total_det / n, total_ocr / n, total_tv / n)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
@@ -969,7 +981,7 @@ class AdversarialPatchTrainer:
 
         for epoch in range(num_epochs):
             self.training  = True
-            train_loss     = self.train_epoch(optimizer, epoch)
+            train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
             self.training  = False
             val_loss       = self.validate()
             scheduler.step()
@@ -989,9 +1001,12 @@ class AdversarialPatchTrainer:
                 self.save_patch(epoch, "patches", stem=f"patch_{self.detector.name}_best")
                 best_marker = "  ★ best"
 
-            line = (f"Epoch {epoch+1:3d}/{num_epochs} | "
-                    f"Loss: {train_loss:.4f} | Val: {val_loss:.4f} | "
-                    f"Δ: {change:+.1f}% | LR: {lr:.2e}{best_marker}")
+            line = (f"Epoch {epoch+1:3d}/{num_epochs} "
+                    f"[{self.detector.name}/{self.ocr.name}] | "
+                    f"loss: {train_loss:.4f}  det: {train_det:.4f}  "
+                    f"ocr: {train_ocr:.4f}  tv: {train_tv:.4f} | "
+                    f"val: {val_loss:.4f} Δ{change:+.1f}% | "
+                    f"lr: {lr:.2e}{best_marker}")
             print(line)
             log_file.write(line + "\n")
             log_file.flush()
