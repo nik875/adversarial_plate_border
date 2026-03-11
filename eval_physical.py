@@ -168,22 +168,26 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
 
     samples = []
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = [pool.submit(_load_one, r) for r in rows]
-        for i in tqdm(range(len(futures)),
-                      desc=f"Preloading images to GPU ({num_workers} threads)"):
-            idx, data = futures[i].result()
-            futures[i] = None          # free Future + its cached result
-            if data is None:
-                continue
-            image, corners = data
-            del data
-            image   = image.to(device)
-            corners = corners.to(device)
-            gt_box  = torch.stack([
-                corners[:, 0].min(), corners[:, 1].min(),
-                corners[:, 0].max(), corners[:, 1].max(),
-            ])
-            samples.append((image, corners, gt_box))
+        pbar = tqdm(total=len(rows),
+                    desc=f"Preloading images to GPU ({num_workers} threads)")
+        # Submit and consume in small batches so at most num_workers
+        # CPU tensors exist at any time.
+        for batch_start in range(0, len(rows), num_workers):
+            batch = rows[batch_start:batch_start + num_workers]
+            futs = [pool.submit(_load_one, r) for r in batch]
+            for f in futs:
+                idx, data = f.result()
+                if data is not None:
+                    image, corners = data
+                    corners_gpu = corners.to(device)
+                    gt_box = torch.stack([
+                        corners_gpu[:, 0].min(), corners_gpu[:, 1].min(),
+                        corners_gpu[:, 0].max(), corners_gpu[:, 1].max(),
+                    ])
+                    samples.append((image.to(device), corners_gpu, gt_box))
+                pbar.update(1)
+            del futs  # free all Futures + their cached CPU tensors
+        pbar.close()
 
     return samples
 
