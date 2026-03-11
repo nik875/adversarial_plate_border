@@ -442,12 +442,6 @@ class AdversarialPatchTrainer:
         """
         Run the decoder forward to produce the patch.
 
-        Parameters
-        ----------
-        training_aug : bool
-            When True, applies the random brightness jitter used during
-            training to simulate print variation.
-
         Returns
         -------
         torch.Tensor
@@ -461,10 +455,6 @@ class AdversarialPatchTrainer:
                 patch.unsqueeze(0), (3, 3),
                 (self.print_blur, self.print_blur),
             ).squeeze(0)
-
-        if training_aug:
-            factor = torch.rand(1, device=self.device) * 0.2
-            patch  = patch * (1.0 - factor)
 
         return patch   # [3, 256, 512]
 
