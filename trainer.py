@@ -27,7 +27,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* LR schedule: 5-epoch linear warmup (1e-4→1e-3) + CosineAnnealingLR (→1e-4), 100 epochs, no early stopping.
+* LR schedule: 5-epoch linear warmup (1e-4→5e-4) + CosineAnnealingLR (→1e-4), 100 epochs, no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
@@ -968,7 +968,7 @@ class AdversarialPatchTrainer:
     def train(
         self,
         num_epochs:    int   = 100,
-        learning_rate: float = 1e-3,
+        learning_rate: float = 5e-4,
         save_interval: int   = 10,
         dry_run:       bool  = False,
         skip_sanity:   bool  = False,
@@ -1103,7 +1103,7 @@ def main():
                         help="Number of channels in the decoder seed (default 128 → 4096 seed params).")
     parser.add_argument("--device",   default="cuda")
     parser.add_argument("--epochs",   type=int,   default=100)
-    parser.add_argument("--lr",       type=float, default=1e-3)
+    parser.add_argument("--lr",       type=float, default=5e-4)
     parser.add_argument("--grad-accumulate", type=int, default=64)
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
