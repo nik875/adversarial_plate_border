@@ -134,8 +134,9 @@ def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
-def preload_images(df: pd.DataFrame, device: str) -> List[Tuple]:
+def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0) -> List[Tuple]:
     """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
+    import torch.nn.functional as F
     to_tensor = T.ToTensor()
     samples = []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Preloading images to GPU"):
@@ -145,12 +146,15 @@ def preload_images(df: pd.DataFrame, device: str) -> List[Tuple]:
             print(f"  [warn] could not load {row['filename']}: {e}")
             continue
         image = to_tensor(pil_img).to(device)
+        if scale != 1.0:
+            image = F.interpolate(image.unsqueeze(0), scale_factor=scale,
+                                  mode="bilinear", align_corners=False).squeeze(0)
         corners = torch.tensor([
             [row["p1_x"], row["p1_y"]],
             [row["p2_x"], row["p2_y"]],
             [row["p3_x"], row["p3_y"]],
             [row["p4_x"], row["p4_y"]],
-        ], dtype=torch.float32, device=device)
+        ], dtype=torch.float32, device=device) * scale
         gt_box = torch.stack([
             corners[:, 0].min(), corners[:, 1].min(),
             corners[:, 0].max(), corners[:, 1].max(),
@@ -288,6 +292,8 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--gpu-preload", action="store_true",
                         help="Preload all images to GPU memory once before evaluation.")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Resize images by this factor before evaluation (e.g. 0.5 to halve resolution).")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--output", default="results/",
                         help="Output directory (default: results/)")
@@ -328,7 +334,7 @@ def main() -> None:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = preload_images(df, args.device) if args.gpu_preload else None
+    samples = preload_images(df, args.device, args.scale) if args.gpu_preload else None
 
     # Evaluate: every backend × (clean + all patches)
     all_results: List[BackendMetrics] = []
@@ -336,7 +342,7 @@ def main() -> None:
         backend.ensure_loaded()
         backend.freeze()
         print(f"\n── Backend: {bname} ──")
-        eval_data = samples if samples is not None else preload_images(df, args.device)
+        eval_data = samples if samples is not None else preload_images(df, args.device, args.scale)
         for patch_name, patch_tensor in patch_tensors:
             m = evaluate_one(
                 backend, eval_data, patch_tensor, patch_name,
