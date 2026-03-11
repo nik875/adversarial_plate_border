@@ -324,8 +324,8 @@ def main() -> None:
                         help="Preload all images to GPU memory once before evaluation.")
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Threads for parallel image loading (default: nproc).")
-    parser.add_argument("--scale", type=float, default=1.0,
-                        help="Resize images by this factor before evaluation (e.g. 0.5 to halve resolution).")
+    parser.add_argument("--scale", type=float, default=0.5,
+                        help="Resize images by this factor before evaluation (default: 0.5).")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
     parser.add_argument("--output", default="results/",
                         help="Output directory (default: results/)")
