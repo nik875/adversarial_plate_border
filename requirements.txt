@@ -19,3 +19,4 @@ b2
 python-doctr[torch]
 opencv-python-headless
 timm==0.4.5  # Required for DTRB ViTSTR backend
+tiktoken
