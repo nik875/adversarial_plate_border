@@ -24,8 +24,11 @@ set -euo pipefail
 DEVICE="cuda"
 CSV="preproc_labels.csv"
 EPOCHS=100
-LR=5e-4
 LR_MIN=1e-5
+# Per-OCR peak LR defaults (tweak per model as needed)
+LR_TROCR=2e-4
+LR_VITSTR=5e-4
+LR_DEFAULT=5e-4
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -58,7 +61,9 @@ while [[ $# -gt 0 ]]; do
         --device)          DEVICE="$2"; shift 2 ;;
         --csv)             CSV="$2"; shift 2 ;;
         --epochs)          EPOCHS="$2"; shift 2 ;;
-        --lr)              LR="$2"; shift 2 ;;
+        --lr-trocr)        LR_TROCR="$2"; shift 2 ;;
+        --lr-vitstr)       LR_VITSTR="$2"; shift 2 ;;
+        --lr-default)      LR_DEFAULT="$2"; shift 2 ;;
         --lr-min)          LR_MIN="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
@@ -136,7 +141,6 @@ BASE_ARGS=(
     --csv "$CSV"
     --device "$DEVICE"
     --epochs "$EPOCHS"
-    --lr "$LR"
     --lr-min "$LR_MIN"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
@@ -189,9 +193,16 @@ for row in "${PAIRS[@]}"; do
         continue
     fi
 
+    case "$ocr" in
+        trocr)        pair_lr="$LR_TROCR" ;;
+        doctr-vitstr) pair_lr="$LR_VITSTR" ;;
+        *)            pair_lr="$LR_DEFAULT" ;;
+    esac
+
     run "$label" \
         python trainer.py \
             "${BASE_ARGS[@]}" \
+            --lr "$pair_lr" \
             --backend "$det" \
             --model-path "$det_w" \
             --ocr-backend "$ocr" \
