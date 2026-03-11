@@ -811,13 +811,14 @@ class AdversarialPatchTrainer:
         self.detector.train_mode()
         self.ocr.train()
         try:
-            patch_norm = self.generate_patch(training_aug=self.training)
+            patch_with_graph = self.generate_patch(training_aug=self.training)
+            patch_leaf = patch_with_graph.detach().requires_grad_(True)
             buffer: list = []
             step = 0
             total_loss = 0.0
             for raw_item in items_raw:
-                item = self._prepare_one(raw_item, patch_norm)
-                item["_patch_norm"] = patch_norm
+                item = self._prepare_one(raw_item, patch_leaf)
+                item["_patch_norm"] = patch_leaf
                 buffer.append(item)
                 if len(buffer) < B:
                     continue
@@ -825,9 +826,12 @@ class AdversarialPatchTrainer:
                 buffer = []
                 step += 1
                 scaled = loss / update_every
-                scaled.backward(retain_graph=(step % update_every != 0))
+                scaled.backward()  # frees item graph; accumulates into patch_leaf.grad
                 total_loss += loss.item()
                 del loss, scaled
+            # Propagate through generator so trainable params get gradients
+            if patch_leaf.grad is not None:
+                patch_with_graph.backward(patch_leaf.grad)
 
             # Zero grads so the optimizer starts clean
             for p in self._trainable_params():
@@ -1069,7 +1073,13 @@ class AdversarialPatchTrainer:
         use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
 
-        patch_norm = self.generate_patch(training_aug=self.training)
+        # Generate the first patch (with generator graph) for the accumulation window.
+        # We use a detach-accumulate-backprop pattern: detach the patch into a
+        # leaf tensor so each per-item backward() frees its graph immediately
+        # (no retain_graph needed).  Accumulated gradients on the leaf are then
+        # back-propagated through the generator in a single call.
+        patch_with_graph = self.generate_patch(training_aug=self.training)
+        patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
         with tqdm(enumerate(self.train_loader),
                   desc=f"Epoch {epoch+1}",
@@ -1102,12 +1112,15 @@ class AdversarialPatchTrainer:
                         "ocr":  f"{total_ocr/step:.4f}",
                         "tv":   f"{total_tv/step:.4f}",
                     })
-                    patch_norm = self.generate_patch(training_aug=self.training)
+                    patch_with_graph = self.generate_patch(training_aug=self.training)
+                    patch_leaf = patch_with_graph.detach().requires_grad_(True)
                     continue
 
                 # ── Standard (non-SAM) accumulation path ─────────────────
-                item = self._prepare_one(raw_item, patch_norm)
-                item["_patch_norm"] = patch_norm
+                # Use the detached patch_leaf so each backward frees its
+                # detector/OCR graph immediately (no retain_graph).
+                item = self._prepare_one(raw_item, patch_leaf)
+                item["_patch_norm"] = patch_leaf
                 buffer.append(item)
 
                 if len(buffer) < B:
@@ -1117,23 +1130,23 @@ class AdversarialPatchTrainer:
                 buffer = []
                 scaled_loss = loss / update_every
                 step += 1
-                # retain_graph until the last backward in this accumulation window;
-                # the shared patch_norm decoder graph must survive all update_every calls
-                scaled_loss.backward(retain_graph=(step % update_every != 0))
+                scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
 
                 accum_loss += loss.item()
                 total_det  += det_l.item()
                 total_ocr  += ocr_l.item()
                 total_tv   += tv_l.item()
+                del loss, scaled_loss
 
                 if step % update_every == 0:
+                    # Propagate accumulated patch gradient through generator.
+                    patch_with_graph.backward(patch_leaf.grad)
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
                     total_loss  += accum_loss
                     num_updates += 1
                     accum_loss   = 0.0
-                    del loss, scaled_loss
                     if self.device == "cuda":
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
@@ -1145,9 +1158,8 @@ class AdversarialPatchTrainer:
                         "tv":   f"{total_tv/step:.4f}",
                     })
                     # New patch for next accumulation window
-                    patch_norm = self.generate_patch(training_aug=self.training)
-                else:
-                    del loss, scaled_loss
+                    patch_with_graph = self.generate_patch(training_aug=self.training)
+                    patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
             # ── Flush remainder at end of epoch ──────────────────────────
             if use_sam and len(window_raw) >= B:
@@ -1167,7 +1179,7 @@ class AdversarialPatchTrainer:
                     loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
                     buffer = []
                     scaled_loss = loss / update_every
-                    scaled_loss.backward()
+                    scaled_loss.backward()  # accumulates into patch_leaf.grad
                     accum_loss += loss.item()
                     total_det  += det_l.item()
                     total_ocr  += ocr_l.item()
@@ -1176,6 +1188,8 @@ class AdversarialPatchTrainer:
                     del loss, scaled_loss
 
                 if step % update_every != 0 and self.grad_accumulate is not None:
+                    # Propagate remainder gradients through generator.
+                    patch_with_graph.backward(patch_leaf.grad)
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
