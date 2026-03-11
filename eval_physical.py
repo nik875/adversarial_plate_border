@@ -138,7 +138,6 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
                    num_workers: int = 0) -> List[Tuple]:
     """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
     import os
-    import torch.nn.functional as F
     from concurrent.futures import ThreadPoolExecutor, as_completed
     to_tensor = T.ToTensor()
     if num_workers == 0:
@@ -153,10 +152,12 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
         except Exception as e:
             print(f"  [warn] could not load {row['filename']}: {e}")
             return idx, None
-        image = to_tensor(pil_img)
         if scale != 1.0:
-            image = F.interpolate(image.unsqueeze(0), scale_factor=scale,
-                                  mode="bilinear", align_corners=False).squeeze(0)
+            new_w = int(pil_img.width * scale)
+            new_h = int(pil_img.height * scale)
+            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        image = to_tensor(pil_img)
+        del pil_img
         corners = torch.tensor([
             [row["p1_x"], row["p1_y"]],
             [row["p2_x"], row["p2_y"]],
