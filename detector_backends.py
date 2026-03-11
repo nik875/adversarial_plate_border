@@ -29,6 +29,18 @@ import torch
 import torch.nn as nn
 
 
+def _box_iou_scalar(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
+    """IoU between two [1,4] xyxy boxes; returns a plain float."""
+    x1 = torch.max(box_a[:, 0], box_b[:, 0])
+    y1 = torch.max(box_a[:, 1], box_b[:, 1])
+    x2 = torch.min(box_a[:, 2], box_b[:, 2])
+    y2 = torch.min(box_a[:, 3], box_b[:, 3])
+    inter = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    area_a = (box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1])
+    area_b = (box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1])
+    return (inter / (area_a + area_b - inter + 1e-6)).item()
+
+
 # ---------------------------------------------------------------------------
 # Detection result container
 # ---------------------------------------------------------------------------
@@ -150,6 +162,31 @@ class DetectorBackend(abc.ABC):
         """Disable gradients for all parameters (call after load())."""
         for p in self.parameters():
             p.requires_grad_(False)
+
+    def differentiable_det_loss(self, image: torch.Tensor,
+                                 target_box: torch.Tensor) -> torch.Tensor:
+        """
+        Return a scalar confidence score for the best-matching detection,
+        with gradients flowing back to ``image``.
+
+        The default falls back to ``predict()`` — gradients only flow if the
+        backend's ``predict()`` already keeps the autograd graph (e.g. Yolov9).
+        Override in backends where ``predict()`` runs under ``no_grad``.
+
+        Parameters
+        ----------
+        image      : [C, H, W] float32 on any device
+        target_box : [x1, y1, x2, y2] float32 — selects the best-IoU detection
+        """
+        dets = self.predict(image)
+        if not dets:
+            return torch.tensor(0.0, device=self.device)
+        box_t = target_box.to(self.device).unsqueeze(0)
+        best = max(dets, key=lambda d: (
+            _box_iou_scalar(d.box.to(self.device).unsqueeze(0), box_t)
+            * d.confidence
+        ))
+        return best.conf.to(self.device)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, path={self.model_path})"
@@ -795,6 +832,39 @@ class FasterRCNNBackend(DetectorBackend):
 
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
+
+    def differentiable_det_loss(self, image: torch.Tensor,
+                                 target_box: torch.Tensor) -> torch.Tensor:
+        """Run forward without no_grad so the returned score has a gradient."""
+        self.ensure_loaded()
+        inp = image.to(self.device)
+        if inp.dim() == 4:
+            inp = inp.squeeze(0)
+
+        # eval-mode forward without no_grad — scores stay in the autograd graph
+        outputs = self._model([inp])
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        if not outputs:
+            return torch.tensor(0.0, device=self.device)
+
+        out = outputs[0]
+        scores = out.get("scores")
+        boxes  = out.get("boxes")
+
+        if scores is None or len(scores) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        # Select best box by IoU × conf (non-differentiable selection only)
+        with torch.no_grad():
+            box_t   = target_box.unsqueeze(0).to(self.device)
+            weights = torch.tensor([
+                _box_iou_scalar(boxes[i].unsqueeze(0), box_t) * scores[i].item()
+                for i in range(len(scores))
+            ])
+            best_idx = int(weights.argmax().item())
+
+        return scores[best_idx]
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:

@@ -202,6 +202,7 @@ class AdversarialPatchTrainer:
     ):
         self.training             = training
         self.tv_weight            = tv_weight
+        self._tv_active           = False   # enabled after LR warmup completes
         self.print_blur           = print_blur
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
@@ -492,19 +493,9 @@ class AdversarialPatchTrainer:
         target_box = self.corners_to_bbox(new_corners)
 
         # ── Detection (preprocessed resolution) ────────────────────────
-        detections = self.detector.predict(patched_prep.squeeze(0))
-        det_loss   = torch.tensor(0.0, device=self.device)
-
-        if detections:
-            best_det = max(
-                detections,
-                key=lambda d: (
-                    self._boxes_iou(d.box.to(self.device).unsqueeze(0),
-                                    target_box.unsqueeze(0)).item()
-                    * d.confidence
-                ),
-            )
-            det_loss = best_det.conf.to(self.device).squeeze()
+        det_loss = self.detector.differentiable_det_loss(
+            patched_prep.squeeze(0), target_box
+        )
 
         # ── OCR (full-res crop for maximum detail) ──────────────────────
         target_text = self.impersonation_target or self.expected_plate_text
@@ -558,9 +549,10 @@ class AdversarialPatchTrainer:
             patched_prep.unsqueeze(0), new_corners,
             patched_orig,              orig_corners,
         )
-        tv_loss   = self.total_variation_loss(patch_norm)
-        total     = (det_loss + ocr_loss) / 2 + self.tv_weight * tv_loss
-        return total, det_loss.detach(), ocr_loss.detach(), tv_loss.detach()
+        tv_loss      = self.total_variation_loss(patch_norm)
+        eff_tv_weight = self.tv_weight if self._tv_active else 0.0
+        total        = (det_loss + ocr_loss) / 2 + eff_tv_weight * tv_loss
+        return total, det_loss.detach(), ocr_loss.detach(), (eff_tv_weight * tv_loss).detach()
 
     # ====================================================================
     # Patch persistence
@@ -980,7 +972,8 @@ class AdversarialPatchTrainer:
         log_file = open(log_path, "w")
 
         for epoch in range(num_epochs):
-            self.training  = True
+            self._tv_active = epoch >= warmup_epochs
+            self.training   = True
             train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
             self.training  = False
             val_loss       = self.validate()
