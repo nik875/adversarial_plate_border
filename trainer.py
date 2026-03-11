@@ -730,7 +730,7 @@ class AdversarialPatchTrainer:
             raise RuntimeError("No training data found for sanity check.")
 
         # Models must be in training mode for cuDNN RNN backward to work
-        self.detector.train()
+        self.detector.train_mode()
         self.ocr.train()
         try:
             patch_norm = self.generate_patch(training_aug=self.training)
