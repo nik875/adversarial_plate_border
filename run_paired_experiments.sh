@@ -18,6 +18,7 @@
 #   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
 #   ./run_paired_experiments.sh --sam        # enable m-SAM (m=8, rho=0.025 by default)
 #   ./run_paired_experiments.sh --sam --sam-rho 0.05  # custom rho
+#   ./run_paired_experiments.sh --augment    # enable online photometric augmentation
 # =============================================================================
 
 set -euo pipefail
@@ -61,6 +62,7 @@ IMPERSONATION_TARGET=""
 SKIP_PAIRS=()
 SAM_M=""
 SAM_RHO=0.025
+AUGMENT=false
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -112,6 +114,7 @@ while [[ $# -gt 0 ]]; do
         --sam)             SAM_M=8; shift ;;
         --sam-m)           SAM_M="$2"; shift 2 ;;
         --sam-rho)         SAM_RHO="$2"; shift 2 ;;
+        --augment)         AUGMENT=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -206,6 +209,9 @@ if [[ -n "$IMPERSONATION_TARGET" ]]; then
 fi
 if [[ -n "$SAM_M" ]]; then
     BASE_ARGS+=(--sam-m "$SAM_M" --sam-rho "$SAM_RHO")
+fi
+if $AUGMENT; then
+    BASE_ARGS+=(--augment)
 fi
 
 # Pair rows:
