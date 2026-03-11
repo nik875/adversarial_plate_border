@@ -33,10 +33,10 @@ LR_CCT=2e-4
 LR_LPRNET=2e-4
 LR_VITSTR=2e-4
 # Per-OCR TV weight (tweak per model as needed)
-TV_TROCR=10
-TV_CCT=10
-TV_LPRNET=10
-TV_VITSTR=10
+TV_TROCR=100
+TV_CCT=100
+TV_LPRNET=100
+TV_VITSTR=100
 # Per-OCR loss scale (tweak per model as needed)
 OCR_SCALE_TROCR=0.5
 OCR_SCALE_CCT=0.7
