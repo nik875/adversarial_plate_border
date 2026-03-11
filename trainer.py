@@ -870,11 +870,12 @@ class AdversarialPatchTrainer:
         step = num_updates = 0
         buffer: list = []
 
+        patch_norm = self.generate_patch(training_aug=self.training)
+
         with tqdm(enumerate(self.train_loader),
                   desc=f"Epoch {epoch+1}",
                   total=len(self.train_loader), leave=False) as pbar:
             for idx, batch in pbar:
-                patch_norm = self.generate_patch(training_aug=self.training)
                 item = self._prepare_one(
                     {k: v[0] for k, v in batch.items()}, patch_norm)
                 item["_patch_norm"] = patch_norm
@@ -912,6 +913,8 @@ class AdversarialPatchTrainer:
                         "ocr":  f"{total_ocr/step:.4f}",
                         "tv":   f"{total_tv/step:.4f}",
                     })
+                    # New patch for next accumulation window
+                    patch_norm = self.generate_patch(training_aug=self.training)
                 else:
                     del loss, scaled_loss
 
@@ -1123,6 +1126,9 @@ def main():
                         help="Weight for total variation loss (default: 2.5).")
     parser.add_argument("--eval-batch-size", type=int, default=1,
                         help="Number of images to batch for detector/OCR evaluation (default 1).")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the detector and OCR models (PyTorch 2.0+, "
+                             "gradients still flow through compiled models).")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -1138,6 +1144,14 @@ def main():
     ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path,
                              device=args.device, **ocr_kwargs)
     ocr.load()
+
+    if args.compile:
+        if hasattr(backend, "_model") and backend._model is not None:
+            print(f"[compile] Compiling detector ({backend.name})...")
+            backend._model = torch.compile(backend._model)
+        if hasattr(ocr, "_model") and ocr._model is not None:
+            print(f"[compile] Compiling OCR ({ocr.name})...")
+            ocr._model = torch.compile(ocr._model)
 
     trainer = AdversarialPatchTrainer(
         detector             = backend,
