@@ -58,6 +58,11 @@ class BackendMetrics:
     iou_values: List[float] = field(default_factory=list)
     conf_values: List[float] = field(default_factory=list)
     latency_ms: List[float] = field(default_factory=list)
+    # OCR categorisation (only populated when an OCR backend is provided)
+    ocr_correct: int = 0
+    ocr_impersonation: int = 0
+    ocr_misread: int = 0
+    ocr_no_detection: int = 0
 
     @property
     def recall(self) -> float:
@@ -84,8 +89,20 @@ class BackendMetrics:
     def avg_dets_per_image(self) -> float:
         return self.total_detections / self.num_images if self.num_images else 0.0
 
+    @property
+    def ocr_total(self) -> int:
+        return self.ocr_correct + self.ocr_impersonation + self.ocr_misread + self.ocr_no_detection
+
+    @property
+    def ocr_impersonation_rate(self) -> float:
+        return self.ocr_impersonation / self.ocr_total if self.ocr_total else 0.0
+
+    @property
+    def ocr_correct_rate(self) -> float:
+        return self.ocr_correct / self.ocr_total if self.ocr_total else 0.0
+
     def to_flat_dict(self) -> dict:
-        return {
+        d = {
             "backend":            self.name,
             "patch":              self.patch_name,
             "num_images":         self.num_images,
@@ -99,14 +116,32 @@ class BackendMetrics:
             "p95_latency_ms":     round(self.p95_latency_ms, 2),
             "avg_dets_per_image": round(self.avg_dets_per_image, 2),
         }
+        if self.ocr_total > 0:
+            d.update({
+                "ocr_correct":            self.ocr_correct,
+                "ocr_impersonation":      self.ocr_impersonation,
+                "ocr_misread":            self.ocr_misread,
+                "ocr_no_detection":       self.ocr_no_detection,
+                "ocr_correct_rate":       round(self.ocr_correct_rate, 4),
+                "ocr_impersonation_rate": round(self.ocr_impersonation_rate, 4),
+            })
+        return d
 
     def summary(self) -> str:
-        return (
+        s = (
             f"[{self.name} | patch={self.patch_name}]  "
             f"Recall={self.recall:.3f}  mIoU={self.mean_iou:.3f}  "
             f"mConf={self.mean_conf:.3f}  "
             f"Lat={self.mean_latency_ms:.1f}ms (p95={self.p95_latency_ms:.1f}ms)"
         )
+        if self.ocr_total > 0:
+            s += (
+                f"  |  OCR: correct={self.ocr_correct_rate:.1%}"
+                f"  imp={self.ocr_impersonation_rate:.1%}"
+                f"  misread={self.ocr_misread/self.ocr_total:.1%}"
+                f"  no_det={self.ocr_no_detection/self.ocr_total:.1%}"
+            )
+        return s
 
 
 # ---------------------------------------------------------------------------

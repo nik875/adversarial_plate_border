@@ -42,7 +42,11 @@ try:
 except ImportError:
     print("Warning: pillow-heif not installed; HEIC images may fail to load.")
 
+import re
+import torch.nn.functional as F
+
 from detector_backends import DetectorBackend, build_backend
+from ocr_backends import OCRBackend, build_ocr_backend
 from evaluator import BackendMetrics
 
 
@@ -193,15 +197,43 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
     return samples
 
 
+def _plate_text_matches(text: str, expected: str) -> bool:
+    """Case-insensitive alphanumeric comparison."""
+    norm = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    return norm(text) == norm(expected)
+
+
+def _ocr_crop(image: torch.Tensor, corners: torch.Tensor,
+              crop_size: Tuple) -> torch.Tensor:
+    """Axis-aligned bbox crop + resize for OCR. image: [C,H,W], corners: [4,2]."""
+    h, w = image.shape[1], image.shape[2]
+    x1 = corners[:, 0].min().long().clamp(0, w - 1)
+    y1 = corners[:, 1].min().long().clamp(0, h - 1)
+    x2 = corners[:, 0].max().long().clamp(0, w)
+    y2 = corners[:, 1].max().long().clamp(0, h)
+    crop = image[:, y1:y2, x1:x2].unsqueeze(0)   # [1, C, ch, cw]
+    th, tw = crop_size
+    if tw is None:
+        ch, cw = crop.shape[2], crop.shape[3]
+        tw = max(1, int(th * cw / ch))
+    return F.interpolate(crop, (th, tw), mode="bilinear", align_corners=False)
+
+
 def evaluate_one(backend: DetectorBackend,
                  samples: List[Tuple],
                  patch: Optional[torch.Tensor],
                  patch_name: str,
                  device: str,
-                 iou_threshold: float = 0.5) -> BackendMetrics:
+                 iou_threshold: float = 0.5,
+                 ocr_backend: Optional[OCRBackend] = None,
+                 expected_plate: str = "",
+                 impersonation_target: str = "") -> BackendMetrics:
     """Evaluate a single backend × patch combo over preloaded samples."""
     m = BackendMetrics(name=backend.name, patch_name=patch_name)
     backend.eval()
+    if ocr_backend is not None:
+        ocr_backend.ensure_loaded()
+        ocr_backend.eval()
 
     with torch.no_grad():
         for image, corners, gt_box in tqdm(samples,
@@ -231,6 +263,21 @@ def evaluate_one(backend: DetectorBackend,
             else:
                 m.false_negatives += 1
 
+            # OCR evaluation (on labeled corners regardless of detection)
+            if ocr_backend is not None:
+                if not dets:
+                    m.ocr_no_detection += 1
+                else:
+                    crop = _ocr_crop(image, corners, ocr_backend.ocr_crop_size)
+                    result = ocr_backend.predict(crop.squeeze(0))
+                    text = result.text or ""
+                    if expected_plate and _plate_text_matches(text, expected_plate):
+                        m.ocr_correct += 1
+                    elif impersonation_target and _plate_text_matches(text, impersonation_target):
+                        m.ocr_impersonation += 1
+                    else:
+                        m.ocr_misread += 1
+
     return m
 
 
@@ -238,28 +285,31 @@ def evaluate_one(backend: DetectorBackend,
 # CLI helpers
 # ---------------------------------------------------------------------------
 
-def _parse_pair(spec: str) -> Tuple[str, str, str, dict]:
-    parts = spec.split(":", 3)
-    if len(parts) < 3:
-        raise ValueError(
-            f"Invalid pair spec '{spec}'. "
-            "Expected: patch_file:backend_name:backend_path[:k=v,...]"
-        )
-    patch_path, backend_name, backend_path = parts[0], parts[1], parts[2]
-    kwargs: dict = {}
-    if len(parts) == 4:
-        for kv in parts[3].split(","):
-            k, _, v = kv.partition("=")
-            try:
-                kwargs[k] = float(v) if "." in v else int(v)
-            except ValueError:
-                kwargs[k] = v
-    return patch_path, backend_name, backend_path, kwargs
+def _parse_pair(spec: str) -> Tuple[str, str, str, Optional[str], Optional[str]]:
+    """Parse pair spec.
+
+    Formats:
+      patch:det:det_weights
+      patch:det:det_weights:ocr:ocr_weights
+    """
+    parts = spec.split(":")
+    if len(parts) == 5:
+        patch_path, det_name, det_weights, ocr_name, ocr_weights = parts
+        return patch_path, det_name, det_weights, ocr_name, ocr_weights
+    elif len(parts) >= 3:
+        patch_path, det_name, det_weights = parts[0], parts[1], parts[2]
+        return patch_path, det_name, det_weights, None, None
+    raise ValueError(
+        f"Invalid pair spec '{spec}'. "
+        "Expected: patch:det:det_weights  or  patch:det:det_weights:ocr:ocr_weights"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+import os as _os
 
 # Default weight paths keyed by backend name
 _DEFAULT_WEIGHTS: Dict[str, str] = {
@@ -270,34 +320,50 @@ _DEFAULT_WEIGHTS: Dict[str, str] = {
     "yolo-v9-384":  "none",
 }
 
+_DEFAULT_OCR_WEIGHTS: Dict[str, str] = {
+    "trocr":        "weights/trocr_small_finetuned.pt",
+    "cct":          _os.path.expanduser("~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"),
+    "lprnet":       "weights/lprnet_deployable_onnx_v1.1/us_lprnet_patched.onnx",
+    "doctr-vitstr": "weights/vitstr_small_finetuned.pt",
+}
+
 
 def _infer_backend(patch_path: str) -> Tuple[str, str]:
-    """Infer backend name and default weights from a patch filename.
+    """Infer detector backend name and default weights from a patch path.
 
-    Expects filenames like patch_BACKEND_*.png produced by the trainer.
+    Looks for known backend names in the filename and parent directory.
     Returns (backend_name, weights_path).
     """
-    stem = Path(patch_path).stem          # e.g. patch_rtdetr_best
+    search = str(patch_path)
+    stem   = Path(patch_path).stem          # e.g. patch_rtdetr_best
+
+    # Try progressively longer token combinations from the filename
     parts = stem.split("_")
-    if len(parts) < 2 or parts[0] != "patch":
-        raise ValueError(
-            f"Cannot infer backend from '{patch_path}'. "
-            "Use --pairs patch:backend:weights instead."
-        )
-    # Backend name follows the leading 'patch_' and may itself contain '_'
-    # Try progressively longer candidate names against the known-weights table.
-    for end in range(len(parts), 1, -1):
-        candidate = "_".join(parts[1:end])
-        if candidate in _DEFAULT_WEIGHTS:
-            weights = _DEFAULT_WEIGHTS[candidate]
-            return candidate, weights
-    # Fall back to everything between 'patch_' and the last token
-    backend = "_".join(parts[1:-1]) if len(parts) > 2 else parts[1]
+    if len(parts) >= 2 and parts[0] == "patch":
+        for end in range(len(parts), 1, -1):
+            candidate = "_".join(parts[1:end])
+            if candidate in _DEFAULT_WEIGHTS:
+                return candidate, _DEFAULT_WEIGHTS[candidate]
+
+    # Fall back: scan full path string for any known backend name
+    for name, weights in _DEFAULT_WEIGHTS.items():
+        if name in search:
+            return name, weights
+
     raise ValueError(
-        f"Unknown backend '{backend}' inferred from '{patch_path}'. "
+        f"Cannot infer detector backend from '{patch_path}'. "
         f"Known backends: {list(_DEFAULT_WEIGHTS)}. "
-        "Use --pairs patch:backend:weights to specify explicitly."
+        "Use --pairs patch:det:det_weights:ocr:ocr_weights instead."
     )
+
+
+def _infer_ocr_backend(patch_path: str) -> Optional[Tuple[str, str]]:
+    """Try to infer OCR backend from patch path. Returns (name, weights) or None."""
+    search = str(patch_path)
+    for name, weights in _DEFAULT_OCR_WEIGHTS.items():
+        if name in search:
+            return name, weights
+    return None
 
 
 def main() -> None:
@@ -327,6 +393,10 @@ def main() -> None:
     parser.add_argument("--scale", type=float, default=0.5,
                         help="Resize images by this factor before evaluation (default: 0.5).")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument("--expected-plate", default="VRJ7774",
+                        help="Correct plate text for OCR categorisation (default: VRJ7774).")
+    parser.add_argument("--impersonation-target", default="VJJ7744",
+                        help="Impersonation target for OCR categorisation (default: VJJ7744).")
     parser.add_argument("--output", default="results/",
                         help="Output directory (default: results/)")
     args = parser.parse_args()
@@ -341,47 +411,80 @@ def main() -> None:
     df = pd.read_csv(args.csv)
     print(f"[eval_physical] {len(df)} images loaded from {args.csv}")
 
-    pairs: List[Tuple[str, str, str, dict]] = [_parse_pair(s) for s in args.pairs]
+    # Build pairs list: (patch_path, det_name, det_weights, ocr_name, ocr_weights)
+    pairs: List[Tuple] = [_parse_pair(s) for s in args.pairs]
     for patch_path in args.patches:
-        backend_name, weights_path = _infer_backend(patch_path)
-        print(f"[eval_physical] Inferred backend '{backend_name}' "
-              f"(weights: {weights_path}) for {patch_path}")
-        pairs.append((patch_path, backend_name, weights_path, {}))
+        det_name, det_weights = _infer_backend(patch_path)
+        ocr_info = _infer_ocr_backend(patch_path)
+        ocr_name, ocr_weights = ocr_info if ocr_info else (None, None)
+        print(f"[eval_physical] Inferred det='{det_name}' ocr='{ocr_name}' for {patch_path}")
+        pairs.append((patch_path, det_name, det_weights, ocr_name, ocr_weights))
 
-    # Build unique backends
-    seen: Dict[tuple, DetectorBackend] = {}
-    for _, bname, bpath, bkwargs in pairs:
-        key = (bname, bpath, tuple(sorted(bkwargs.items())))
-        if key not in seen:
-            seen[key] = build_backend(bname, bpath, device=args.device, **bkwargs)
+    # Build unique detector backends
+    seen_det: Dict[Tuple, DetectorBackend] = {}
+    for _, bname, bpath, _, _ in pairs:
+        key = (bname, bpath)
+        if key not in seen_det:
+            seen_det[key] = build_backend(bname, bpath, device=args.device)
 
-    # Load patches
-    patch_tensors: List[Tuple[str, Optional[torch.Tensor]]] = [("clean", None)]
-    for patch_path, _, _, _ in pairs:
+    # Build unique OCR backends
+    seen_ocr: Dict[Tuple, Optional[OCRBackend]] = {}
+    for _, _, _, ocr_name, ocr_weights in pairs:
+        if ocr_name is None:
+            continue
+        key = (ocr_name, ocr_weights)
+        if key not in seen_ocr:
+            ocr = build_ocr_backend(ocr_name, ocr_weights or "none", device=args.device)
+            ocr.load()
+            ocr.freeze()
+            seen_ocr[key] = ocr
+
+    # Load patches — associate each with its det+ocr backend
+    # patch_entries: list of (patch_name, patch_tensor, det_key, ocr_key)
+    patch_entries: List[Tuple] = [("clean", None, None, None)]
+    for patch_path, det_name, det_weights, ocr_name, ocr_weights in pairs:
         name   = Path(patch_path).stem
         tensor = _load_patch(patch_path, args.device)
-        patch_tensors.append((name, tensor))
-        print(f"[eval_physical] Loaded patch '{name}' from {patch_path}")
+        det_key = (det_name, det_weights)
+        ocr_key = (ocr_name, ocr_weights) if ocr_name else None
+        patch_entries.append((name, tensor, det_key, ocr_key))
+        print(f"[eval_physical] Loaded patch '{name}'  det={det_name}  ocr={ocr_name}")
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     samples = preload_images(df, args.device, args.scale, args.num_workers) if args.gpu_preload else None
 
-    # Evaluate: every backend × (clean + all patches)
+    # Evaluate: for clean run all detectors; for each patch use its paired detector
     all_results: List[BackendMetrics] = []
-    for (bname, bpath, bkwargs_t), backend in seen.items():
+
+    # Clean baseline — run every detector, no OCR
+    eval_data = samples if samples is not None else preload_images(df, args.device, args.scale, args.num_workers)
+    for det_key, backend in seen_det.items():
         backend.ensure_loaded()
         backend.freeze()
-        print(f"\n── Backend: {bname} ──")
+        m = evaluate_one(backend, eval_data, None, "clean",
+                         device=args.device, iou_threshold=args.iou_threshold)
+        all_results.append(m)
+        print(f"  {m.summary()}")
+
+    # Patch evaluations — use paired detector and OCR
+    for patch_name, patch_tensor, det_key, ocr_key in patch_entries:
+        if patch_name == "clean":
+            continue
+        backend = seen_det[det_key]
+        ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
         eval_data = samples if samples is not None else preload_images(df, args.device, args.scale, args.num_workers)
-        for patch_name, patch_tensor in patch_tensors:
-            m = evaluate_one(
-                backend, eval_data, patch_tensor, patch_name,
-                device=args.device, iou_threshold=args.iou_threshold,
-            )
-            all_results.append(m)
-            print(f"  {m.summary()}")
+        print(f"\n── Patch: {patch_name} | det={det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+        m = evaluate_one(
+            backend, eval_data, patch_tensor, patch_name,
+            device=args.device, iou_threshold=args.iou_threshold,
+            ocr_backend=ocr_backend,
+            expected_plate=args.expected_plate,
+            impersonation_target=args.impersonation_target,
+        )
+        all_results.append(m)
+        print(f"  {m.summary()}")
 
     # Save outputs via evaluator helpers
     from evaluator import DetectorEvaluator
