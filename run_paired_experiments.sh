@@ -23,7 +23,7 @@ set -euo pipefail
 # Defaults
 DEVICE="cuda"
 CSV="preproc_labels.csv"
-EPOCHS=100
+EPOCHS=120
 LR_MIN=1e-5
 # Per-OCR peak LR (tweak per model as needed)
 LR_TROCR=2e-4
@@ -31,11 +31,11 @@ LR_CCT=5e-4
 LR_LPRNET=5e-4
 LR_VITSTR=5e-4
 # Per-OCR TV weight (tweak per model as needed)
-TV_TROCR=0.5
+TV_TROCR=10
 TV_CCT=10
 TV_LPRNET=10
 TV_VITSTR=10
-GRAD_ACCUM=16
+GRAD_ACCUM=32
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
 PRELOAD_IMAGES=false

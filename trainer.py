@@ -987,7 +987,7 @@ class AdversarialPatchTrainer:
             print("\nDry run complete.")
             return {}
 
-        warmup_epochs = 5
+        warmup_epochs = 10
         eta_min       = lr_min
 
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
@@ -1036,7 +1036,12 @@ class AdversarialPatchTrainer:
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
+            # Disable TV loss during warmup so the patch can move freely early on
+            saved_tv = self.tv_weight
+            if epoch < warmup_epochs:
+                self.tv_weight = 0.0
             train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
+            self.tv_weight = saved_tv
             self.training  = False
             val_loss       = self.validate()
             scheduler.step()
