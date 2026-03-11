@@ -14,6 +14,7 @@
 #   chmod +x run_paired_experiments.sh
 #   ./run_paired_experiments.sh
 #   ./run_paired_experiments.sh --epochs 20 --device cuda --limit 64
+#   ./run_paired_experiments.sh --eval-batch-size 8 --compile   # batch GPU evals + compiled models
 #   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
 # =============================================================================
 
@@ -32,6 +33,9 @@ LIMIT=0
 DRY_RUN=false
 SKIP_SANITY=false
 GPU_PRELOAD=false
+
+EVAL_BATCH_SIZE=4
+COMPILE=false
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -62,6 +66,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)         DRY_RUN=true; shift ;;
         --skip-sanity)     SKIP_SANITY=true; shift ;;
         --gpu-preload)     GPU_PRELOAD=true; shift ;;
+        --eval-batch-size) EVAL_BATCH_SIZE="$2"; shift 2 ;;
+        --compile)         COMPILE=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -130,6 +136,7 @@ BASE_ARGS=(
     --lr "$LR"
     --grad-accumulate "$GRAD_ACCUM"
     --num-workers "$NUM_WORKERS"
+    --eval-batch-size "$EVAL_BATCH_SIZE"
 )
 
 if $PIN_MEMORY; then
@@ -147,6 +154,9 @@ fi
 if $GPU_PRELOAD; then
     BASE_ARGS+=(--gpu-preload)
 fi
+if $COMPILE; then
+    BASE_ARGS+=(--compile)
+fi
 
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights
@@ -158,6 +168,8 @@ PAIRS=(
 )
 
 # Removed: pair_fasterrcnn_dtrb (dtrb/ViTSTR checkpoint backend has not worked)
+
+EXTRA_ARGS=()
 
 log "━━━━  Paired Training  ━━━━"
 
