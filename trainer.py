@@ -198,7 +198,7 @@ class AdversarialPatchTrainer:
         training:             bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
-        tv_weight:            float          = 2.5,
+        tv_weight:            float          = 0.25,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -1059,7 +1059,7 @@ def main():
     parser.add_argument("--dry-run",    action="store_true")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check and debug image generation.")
-    parser.add_argument("--tv-weight", type=float, default=1.0,
+    parser.add_argument("--tv-weight", type=float, default=0.25,
                         help="Weight for total variation loss (default: 2.5).")
     args = parser.parse_args()
 
