@@ -1040,7 +1040,7 @@ def main():
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
-    backend.load()
+    backend.ensure_loaded()
 
     ocr_kwargs = {}
     if args.ocr_backend == "dtrb":
@@ -1051,7 +1051,7 @@ def main():
         ocr_kwargs["transformation"]     = args.dtrb_transformation
     ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path,
                              device=args.device, **ocr_kwargs)
-    ocr.load()
+    ocr.ensure_loaded()
 
     trainer = AdversarialPatchTrainer(
         detector             = backend,
