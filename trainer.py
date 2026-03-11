@@ -270,6 +270,7 @@ class AdversarialPatchTrainer:
         sam_m:                Optional[int]  = None,
         sam_rho:              float          = 0.025,
         skip_sanity:          bool           = False,
+        augment:              bool           = False,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -280,6 +281,7 @@ class AdversarialPatchTrainer:
         self.sam_m                = sam_m
         self.sam_rho              = sam_rho
         self.print_blur           = print_blur
+        self.augment              = augment
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
         self.impersonation_target = impersonation_target
@@ -632,6 +634,58 @@ class AdversarialPatchTrainer:
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         return (tv_h + tv_v) / num_comparisons
 
+    def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable photometric augmentation on a [1, C, H, W] image in [0, 1].
+        Applied after patch compositing so the patch must be robust to all transforms.
+        Autograd graph is fully preserved — gradients still flow back to the decoder.
+
+        Transforms applied every call with independently resampled parameters:
+          1. Brightness       — U(0.5, 1.5) multiplicative scale
+          2. Contrast         — U(0.7, 1.3) scale around channel mean
+          3. Saturation       — U(0.5, 1.5) via kornia
+          4. Color temperature — U(-0.2, 0.2) shift: warm (+) boosts R, reduces B;
+                                 cool (-) does the opposite
+          5. Directional shadow — random angle U(0, 360°), intensity U(0.1, 0.4),
+                                  linear gradient mask across the image
+        """
+        # Brightness
+        factor = random.uniform(0.5, 1.5)
+        image = image * factor
+
+        # Contrast
+        factor = random.uniform(0.7, 1.3)
+        mean   = image.mean()
+        image  = (image - mean) * factor + mean
+
+        # Saturation
+        factor = random.uniform(0.5, 1.5)
+        image  = kornia.enhance.adjust_saturation(image, factor)
+
+        # Color temperature: single shift drives R and B in opposite directions
+        shift      = random.uniform(-0.2, 0.2)
+        temp_scale = torch.tensor(
+            [1.0 + shift * 0.3, 1.0, 1.0 - shift * 0.3],
+            dtype=image.dtype, device=self.device,
+        ).view(1, 3, 1, 1)
+        image = image * temp_scale
+
+        # Directional shadow: linear gradient at a random angle
+        angle_deg = random.uniform(0.0, 360.0)
+        intensity = random.uniform(0.1, 0.4)
+        H, W      = image.shape[-2], image.shape[-1]
+        xs        = torch.linspace(0.0, 1.0, W, device=self.device)
+        ys        = torch.linspace(0.0, 1.0, H, device=self.device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")   # [H, W]
+        cos_a     = float(np.cos(np.radians(angle_deg)))
+        sin_a     = float(np.sin(np.radians(angle_deg)))
+        gradient  = grid_x * cos_a + grid_y * sin_a               # [H, W]
+        gradient  = (gradient - gradient.min()) / (gradient.max() - gradient.min() + 1e-6)
+        shadow    = 1.0 - gradient * intensity                     # [H, W]
+        image     = image * shadow.unsqueeze(0).unsqueeze(0)
+
+        return torch.clamp(image, 0.0, 1.0)
+
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
         orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
@@ -648,6 +702,10 @@ class AdversarialPatchTrainer:
 
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0), patch_norm=patch_norm)
+
+        if self.augment:
+            patched_orig = self._augment_image(patched_orig)
+
         patched_prep_chw, new_corners_np = self.diff_prep(
             patched_orig.squeeze(0), orig_corners_np)
         new_corners = torch.from_numpy(new_corners_np).to(self.device)
@@ -683,8 +741,7 @@ class AdversarialPatchTrainer:
         ocr_losses  = self.ocr.differentiable_loss_batch(
             ocr_crops, target_text, impersonation=bool(self.impersonation_target))
 
-        effective_det_scale = self.det_loss_scale * (2.0 if self.ocr.name == "trocr" else 1.0)
-        det_l = torch.stack(det_losses).mean() * effective_det_scale
+        det_l = torch.stack(det_losses).mean() * self.det_loss_scale
         ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
         tv_l  = self.total_variation_loss(patch_norm)
         if self.disable_disruption:
@@ -1351,6 +1408,10 @@ def main():
     parser.add_argument("--sam-rho", type=float, default=0.025,
                         help="SAM perturbation radius rho (default 0.025). "
                              "Only used when --sam-m is set.")
+    parser.add_argument("--augment", action="store_true",
+                        help="Apply differentiable photometric augmentations (brightness, "
+                             "contrast, saturation, color temperature, directional shadow) "
+                             "after patch application at each training step.")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the detector and OCR models (PyTorch 2.0+, "
                              "gradients still flow through compiled models).")
@@ -1404,6 +1465,7 @@ def main():
         sam_m                = args.sam_m,
         sam_rho              = args.sam_rho,
         skip_sanity          = args.skip_sanity,
+        augment              = args.augment,
     )
 
     trainer.train(
