@@ -1321,7 +1321,7 @@ class Yolov9TorchBackend(DetectorBackend):
         padded   = F.pad(resized,
                          (pad_left, size - new_w - pad_left,
                           pad_top,  size - new_h - pad_top),
-                         value=0.5)
+                         value=114 / 255)   # standard YOLO letterbox gray
         return padded, scale, pad_left, pad_top
 
     def predict(self, image: torch.Tensor) -> List[Detection]:
