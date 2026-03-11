@@ -30,6 +30,11 @@ LR_TROCR=2e-4
 LR_CCT=5e-4
 LR_LPRNET=5e-4
 LR_VITSTR=5e-4
+# Per-OCR TV weight (tweak per model as needed)
+TV_TROCR=2
+TV_CCT=10
+TV_LPRNET=10
+TV_VITSTR=10
 GRAD_ACCUM=64
 NUM_WORKERS=$(nproc)
 PIN_MEMORY=false
@@ -67,6 +72,10 @@ while [[ $# -gt 0 ]]; do
         --lr-lprnet)       LR_LPRNET="$2"; shift 2 ;;
         --lr-vitstr)       LR_VITSTR="$2"; shift 2 ;;
         --lr-min)          LR_MIN="$2"; shift 2 ;;
+        --tv-trocr)        TV_TROCR="$2"; shift 2 ;;
+        --tv-cct)          TV_CCT="$2"; shift 2 ;;
+        --tv-lprnet)       TV_LPRNET="$2"; shift 2 ;;
+        --tv-vitstr)       TV_VITSTR="$2"; shift 2 ;;
         --grad-accumulate) GRAD_ACCUM="$2"; shift 2 ;;
         --num-workers)     NUM_WORKERS="$2"; shift 2 ;;
         --pin-memory)      PIN_MEMORY=true; shift ;;
@@ -196,16 +205,17 @@ for row in "${PAIRS[@]}"; do
     fi
 
     case "$ocr" in
-        trocr)        pair_lr="$LR_TROCR" ;;
-        cct)          pair_lr="$LR_CCT" ;;
-        lprnet)       pair_lr="$LR_LPRNET" ;;
-        doctr-vitstr) pair_lr="$LR_VITSTR" ;;
+        trocr)        pair_lr="$LR_TROCR"; pair_tv="$TV_TROCR" ;;
+        cct)          pair_lr="$LR_CCT";   pair_tv="$TV_CCT" ;;
+        lprnet)       pair_lr="$LR_LPRNET"; pair_tv="$TV_LPRNET" ;;
+        doctr-vitstr) pair_lr="$LR_VITSTR"; pair_tv="$TV_VITSTR" ;;
     esac
 
     run "$label" \
         python trainer.py \
             "${BASE_ARGS[@]}" \
             --lr "$pair_lr" \
+            --tv-weight "$pair_tv" \
             --backend "$det" \
             --model-path "$det_w" \
             --ocr-backend "$ocr" \
