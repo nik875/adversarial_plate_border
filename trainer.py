@@ -198,7 +198,7 @@ class AdversarialPatchTrainer:
         training:             bool           = False,
         use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
-        tv_weight:            float          = 1000.0,
+        tv_weight:            float          = 100.0,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
