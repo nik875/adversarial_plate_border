@@ -31,6 +31,7 @@ PRELOAD_IMAGES=false
 LIMIT=0
 DRY_RUN=false
 SKIP_SANITY=false
+GPU_PRELOAD=false
 
 PATCH_DIR="patches"
 LOG_DIR="logs"
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --limit)           LIMIT="$2"; shift 2 ;;
         --dry-run)         DRY_RUN=true; shift ;;
         --skip-sanity)     SKIP_SANITY=true; shift ;;
+        --gpu-preload)     GPU_PRELOAD=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -141,6 +143,9 @@ if [[ "$LIMIT" -gt 0 ]]; then
 fi
 if $SKIP_SANITY; then
     BASE_ARGS+=(--skip-sanity)
+fi
+if $GPU_PRELOAD; then
+    BASE_ARGS+=(--gpu-preload)
 fi
 
 # Pair rows:

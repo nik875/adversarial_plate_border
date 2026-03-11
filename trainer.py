@@ -193,6 +193,7 @@ class AdversarialPatchTrainer:
         csv_path:             str            = "preproc_labels.csv",
         seed_channels:        int            = 128,
         preload_images:       bool           = False,
+        gpu_preload:          bool           = False,
         num_workers:          int            = 0,
         pin_memory:           bool           = False,
         limit:                int            = 0,
@@ -256,9 +257,10 @@ class AdversarialPatchTrainer:
             csv_path,
             transform=self.transform,
             preload=preload_images,
+            gpu_device=self.device if gpu_preload else None,
             batch_size=1,
-            n_jobs=num_workers,
-            pin_memory=pin_memory,
+            n_jobs=0 if gpu_preload else num_workers,
+            pin_memory=False if gpu_preload else pin_memory,
             limit=limit,
             use_all_for_train=use_all_for_train,
             use_original=True,
@@ -1048,6 +1050,8 @@ def main():
     parser.add_argument("--lr",       type=float, default=1.5e-3)
     parser.add_argument("--grad-accumulate", type=int, default=64)
     parser.add_argument("--preload-images",  action="store_true")
+    parser.add_argument("--gpu-preload",     action="store_true",
+                        help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
     parser.add_argument("--num-workers",     type=int, default=0)
     parser.add_argument("--pin-memory",      action="store_true")
     parser.add_argument("--limit",           type=int, default=0)
@@ -1083,6 +1087,7 @@ def main():
         csv_path             = args.csv,
         seed_channels        = args.seed_channels,
         preload_images       = args.preload_images,
+        gpu_preload          = args.gpu_preload,
         num_workers          = args.num_workers,
         pin_memory           = args.pin_memory,
         limit                = args.limit,

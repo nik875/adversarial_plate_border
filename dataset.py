@@ -160,12 +160,14 @@ def letterbox_preprocess(img: np.ndarray, corners: np.ndarray, homography: np.nd
 
 class AdversarialPatchDataset(Dataset):
     def __init__(self, df, transform=None, preload=False, target_size=384,
-                 use_original: bool = False):
+                 use_original: bool = False, gpu_device=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform or T.ToTensor()
-        self.preload = preload
+        self.preload = preload or (gpu_device is not None)
         self.target_size = target_size
         self.use_original = use_original
+        self.gpu_device = gpu_device
+        self._gpu_cache = None
 
         # When use_original=True, always ignore preprocessed_filename
         if use_original:
@@ -219,10 +221,23 @@ class AdversarialPatchDataset(Dataset):
         else:
             self.preloaded_images = None
 
+        if gpu_device is not None:
+            assert self.preload, "gpu_device requires preload=True"
+            self._gpu_cache = []
+            for idx in tqdm(range(len(self.df)), desc=f"Transferring dataset to {gpu_device}"):
+                item = self[idx]  # CPU tensors via normal __getitem__
+                self._gpu_cache.append({
+                    k: (v.to(gpu_device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in item.items()
+                })
+
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
+        if self._gpu_cache is not None:
+            return self._gpu_cache[idx]
+
         row = self.df.iloc[idx]
 
         # Load images - from memory if preloaded, from disk otherwise
@@ -331,7 +346,7 @@ class AdversarialPatchDataset(Dataset):
 def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=0.8,
                        n_jobs=1, limit=0, use_all_for_train=False,
                        use_original: bool = False,
-                       pin_memory=True, **kwargs):
+                       pin_memory=True, gpu_device=None, **kwargs):
     """Create train and validation DataLoaders
 
     Args:
@@ -342,8 +357,15 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         limit: Limit number of samples (0 = no limit)
         use_all_for_train: If True, use all data for training (val_loader will be empty)
         pin_memory: Enable DataLoader pinned memory (useful for CUDA, but can increase RAM pressure)
+        gpu_device: If set, preload entire dataset as GPU tensors (implies preload=True, n_jobs=0)
         **kwargs: Additional arguments passed to AdversarialPatchDataset
     """
+    if gpu_device is not None:
+        if n_jobs > 0:
+            raise ValueError("gpu_device requires n_jobs=0 (tensors cannot be shared across workers)")
+        kwargs["preload"] = True
+        pin_memory = False  # data is already on GPU
+
     preload = kwargs.get("preload", False)
     if preload and n_jobs > 0:
         raise ValueError(
@@ -371,8 +393,8 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Create datasets
-    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, **kwargs)
-    val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, **kwargs)
+    train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, gpu_device=gpu_device, **kwargs)
+    val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, gpu_device=gpu_device, **kwargs)
 
     # Create dataloaders
     train_loader = DataLoader(
