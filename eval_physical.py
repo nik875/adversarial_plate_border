@@ -230,21 +230,6 @@ def _plate_text_matches(text: str, expected: str) -> bool:
     return norm(text) == norm(expected)
 
 
-def _ocr_crop(image: torch.Tensor, corners: torch.Tensor,
-              crop_size: Tuple) -> torch.Tensor:
-    """Axis-aligned bbox crop + resize for OCR. image: [C,H,W], corners: [4,2]."""
-    h, w = image.shape[1], image.shape[2]
-    x1 = corners[:, 0].min().long().clamp(0, w - 1)
-    y1 = corners[:, 1].min().long().clamp(0, h - 1)
-    x2 = corners[:, 0].max().long().clamp(0, w)
-    y2 = corners[:, 1].max().long().clamp(0, h)
-    crop = image[:, y1:y2, x1:x2].unsqueeze(0)   # [1, C, ch, cw]
-    th, tw = crop_size
-    if tw is None:
-        ch, cw = crop.shape[2], crop.shape[3]
-        tw = max(1, int(th * cw / ch))
-    return F.interpolate(crop, (th, tw), mode="bilinear", align_corners=False)
-
 
 def evaluate_one(backend: DetectorBackend,
                  samples: List[Tuple],
@@ -276,11 +261,13 @@ def evaluate_one(backend: DetectorBackend,
             m.total_detections += len(dets)
 
             best_iou = best_conf = 0.0
+            best_det = None
             for det in dets:
                 iou = _iou(det.box, gt_box)
                 if iou > best_iou:
                     best_iou  = iou
                     best_conf = det.confidence
+                    best_det  = det
 
             m.iou_values.append(best_iou)
             m.conf_values.append(best_conf)
@@ -289,12 +276,24 @@ def evaluate_one(backend: DetectorBackend,
             else:
                 m.false_negatives += 1
 
-            # OCR evaluation (on labeled corners regardless of detection)
+            # OCR evaluation — crop from the detector's predicted box (matches training),
+            # not GT corners (which exclude the adversarial border entirely).
             if ocr_backend is not None:
-                if not dets:
+                if best_det is None:
                     m.ocr_no_detection += 1
                 else:
-                    crop = _ocr_crop(image, corners, ocr_backend.ocr_crop_size)
+                    h, w = image.shape[1], image.shape[2]
+                    bx = best_det.box
+                    x1 = int(bx[0].clamp(0, w - 1).item())
+                    y1 = int(bx[1].clamp(0, h - 1).item())
+                    x2 = int(bx[2].clamp(0, w).item())
+                    y2 = int(bx[3].clamp(0, h).item())
+                    th, tw = ocr_backend.ocr_crop_size
+                    raw = image[:, y1:y2, x1:x2].unsqueeze(0)
+                    if tw is None:
+                        ch, cw = raw.shape[2], raw.shape[3]
+                        tw = max(1, int(th * cw / max(ch, 1)))
+                    crop = F.interpolate(raw, (th, tw), mode="bilinear", align_corners=False)
                     result = ocr_backend.predict(crop.squeeze(0))
                     text = result.text or ""
                     if expected_plate and _plate_text_matches(text, expected_plate):
