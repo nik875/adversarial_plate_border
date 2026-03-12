@@ -824,48 +824,46 @@ class AdversarialPatchTrainer:
         target_text  = self.impersonation_target or self.expected_plate_text
         tv_l         = self.total_variation_loss(patch_norm)
 
-        if self.disable_disruption:
-            # No detector call: use ground-truth OCR crops as fallback
-            ocr_crops  = [x["ocr_crop"] for x in items]
-            ocr_losses = self.ocr.differentiable_loss_batch(
-                ocr_crops, target_text, impersonation=bool(self.impersonation_target))
-            det_l = torch.zeros(1, device=self.device).squeeze()
-            ocr_l = torch.stack(ocr_losses).mean() * self.ocr_loss_scale
-            total = ocr_l + self.tv_weight * tv_l
-        else:
-            # Detection enabled: chain detector → OCR through predicted box.
-            # When the plate is detected we crop at the predicted location so
-            # the OCR gradient also flows through the detection head.
-            # When no plate is detected the attack is already succeeding on
-            # detection; det_i ≈ 0 with gradient, so the optimizer stays there.
-            det_results = self.detector.differentiable_predict_box_batch(
-                batched_prep, target_boxes)
+        det_results = self.detector.differentiable_predict_box_batch(
+            batched_prep, target_boxes)
 
-            image_losses, det_l_list, ocr_l_list = [], [], []
-            for i, (conf_loss, pred_box) in enumerate(det_results):
-                det_i = conf_loss * self.det_loss_scale
-                if pred_box is not None:
-                    diff_crop = _bbox_ocr_crop_diff(
-                        items[i]["patched_prep"].unsqueeze(0),
-                        pred_box.to(self.device),
-                        self.ocr.ocr_crop_size,
-                    )
+        image_losses, det_l_list, ocr_l_list = [], [], []
+        for i, (conf_loss, pred_box) in enumerate(det_results):
+            det_i = conf_loss * self.det_loss_scale
+            if pred_box is not None:
+                diff_crop = _bbox_ocr_crop_diff(
+                    items[i]["patched_prep"].unsqueeze(0),
+                    pred_box.to(self.device),
+                    self.ocr.ocr_crop_size,
+                )
+                ocr_i = self.ocr.differentiable_loss_batch(
+                    [diff_crop], target_text,
+                    impersonation=bool(self.impersonation_target),
+                )[0] * self.ocr_loss_scale
+                if self.disable_disruption:
+                    image_losses.append(ocr_i)
+                else:
+                    image_losses.append((det_i + ocr_i) / 2)
+                ocr_l_list.append(ocr_i.detach())
+            else:
+                if self.disable_disruption:
+                    # No detection but disruption not our goal: fall back to GT
+                    # crop so OCR attack still receives gradient signal.
                     ocr_i = self.ocr.differentiable_loss_batch(
-                        [diff_crop], target_text,
+                        [items[i]["ocr_crop"]], target_text,
                         impersonation=bool(self.impersonation_target),
                     )[0] * self.ocr_loss_scale
-                    image_losses.append((det_i + ocr_i) / 2)
+                    image_losses.append(ocr_i)
                     ocr_l_list.append(ocr_i.detach())
                 else:
-                    # No valid predicted box: attack has succeeded on detection,
-                    # nothing left to optimize for this image.
+                    # Detection is the goal: no valid box means attack succeeded.
                     image_losses.append(torch.zeros(1, device=self.device).squeeze())
                     ocr_l_list.append(torch.zeros(1, device=self.device).squeeze())
-                det_l_list.append(det_i.detach())
+            det_l_list.append(det_i.detach())
 
-            total = torch.stack(image_losses).mean() + self.tv_weight * tv_l
-            det_l = torch.stack(det_l_list).mean()
-            ocr_l = torch.stack(ocr_l_list).mean()
+        total = torch.stack(image_losses).mean() + self.tv_weight * tv_l
+        det_l = torch.stack(det_l_list).mean()
+        ocr_l = torch.stack(ocr_l_list).mean()
 
         return total, det_l.detach(), ocr_l.detach(), (self.tv_weight * tv_l).detach()
 
