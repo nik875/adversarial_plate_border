@@ -55,12 +55,34 @@ from evaluator import BackendMetrics
 # ---------------------------------------------------------------------------
 
 def _load_patch(path: str, device: str) -> torch.Tensor:
-    """Load a patch PNG/JPG or .pt checkpoint → [3, H, W] float32 in [0, 1]."""
+    """Load a patch PNG/JPG or .pt checkpoint → [3, H, W] float32 in [0, 1].
+
+    .pt checkpoints may contain a pre-rendered "patch" tensor (saved by
+    trainer.py after the fix) or the raw seed+decoder weights (older
+    checkpoints), in which case the decoder is reconstructed and run.
+    """
     p = Path(path)
     if p.suffix == ".pt":
         ckpt = torch.load(path, map_location="cpu")
-        raw = ckpt.get("patch", ckpt)
-        patch = (torch.tanh(raw) * 0.5 + 0.5).clamp(0, 1)
+        if "patch" in ckpt and isinstance(ckpt["patch"], torch.Tensor):
+            # Legacy or future format with pre-rendered patch tensor
+            patch = ckpt["patch"].float().clamp(0, 1)
+        elif "seed" in ckpt and "decoder" in ckpt:
+            # Standard trainer.py format: reconstruct via decoder
+            from trainer import PatchDecoder
+            seed_ch = ckpt.get("seed_channels", 32)
+            ph, pw  = ckpt.get("patch_size", (256, 512))
+            decoder = PatchDecoder(seed_ch, ph, pw)
+            decoder.load_state_dict(ckpt["decoder"])
+            decoder.eval()
+            with torch.no_grad():
+                # PatchDecoder.forward already applies tanh*0.5+0.5 → [0,1]
+                patch = decoder(ckpt["seed"].unsqueeze(0)).squeeze(0).clamp(0, 1)
+        else:
+            raise ValueError(
+                f"Unrecognised .pt format in '{path}'. "
+                "Expected keys 'seed'+'decoder' or 'patch'."
+            )
     else:
         img = Image.open(path).convert("RGB")
         patch = T.ToTensor()(img)

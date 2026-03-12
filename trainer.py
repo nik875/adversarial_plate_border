@@ -896,6 +896,7 @@ class AdversarialPatchTrainer:
                 "backend":       self.detector.name,
                 "ocr":           self.ocr.name,
                 "patch_size":    (self.patch_height, self.patch_width),
+                "patch":         patch_img.cpu(),   # rendered tensor (incl. print_blur)
             }, str(save_dir / f"{stem}.pt"))
 
     # ====================================================================
