@@ -189,7 +189,7 @@ def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
 
 def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
                    num_workers: int = 0) -> List[Tuple]:
-    """Load all images and corners to GPU once. Returns list of (image, corners, gt_box)."""
+    """Load all images and corners to GPU once. Returns list of (image, corners, gt_box, filename)."""
     import os
     from concurrent.futures import ThreadPoolExecutor
     to_tensor = T.ToTensor()
@@ -200,10 +200,11 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
 
     def _load_one(args):
         idx, row = args
+        fname = row["filename"]
         try:
-            pil_img = Image.open(row["filename"]).convert("RGB")
+            pil_img = Image.open(fname).convert("RGB")
         except Exception as e:
-            print(f"  [warn] could not load {row['filename']}: {e}")
+            print(f"  [warn] could not load {fname}: {e}")
             return idx, None
         if scale != 1.0:
             new_w = int(pil_img.width * scale)
@@ -217,7 +218,7 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
             [row["p3_x"], row["p3_y"]],
             [row["p4_x"], row["p4_y"]],
         ], dtype=torch.float32) * scale
-        return idx, (image, corners)
+        return idx, (image, corners, fname)
 
     samples = []
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
@@ -232,13 +233,13 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
             for f in futs:
                 idx, data = f.result()
                 if data is not None:
-                    image, corners = data
+                    image, corners, fname = data
                     corners_gpu = corners.to(device)
                     gt_box = torch.stack([
                         corners_gpu[:, 0].min(), corners_gpu[:, 1].min(),
                         corners_gpu[:, 0].max(), corners_gpu[:, 1].max(),
                     ])
-                    samples.append((image.to(device), corners_gpu, gt_box))
+                    samples.append((image.to(device), corners_gpu, gt_box, fname))
                 pbar.update(1)
             del futs  # free all Futures + their cached CPU tensors
         pbar.close()
@@ -252,6 +253,35 @@ def _plate_text_matches(text: str, expected: str) -> bool:
     return norm(text) == norm(expected)
 
 
+def _parse_filename_meta(filename: str) -> dict:
+    """Extract time_of_day, x, y from a physical-world test path.
+
+    Expected structure:
+      .../organized/{time_of_day}/.../{y_dir}/x_{±XX}_y_{YY}.ext
+
+    Returns dict with keys time_of_day (str), x (int), y (int).
+    All values are None if the path doesn't match the expected structure.
+    """
+    import re as _re
+    parts = Path(filename).parts
+    # Find "organized" anchor
+    try:
+        org_idx = next(i for i, p in enumerate(parts) if p == "organized")
+        time_of_day = parts[org_idx + 1]
+    except (StopIteration, IndexError):
+        time_of_day = None
+
+    stem = Path(filename).stem   # e.g. "x_+00_y_05"
+    m = _re.match(r"x_([+-]?\d+)_y_(\d+)", stem)
+    if m:
+        x = int(m.group(1))
+        y = int(m.group(2))
+    else:
+        x = y = None
+
+    return {"time_of_day": time_of_day, "x": x, "y": y}
+
+
 
 def evaluate_one(backend: DetectorBackend,
                  samples: List[Tuple],
@@ -261,9 +291,16 @@ def evaluate_one(backend: DetectorBackend,
                  iou_threshold: float = 0.5,
                  ocr_backend: Optional[OCRBackend] = None,
                  expected_plate: str = "",
-                 impersonation_target: str = "") -> BackendMetrics:
-    """Evaluate a single backend × patch combo over preloaded samples."""
+                 impersonation_target: str = "",
+                 condition: str = "") -> Tuple[BackendMetrics, List[dict]]:
+    """Evaluate a single backend × patch combo over preloaded samples.
+
+    Returns (BackendMetrics, per_image_rows) where per_image_rows is a list
+    of dicts compatible with the full_results_largedet.csv schema used by
+    the publication_figures scripts.
+    """
     m = BackendMetrics(name=backend.name, patch_name=patch_name)
+    per_image_rows: List[dict] = []
     backend.eval()
     if ocr_backend is not None:
         ocr_backend.ensure_loaded()
@@ -271,7 +308,7 @@ def evaluate_one(backend: DetectorBackend,
 
     with torch.no_grad():
         pbar = tqdm(samples, desc=f"  {backend.name} | {patch_name}", leave=False)
-        for image, corners, gt_box in pbar:
+        for image, corners, gt_box, filename in pbar:
             if patch is not None:
                 image = _apply_patch(image, corners, patch)
 
@@ -300,6 +337,7 @@ def evaluate_one(backend: DetectorBackend,
 
             # OCR evaluation — crop from the detector's predicted box (matches training),
             # not GT corners (which exclude the adversarial border entirely).
+            detected_plate_text: Optional[str] = None
             if ocr_backend is not None:
                 if best_det is None:
                     m.ocr_no_detection += 1
@@ -318,6 +356,7 @@ def evaluate_one(backend: DetectorBackend,
                     crop = F.interpolate(raw, (th, tw), mode="bilinear", align_corners=False)
                     result = ocr_backend.predict(crop.squeeze(0))
                     text = result.text or ""
+                    detected_plate_text = text
                     if expected_plate and _plate_text_matches(text, expected_plate):
                         m.ocr_correct += 1
                     elif impersonation_target and _plate_text_matches(text, impersonation_target):
@@ -329,7 +368,24 @@ def evaluate_one(backend: DetectorBackend,
                 rate = m.ocr_correct / ocr_seen if ocr_seen else 0.0
                 pbar.set_postfix(correct=f"{m.ocr_correct}/{ocr_seen} ({rate:.1%})")
 
-    return m
+            # Collect per-image row for publication CSV
+            meta = _parse_filename_meta(filename)
+            per_image_rows.append({
+                "filename":                 filename,
+                "patch_name":               patch_name,
+                "backend":                  backend.name,
+                "condition":                condition,
+                "time_of_day":              meta["time_of_day"],
+                "x":                        meta["x"],
+                "y":                        meta["y"],
+                "any_plate_detected":       best_det is not None,
+                "best_iou":                 best_iou,
+                "detected_plate_confidence": best_conf if best_det is not None else float("nan"),
+                "detected_plate_text":      detected_plate_text,
+                "detection_text":           detected_plate_text,  # alias used by some scripts
+            })
+
+    return m, per_image_rows
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +588,14 @@ def main() -> None:
         if patch_name != "clean":
             patches_by_det[det_key].append((patch_name, patch_tensor, ocr_key))
 
-    all_results: List[BackendMetrics] = []
+    all_results:    List[BackendMetrics] = []
+    all_image_rows: List[dict]           = []
+
+    # Determine patch condition label for publication CSV
+    def _condition_label(pname: str) -> str:
+        if pname == "clean":
+            return "control"
+        return "impersonation" if args.impersonation_target else "disruption"
 
     for det_key, backend in seen_det.items():
         backend.ensure_loaded()
@@ -548,23 +611,27 @@ def main() -> None:
         for patch_name, patch_tensor, ocr_key in patches_by_det.get(det_key, []):
             ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
             print(f"\n── Patch: {patch_name} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
-            m = evaluate_one(
+            m, rows = evaluate_one(
                 backend, samples, patch_tensor, patch_name,
                 device=args.device, iou_threshold=args.iou_threshold,
                 ocr_backend=ocr_backend,
                 expected_plate=args.expected_plate,
                 impersonation_target=args.impersonation_target,
+                condition=_condition_label(patch_name),
             )
             all_results.append(m)
+            all_image_rows.extend(rows)
             print(f"  {m.summary()}")
 
         print(f"\n── clean | ocr={clean_ocr_key[0] if clean_ocr_key else 'none'} ──")
-        m = evaluate_one(backend, samples, None, "clean",
-                         device=args.device, iou_threshold=args.iou_threshold,
-                         ocr_backend=clean_ocr,
-                         expected_plate=args.expected_plate,
-                         impersonation_target=args.impersonation_target)
+        m, rows = evaluate_one(backend, samples, None, "clean",
+                               device=args.device, iou_threshold=args.iou_threshold,
+                               ocr_backend=clean_ocr,
+                               expected_plate=args.expected_plate,
+                               impersonation_target=args.impersonation_target,
+                               condition="control")
         all_results.append(m)
+        all_image_rows.extend(rows)
         print(f"  {m.summary()}")
 
     # Save outputs via evaluator helpers
@@ -575,6 +642,12 @@ def main() -> None:
     ev.save_summary_table(all_results, str(out_dir / "summary_table.txt"))
     ev.save_bar_chart(all_results,     str(out_dir / "bar_chart.png"))
     ev.save_matrix_heatmaps(all_results, str(out_dir))
+
+    # Per-image publication CSV (only meaningful for physical-world test set)
+    if not args.train and all_image_rows:
+        pub_csv = str(out_dir / "full_results_largedet.csv")
+        pd.DataFrame(all_image_rows).to_csv(pub_csv, index=False)
+        print(f"\n[eval_physical] Per-image CSV written to {pub_csv}")
 
 
 if __name__ == "__main__":
