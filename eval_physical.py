@@ -199,7 +199,7 @@ def sanity_check_backends(
 
     # Pick the first row from the CSV as the test image
     row = df.iloc[0]
-    img_path = row["image_path"]
+    img_path = row["filename"]
     try:
         from PIL import Image as _PILImage
         pil = _PILImage.open(img_path).convert("RGB")
