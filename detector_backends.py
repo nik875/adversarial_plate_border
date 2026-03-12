@@ -267,7 +267,7 @@ class DetectorBackend(abc.ABC):
             _box_iou_scalar(d.box.to(self.device).unsqueeze(0), box_t)
             * d.confidence
         ))
-        if _box_iou_scalar(best.box.to(self.device).unsqueeze(0), box_t).item() < 1e-6:
+        if _box_iou_scalar(best.box.to(self.device).unsqueeze(0), box_t) < 1e-6:
             return torch.tensor(0.0, device=self.device), None
         thresh = getattr(self, "conf_threshold", 0.25)
         if best.confidence < thresh:
