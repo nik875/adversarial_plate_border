@@ -45,7 +45,7 @@ except ImportError:
 import re
 import torch.nn.functional as F
 
-from detector_backends import DetectorBackend, build_backend
+from detector_backends import DetectorBackend, build_backend, OpenImageModelsBackend
 from ocr_backends import OCRBackend, build_ocr_backend
 from evaluator import BackendMetrics
 
@@ -551,7 +551,13 @@ def main() -> None:
     for _, bname, bpath, _, _ in pairs:
         key = (bname, bpath)
         if key not in seen_det:
-            seen_det[key] = build_backend(bname, bpath, device=args.device)
+            if bname == "yolo-v9-384":
+                # eval_physical doesn't need autograd — use the larger ONNX model
+                # for better detection quality and lower OCR misread rate.
+                seen_det[key] = OpenImageModelsBackend(
+                    "yolo-v9-c-640-license-plate-end2end", device=args.device)
+            else:
+                seen_det[key] = build_backend(bname, bpath, device=args.device)
 
     # Build unique OCR backends
     seen_ocr: Dict[Tuple, Optional[OCRBackend]] = {}
@@ -581,13 +587,6 @@ def main() -> None:
 
     samples = preload_images(df, args.device, args.scale, args.num_workers)
 
-    # Group patch entries by detector so we do clean+patches per backend in one shot
-    from collections import defaultdict
-    patches_by_det: Dict[Tuple, List] = defaultdict(list)
-    for patch_name, patch_tensor, det_key, ocr_key in patch_entries:
-        if patch_name != "clean":
-            patches_by_det[det_key].append((patch_name, patch_tensor, ocr_key))
-
     all_results:    List[BackendMetrics] = []
     all_image_rows: List[dict]           = []
 
@@ -597,24 +596,51 @@ def main() -> None:
             return "control"
         return "impersonation" if args.impersonation_target else "disruption"
 
-    for det_key, backend in seen_det.items():
+    # Default OCR for each detector key (first OCR paired with that detector)
+    backend_default_ocr: Dict[Tuple, Optional[Tuple]] = {}
+    for det_key in seen_det:
+        paired_for_det = [ok for _, _, dk, ok in patch_entries if dk == det_key]
+        backend_default_ocr[det_key] = paired_for_det[0] if paired_for_det else None
+
+    # Load and freeze all backends up front
+    for backend in seen_det.values():
         backend.ensure_loaded()
         backend.freeze()
 
-        # Use the first OCR backend paired with this detector for the clean baseline
-        paired = patches_by_det.get(det_key, [])
-        clean_ocr_key = paired[0][2] if paired else None
-        clean_ocr = seen_ocr.get(clean_ocr_key) if clean_ocr_key else None
+    # Non-clean patches in input order
+    patch_list = [(n, t, dk, ok) for n, t, dk, ok in patch_entries if n != "clean"]
 
-        print(f"\n══ Backend: {det_key[0]} ══")
+    # For each patch: white-box (target detector) first, then all other detectors
+    for patch_name, patch_tensor, det_key, ocr_key in patch_list:
+        print(f"\n══ Patch: {patch_name} ══")
 
-        for patch_name, patch_tensor, ocr_key in patches_by_det.get(det_key, []):
-            ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
-            print(f"\n── Patch: {patch_name} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+        # White-box evaluation on the patch's own (target) detector
+        target_backend = seen_det[det_key]
+        ocr_backend    = seen_ocr.get(ocr_key) if ocr_key else None
+        print(f"\n── [white-box] {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+        m, rows = evaluate_one(
+            target_backend, samples, patch_tensor, patch_name,
+            device=args.device, iou_threshold=args.iou_threshold,
+            ocr_backend=ocr_backend,
+            expected_plate=args.expected_plate,
+            impersonation_target=args.impersonation_target,
+            condition=_condition_label(patch_name),
+        )
+        all_results.append(m)
+        all_image_rows.extend(rows)
+        print(f"  {m.summary()}")
+
+        # Black-box transfer evaluation on every other detector
+        for other_det_key, other_backend in seen_det.items():
+            if other_det_key == det_key:
+                continue
+            other_ocr_key = backend_default_ocr[other_det_key]
+            other_ocr     = seen_ocr.get(other_ocr_key) if other_ocr_key else None
+            print(f"\n── [black-box] {other_det_key[0]} | ocr={other_ocr_key[0] if other_ocr_key else 'none'} ──")
             m, rows = evaluate_one(
-                backend, samples, patch_tensor, patch_name,
+                other_backend, samples, patch_tensor, patch_name,
                 device=args.device, iou_threshold=args.iou_threshold,
-                ocr_backend=ocr_backend,
+                ocr_backend=other_ocr,
                 expected_plate=args.expected_plate,
                 impersonation_target=args.impersonation_target,
                 condition=_condition_label(patch_name),
@@ -623,13 +649,20 @@ def main() -> None:
             all_image_rows.extend(rows)
             print(f"  {m.summary()}")
 
-        print(f"\n── clean | ocr={clean_ocr_key[0] if clean_ocr_key else 'none'} ──")
-        m, rows = evaluate_one(backend, samples, None, "clean",
-                               device=args.device, iou_threshold=args.iou_threshold,
-                               ocr_backend=clean_ocr,
-                               expected_plate=args.expected_plate,
-                               impersonation_target=args.impersonation_target,
-                               condition="control")
+    # Clean baseline: all backends, no patch
+    print(f"\n══ Clean (no patch) ══")
+    for det_key, backend in seen_det.items():
+        ocr_key = backend_default_ocr[det_key]
+        ocr     = seen_ocr.get(ocr_key) if ocr_key else None
+        print(f"\n── clean | {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+        m, rows = evaluate_one(
+            backend, samples, None, "clean",
+            device=args.device, iou_threshold=args.iou_threshold,
+            ocr_backend=ocr,
+            expected_plate=args.expected_plate,
+            impersonation_target=args.impersonation_target,
+            condition="control",
+        )
         all_results.append(m)
         all_image_rows.extend(rows)
         print(f"  {m.summary()}")
