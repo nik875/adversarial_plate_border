@@ -941,10 +941,12 @@ class OpenImageModelsBackend(DetectorBackend):
     GPU:  pip install open-image-models[onnx-gpu]
 
     Available detector_model strings (pass via model_path):
-        yolo-v9-t-256-license-plate-end2end  (default, fastest)
-        yolo-v9-t-384-license-plate-end2end  (balanced)
-        yolo-v9-s-384-license-plate-end2end  (more accurate)
-        yolo-v9-c-384-license-plate-end2end  (most accurate)
+        yolo-v9-t-256-license-plate-end2end  (fastest)
+        yolo-v9-t-384-license-plate-end2end  (default, balanced)
+        yolo-v9-t-416-license-plate-end2end
+        yolo-v9-t-512-license-plate-end2end
+        yolo-v9-t-640-license-plate-end2end
+        yolo-v9-s-608-license-plate-end2end  (most accurate — small model)
 
     Pass the model string as model_path:
         OpenImageModelsBackend("yolo-v9-t-384-license-plate-end2end")

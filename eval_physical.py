@@ -555,7 +555,7 @@ def main() -> None:
                 # eval_physical doesn't need autograd — use the larger ONNX model
                 # for better detection quality and lower OCR misread rate.
                 seen_det[key] = OpenImageModelsBackend(
-                    "yolo-v9-c-640-license-plate-end2end", device=args.device)
+                    "yolo-v9-s-608-license-plate-end2end", device=args.device)
             else:
                 seen_det[key] = build_backend(bname, bpath, device=args.device)
 
