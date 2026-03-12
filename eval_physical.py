@@ -76,7 +76,12 @@ def _apply_patch(image: torch.Tensor,
                  patch: torch.Tensor,
                  border_scale: float = 1.4) -> torch.Tensor:
     """
-    Warp patch as a border around the licence plate at original resolution.
+    Warp patch as a border around the licence plate, matching trainer.py exactly:
+      1. Warp image border region → canonical (patch-canvas) space.
+      2. Build plate mask in canonical space.
+      3. Scale patch brightness to match plate region (same as training).
+      4. Composite patch ring + original plate pixels in canonical space.
+      5. Warp composite back to image space.
 
     Parameters
     ----------
@@ -86,36 +91,58 @@ def _apply_patch(image: torch.Tensor,
     """
     device = image.device
     img_h, img_w = image.shape[1], image.shape[2]
-    patch_h, patch_w = patch.shape[1], patch.shape[2]
+    ph, pw = patch.shape[1], patch.shape[2]
 
-    plate = corners.to(device)                       # [4, 2]
-    cx = plate[:, 0].mean()
-    cy = plate[:, 1].mean()
-    ctr = torch.stack([cx, cy])
+    plate  = corners.to(device)                       # [4, 2]
+    cx     = plate[:, 0].mean()
+    cy     = plate[:, 1].mean()
+    center = torch.stack([cx, cy])
 
-    border = (ctr.unsqueeze(0) + (plate - ctr.unsqueeze(0)) * border_scale
+    border = (center.unsqueeze(0) + (plate - center.unsqueeze(0)) * border_scale
               ).unsqueeze(0)                          # [1, 4, 2]
-    plate_b = plate.unsqueeze(0)                      # [1, 4, 2]
 
     src = torch.tensor(
-        [[0, 0], [patch_w, 0], [patch_w, patch_h], [0, patch_h]],
+        [[0, 0], [pw, 0], [pw, ph], [0, ph]],
         dtype=torch.float32, device=device,
     ).unsqueeze(0)                                    # [1, 4, 2]
 
-    M_border = K.get_perspective_transform(src, border)
-    M_plate  = K.get_perspective_transform(src, plate_b)
+    M_border       = K.get_perspective_transform(src, border)   # patch canvas → image border
+    M_to_canonical = K.get_perspective_transform(border, src)   # image border → patch canvas
 
-    batch   = image.unsqueeze(0)
-    ones    = torch.ones(1, 1, patch_h, patch_w, device=device)
-    dsize   = (img_h, img_w)
-    kwargs  = dict(mode="bilinear", padding_mode="zeros", align_corners=True)
+    batch  = image.unsqueeze(0)                       # [1, 3, H, W]
+    ones   = torch.ones(1, 1, ph, pw, device=device)
+    kwargs = dict(mode="bilinear", padding_mode="zeros", align_corners=True)
 
-    warped        = K.warp_perspective(patch.unsqueeze(0), M_border, dsize, **kwargs)
-    w_border_mask = K.warp_perspective(ones,               M_border, dsize, **kwargs)
-    w_plate_mask  = K.warp_perspective(ones,               M_plate,  dsize, **kwargs)
+    # ── Step 1: extract canonical view of the border+plate region ──────────
+    canonical = K.warp_perspective(batch, M_to_canonical, (ph, pw), **kwargs)  # [1, 3, ph, pw]
 
-    mask = torch.clamp(w_border_mask - w_plate_mask, 0, 1).expand(-1, 3, -1, -1)
-    return torch.clamp(batch * (1 - mask) + warped * mask, 0, 1).squeeze(0)
+    # ── Step 2: plate mask in canonical space ──────────────────────────────
+    M_c  = M_to_canonical[0]                                    # [3, 3]
+    ph4  = torch.cat([plate, plate.new_ones(4, 1)], dim=1).T   # [3, 4]
+    pc_h = M_c @ ph4                                            # [3, 4]
+    plate_canonical = (pc_h[:2] / pc_h[2:3]).T.contiguous().unsqueeze(0)  # [1, 4, 2]
+
+    M_plate_in_canonical = K.get_perspective_transform(src, plate_canonical)
+    plate_mask   = K.warp_perspective(ones, M_plate_in_canonical, (ph, pw), **kwargs)  # [1, 1, ph, pw]
+    plate_mask_3 = plate_mask.expand(-1, 3, -1, -1)
+
+    # ── Step 3: brightness-normalised composite ────────────────────────────
+    patch_batch = patch.unsqueeze(0)                  # [1, 3, ph, pw]
+    plate_brightness = ((canonical * plate_mask_3).sum()
+                        / plate_mask_3.sum().clamp(min=1e-6))
+    patch_brightness = patch_batch.mean().clamp(min=1e-6)
+    brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+    patch_batch = patch_batch * brightness_scale
+
+    composite = patch_batch * (1 - plate_mask_3) + canonical * plate_mask_3
+
+    # ── Step 4: warp composite back to image space ─────────────────────────
+    dsize       = (img_h, img_w)
+    warped_back = K.warp_perspective(composite, M_border, dsize, **kwargs)
+    border_mask = K.warp_perspective(ones, M_border, dsize, **kwargs).expand(-1, 3, -1, -1)
+
+    result = batch * (1 - border_mask) + warped_back * border_mask
+    return torch.clamp(result, 0, 1).squeeze(0)
 
 
 # ---------------------------------------------------------------------------
