@@ -263,9 +263,8 @@ def evaluate_one(backend: DetectorBackend,
         ocr_backend.eval()
 
     with torch.no_grad():
-        for image, corners, gt_box in tqdm(samples,
-                                           desc=f"  {backend.name} | {patch_name}",
-                                           leave=False):
+        pbar = tqdm(samples, desc=f"  {backend.name} | {patch_name}", leave=False)
+        for image, corners, gt_box in pbar:
             if patch is not None:
                 image = _apply_patch(image, corners, patch)
 
@@ -304,6 +303,10 @@ def evaluate_one(backend: DetectorBackend,
                         m.ocr_impersonation += 1
                     else:
                         m.ocr_misread += 1
+
+                ocr_seen = m.ocr_correct + m.ocr_impersonation + m.ocr_misread
+                rate = m.ocr_correct / ocr_seen if ocr_seen else 0.0
+                pbar.set_postfix(correct=f"{m.ocr_correct}/{ocr_seen} ({rate:.1%})")
 
     return m
 
@@ -499,13 +502,6 @@ def main() -> None:
         clean_ocr = seen_ocr.get(clean_ocr_key) if clean_ocr_key else None
 
         print(f"\n══ Backend: {det_key[0]} ══")
-        m = evaluate_one(backend, samples, None, "clean",
-                         device=args.device, iou_threshold=args.iou_threshold,
-                         ocr_backend=clean_ocr,
-                         expected_plate=args.expected_plate,
-                         impersonation_target=args.impersonation_target)
-        all_results.append(m)
-        print(f"  {m.summary()}")
 
         for patch_name, patch_tensor, ocr_key in patches_by_det.get(det_key, []):
             ocr_backend = seen_ocr.get(ocr_key) if ocr_key else None
@@ -519,6 +515,15 @@ def main() -> None:
             )
             all_results.append(m)
             print(f"  {m.summary()}")
+
+        print(f"\n── clean | ocr={clean_ocr_key[0] if clean_ocr_key else 'none'} ──")
+        m = evaluate_one(backend, samples, None, "clean",
+                         device=args.device, iou_threshold=args.iou_threshold,
+                         ocr_backend=clean_ocr,
+                         expected_plate=args.expected_plate,
+                         impersonation_target=args.impersonation_target)
+        all_results.append(m)
+        print(f"  {m.summary()}")
 
     # Save outputs via evaluator helpers
     from evaluator import DetectorEvaluator
