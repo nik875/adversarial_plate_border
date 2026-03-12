@@ -415,6 +415,15 @@ def main() -> None:
         "--csv", default="control_plate_corners.csv",
         help="Corners CSV (default: control_plate_corners.csv)",
     )
+    parser.add_argument(
+        "--train", action="store_true",
+        help="Use the training dataset (preproc_labels.csv) instead of the physical-world CSV.",
+    )
+    parser.add_argument(
+        "--split", choices=["train", "val", "all"], default="all",
+        help="Which portion of the training dataset to use (only applies with --train). "
+             "train/val use the same 80/20 seed=42 split as trainer.py (default: all).",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Threads for parallel image loading (default: nproc).")
@@ -436,8 +445,20 @@ def main() -> None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[eval_physical] device={args.device}  csv={args.csv}")
 
-    df = pd.read_csv(args.csv)
-    print(f"[eval_physical] {len(df)} images loaded from {args.csv}")
+    if args.train:
+        csv_path = "preproc_labels.csv"
+        df = pd.read_csv(csv_path).sample(frac=1, random_state=42).reset_index(drop=True)
+        n_train = int(0.8 * len(df))
+        if args.split == "train":
+            df = df.iloc[:n_train]
+        elif args.split == "val":
+            df = df.iloc[n_train:]
+        # else "all": keep full shuffled df
+        print(f"[eval_physical] training dataset ({args.split}): {len(df)} images from {csv_path}")
+    else:
+        csv_path = args.csv
+        df = pd.read_csv(csv_path)
+        print(f"[eval_physical] {len(df)} images loaded from {csv_path}")
 
     # Build pairs list: (patch_path, det_name, det_weights, ocr_name, ocr_weights)
     pairs: List[Tuple] = [_parse_pair(s) for s in args.pairs]
