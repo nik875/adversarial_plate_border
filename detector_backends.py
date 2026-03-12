@@ -995,7 +995,12 @@ class OpenImageModelsBackend(DetectorBackend):
             if conf < self.conf_threshold:
                 continue
 
-            x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+            # BoundingBox is a dataclass with .x1/.y1/.x2/.y2 attributes;
+            # fall back to index-based access for older versions.
+            try:
+                x1, y1, x2, y2 = float(bb.x1), float(bb.y1), float(bb.x2), float(bb.y2)
+            except AttributeError:
+                x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
             synthetic = torch.tensor([0.0, x1, y1, x2, y2, 0.0, conf],
                                      dtype=torch.float32)
             detections.append(Detection(

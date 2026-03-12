@@ -184,6 +184,79 @@ def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Sanity check
+# ---------------------------------------------------------------------------
+
+def sanity_check_backends(
+    det_backends: dict,
+    ocr_backends: dict,
+    df: pd.DataFrame,
+    device: str,
+    scale: float,
+) -> None:
+    """Load every backend and run one clean image through each to verify correctness."""
+    print("\n── Sanity check ──────────────────────────────────────────────────")
+
+    # Pick the first row from the CSV as the test image
+    row = df.iloc[0]
+    img_path = row["image_path"]
+    try:
+        from PIL import Image as _PILImage
+        pil = _PILImage.open(img_path).convert("RGB")
+        if scale != 1.0:
+            w, h = pil.size
+            pil = pil.resize((int(w * scale), int(h * scale)), _PILImage.BILINEAR)
+        import torchvision.transforms as _T
+        image = _T.ToTensor()(pil).to(device)
+    except Exception as exc:
+        print(f"  [sanity] Could not load test image '{img_path}': {exc}")
+        return
+
+    print(f"  Test image : {img_path}  ({image.shape[1]}×{image.shape[2]})")
+
+    all_ok = True
+
+    for det_key, backend in det_backends.items():
+        name = det_key[0]
+        try:
+            backend.ensure_loaded()
+            backend.eval()
+            with torch.no_grad():
+                dets = backend.predict(image)
+            status = f"{len(dets)} detection(s)"
+            if dets:
+                d = dets[0]
+                status += f"  best conf={d.confidence:.3f}  box=[{d.x1:.0f},{d.y1:.0f},{d.x2:.0f},{d.y2:.0f}]"
+            print(f"  [det  ] {name:20s}  OK  —  {status}")
+        except Exception as exc:
+            print(f"  [det  ] {name:20s}  FAIL  —  {exc}")
+            all_ok = False
+
+    for ocr_key, ocr in ocr_backends.items():
+        name = ocr_key[0]
+        try:
+            ocr.ensure_loaded()
+            ocr.eval()
+            th, tw = ocr.ocr_crop_size
+            if tw is None:
+                tw = th * 2
+            crop = F.interpolate(image.unsqueeze(0), (th, tw), mode="bilinear",
+                                 align_corners=False)
+            with torch.no_grad():
+                result = ocr.predict(crop.squeeze(0))
+            text = result.text or "<no text>"
+            print(f"  [ocr  ] {name:20s}  OK  —  text='{text}'  conf={result.confidence:.3f}")
+        except Exception as exc:
+            print(f"  [ocr  ] {name:20s}  FAIL  —  {exc}")
+            all_ok = False
+
+    if all_ok:
+        print("  All backends passed.\n")
+    else:
+        raise RuntimeError("One or more backends failed the sanity check (see above).")
+
+
+# ---------------------------------------------------------------------------
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -513,6 +586,9 @@ def main() -> None:
                         help="Impersonation target for OCR categorisation (default: VJJ7744).")
     parser.add_argument("--output", default="results/",
                         help="Output directory (default: results/)")
+    parser.add_argument("--sanity-check", action="store_true",
+                        help="Before full evaluation, run a quick single-image test on every "
+                             "detector and OCR backend to verify they load and produce output.")
     args = parser.parse_args()
 
     if not args.pairs and not args.patches:
@@ -584,6 +660,9 @@ def main() -> None:
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.sanity_check:
+        sanity_check_backends(seen_det, seen_ocr, df, args.device, args.scale)
 
     samples = preload_images(df, args.device, args.scale, args.num_workers)
 
