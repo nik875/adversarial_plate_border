@@ -217,7 +217,10 @@ def sanity_check_backends(
     all_ok = True
 
     for det_key, backend in det_backends.items():
-        name = det_key[0]
+        label = det_key[0]
+        # Show the actual model string for backends that wrap a configurable model
+        actual = getattr(backend, "detector_model_name", None) or backend.name
+        display = f"{label} ({actual})" if actual != label else label
         try:
             backend.ensure_loaded()
             backend.eval()
@@ -227,9 +230,9 @@ def sanity_check_backends(
             if dets:
                 d = dets[0]
                 status += f"  best conf={d.confidence:.3f}  box=[{d.x1:.0f},{d.y1:.0f},{d.x2:.0f},{d.y2:.0f}]"
-            print(f"  [det  ] {name:20s}  OK  —  {status}")
+            print(f"  [det  ] {display:45s}  OK  —  {status}")
         except Exception as exc:
-            print(f"  [det  ] {name:20s}  FAIL  —  {exc}")
+            print(f"  [det  ] {display:45s}  FAIL  —  {exc}")
             all_ok = False
 
     for ocr_key, ocr in ocr_backends.items():
@@ -500,6 +503,15 @@ _DEFAULT_WEIGHTS: Dict[str, str] = {
     "yolo-v9-384":  "none",
 }
 
+# Canonical detector→OCR pairings from run_paired_experiments.sh.
+# These are always loaded so every patch is evaluated across all backends.
+_CANONICAL_PAIRS: List[Tuple[str, str]] = [
+    ("rtdetr",      "trocr"),
+    ("yolo-v9-384", "cct"),
+    ("yolov8",      "lprnet"),
+    ("fasterrcnn",  "doctr-vitstr"),
+]
+
 _DEFAULT_OCR_WEIGHTS: Dict[str, str] = {
     "trocr":        "weights/trocr_small_finetuned.pt",
     "cct":          _os.path.expanduser("~/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"),
@@ -622,20 +634,22 @@ def main() -> None:
         print(f"[eval_physical] Inferred det='{det_name}' ocr='{ocr_name}' for {patch_path}")
         pairs.append((patch_path, det_name, det_weights, ocr_name, ocr_weights))
 
-    # Build unique detector backends
+    def _make_det_backend(bname: str, bpath: str) -> DetectorBackend:
+        if bname == "yolo-v9-384":
+            # eval_physical doesn't need autograd — use the larger ONNX model
+            # for better detection quality and lower OCR misread rate.
+            return OpenImageModelsBackend(
+                "yolo-v9-s-608-license-plate-end2end", device=args.device)
+        return build_backend(bname, bpath, device=args.device)
+
+    # Build unique detector backends from pairs
     seen_det: Dict[Tuple, DetectorBackend] = {}
     for _, bname, bpath, _, _ in pairs:
         key = (bname, bpath)
         if key not in seen_det:
-            if bname == "yolo-v9-384":
-                # eval_physical doesn't need autograd — use the larger ONNX model
-                # for better detection quality and lower OCR misread rate.
-                seen_det[key] = OpenImageModelsBackend(
-                    "yolo-v9-s-608-license-plate-end2end", device=args.device)
-            else:
-                seen_det[key] = build_backend(bname, bpath, device=args.device)
+            seen_det[key] = _make_det_backend(bname, bpath)
 
-    # Build unique OCR backends
+    # Build unique OCR backends from pairs
     seen_ocr: Dict[Tuple, Optional[OCRBackend]] = {}
     for _, _, _, ocr_name, ocr_weights in pairs:
         if ocr_name is None:
@@ -646,6 +660,22 @@ def main() -> None:
             ocr.load()
             ocr.freeze()
             seen_ocr[key] = ocr
+
+    # Always load all canonical backends (from run_paired_experiments.sh) so every
+    # patch is evaluated across the full suite, even if not all patches were provided.
+    for canon_det, canon_ocr in _CANONICAL_PAIRS:
+        det_weights = _DEFAULT_WEIGHTS.get(canon_det, "none")
+        det_key = (canon_det, det_weights)
+        if det_key not in seen_det:
+            seen_det[det_key] = _make_det_backend(canon_det, det_weights)
+
+        ocr_weights = _DEFAULT_OCR_WEIGHTS.get(canon_ocr, "none")
+        ocr_key = (canon_ocr, ocr_weights)
+        if ocr_key not in seen_ocr:
+            ocr = build_ocr_backend(canon_ocr, ocr_weights, device=args.device)
+            ocr.load()
+            ocr.freeze()
+            seen_ocr[ocr_key] = ocr
 
     # Load patches — associate each with its det+ocr backend
     # patch_entries: list of (patch_name, patch_tensor, det_key, ocr_key)
@@ -675,11 +705,21 @@ def main() -> None:
             return "control"
         return "impersonation" if args.impersonation_target else "disruption"
 
-    # Default OCR for each detector key (first OCR paired with that detector)
+    # Default OCR for each detector key: prefer the canonical pairing from
+    # run_paired_experiments.sh; fall back to the first explicitly-paired OCR.
+    _canon_ocr_for_det: Dict[Tuple, Tuple] = {}
+    for det, ocr in _CANONICAL_PAIRS:
+        det_key = (det, _DEFAULT_WEIGHTS.get(det, "none"))
+        ocr_key = (ocr, _DEFAULT_OCR_WEIGHTS.get(ocr, "none"))
+        _canon_ocr_for_det[det_key] = ocr_key
+
     backend_default_ocr: Dict[Tuple, Optional[Tuple]] = {}
     for det_key in seen_det:
-        paired_for_det = [ok for _, _, dk, ok in patch_entries if dk == det_key]
-        backend_default_ocr[det_key] = paired_for_det[0] if paired_for_det else None
+        if det_key in _canon_ocr_for_det:
+            backend_default_ocr[det_key] = _canon_ocr_for_det[det_key]
+        else:
+            paired_for_det = [ok for _, _, dk, ok in patch_entries if dk == det_key]
+            backend_default_ocr[det_key] = paired_for_det[0] if paired_for_det else None
 
     # Load and freeze all backends up front
     for backend in seen_det.values():
