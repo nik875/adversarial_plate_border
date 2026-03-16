@@ -126,21 +126,6 @@ legend_elements = [
 ]
 ax.legend(handles=legend_elements, loc='lower left', fontsize=11, framealpha=0.9)
 
-# Add sample sizes as text below each group
-for i, lighting in enumerate(available_lighting):
-    n_control = len(data_control[i])
-    n_disruption = len(data_disruption[i])
-    n_impersonation = len(data_impersonation[i])
-
-    ax.text(i, -0.15, f'n={n_control}', ha='center', va='top',
-            fontsize=8, color='#51cf66', fontweight='bold',
-            transform=ax.get_xaxis_transform())
-    ax.text(i, -0.20, f'n={n_disruption}', ha='center', va='top',
-            fontsize=8, color='#ff6b6b', fontweight='bold',
-            transform=ax.get_xaxis_transform())
-    ax.text(i, -0.25, f'n={n_impersonation}', ha='center', va='top',
-            fontsize=8, color='#9775fa', fontweight='bold',
-            transform=ax.get_xaxis_transform())
 
 plt.tight_layout()
 plt.savefig('confidence_by_lighting_boxplot.png', dpi=300, bbox_inches='tight')
