@@ -95,7 +95,8 @@ for variant_name, row, col in variant_order:
     ax.axis('off')
 
 plt.suptitle('Adversarial Rim Patches - Ablation Study',
-             fontsize=15, fontweight='bold', y=0.995)
-plt.tight_layout(rect=[0, 0, 1, 0.99])
+             fontsize=15, fontweight='bold')
+plt.tight_layout()
+plt.subplots_adjust(hspace=0.15)
 plt.savefig('all_patch_variants_display.png', dpi=300, bbox_inches='tight')
 print("\n✅ Saved: all_patch_variants_display.png")
