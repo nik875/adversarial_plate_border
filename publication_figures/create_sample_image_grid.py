@@ -17,7 +17,7 @@ BASE_PATH = "physical_world_test/full test/organized"
 X_COORD = 5   # Slight angle
 Y_COORD = 5   # Closest available distance
 LIGHTING_CONDITIONS = ['full sun', 'dusk', 'dark no flash', 'dark flash']
-PORT = 8080
+PORT = 8090
 
 app = Flask(__name__)
 
