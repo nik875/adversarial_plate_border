@@ -271,6 +271,8 @@ if __name__ == '__main__':
         if img_path:
             img = load_and_convert_image(img_path)
             if img is not None:
+                h = img.shape[0]
+                img = img[int(h * 0.2):int(h * 0.8), :]
                 images[lighting] = img
                 image_paths[lighting] = img_path
                 print(f"✓ Loaded: {lighting}")
