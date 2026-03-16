@@ -95,7 +95,7 @@ for variant_name, row, col in variant_order:
     ax.set_aspect('auto')
     ax.axis('off')
 
-plt.suptitle('Adversarial Rim Patches - Ablation Study',
+plt.suptitle('Ablation Cases (Disruption)',
              fontsize=15, fontweight='bold')
 plt.tight_layout()
 plt.subplots_adjust(hspace=0.15)
