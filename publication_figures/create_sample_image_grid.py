@@ -13,7 +13,7 @@ register_heif_opener()
 # Configuration
 BASE_PATH = "physical_world_test/full test/organized"
 X_COORD = 5   # Slight angle
-Y_COORD = -10  # Close to plate
+Y_COORD = 5   # Closest available distance
 LIGHTING_CONDITIONS = ['full sun', 'dusk', 'dark no flash', 'dark flash']
 
 # Store corner points
