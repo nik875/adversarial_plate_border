@@ -12,8 +12,8 @@ register_heif_opener()
 
 # Configuration
 BASE_PATH = "physical_world_test/full test/organized"
-X_COORD = 10  # Slight angle
-Y_COORD = 25  # Mid-height
+X_COORD = 5   # Slight angle
+Y_COORD = -10  # Close to plate
 LIGHTING_CONDITIONS = ['full sun', 'dusk', 'dark no flash', 'dark flash']
 
 # Store corner points
@@ -106,24 +106,14 @@ if len(images) == 0:
     print("Error: No images could be loaded!")
     exit(1)
 
-# Step 2: Create initial plot with placeholder
-fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+# Step 2: Create initial plot
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 axes = axes.flatten()
 
-lighting_order = ['full sun', 'dusk', 'dark no flash', 'dark flash', 'placeholder']
-
-for idx, lighting in enumerate(lighting_order):
+for idx, lighting in enumerate(LIGHTING_CONDITIONS):
     ax = axes[idx]
 
-    if lighting == 'placeholder':
-        # Create placeholder
-        ax.text(0.5, 0.5, 'Final Sample\n(Will be added)',
-               ha='center', va='center', fontsize=12,
-               bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis('off')
-    elif lighting in images:
+    if lighting in images:
         ax.imshow(images[lighting])
         ax.set_title(f'{lighting.title()}\n(x={X_COORD:+d}, y={Y_COORD})',
                     fontsize=11, fontweight='bold')
@@ -134,9 +124,6 @@ for idx, lighting in enumerate(lighting_order):
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.axis('off')
-
-# Remove extra subplot
-axes[5].remove()
 
 plt.suptitle(f'Sample Images from Different Lighting Conditions (Position: x={X_COORD:+d}, y={Y_COORD})',
              fontsize=14, fontweight='bold')
@@ -187,20 +174,13 @@ for lighting in images.keys():
         blurred_images[lighting] = current_image
 
 # Step 4: Create final blurred plot
-fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 axes = axes.flatten()
 
-for idx, lighting in enumerate(lighting_order):
+for idx, lighting in enumerate(LIGHTING_CONDITIONS):
     ax = axes[idx]
 
-    if lighting == 'placeholder':
-        ax.text(0.5, 0.5, 'Final Sample\n(Will be added)',
-               ha='center', va='center', fontsize=12,
-               bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis('off')
-    elif lighting in blurred_images:
+    if lighting in blurred_images:
         ax.imshow(blurred_images[lighting])
         ax.set_title(f'{lighting.title()}\n(x={X_COORD:+d}, y={Y_COORD})',
                     fontsize=11, fontweight='bold')
@@ -211,8 +191,6 @@ for idx, lighting in enumerate(lighting_order):
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.axis('off')
-
-axes[5].remove()
 
 plt.suptitle(f'Sample Images from Different Lighting Conditions (Position: x={X_COORD:+d}, y={Y_COORD})',
              fontsize=14, fontweight='bold')
