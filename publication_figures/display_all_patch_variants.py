@@ -51,7 +51,7 @@ final_patches_map = {
 ablation_base = Path('patch_variants_20260101_001131')
 
 # Create figure
-fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+fig, axes = plt.subplots(2, 2, figsize=(10, 6))
 
 for variant_name, row, col in variant_order:
     ax = axes[row, col]
@@ -92,6 +92,7 @@ for variant_name, row, col in variant_order:
 
     # Set title
     ax.set_title(create_variant_label(variant_name), fontsize=11, fontweight='bold', pad=8)
+    ax.set_aspect('auto')
     ax.axis('off')
 
 plt.suptitle('Adversarial Rim Patches - Ablation Study',
