@@ -34,7 +34,7 @@ def get_variant_label(variant):
     return config
 
 # Create figure with subplots (2 rows x 2 columns)
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 
 for variant, row, col in variant_positions:
     ax = axes[row, col]
