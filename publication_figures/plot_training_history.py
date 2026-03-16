@@ -23,13 +23,13 @@ def get_variant_label(variant):
     """Create clean variant label without PII"""
     # Determine configuration
     if '_notv' in variant and '_nohomo' in variant:
-        config = 'No TV + No Homo'
+        config = 'No TV + No Homography'
     elif '_notv' in variant:
         config = 'No TV Loss'
     elif '_nohomo' in variant:
         config = 'No Homography'
     else:
-        config = 'Full (TV + Homo)'
+        config = 'Full (TV + Homography)'
 
     return config
 
