@@ -25,37 +25,25 @@ def get_best_patch(variant_dir):
 
 def create_variant_label(variant_name):
     """Create clean label without PII"""
-    if variant_name.startswith('VJJ7744'):
-        attack_type = 'Impersonation'
-    else:
-        attack_type = 'Disruption'
-
     if '_notv' in variant_name and '_nohomo' in variant_name:
-        config = 'No TV + No Homography'
+        return 'No TV + No Homography'
     elif '_notv' in variant_name:
-        config = 'No TV Loss'
+        return 'No TV Loss'
     elif '_nohomo' in variant_name:
-        config = 'No Homography'
+        return 'No Homography'
     else:
-        config = 'Full (TV + Homography)'
+        return 'Full (TV + Homography)'
 
-    return f"{attack_type}\n{config}"
-
-# Define variant order (4 rows x 2 columns)
+# Define variant order (2 rows x 2 columns, disruption only)
 variant_order = [
-    ('VJJ7744', 0, 0),
-    ('SHX8459', 0, 1),
-    ('VJJ7744_nohomo', 1, 0),
-    ('SHX8459_nohomo', 1, 1),
-    ('VJJ7744_notv', 2, 0),
-    ('SHX8459_notv', 2, 1),
-    ('VJJ7744_notv_nohomo', 3, 0),
-    ('SHX8459_notv_nohomo', 3, 1)
+    ('SHX8459', 0, 0),
+    ('SHX8459_nohomo', 0, 1),
+    ('SHX8459_notv', 1, 0),
+    ('SHX8459_notv_nohomo', 1, 1),
 ]
 
-# Try loading from final_patches first for the full variants
+# Try loading from final_patches first for the full variant
 final_patches_map = {
-    'VJJ7744': Path('final_patches/VJJ7744/best_patches'),
     'SHX8459': Path('final_patches/SHX8459/best_patches')
 }
 
@@ -63,7 +51,7 @@ final_patches_map = {
 ablation_base = Path('patch_variants_20260101_001131')
 
 # Create figure
-fig, axes = plt.subplots(4, 2, figsize=(10, 16))
+fig, axes = plt.subplots(2, 2, figsize=(10, 10))
 
 for variant_name, row, col in variant_order:
     ax = axes[row, col]
@@ -105,12 +93,6 @@ for variant_name, row, col in variant_order:
     # Set title
     ax.set_title(create_variant_label(variant_name), fontsize=11, fontweight='bold', pad=8)
     ax.axis('off')
-
-# Add column labels at top
-column_labels = ['Impersonation Attack', 'Disruption Attack']
-for j, label in enumerate(column_labels):
-    axes[0, j].text(0.5, 1.15, label.upper(), ha='center', va='bottom',
-                   transform=axes[0, j].transAxes, fontsize=13, fontweight='bold')
 
 plt.suptitle('Adversarial Rim Patches - Ablation Study',
              fontsize=15, fontweight='bold', y=0.995)
