@@ -64,7 +64,7 @@ def blur_region(image, corners):
     mask = np.zeros(image.shape[:2], dtype=np.uint8)
     pts = np.array(corners, dtype=np.int32)
     cv2.fillPoly(mask, [pts], 255)
-    blurred = cv2.GaussianBlur(image, (99, 99), 30)
+    blurred = cv2.GaussianBlur(image, (199, 199), 60)
     result = image.copy()
     result[mask == 255] = blurred[mask == 255]
     return result
