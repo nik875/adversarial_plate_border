@@ -9,14 +9,10 @@ from pathlib import Path
 
 # Define patch variants (organized as row, col positions)
 variant_positions = [
-    ('VJJ7744', 0, 0),
-    ('SHX8459', 0, 1),
-    ('VJJ7744_nohomo', 1, 0),
-    ('SHX8459_nohomo', 1, 1),
-    ('VJJ7744_notv', 2, 0),
-    ('SHX8459_notv', 2, 1),
-    ('VJJ7744_notv_nohomo', 3, 0),
-    ('SHX8459_notv_nohomo', 3, 1)
+    ('SHX8459', 0, 0),
+    ('SHX8459_nohomo', 0, 1),
+    ('SHX8459_notv', 1, 0),
+    ('SHX8459_notv_nohomo', 1, 1),
 ]
 
 # Base directory
@@ -25,12 +21,6 @@ base_dir = Path('patch_variants_20260101_001131')
 # Create labels for variants (no PII)
 def get_variant_label(variant):
     """Create clean variant label without PII"""
-    # Determine attack type
-    if variant.startswith('VJJ7744'):
-        attack_type = 'Impersonation'
-    else:
-        attack_type = 'Disruption'
-
     # Determine configuration
     if '_notv' in variant and '_nohomo' in variant:
         config = 'No TV + No Homo'
@@ -41,10 +31,10 @@ def get_variant_label(variant):
     else:
         config = 'Full (TV + Homo)'
 
-    return f'{attack_type}\n{config}'
+    return config
 
-# Create figure with subplots (4 rows x 2 columns)
-fig, axes = plt.subplots(4, 2, figsize=(14, 16))
+# Create figure with subplots (2 rows x 2 columns)
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
 for variant, row, col in variant_positions:
     ax = axes[row, col]
@@ -78,13 +68,7 @@ for variant, row, col in variant_positions:
         ax.axvline(x=first_lr_change, color='gray', linestyle='--',
                   linewidth=1, alpha=0.5, label=f'LR change (epoch {first_lr_change})')
 
-# Add column labels at the top
-column_labels = ['IMPERSONATION ATTACK', 'DISRUPTION ATTACK']
-for j, label in enumerate(column_labels):
-    axes[0, j].text(0.5, 1.15, label, ha='center', va='bottom',
-                   transform=axes[0, j].transAxes, fontsize=13, fontweight='bold')
-
-plt.suptitle('Training History - Patch Variants Ablation Study',
+plt.suptitle('Training History of Ablation Cases',
              fontsize=14, fontweight='bold', y=0.995)
 plt.tight_layout(rect=[0, 0, 1, 0.99])
 plt.savefig('training_history_all_variants.png', dpi=300, bbox_inches='tight')
