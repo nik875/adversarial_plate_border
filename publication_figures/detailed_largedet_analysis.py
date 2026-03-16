@@ -34,13 +34,13 @@ colors = {
 category_order = ['No plate detected', 'Correct plate',
                   'Impersonation target', 'Other plate (misread)']
 
-# Create figure with subplots
-fig, axes = plt.subplots(len(times_of_day), len(conditions),
-                         figsize=(16, 16))
+# Create figure with subplots (rows=conditions, cols=times_of_day)
+fig, axes = plt.subplots(len(conditions), len(times_of_day),
+                         figsize=(20, 12))
 
 # Create each pie chart
-for i, time in enumerate(times_of_day):
-    for j, condition in enumerate(conditions):
+for i, condition in enumerate(conditions):
+    for j, time in enumerate(times_of_day):
         ax = axes[i, j]
 
         # Filter data for this combination
@@ -81,14 +81,14 @@ for i, time in enumerate(times_of_day):
         title = f"{time.title()}\n{condition.title()}\n(n={len(subset)})"
         ax.set_title(title, fontsize=9, fontweight='bold', pad=10)
 
-# Add column labels at the top
-for j, condition in enumerate(conditions):
-    axes[0, j].text(0.5, 1.35, condition.upper(), ha='center', va='bottom',
+# Add column labels at the top (lighting conditions)
+for j, time in enumerate(times_of_day):
+    axes[0, j].text(0.5, 1.35, time.upper(), ha='center', va='bottom',
                    transform=axes[0, j].transAxes, fontsize=12, fontweight='bold')
 
-# Add row labels on the left
-for i, time in enumerate(times_of_day):
-    axes[i, 0].text(-0.35, 0.5, time.upper().replace(' ', '\n'), ha='right', va='center',
+# Add row labels on the left (patch types)
+for i, condition in enumerate(conditions):
+    axes[i, 0].text(-0.35, 0.5, condition.upper(), ha='right', va='center',
                    transform=axes[i, 0].transAxes, fontsize=11, fontweight='bold',
                    rotation=0)
 
