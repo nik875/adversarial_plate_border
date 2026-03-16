@@ -70,7 +70,7 @@ def blur_region(image, corners):
     return result
 
 def save_grid(imgs_dict, filename):
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     axes = axes.flatten()
     for idx, lighting in enumerate(LIGHTING_CONDITIONS):
         ax = axes[idx]
