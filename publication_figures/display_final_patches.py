@@ -41,7 +41,7 @@ for ax, (label, best_dir) in zip(axes, patches.items()):
     ax.axis('off')
     print(f"✓ Loaded {label} ({patch_path.stem})")
 
-plt.suptitle('Final Adversarial Rim Patches', fontsize=15, fontweight='bold')
-plt.tight_layout()
+plt.suptitle('Final Adversarial Rim Patches', fontsize=15, fontweight='bold', y=0.98)
+plt.tight_layout(rect=[0, 0, 1, 0.95])
 plt.savefig('final_patches_display.png', dpi=300, bbox_inches='tight')
 print("\n✅ Saved: final_patches_display.png")
