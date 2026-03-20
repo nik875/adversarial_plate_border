@@ -84,7 +84,7 @@ def save_grid(imgs_dict, filename):
             ax.set_xlim(0, 1)
             ax.set_ylim(0, 1)
             ax.axis('off')
-    plt.suptitle('Sample Images from Each Lighting Condition', fontsize=20, fontweight='bold')
+    plt.suptitle('Sample Images from Each Lighting Condition', fontsize=24, fontweight='bold')
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.close()
