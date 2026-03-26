@@ -76,17 +76,15 @@ def save_grid(imgs_dict, filename):
         ax = axes[idx]
         if lighting in imgs_dict:
             ax.imshow(imgs_dict[lighting])
-            ax.set_title(f'{lighting.title()}\n(x={X_COORD:+d}, y={Y_COORD})',
-                         fontsize=11, fontweight='bold')
+            ax.set_title(lighting.title(), fontsize=16, fontweight='bold')
             ax.axis('off')
         else:
             ax.text(0.5, 0.5, f'{lighting.title()}\n(Not available)',
-                    ha='center', va='center', fontsize=10)
+                    ha='center', va='center', fontsize=14)
             ax.set_xlim(0, 1)
             ax.set_ylim(0, 1)
             ax.axis('off')
-    plt.suptitle(f'Sample Images — Different Lighting Conditions (x={X_COORD:+d}, y={Y_COORD})',
-                 fontsize=14, fontweight='bold')
+    plt.suptitle('Sample Images from Each Lighting Condition', fontsize=24, fontweight='bold')
     plt.tight_layout()
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     plt.close()
