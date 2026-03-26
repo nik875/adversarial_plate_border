@@ -7,11 +7,11 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from pathlib import Path
 
-VARIANTS_DIR = Path('patch_variants_20260101_001131')
+FINAL_PATCHES_DIR = Path('final_patches')
 
 patches = {
-    'Disruption':     VARIANTS_DIR / 'patches_SHX8459'  / 'best_patches',
-    'Impersonation':  VARIANTS_DIR / 'patches_VJJ7744'  / 'best_patches',
+    'Disruption':     FINAL_PATCHES_DIR / 'SHX8459'   / 'best_patches',
+    'Impersonation':  FINAL_PATCHES_DIR / 'VJJ7744'   / 'best_patches',
 }
 
 fig, axes = plt.subplots(1, 2, figsize=(10, 5))
