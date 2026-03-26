@@ -26,7 +26,7 @@ set -euo pipefail
 DEVICE="cuda"
 CSV="updated_control_corners.csv"
 EPOCHS=100
-LR=0.1
+LR=1e-4
 GRAD_ACCUM=64
 NUM_WORKERS=0
 PIN_MEMORY=false
@@ -62,6 +62,7 @@ DEFAULT_DET_WEIGHTS="$YOLOV8_WEIGHTS"
 SKIP_OCR=false
 SKIP_TRAIN=false    # set true to jump straight to evaluation (re-use existing patches)
 DRY_RUN=false
+GPU_PRELOAD=false
 IMPERSONATION_TARGET=""   # when non-empty, passes --impersonation-target + --no-disruption
 
 # ── Parse CLI args ─────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --skip-ocr)             SKIP_OCR=true;                 shift   ;;
         --skip-train)           SKIP_TRAIN=true;               shift   ;;
         --dry-run)              DRY_RUN=true;                  shift   ;;
+        --gpu-preload)          GPU_PRELOAD=true;              shift   ;;
         --impersonation-target) IMPERSONATION_TARGET="$2";     shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -154,6 +156,9 @@ if $PIN_MEMORY; then
 fi
 if $PRELOAD_IMAGES; then
     BASE_TRAIN_ARGS+=(--preload-images)
+fi
+if $GPU_PRELOAD; then
+    BASE_TRAIN_ARGS+=(--gpu-preload)
 fi
 if [[ "$LIMIT" -gt 0 ]]; then
     BASE_TRAIN_ARGS+=(--limit "$LIMIT")
