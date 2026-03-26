@@ -152,15 +152,18 @@ class OCRBackend(abc.ABC):
         target_text: str,
         impersonation: bool = False,
         correct_text: Optional[str] = None,
+        diff_positions: Optional[List[int]] = None,
     ) -> list:
         """Default: sequential loop. Override for batch GPU inference."""
         losses = []
-        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (impersonation and correct_text) else None))
         for crop in crops:
             if self.is_trainable and hasattr(self, "differentiable_loss"):
                 losses.append(self.differentiable_loss(
                     crop, target_text, impersonation=impersonation,
-                    correct_text=correct_text))
+                    correct_text=correct_text, diff_positions=diff_positions))
             else:
                 with torch.no_grad():
                     result = self.predict(crop.squeeze(0))
@@ -610,7 +613,8 @@ class CRNNBackend(OCRBackend):
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
-                             correct_text: Optional[str] = None) -> torch.Tensor:
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Fully differentiable CTC loss on a crop tensor.
 
@@ -623,11 +627,16 @@ class CRNNBackend(OCRBackend):
         impersonation : bool
             True → minimise CTC loss toward target_text.
             False → maximise CTC loss (negate).
+        diff_positions : list of int, optional
+            If provided, restrict the CTC loss to these character positions.
+            Takes precedence over correct_text.
         """
         self.ensure_loaded()
         preprocessed = self._preprocess(crop)          # [1, 1, 32, W]
         logits = self._model(preprocessed).squeeze(1)  # [T, num_classes]
-        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (impersonation and correct_text) else None))
         base = self.ctc_loss(logits, target_text, diff_positions=diff_pos)
         return base if impersonation else -base
 
@@ -767,24 +776,34 @@ class LPRNetBackend(OCRBackend):
         )
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+                             impersonation: bool = False,
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """Differentiable CTC loss on a [1, 3, H, W] crop tensor."""
         self.ensure_loaded()
         probs     = self._model(self._preprocess(crop))       # [1, 24, 36]
         log_probs = torch.log(probs[0].clamp(min=1e-8))      # [24, 36]
-        base = self.ctc_loss(log_probs, target_text)
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (impersonation and correct_text) else None))
+        base = self.ctc_loss(log_probs, target_text, diff_positions=diff_pos)
         return base if impersonation else -base
 
     def differentiable_loss_batch(self, crops: list, target_text: str,
-                                   impersonation: bool = False) -> list:
+                                   impersonation: bool = False,
+                                   correct_text: Optional[str] = None,
+                                   diff_positions: Optional[List[int]] = None) -> list:
         """True batch forward: preprocess all crops, one model call."""
         self.ensure_loaded()
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (impersonation and correct_text) else None))
         inp = torch.cat([self._preprocess(c) for c in crops], dim=0)  # [B, 3, 48, 96]
         probs = self._model(inp)   # [B, 24, 36]
         losses = []
         for i in range(len(crops)):
             log_probs = torch.log(probs[i].clamp(min=1e-8))  # [24, 36]
-            base = self.ctc_loss(log_probs, target_text)
+            base = self.ctc_loss(log_probs, target_text, diff_positions=diff_pos)
             losses.append(base if impersonation else -base)
         return losses
 
@@ -1013,7 +1032,8 @@ class TrOCROCRBackend(OCRBackend):
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
                              variants: list = [],
-                             correct_text: Optional[str] = None) -> torch.Tensor:
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Differentiable loss based on the combined log-probability of the target
         text and any spelling variants (e.g. "VRJ-7774", "VRJ 7774").
@@ -1029,11 +1049,15 @@ class TrOCROCRBackend(OCRBackend):
         variants : extra acceptable spellings of target_text (base NOT included).
         correct_text : when provided and impersonation=True, average only over
             character positions where target_text differs from correct_text.
+        diff_positions : if provided, restrict to these character positions
+            directly. Takes precedence over correct_text.
         """
         self.ensure_loaded()
         pixel_values = (crop - 0.5) / 0.5   # [1, 3, H, W], differentiable
 
-        diff_pos = _diff_char_positions(target_text, correct_text) if (correct_text and impersonation) else None
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (correct_text and impersonation) else None))
         all_texts  = [target_text] + list(variants)
         log_probs  = torch.stack([
             self._sequence_log_prob(pixel_values, t, diff_positions=diff_pos) for t in all_texts
@@ -1350,7 +1374,8 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
-                             correct_text: Optional[str] = None) -> torch.Tensor:
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """Differentiable CTC loss on a [1, 3, H, W] crop tensor (CTC mode only)."""
         if self._prediction != "CTC" or not self.is_trainable:
             return torch.tensor(0.0, device=self.device)
@@ -1359,7 +1384,9 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         text_for_pred = torch.LongTensor(1, self.max_label_length + 1).fill_(0).to(self.device)
         preds = self._model(preprocessed, text_for_pred)  # [1, T, C]
         logits = preds.squeeze(0)                          # [T, C]
-        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
+        diff_pos = (diff_positions if diff_positions is not None
+                    else (_diff_char_positions(target_text, correct_text)
+                          if (impersonation and correct_text) else None))
         base = self.ctc_loss(logits, target_text, diff_positions=diff_pos)
         return base if impersonation else -base
 
@@ -1532,10 +1559,13 @@ class CCTOCRBackend(OCRBackend):
         return F.nll_loss(log_probs, target_ids)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+                             impersonation: bool = False,
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Differentiable NLL loss on a [1, 3, H, W] crop tensor.
         Gradients flow through CCTOCRTorch model → crop → patch.
+        Note: diff_positions is not supported by this backend and is ignored.
         """
         self.ensure_loaded()
         preprocessed = self._preprocess(crop.to(self.device))   # [1, 64, 128, 3]
@@ -1544,11 +1574,14 @@ class CCTOCRBackend(OCRBackend):
         return base if impersonation else -base
 
     def differentiable_loss_batch(self, crops: list, target_text: str,
-                                   impersonation: bool = False) -> list:
+                                   impersonation: bool = False,
+                                   correct_text: Optional[str] = None,
+                                   diff_positions: Optional[List[int]] = None) -> list:
         """
         True batch forward: one model call for all crops.
 
         crops : list of [1, 3, H, W] tensors (may vary in H/W; resized in preprocess)
+        Note: diff_positions is not supported by this backend and is ignored.
         """
         self.ensure_loaded()
         # Stack + preprocess all crops in one F.interpolate call
@@ -1653,11 +1686,14 @@ class DoctrViTSTRBackend(OCRBackend):
         return OCRResult(logits=None, text=text, confidence=conf)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+                             impersonation: bool = False,
+                             correct_text: Optional[str] = None,
+                             diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Cross-entropy loss via doctr's built-in compute_loss.
         Gradients flow through the ViT into the patch.
         target_text is lowercased to match the doctr vocab.
+        Note: diff_positions is not supported by this backend and is ignored.
         """
         self.ensure_loaded()
         inp = self._preprocess(crop)
@@ -1670,8 +1706,12 @@ class DoctrViTSTRBackend(OCRBackend):
         return loss if impersonation else -loss
 
     def differentiable_loss_batch(self, crops: list, target_text: str,
-                                   impersonation: bool = False) -> list:
-        """Batch preprocessing + sequential model calls (doctr targets per-sample)."""
+                                   impersonation: bool = False,
+                                   correct_text: Optional[str] = None,
+                                   diff_positions: Optional[List[int]] = None) -> list:
+        """Batch preprocessing + sequential model calls (doctr targets per-sample).
+        Note: diff_positions is not supported by this backend and is ignored.
+        """
         self.ensure_loaded()
         self._model.train()
         target = [target_text.lower()]

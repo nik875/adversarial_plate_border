@@ -56,7 +56,7 @@ import kornia.geometry as K
 from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
-from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
+from ocr_backends import OCRBackend, OCRResult, build_ocr_backend, _diff_char_positions
 from dataset import (create_dataloaders,
                      make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
@@ -581,6 +581,18 @@ class AdversarialPatchTrainer:
         inter = iw * ih
         return inter / (a1 + a2 - inter + 1e-8)
 
+    @staticmethod
+    def _rim_bbox(corners: torch.Tensor, border_scale: float = 1.4) -> torch.Tensor:
+        """Bounding box of the outer rim (plate corners scaled by border_scale).
+
+        corners : [4, 2] plate corners in detector space.
+        Returns [x1, y1, x2, y2].
+        """
+        ctr = corners.mean(dim=0)
+        rim = ctr.unsqueeze(0) + (corners - ctr.unsqueeze(0)) * border_scale
+        return torch.stack([rim[:, 0].min(), rim[:, 1].min(),
+                            rim[:, 0].max(), rim[:, 1].max()])
+
     # ====================================================================
     # Patch application
     # ====================================================================
@@ -798,11 +810,13 @@ class AdversarialPatchTrainer:
             patched_orig.squeeze(0), orig_corners_np)
         new_corners = torch.from_numpy(new_corners_np).to(self.device)
         target_box  = self.corners_to_bbox(new_corners)
+        rim_box     = self._rim_bbox(new_corners)
         ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
         return {
             "patched_prep": patched_prep_chw,   # [C, H_p, W_p]
             "target_box":   target_box,          # [4]
+            "rim_box":      rim_box,             # [4]
             "ocr_crop":     ocr_crop,            # [1, 3, H_c, W_c]
         }
 
@@ -824,22 +838,57 @@ class AdversarialPatchTrainer:
         target_text  = self.impersonation_target or self.expected_plate_text
         tv_l         = self.total_variation_loss(patch_norm)
 
+        # Pre-compute diff/same positions for the weighted impersonation OCR loss.
+        if self.impersonation_target and self.expected_plate_text:
+            diff_pos = _diff_char_positions(self.impersonation_target,
+                                            self.expected_plate_text)
+            n = max(len(self.impersonation_target), len(self.expected_plate_text))
+            same_pos = [i for i in range(n) if i not in diff_pos]
+        else:
+            diff_pos, same_pos = None, None
+
         det_results = self.detector.differentiable_predict_box_batch(
             batched_prep, target_boxes)
 
         image_losses, det_l_list, ocr_l_list = [], [], []
         for i, (conf_loss, pred_box) in enumerate(det_results):
-            det_i = conf_loss * self.det_loss_scale
+            if self.impersonation_target and pred_box is not None:
+                # Impersonation detection objective: maximise IoU with the rim bbox.
+                # No confidence weighting.
+                rim_box = items[i]["rim_box"].to(self.device)
+                iou = self._boxes_iou(
+                    pred_box.unsqueeze(0), rim_box.unsqueeze(0)
+                ).squeeze()
+                det_i = -iou
+            else:
+                det_i = conf_loss * self.det_loss_scale
+
             if pred_box is not None:
                 diff_crop = _bbox_ocr_crop_diff(
                     items[i]["patched_prep"].unsqueeze(0),
                     pred_box.to(self.device),
                     self.ocr.ocr_crop_size,
                 )
-                ocr_i = self.ocr.differentiable_loss_batch(
-                    [diff_crop], target_text,
-                    impersonation=bool(self.impersonation_target),
-                )[0] * self.ocr_loss_scale
+                if self.impersonation_target and diff_pos is not None:
+                    # Weighted positional OCR loss: 4:1 emphasis on differing chars.
+                    # Both terms are length-normalised so weights sum to 1 to
+                    # preserve the same overall loss magnitude.
+                    loss_diff = self.ocr.differentiable_loss_batch(
+                        [diff_crop], self.impersonation_target,
+                        impersonation=True,
+                        diff_positions=diff_pos if diff_pos else None,
+                    )[0]
+                    loss_same = self.ocr.differentiable_loss_batch(
+                        [diff_crop], self.expected_plate_text,
+                        impersonation=True,
+                        diff_positions=same_pos if same_pos else None,
+                    )[0]
+                    ocr_i = (0.8 * loss_diff + 0.2 * loss_same) * self.ocr_loss_scale
+                else:
+                    ocr_i = self.ocr.differentiable_loss_batch(
+                        [diff_crop], target_text,
+                        impersonation=bool(self.impersonation_target),
+                    )[0] * self.ocr_loss_scale
                 if self.disable_disruption:
                     image_losses.append(ocr_i)
                 else:
