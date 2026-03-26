@@ -40,6 +40,15 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _diff_char_positions(target: str, correct: str) -> List[int]:
+    """Return the character indices where target[i] != correct[i]."""
+    return [i for i in range(min(len(target), len(correct))) if target[i] != correct[i]]
+
+
+# ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
 
@@ -61,12 +70,17 @@ class OCRResult:
     text: Optional[str]
     confidence: float = 0.0
 
-    def char_accuracy(self, target: str) -> float:
+    def char_accuracy(self, target: str, diff_positions: Optional[List[int]] = None) -> float:
         """Fraction of characters matching target (left-padded with spaces)."""
         if self.text is None:
             return 0.0
         pred = self.text.ljust(len(target))[:len(target)]
-        return sum(a == b for a, b in zip(pred, target)) / max(len(target), 1)
+        if diff_positions is not None:
+            positions = [i for i in diff_positions if i < len(target)]
+            if not positions:
+                return 1.0
+            return sum(pred[i] == target[i] for i in positions) / len(positions)
+        return sum(p == t for p, t in zip(pred, target)) / len(target)
 
 
 # ---------------------------------------------------------------------------
@@ -137,17 +151,20 @@ class OCRBackend(abc.ABC):
         crops: list,           # B × [1, 3, H_c, W_c]
         target_text: str,
         impersonation: bool = False,
+        correct_text: Optional[str] = None,
     ) -> list:
         """Default: sequential loop. Override for batch GPU inference."""
         losses = []
+        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
         for crop in crops:
             if self.is_trainable and hasattr(self, "differentiable_loss"):
                 losses.append(self.differentiable_loss(
-                    crop, target_text, impersonation=impersonation))
+                    crop, target_text, impersonation=impersonation,
+                    correct_text=correct_text))
             else:
                 with torch.no_grad():
                     result = self.predict(crop.squeeze(0))
-                acc = result.char_accuracy(target_text)
+                acc = result.char_accuracy(target_text, diff_positions=diff_pos)
                 losses.append(torch.tensor(
                     (1.0 - acc) if impersonation else acc,
                     device=self.device,
@@ -550,7 +567,8 @@ class CRNNBackend(OCRBackend):
 
         return "".join(chars), float(sum(confs) / len(confs))
 
-    def ctc_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ctc_loss(self, logits: torch.Tensor, target_text: str,
+                 diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Convenience method: compute CTC loss between model logits and a
         target string.  Useful for impersonation training.
@@ -561,12 +579,18 @@ class CRNNBackend(OCRBackend):
             Shape [T, num_classes] — from OCRResult.logits.
         target_text : str
             Desired plate string, e.g. "ABC123".
+        diff_positions : list of int, optional
+            When provided, filter target_text to only the characters at those positions.
 
         Returns
         -------
         torch.Tensor
             Scalar CTC loss (lower = closer to target_text).
         """
+        if diff_positions is not None:
+            target_text = "".join(target_text[i] for i in diff_positions if i < len(target_text))
+            if not target_text:
+                return torch.tensor(0.0, device=logits.device)
         log_probs   = F.log_softmax(logits.unsqueeze(1), dim=2)  # [T, 1, C]
         # blank=0 convention: character indices are 1-based
         target_ids  = torch.tensor(
@@ -585,7 +609,8 @@ class CRNNBackend(OCRBackend):
         )
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+                             impersonation: bool = False,
+                             correct_text: Optional[str] = None) -> torch.Tensor:
         """
         Fully differentiable CTC loss on a crop tensor.
 
@@ -602,7 +627,8 @@ class CRNNBackend(OCRBackend):
         self.ensure_loaded()
         preprocessed = self._preprocess(crop)          # [1, 1, 32, W]
         logits = self._model(preprocessed).squeeze(1)  # [T, num_classes]
-        base = self.ctc_loss(logits, target_text)
+        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
+        base = self.ctc_loss(logits, target_text, diff_positions=diff_pos)
         return base if impersonation else -base
 
     def parameters(self) -> Iterator[nn.Parameter]:
@@ -949,13 +975,16 @@ class TrOCROCRBackend(OCRBackend):
         return outputs.loss
 
     def _sequence_log_prob(
-        self, pixel_values: torch.Tensor, text: str
+        self, pixel_values: torch.Tensor, text: str,
+        diff_positions: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
         Log P(text | image) via a single teacher-forced forward pass.
 
         pixel_values : [1, 3, H, W], already normalised to [-1, 1].
         Returns a scalar log-probability (≤ 0).  Fully differentiable.
+        diff_positions : when provided, average only over those character positions
+            (assumes 1:1 char-to-token alignment).
         """
         tok = self._processor.tokenizer(
             text, return_tensors="pt", truncation=True,
@@ -972,12 +1001,19 @@ class TrOCROCRBackend(OCRBackend):
         outputs   = self._model(pixel_values=pixel_values,
                                 decoder_input_ids=decoder_input_ids)
         log_probs = F.log_softmax(outputs.logits, dim=-1)   # [1, L-1, vocab]
-        token_lp  = log_probs.gather(2, label_ids.unsqueeze(-1)).squeeze(-1)
+        token_lp  = log_probs.gather(2, label_ids.unsqueeze(-1)).squeeze(-1).squeeze(0)  # [L-1]
+        if diff_positions is not None:
+            n_chars = token_lp.shape[0] - 1  # exclude EOS
+            valid = [i for i in diff_positions if i < n_chars]
+            if valid:
+                return token_lp[valid].mean()
+            # fallback if all chars match (shouldn't happen when impersonating)
         return token_lp.mean()   # mean per-token log P (normalised by length)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,
-                             variants: list = []) -> torch.Tensor:
+                             variants: list = [],
+                             correct_text: Optional[str] = None) -> torch.Tensor:
         """
         Differentiable loss based on the combined log-probability of the target
         text and any spelling variants (e.g. "VRJ-7774", "VRJ 7774").
@@ -991,13 +1027,16 @@ class TrOCROCRBackend(OCRBackend):
 
         crop     : [1, 3, 384, 384] in [0, 1].
         variants : extra acceptable spellings of target_text (base NOT included).
+        correct_text : when provided and impersonation=True, average only over
+            character positions where target_text differs from correct_text.
         """
         self.ensure_loaded()
         pixel_values = (crop - 0.5) / 0.5   # [1, 3, H, W], differentiable
 
+        diff_pos = _diff_char_positions(target_text, correct_text) if (correct_text and impersonation) else None
         all_texts  = [target_text] + list(variants)
         log_probs  = torch.stack([
-            self._sequence_log_prob(pixel_values, t) for t in all_texts
+            self._sequence_log_prob(pixel_values, t, diff_positions=diff_pos) for t in all_texts
         ])
         total_log_prob = torch.logsumexp(log_probs, dim=0)   # log P(any variant)
 
@@ -1264,17 +1303,24 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         text = text.strip() if isinstance(text, str) else text
         return OCRResult(logits=logits, text=(text if text else None), confidence=confidence)
 
-    def ctc_loss(self, logits: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ctc_loss(self, logits: torch.Tensor, target_text: str,
+                 diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         CTC loss for DTRB CTC models.
 
         Expects logits shape [T, C] from OCRResult.logits.
+        diff_positions : when provided, filter target_text to only the differing positions.
         """
         if self._prediction != "CTC":
             raise RuntimeError("ctc_loss is only valid when DTRB prediction=CTC")
 
         if logits.dim() != 2:
             raise ValueError(f"Expected logits [T, C], got shape {tuple(logits.shape)}")
+
+        if diff_positions is not None:
+            target_text = "".join(target_text[i] for i in diff_positions if i < len(target_text))
+            if not target_text:
+                return logits.new_tensor(0.0)
 
         # Most DTRB plate checkpoints use lowercase alpha chars.
         normalized = target_text.lower()
@@ -1303,7 +1349,8 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         )
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
-                             impersonation: bool = False) -> torch.Tensor:
+                             impersonation: bool = False,
+                             correct_text: Optional[str] = None) -> torch.Tensor:
         """Differentiable CTC loss on a [1, 3, H, W] crop tensor (CTC mode only)."""
         if self._prediction != "CTC" or not self.is_trainable:
             return torch.tensor(0.0, device=self.device)
@@ -1312,7 +1359,8 @@ class DeepTextRecognitionBenchmarkOCRBackend(OCRBackend):
         text_for_pred = torch.LongTensor(1, self.max_label_length + 1).fill_(0).to(self.device)
         preds = self._model(preprocessed, text_for_pred)  # [1, T, C]
         logits = preds.squeeze(0)                          # [T, C]
-        base = self.ctc_loss(logits, target_text)
+        diff_pos = _diff_char_positions(target_text, correct_text) if (impersonation and correct_text) else None
+        base = self.ctc_loss(logits, target_text, diff_positions=diff_pos)
         return base if impersonation else -base
 
     def parameters(self) -> Iterator[nn.Parameter]:
@@ -1447,7 +1495,8 @@ class CCTOCRBackend(OCRBackend):
 
         return OCRResult(logits=logits.detach(), text=text, confidence=confidence)
 
-    def ce_loss(self, probs: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ce_loss(self, probs: torch.Tensor, target_text: str,
+                diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
         Per-slot NLL loss.  Expects softmax *probabilities* [1/T, vocab] as
         output by CCTOCRTorch (which returns softmax, not raw logits).
@@ -1458,6 +1507,8 @@ class CCTOCRBackend(OCRBackend):
             Shape [1, T, vocab] or [T, vocab] — softmax probabilities.
         target_text : str
             Plate string, e.g. "VRJ7774".  Padded/trimmed to T slots with '_'.
+        diff_positions : list of int, optional
+            When provided, only compute NLL loss over those character positions.
         """
         if probs.dim() == 3:
             probs = probs.squeeze(0)   # [T, vocab]
@@ -1469,7 +1520,16 @@ class CCTOCRBackend(OCRBackend):
             dtype=torch.long, device=probs.device,
         )
         # CCTOCRTorch returns softmax probs — use NLL loss directly to avoid double-softmax
-        return F.nll_loss(torch.log(probs.clamp(min=1e-8)), target_ids)
+        log_probs = torch.log(probs.clamp(min=1e-8))
+        if diff_positions is not None:
+            mask = torch.zeros(T, dtype=torch.bool, device=probs.device)
+            for i in diff_positions:
+                if i < T:
+                    mask[i] = True
+            if mask.any():
+                return F.nll_loss(log_probs[mask], target_ids[mask])
+            # fallback: no positions to filter
+        return F.nll_loss(log_probs, target_ids)
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False) -> torch.Tensor:
