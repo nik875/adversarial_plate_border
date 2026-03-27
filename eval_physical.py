@@ -835,6 +835,12 @@ def main() -> None:
                     _rows=job_rows[i],
                 )
             del batch
+            for i, (label, backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, condition) in enumerate(jobs):
+                m = job_metrics[i]
+                s = f"    [{label}] {det_key[0]} | {patch_name}  n={m.num_images}  recall={m.recall:.3f}  mIoU={m.mean_iou:.3f}"
+                if m.ocr_total > 0:
+                    s += f"  ocr_imp={m.ocr_impersonation_rate:.1%}"
+                print(s)
 
         # Print summaries and collect results
         prev_patch = None
