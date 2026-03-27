@@ -5,8 +5,8 @@
 # Train one adversarial patch per explicit detector+OCR pairing.
 #
 # Pairings configured by default:
-#   1) rtdetr     + trocr
-#   2) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
+#   1) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
+#   2) rtdetr     + trocr
 #   3) yolov8     + lprnet
 #   4) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
 #
@@ -217,8 +217,8 @@ fi
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights
 PAIRS=(
-    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
     "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS"
+    "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
     "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS"
     "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"
 )
