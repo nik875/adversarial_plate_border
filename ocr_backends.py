@@ -759,7 +759,8 @@ class LPRNetBackend(OCRBackend):
             return None, 0.0
         return "".join(chars), float(sum(confs) / len(confs))
 
-    def ctc_loss(self, log_probs: torch.Tensor, target_text: str) -> torch.Tensor:
+    def ctc_loss(self, log_probs: torch.Tensor, target_text: str,
+                 diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """CTC loss on [T, C] log-probabilities."""
         lp = log_probs.unsqueeze(1)   # [T, 1, C]
         target_ids = torch.tensor(
