@@ -652,6 +652,8 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-workers", type=int, default=0,
                         help="Threads for parallel image loading (default: nproc).")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Images per batch for CPU evaluation (default: 64).")
     parser.add_argument("--scale", type=float, default=0.5,
                         help="Resize images by this factor before evaluation (default: 0.5).")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
@@ -818,7 +820,7 @@ def main() -> None:
 
         print(f"[eval_physical] CPU mode: evaluating {len(jobs)} jobs over batched image loading")
         for batch_idx, batch in enumerate(
-            iter_image_batches(df, args.device, args.scale, args.num_workers)
+            iter_image_batches(df, args.device, args.scale, args.num_workers, args.batch_size)
         ):
             print(f"  batch {batch_idx + 1} ({len(batch)} images)")
             for i, (label, backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, condition) in enumerate(jobs):
