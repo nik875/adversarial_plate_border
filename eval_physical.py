@@ -323,6 +323,64 @@ def preload_images(df: pd.DataFrame, device: str, scale: float = 1.0,
     return samples
 
 
+def iter_image_batches(df: pd.DataFrame, device: str, scale: float = 1.0,
+                       num_workers: int = 0, batch_size: int = 64):
+    """Generator that loads images in batches, yields each batch, then frees it.
+
+    Used for CPU evaluation to avoid holding all images in memory at once.
+    Each yielded batch is a list of (image, corners, gt_box, filename).
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    to_tensor = T.ToTensor()
+    if num_workers == 0:
+        num_workers = os.cpu_count() or 1
+
+    rows = list(df.iterrows())
+    BATCH = max(num_workers, batch_size)
+
+    def _load_one(args):
+        idx, row = args
+        fname = row["filename"]
+        try:
+            pil_img = Image.open(fname).convert("RGB")
+        except Exception as e:
+            print(f"  [warn] could not load {fname}: {e}")
+            return idx, None
+        if scale != 1.0:
+            new_w = int(pil_img.width * scale)
+            new_h = int(pil_img.height * scale)
+            pil_img = pil_img.resize((new_w, new_h), Image.BILINEAR)
+        image = to_tensor(pil_img)
+        del pil_img
+        corners = torch.tensor([
+            [row["p1_x"], row["p1_y"]],
+            [row["p2_x"], row["p2_y"]],
+            [row["p3_x"], row["p3_y"]],
+            [row["p4_x"], row["p4_y"]],
+        ], dtype=torch.float32) * scale
+        return idx, (image, corners, fname)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for batch_start in range(0, len(rows), BATCH):
+            batch_rows = rows[batch_start:batch_start + BATCH]
+            futs = [pool.submit(_load_one, r) for r in batch_rows]
+            samples = []
+            for f in futs:
+                idx, data = f.result()
+                if data is not None:
+                    image, corners, fname = data
+                    corners_dev = corners.to(device)
+                    gt_box = torch.stack([
+                        corners_dev[:, 0].min(), corners_dev[:, 1].min(),
+                        corners_dev[:, 0].max(), corners_dev[:, 1].max(),
+                    ])
+                    samples.append((image.to(device), corners_dev, gt_box, fname))
+            del futs
+            yield samples
+            del samples
+
+
 def _plate_text_matches(text: str, expected: str) -> bool:
     """Case-insensitive alphanumeric comparison."""
     norm = lambda s: re.sub(r"[^A-Za-z0-9]", "", s).upper()
@@ -368,15 +426,20 @@ def evaluate_one(backend: DetectorBackend,
                  ocr_backend: Optional[OCRBackend] = None,
                  expected_plate: str = "",
                  impersonation_target: str = "",
-                 condition: str = "") -> Tuple[BackendMetrics, List[dict]]:
+                 condition: str = "",
+                 _m: Optional[BackendMetrics] = None,
+                 _rows: Optional[List[dict]] = None) -> Tuple[BackendMetrics, List[dict]]:
     """Evaluate a single backend × patch combo over preloaded samples.
 
     Returns (BackendMetrics, per_image_rows) where per_image_rows is a list
     of dicts compatible with the full_results_largedet.csv schema used by
     the publication_figures scripts.
+
+    If _m and _rows are provided, results are accumulated into them (for
+    batch-first evaluation on CPU).
     """
-    m = BackendMetrics(name=backend.name, patch_name=patch_name)
-    per_image_rows: List[dict] = []
+    m = _m if _m is not None else BackendMetrics(name=backend.name, patch_name=patch_name)
+    per_image_rows: List[dict] = _rows if _rows is not None else []
     backend.eval()
     if ocr_backend is not None:
         ocr_backend.ensure_loaded()
@@ -694,8 +757,6 @@ def main() -> None:
     if args.sanity_check:
         sanity_check_backends(seen_det, seen_ocr, df, args.device, args.scale)
 
-    samples = preload_images(df, args.device, args.scale, args.num_workers)
-
     all_results:    List[BackendMetrics] = []
     all_image_rows: List[dict]           = []
 
@@ -729,62 +790,95 @@ def main() -> None:
     # Non-clean patches in input order
     patch_list = [(n, t, dk, ok) for n, t, dk, ok in patch_entries if n != "clean"]
 
-    # For each patch: white-box (target detector) first, then all other detectors
+    # Build the flat list of evaluation jobs so we can run them in any order.
+    # Each job: (label, backend, patch_tensor_or_None, patch_name, ocr_backend, condition)
+    jobs: List[Tuple] = []
     for patch_name, patch_tensor, det_key, ocr_key in patch_list:
-        print(f"\n══ Patch: {patch_name} ══")
-
-        # White-box evaluation on the patch's own (target) detector
         target_backend = seen_det[det_key]
         ocr_backend    = seen_ocr.get(ocr_key) if ocr_key else None
-        print(f"\n── [white-box] {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
-        m, rows = evaluate_one(
-            target_backend, samples, patch_tensor, patch_name,
-            device=args.device, iou_threshold=args.iou_threshold,
-            ocr_backend=ocr_backend,
-            expected_plate=args.expected_plate,
-            impersonation_target=args.impersonation_target,
-            condition=_condition_label(patch_name),
-        )
-        all_results.append(m)
-        all_image_rows.extend(rows)
-        print(f"  {m.summary()}")
-
-        # Black-box transfer evaluation on every other detector
+        jobs.append(("white-box", target_backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, _condition_label(patch_name)))
         for other_det_key, other_backend in seen_det.items():
             if other_det_key == det_key:
                 continue
             other_ocr_key = backend_default_ocr[other_det_key]
             other_ocr     = seen_ocr.get(other_ocr_key) if other_ocr_key else None
-            print(f"\n── [black-box] {other_det_key[0]} | ocr={other_ocr_key[0] if other_ocr_key else 'none'} ──")
+            jobs.append(("black-box", other_backend, patch_tensor, patch_name, other_det_key, other_ocr_key, other_ocr, _condition_label(patch_name)))
+    for det_key, backend in seen_det.items():
+        ocr_key = backend_default_ocr[det_key]
+        ocr     = seen_ocr.get(ocr_key) if ocr_key else None
+        jobs.append(("clean", backend, None, "clean", det_key, ocr_key, ocr, "control"))
+
+    if args.device == "cpu":
+        # Batch-first: load a chunk of images, evaluate ALL jobs on it, free, repeat.
+        # This avoids holding the entire dataset in RAM simultaneously.
+        job_metrics: List[BackendMetrics] = [
+            BackendMetrics(name=j[1].name, patch_name=j[3]) for j in jobs
+        ]
+        job_rows: List[List[dict]] = [[] for _ in jobs]
+
+        print(f"[eval_physical] CPU mode: evaluating {len(jobs)} jobs over batched image loading")
+        for batch_idx, batch in enumerate(
+            iter_image_batches(df, args.device, args.scale, args.num_workers)
+        ):
+            print(f"  batch {batch_idx + 1} ({len(batch)} images)")
+            for i, (label, backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, condition) in enumerate(jobs):
+                evaluate_one(
+                    backend, batch, patch_tensor, patch_name,
+                    device=args.device, iou_threshold=args.iou_threshold,
+                    ocr_backend=ocr_backend,
+                    expected_plate=args.expected_plate,
+                    impersonation_target=args.impersonation_target,
+                    condition=condition,
+                    _m=job_metrics[i],
+                    _rows=job_rows[i],
+                )
+            del batch
+
+        # Print summaries and collect results
+        prev_patch = None
+        printed_clean_header = False
+        for i, (label, backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, condition) in enumerate(jobs):
+            if label == "clean":
+                if not printed_clean_header:
+                    print(f"\n══ Clean (no patch) ══")
+                    printed_clean_header = True
+            elif patch_name != prev_patch:
+                print(f"\n══ Patch: {patch_name} ══")
+            prev_patch = patch_name
+            ocr_label = ocr_key[0] if ocr_key else "none"
+            det_label = det_key[0]
+            print(f"\n── [{label}] {det_label} | ocr={ocr_label} ──")
+            print(f"  {job_metrics[i].summary()}")
+            all_results.append(job_metrics[i])
+            all_image_rows.extend(job_rows[i])
+    else:
+        # GPU: preload everything to device memory once, then iterate jobs.
+        samples = preload_images(df, args.device, args.scale, args.num_workers)
+
+        prev_patch = None
+        printed_clean_header = False
+        for label, backend, patch_tensor, patch_name, det_key, ocr_key, ocr_backend, condition in jobs:
+            if label == "white-box":
+                print(f"\n══ Patch: {patch_name} ══")
+                print(f"\n── [white-box] {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+            elif label == "black-box":
+                print(f"\n── [black-box] {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
+            else:
+                if not printed_clean_header:
+                    print(f"\n══ Clean (no patch) ══")
+                    printed_clean_header = True
+                print(f"\n── clean | {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
             m, rows = evaluate_one(
-                other_backend, samples, patch_tensor, patch_name,
+                backend, samples, patch_tensor, patch_name,
                 device=args.device, iou_threshold=args.iou_threshold,
-                ocr_backend=other_ocr,
+                ocr_backend=ocr_backend,
                 expected_plate=args.expected_plate,
                 impersonation_target=args.impersonation_target,
-                condition=_condition_label(patch_name),
+                condition=condition,
             )
             all_results.append(m)
             all_image_rows.extend(rows)
             print(f"  {m.summary()}")
-
-    # Clean baseline: all backends, no patch
-    print(f"\n══ Clean (no patch) ══")
-    for det_key, backend in seen_det.items():
-        ocr_key = backend_default_ocr[det_key]
-        ocr     = seen_ocr.get(ocr_key) if ocr_key else None
-        print(f"\n── clean | {det_key[0]} | ocr={ocr_key[0] if ocr_key else 'none'} ──")
-        m, rows = evaluate_one(
-            backend, samples, None, "clean",
-            device=args.device, iou_threshold=args.iou_threshold,
-            ocr_backend=ocr,
-            expected_plate=args.expected_plate,
-            impersonation_target=args.impersonation_target,
-            condition="control",
-        )
-        all_results.append(m)
-        all_image_rows.extend(rows)
-        print(f"  {m.summary()}")
 
     # Save outputs via evaluator helpers
     from evaluator import DetectorEvaluator
