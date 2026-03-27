@@ -447,6 +447,7 @@ def evaluate_one(backend: DetectorBackend,
 
     with torch.no_grad():
         pbar = tqdm(samples, desc=f"  {backend.name} | {patch_name}", leave=False)
+        last_text = "—"
         for image, corners, gt_box, filename in pbar:
             if patch is not None:
                 image = _apply_patch(image, corners, patch)
@@ -496,6 +497,7 @@ def evaluate_one(backend: DetectorBackend,
                     result = ocr_backend.predict(crop.squeeze(0))
                     text = result.text or ""
                     detected_plate_text = text
+                    last_text = text or "—"
                     if expected_plate and _plate_text_matches(text, expected_plate):
                         m.ocr_correct += 1
                     elif impersonation_target and _plate_text_matches(text, impersonation_target):
@@ -504,8 +506,13 @@ def evaluate_one(backend: DetectorBackend,
                         m.ocr_misread += 1
 
                 ocr_seen = m.ocr_total  # includes no_detection cases
-                rate = m.ocr_correct / ocr_seen if ocr_seen else 0.0
-                pbar.set_postfix(correct=f"{m.ocr_correct}/{ocr_seen} ({rate:.1%})")
+                correct_rate = m.ocr_correct / ocr_seen if ocr_seen else 0.0
+                imp_rate = m.ocr_impersonation / ocr_seen if ocr_seen else 0.0
+                pbar.set_postfix(
+                    correct=f"{m.ocr_correct}/{ocr_seen} ({correct_rate:.1%})",
+                    imp=f"{m.ocr_impersonation}/{ocr_seen} ({imp_rate:.1%})",
+                    last=last_text,
+                )
 
             # Collect per-image row for publication CSV
             meta = _parse_filename_meta(filename)
@@ -839,7 +846,7 @@ def main() -> None:
                 m = job_metrics[i]
                 s = f"    [{label}] {det_key[0]} | {patch_name}  n={m.num_images}  recall={m.recall:.3f}  mIoU={m.mean_iou:.3f}"
                 if m.ocr_total > 0:
-                    s += f"  ocr_imp={m.ocr_impersonation_rate:.1%}"
+                    s += f"  ocr_correct={m.ocr_correct_rate:.1%}  ocr_imp={m.ocr_impersonation_rate:.1%}"
                 print(s)
 
         # Print summaries and collect results
