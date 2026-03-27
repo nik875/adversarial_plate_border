@@ -503,7 +503,7 @@ def evaluate_one(backend: DetectorBackend,
                     else:
                         m.ocr_misread += 1
 
-                ocr_seen = m.ocr_correct + m.ocr_impersonation + m.ocr_misread
+                ocr_seen = m.ocr_total  # includes no_detection cases
                 rate = m.ocr_correct / ocr_seen if ocr_seen else 0.0
                 pbar.set_postfix(correct=f"{m.ocr_correct}/{ocr_seen} ({rate:.1%})")
 
