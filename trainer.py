@@ -852,14 +852,18 @@ class AdversarialPatchTrainer:
 
         image_losses, det_l_list, ocr_l_list = [], [], []
         for i, (conf_loss, pred_box) in enumerate(det_results):
-            if self.impersonation_target and pred_box is not None:
-                # Impersonation detection objective: maximise IoU with the rim bbox.
-                # No confidence weighting.
-                rim_box = items[i]["rim_box"].to(self.device)
-                iou = self._boxes_iou(
-                    pred_box.unsqueeze(0), rim_box.unsqueeze(0)
-                ).squeeze()
-                det_i = -iou
+            if self.impersonation_target:
+                if pred_box is not None:
+                    # Impersonation detection objective: minimise IoU with the
+                    # ground-truth plate bbox. A missed detection is a success
+                    # (loss = 0).
+                    target_box = items[i]["target_box"].to(self.device)
+                    iou = self._boxes_iou(
+                        pred_box.unsqueeze(0), target_box.unsqueeze(0)
+                    ).squeeze()
+                    det_i = iou
+                else:
+                    det_i = torch.tensor(0.0, device=self.device)
             else:
                 det_i = conf_loss * self.det_loss_scale
 
