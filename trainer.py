@@ -890,175 +890,110 @@ class AdversarialPatchTrainer:
         }
 
     def compute_loss_batch(self, items: list) -> tuple:
-        """Batch the slow model-eval calls; average losses over B items."""
+        """Batch the slow model-eval calls; average losses over B items.
+
+        Dual-flow top-extend impersonation:
+          Flow 1 (real plate, suppress): minimize IoU when detected, else
+            minimize conf score — gradient always flows.
+          Flow 2 (top region, attract): maximize IoU when detected, else
+            maximize conf score — gradient always flows.
+        OCR: differentiable crop from predicted box when available; GT crop
+          fallback only when --no-disruption; otherwise that flow is skipped.
+        """
         patch_norm = items[0]["_patch_norm"]
         preps = [x["patched_prep"] for x in items]
         if all(p.shape == preps[0].shape for p in preps):
             batched_prep = torch.stack(preps)
         else:
-            # Variable-size images (e.g. fasterrcnn passthrough): pad to max H×W
             max_h = max(p.shape[1] for p in preps)
             max_w = max(p.shape[2] for p in preps)
             batched_prep = torch.stack([
                 F.pad(p, (0, max_w - p.shape[2], 0, max_h - p.shape[1]))
                 for p in preps
             ])
-        target_boxes = [x["target_box"] for x in items]
-        target_text  = self.impersonation_target or self.expected_plate_text
-        tv_l         = self.total_variation_loss(patch_norm)
+        target_boxes     = [x["target_box"]     for x in items]
+        top_region_boxes = [x["top_region_box"] for x in items]
+        tv_l             = self.total_variation_loss(patch_norm)
 
-        # Pre-compute diff/same positions for the weighted impersonation OCR loss.
-        if self.impersonation_target and self.expected_plate_text:
+        # Positional OCR weights: diff chars get 4× emphasis over same chars.
+        if self.expected_plate_text:
             diff_pos = _diff_char_positions(self.impersonation_target,
                                             self.expected_plate_text)
-            n = max(len(self.impersonation_target), len(self.expected_plate_text))
+            n        = max(len(self.impersonation_target), len(self.expected_plate_text))
             same_pos = [i for i in range(n) if i not in diff_pos]
         else:
             diff_pos, same_pos = None, None
 
-        if self.top_extend and self.impersonation_target:
-            top_region_boxes = [x["top_region_box"] for x in items]
-            two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
-                batched_prep, target_boxes, top_region_boxes)
-            det_results = [r[0] for r in two_target_results]
-            top_det_results = [r[1] for r in two_target_results]
-        else:
-            det_results = self.detector.differentiable_predict_box_batch(
-                batched_prep, target_boxes)
-            top_det_results = None
+        two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
+            batched_prep, target_boxes, top_region_boxes)
 
         image_losses, det_l_list, ocr_l_list = [], [], []
-        for i, (conf_loss, pred_box) in enumerate(det_results):
-            if self.top_extend and self.impersonation_target:
-                # ── Dual-flow impersonation ─────────────────────────────────
-                # Flow 1 (real plate): suppress — minimize IoU with plate bbox.
-                #   Missed detection counts as success (loss = 0).
-                # Flow 2 (top region): attract — maximize IoU of the best
-                #   top-region detection. No detection → no loss from this flow
-                #   (gradient signal comes from flow 1 shifting detections away).
-                top_conf_loss, top_pred_box = top_det_results[i]
-
-                if pred_box is not None:
-                    target_box_t = items[i]["target_box"].to(self.device)
-                    iou_real = self._boxes_iou(
-                        pred_box.unsqueeze(0), target_box_t.unsqueeze(0)).squeeze()
-                    det_real = iou_real
-                else:
-                    det_real = torch.tensor(0.0, device=self.device)
-
-                if top_pred_box is not None:
-                    top_box_t = items[i]["top_region_box"].to(self.device)
-                    iou_top = self._boxes_iou(
-                        top_pred_box.unsqueeze(0), top_box_t.unsqueeze(0)).squeeze()
-                    det_top = -iou_top
-                else:
-                    det_top = torch.tensor(0.0, device=self.device)
-
-                det_i = det_real + det_top
-
-                # OCR: average impersonation loss over real plate crop and top crop.
-                if pred_box is not None:
-                    real_crop = _bbox_ocr_crop_diff(
-                        items[i]["patched_prep"].unsqueeze(0),
-                        pred_box.to(self.device), self.ocr.ocr_crop_size)
-                else:
-                    real_crop = items[i]["ocr_crop"]
-
-                if top_pred_box is not None:
-                    top_crop = _bbox_ocr_crop_diff(
-                        items[i]["patched_prep"].unsqueeze(0),
-                        top_pred_box.to(self.device), self.ocr.ocr_crop_size)
-                else:
-                    top_crop = items[i]["top_ocr_crop"]
-
-                if diff_pos is not None:
-                    ocr_real_d = self.ocr.differentiable_loss_batch(
-                        [real_crop], self.impersonation_target,
-                        impersonation=True, diff_positions=diff_pos)[0]
-                    ocr_real_s = self.ocr.differentiable_loss_batch(
-                        [real_crop], self.expected_plate_text,
-                        impersonation=True, diff_positions=same_pos)[0]
-                    ocr_top_d  = self.ocr.differentiable_loss_batch(
-                        [top_crop], self.impersonation_target,
-                        impersonation=True, diff_positions=diff_pos)[0]
-                    ocr_top_s  = self.ocr.differentiable_loss_batch(
-                        [top_crop], self.expected_plate_text,
-                        impersonation=True, diff_positions=same_pos)[0]
-                    ocr_real_i = (0.8 * ocr_real_d + 0.2 * ocr_real_s) * self.ocr_loss_scale
-                    ocr_top_i  = (0.8 * ocr_top_d  + 0.2 * ocr_top_s)  * self.ocr_loss_scale
-                else:
-                    ocr_real_i = self.ocr.differentiable_loss_batch(
-                        [real_crop], target_text, impersonation=True)[0] * self.ocr_loss_scale
-                    ocr_top_i  = self.ocr.differentiable_loss_batch(
-                        [top_crop], target_text, impersonation=True)[0] * self.ocr_loss_scale
-
-                ocr_i = (ocr_real_i + ocr_top_i) / 2
-                image_losses.append((det_i + ocr_i) / 2)
-                det_l_list.append(det_i.detach())
-                ocr_l_list.append(ocr_i.detach())
-                continue
-
-            if self.impersonation_target:
-                if pred_box is not None:
-                    # Impersonation detection objective: minimise IoU with the
-                    # ground-truth plate bbox. A missed detection is a success
-                    # (loss = 0).
-                    target_box = items[i]["target_box"].to(self.device)
-                    iou = self._boxes_iou(
-                        pred_box.unsqueeze(0), target_box.unsqueeze(0)
-                    ).squeeze()
-                    det_i = iou
-                else:
-                    det_i = torch.tensor(0.0, device=self.device)
-            else:
-                det_i = conf_loss * self.det_loss_scale
-
+        for i, ((conf_real, pred_box), (conf_top, top_pred_box)) in enumerate(two_target_results):
+            # ── Detection ─────────────────────────────────────────────────
+            # Real plate (suppress): if detected use IoU, else use conf.
+            # Both are in [0, det_loss_scale]; gradient flows either way.
             if pred_box is not None:
-                diff_crop = _bbox_ocr_crop_diff(
-                    items[i]["patched_prep"].unsqueeze(0),
-                    pred_box.to(self.device),
-                    self.ocr.ocr_crop_size,
-                )
-                if self.impersonation_target and diff_pos is not None:
-                    # Weighted positional OCR loss: 4:1 emphasis on differing chars.
-                    # Both terms are length-normalised so weights sum to 1 to
-                    # preserve the same overall loss magnitude.
-                    loss_diff = self.ocr.differentiable_loss_batch(
-                        [diff_crop], self.impersonation_target,
-                        impersonation=True,
-                        diff_positions=diff_pos if diff_pos else None,
-                    )[0]
-                    loss_same = self.ocr.differentiable_loss_batch(
-                        [diff_crop], self.expected_plate_text,
-                        impersonation=True,
-                        diff_positions=same_pos if same_pos else None,
-                    )[0]
-                    ocr_i = (0.8 * loss_diff + 0.2 * loss_same) * self.ocr_loss_scale
-                else:
-                    ocr_i = self.ocr.differentiable_loss_batch(
-                        [diff_crop], target_text,
-                        impersonation=bool(self.impersonation_target),
-                    )[0] * self.ocr_loss_scale
-                if self.disable_disruption:
-                    image_losses.append(ocr_i)
-                else:
-                    image_losses.append((det_i + ocr_i) / 2)
-                ocr_l_list.append(ocr_i.detach())
+                iou_real = self._boxes_iou(
+                    pred_box.unsqueeze(0),
+                    items[i]["target_box"].to(self.device).unsqueeze(0)).squeeze()
+                det_real = iou_real * self.det_loss_scale
             else:
-                if self.disable_disruption:
-                    # No detection but disruption not our goal: fall back to GT
-                    # crop so OCR attack still receives gradient signal.
-                    ocr_i = self.ocr.differentiable_loss_batch(
-                        [items[i]["ocr_crop"]], target_text,
-                        impersonation=bool(self.impersonation_target),
-                    )[0] * self.ocr_loss_scale
-                    image_losses.append(ocr_i)
-                    ocr_l_list.append(ocr_i.detach())
+                det_real = conf_real * self.det_loss_scale
+
+            # Top region (attract): negate so minimizing loss maximizes detection.
+            if top_pred_box is not None:
+                iou_top = self._boxes_iou(
+                    top_pred_box.unsqueeze(0),
+                    items[i]["top_region_box"].to(self.device).unsqueeze(0)).squeeze()
+                det_top = -iou_top * self.det_loss_scale
+            else:
+                det_top = -conf_top * self.det_loss_scale
+
+            det_i = det_real + det_top
+
+            # ── OCR ───────────────────────────────────────────────────────
+            # Use differentiable crop from predicted box when available.
+            # With --no-disruption, fall back to GT crop so OCR loss still flows
+            # when the detector hasn't fired yet. Otherwise skip that flow.
+            if pred_box is not None:
+                real_crop = _bbox_ocr_crop_diff(
+                    items[i]["patched_prep"].unsqueeze(0),
+                    pred_box.to(self.device), self.ocr.ocr_crop_size)
+            elif self.disable_disruption:
+                real_crop = items[i]["ocr_crop"]
+            else:
+                real_crop = None
+
+            if top_pred_box is not None:
+                top_crop = _bbox_ocr_crop_diff(
+                    items[i]["patched_prep"].unsqueeze(0),
+                    top_pred_box.to(self.device), self.ocr.ocr_crop_size)
+            elif self.disable_disruption:
+                top_crop = items[i]["top_ocr_crop"]
+            else:
+                top_crop = None
+
+            ocr_parts = []
+            for crop in filter(None, [real_crop, top_crop]):
+                if diff_pos is not None:
+                    loss_d = self.ocr.differentiable_loss_batch(
+                        [crop], self.impersonation_target,
+                        impersonation=True, diff_positions=diff_pos)[0]
+                    loss_s = self.ocr.differentiable_loss_batch(
+                        [crop], self.expected_plate_text,
+                        impersonation=True, diff_positions=same_pos)[0]
+                    ocr_parts.append((0.8 * loss_d + 0.2 * loss_s) * self.ocr_loss_scale)
                 else:
-                    # Detection is the goal: no valid box means attack succeeded.
-                    image_losses.append(torch.zeros(1, device=self.device).squeeze())
-                    ocr_l_list.append(torch.zeros(1, device=self.device).squeeze())
+                    ocr_parts.append(self.ocr.differentiable_loss_batch(
+                        [crop], self.impersonation_target,
+                        impersonation=True)[0] * self.ocr_loss_scale)
+
+            ocr_i = (sum(ocr_parts) / len(ocr_parts)) if ocr_parts \
+                else torch.tensor(0.0, device=self.device)
+
+            image_losses.append((det_i + ocr_i) / 2)
             det_l_list.append(det_i.detach())
+            ocr_l_list.append(ocr_i.detach())
 
         total = torch.stack(image_losses).mean() + self.tv_weight * tv_l
         det_l = torch.stack(det_l_list).mean()

@@ -100,7 +100,8 @@ def _select_best_from_scores_boxes(
     with torch.no_grad():
         ious = _box_iou_vectorized(tb, boxes_xyxy.detach())
         if ious.max().item() < 1e-6:
-            return torch.tensor(0.0, device=device), None
+            # No box overlaps target at all — return max score so gradient still flows.
+            return scores.max(), None
         best_idx = int((ious * scores.detach()).argmax().item())
     if scores[best_idx].detach().item() < conf_threshold:
         return scores[best_idx], None
