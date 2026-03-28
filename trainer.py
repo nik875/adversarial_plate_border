@@ -690,6 +690,22 @@ class AdversarialPatchTrainer:
         if augment:
             patch_batch = self._augment_image(patch_batch)
 
+        # Brightness correction: scale patch to match the plate region's mean
+        # brightness, so it doesn't stand out against different lighting conditions.
+        # During training, skipped with probability 0.2 so the model doesn't
+        # learn to rely on it as a secondary activation.
+        if not (self.training and torch.rand(1, device=self.device).item() < 0.2):
+            with torch.no_grad():
+                px1 = int(plate[:, 0].min().clamp(0, W - 1).item())
+                px2 = int(plate[:, 0].max().clamp(0, W).item())
+                py1 = int(plate[:, 1].min().clamp(0, H - 1).item())
+                py2 = int(plate[:, 1].max().clamp(0, H).item())
+                if px2 > px1 and py2 > py1:
+                    plate_brightness = image[0, :, py1:py2, px1:px2].mean().clamp(min=1e-6)
+                    patch_brightness = patch_batch.mean().clamp(min=1e-6)
+                    brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+                    patch_batch = patch_batch * brightness_scale
+
         ones = torch.ones(B, 1, ph, pw, device=self.device)
 
         warped_patch       = K.warp_perspective(patch_batch, M_border, (H, W),
