@@ -94,15 +94,38 @@ def _select_best_from_scores_boxes(
     target_box: torch.Tensor,
     conf_threshold: float,
     device: str,
+    mode: str = "suppress",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Select (conf_loss, pred_box) for target_box from pre-computed scores/boxes."""
+    """Select (conf_loss, pred_box) for target_box from pre-computed scores/boxes.
+
+    mode='suppress': caller minimizes the returned score (real plate, suppress flow).
+      No IoU overlap → already succeeded; return constant 0.0 with no gradient.
+    mode='attract':  caller negates and minimizes the returned score (top-region flow).
+      No IoU overlap → return proximity-weighted sum of scores so gradient pulls
+      the spatially nearest anchors toward the target (weights fixed, scores carry grad).
+      The weights are computed under no_grad and used outside it so gradient flows.
+    """
     tb = target_box.to(device)
+    proximity_weights = None
+    best_idx = None
     with torch.no_grad():
         ious = _box_iou_vectorized(tb, boxes_xyxy.detach())
         if ious.max().item() < 1e-6:
-            # No box overlaps target at all — return max score so gradient still flows.
-            return scores.max(), None
-        best_idx = int((ious * scores.detach()).argmax().item())
+            if mode == "suppress":
+                return torch.tensor(0.0, device=device), None
+            # attract — no overlap yet: compute fixed proximity weights.
+            # scores * proximity_weights is evaluated outside no_grad below.
+            box_centers  = (boxes_xyxy[:, :2] + boxes_xyxy[:, 2:]) / 2
+            target_center = torch.stack([(tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2])
+            dists        = ((box_centers - target_center) ** 2).sum(-1).sqrt()
+            target_size  = max((tb[2] - tb[0]).item(), (tb[3] - tb[1]).item(), 1.0)
+            proximity_weights = torch.softmax(-dists / target_size, dim=0)
+        else:
+            best_idx = int((ious * scores.detach()).argmax().item())
+
+    # Outside no_grad: gradient flows through scores.
+    if proximity_weights is not None:
+        return (scores * proximity_weights).sum(), None
     if scores[best_idx].detach().item() < conf_threshold:
         return scores[best_idx], None
     return scores[best_idx], boxes_xyxy[best_idx]
@@ -327,8 +350,8 @@ class DetectorBackend(abc.ABC):
                 continue
             sc = torch.stack([d.conf.to(self.device) for d in dets])
             bx = torch.stack([d.box.to(self.device) for d in dets])
-            r1 = _select_best_from_scores_boxes(sc, bx, target_boxes1[i], thresh, self.device)
-            r2 = _select_best_from_scores_boxes(sc, bx, target_boxes2[i], thresh, self.device)
+            r1 = _select_best_from_scores_boxes(sc, bx, target_boxes1[i], thresh, self.device, mode="suppress")
+            r2 = _select_best_from_scores_boxes(sc, bx, target_boxes2[i], thresh, self.device, mode="attract")
             results.append((r1, r2))
         return results
 
@@ -868,8 +891,8 @@ class RTDETRBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device, requires_grad=True)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes2[i], self.conf_threshold, self.device)
+            r1 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes1[i], self.conf_threshold, self.device, mode="suppress")
+            r2 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes2[i], self.conf_threshold, self.device, mode="attract")
             results.append((r1, r2))
         return results
 
@@ -1292,8 +1315,8 @@ class FasterRCNNBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes2[i], self.conf_threshold, self.device)
+            r1 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes1[i], self.conf_threshold, self.device, mode="suppress")
+            r2 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes2[i], self.conf_threshold, self.device, mode="attract")
             results.append((r1, r2))
         return results
 
@@ -1814,8 +1837,8 @@ class YOLOv11Backend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes2[i], self.conf_threshold, self.device)
+            r1 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes1[i], self.conf_threshold, self.device, mode="suppress")
+            r2 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes2[i], self.conf_threshold, self.device, mode="attract")
             results.append((r1, r2))
         return results
 
@@ -2050,8 +2073,8 @@ class Yolov9TorchBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes2[i], self.conf_threshold, self.device)
+            r1 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes1[i], self.conf_threshold, self.device, mode="suppress")
+            r2 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes2[i], self.conf_threshold, self.device, mode="attract")
             results.append((r1, r2))
         return results
 

@@ -358,7 +358,6 @@ class AdversarialPatchTrainer:
         print_blur:           float          = 0.0,
         training:             bool           = False,
         train_detector:       bool           = False,
-        use_homography:       bool           = True,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
         ocr_loss_scale:       float          = 1.0,
@@ -382,7 +381,6 @@ class AdversarialPatchTrainer:
         self.print_blur           = print_blur
         self.augment              = augment
         self.top_extend           = top_extend
-        self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
         self.impersonation_target = impersonation_target
         self.expected_plate_text  = expected_plate_text
@@ -615,46 +613,6 @@ class AdversarialPatchTrainer:
     # Patch application
     # ====================================================================
 
-    def _apply_patch_simple(self, image: torch.Tensor, corners: torch.Tensor,
-                             patch_norm: torch.Tensor,
-                             border_scale: float = 1.4) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, C, H, W = image.shape
-        plate = corners[0]
-        cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
-        ctr    = torch.tensor([cx, cy], device=self.device)
-        border = ctr.unsqueeze(0) + (plate - ctr.unsqueeze(0)) * border_scale
-
-        bx1 = torch.clamp(border[:, 0].min(), 0, W).int()
-        bx2 = torch.clamp(border[:, 0].max(), 0, W).int()
-        by2 = torch.clamp(border[:, 1].max(), 0, H).int()
-        px1 = torch.clamp(plate[:, 0].min(),  0, W).int()
-        px2 = torch.clamp(plate[:, 0].max(),  0, W).int()
-        py1 = torch.clamp(plate[:, 1].min(),  0, H).int()
-        py2 = torch.clamp(plate[:, 1].max(),  0, H).int()
-        if self.top_extend:
-            # Double the border's vertical size, all extra on top.
-            # Normal border: total height = 1.4 * ph, so top margin = 0.2 * ph.
-            # Doubled: total height = 2.8 * ph → new top margin = 1.6 * ph.
-            plate_h_px = (py2 - py1).float()
-            by1 = torch.clamp((py1.float() - 1.6 * plate_h_px).int(),
-                               torch.tensor(0), torch.tensor(H))
-        else:
-            by1 = torch.clamp(border[:, 1].min(), 0, H).int()
-
-        result = image.clone()
-        mask   = torch.zeros(B, 3, H, W, device=self.device)
-        bh, bw = by2 - by1, bx2 - bx1
-        if bh > 0 and bw > 0:
-            resized = F.interpolate(patch_norm.unsqueeze(0), size=(bh, bw),
-                                    mode="bilinear", align_corners=True)
-            for b in range(B):
-                result[b, :, by1:by2, bx1:bx2] = resized[0]
-                mask[b,   :, by1:by2, bx1:bx2] = 1.0
-                if py2 > py1 and px2 > px1:
-                    result[b, :, py1:py2, px1:px2] = image[b, :, py1:py2, px1:px2]
-                    mask[b,   :, py1:py2, px1:px2] = 0.0
-        return torch.clamp(result, 0, 1), mask
-
     def apply_patch_to_image(
         self,
         image:          torch.Tensor,
@@ -690,32 +648,28 @@ class AdversarialPatchTrainer:
         B    = image.shape[0]
         H, W = image.shape[2], image.shape[3]
 
-        if not self.use_homography:
-            return self._apply_patch_simple(image, corners, patch_norm, border_scale)
-
         plate  = corners[0]
         cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
         center = torch.tensor([cx, cy], device=self.device)
 
         if self.top_extend:
-            # Axis-aligned asymmetric border: same x/bottom extent as normal
-            # border_scale, but top extended by one full plate height.
-            px1_ = plate[:, 0].min();  px2_ = plate[:, 0].max()
-            py1_ = plate[:, 1].min();  py2_ = plate[:, 1].max()
-            plate_w_ = px2_ - px1_;    plate_h_ = py2_ - py1_
-            margin_x_   = plate_w_ * (border_scale - 1) / 2
-            margin_bot_ = plate_h_ * (border_scale - 1) / 2  # 0.2 * ph
-            bx1_ = (px1_ - margin_x_).clamp(0, W)
-            bx2_ = (px2_ + margin_x_).clamp(0, W)
-            by2_ = (py2_ + margin_bot_).clamp(0, H)
-            top_ = (py1_ - 1.6 * plate_h_).clamp(0, H)  # doubled height, all extra on top
-            # TL, TR, BR, BL — matches src ordering below
-            border = torch.stack([
-                torch.stack([bx1_, top_]),
-                torch.stack([bx2_, top_]),
-                torch.stack([bx2_, by2_]),
-                torch.stack([bx1_, by2_]),
-            ]).to(dtype=torch.float32).unsqueeze(0)
+            # Perspective-correct asymmetric border.
+            # Corners are ordered TL(0), TR(1), BR(2), BL(3).
+            # Bottom corners: normal 1.4× scale from center (0.2*ph margin below plate).
+            # Top corners: normal 1.4× scale PLUS an extra 1.4*col_vec shift upward
+            #   along each column direction, giving total top margin = 1.6*ph and
+            #   total border column height = 2.8*ph (vs 1.4*ph for normal border).
+            # This preserves the plate's perspective skew/tilt in the border region.
+            p1_b = center + (plate[0] - center) * border_scale  # TL border (normal)
+            p2_b = center + (plate[1] - center) * border_scale  # TR border (normal)
+            p3_b = center + (plate[2] - center) * border_scale  # BR border (normal)
+            p4_b = center + (plate[3] - center) * border_scale  # BL border (normal)
+            # Column vectors in image space: TL-BL and TR-BR (point "upward").
+            col_left  = plate[0] - plate[3]   # p1 - p4
+            col_right = plate[1] - plate[2]   # p2 - p3
+            new_tl = p1_b + 1.4 * col_left
+            new_tr = p2_b + 1.4 * col_right
+            border = torch.stack([new_tl, new_tr, p3_b, p4_b]).unsqueeze(0)  # [1, 4, 2]
         else:
             border = (center.unsqueeze(0) +
                       (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
@@ -783,41 +737,6 @@ class AdversarialPatchTrainer:
     # ====================================================================
     # Loss
     # ====================================================================
-
-    def partial_loss(
-        self,
-        patched_prep: torch.Tensor,   # [1, C, H_prep, W_prep] — for detector
-        new_corners:  torch.Tensor,   # [4, 2] — detector-space corners
-        patched_orig: torch.Tensor,   # [1, C, H_full, W_full] — for OCR crop
-        orig_corners: torch.Tensor,   # [4, 2] — full-res corners
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        target_box = self.corners_to_bbox(new_corners)
-
-        # ── Detection (preprocessed resolution) ────────────────────────
-        det_loss = self.detector.differentiable_det_loss(
-            patched_prep.squeeze(0), target_box
-        )
-
-        # ── OCR (full-res crop for maximum detail) ──────────────────────
-        target_text = self.impersonation_target or self.expected_plate_text
-        ocr_loss    = torch.tensor(0.0, device=self.device)
-
-        crop = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
-
-        if self.ocr.is_trainable and hasattr(self.ocr, "differentiable_loss"):
-            ocr_loss = self.ocr.differentiable_loss(
-                crop, target_text, impersonation=bool(self.impersonation_target),
-            )
-        else:
-            with torch.no_grad():
-                ocr_result = self.ocr.predict(crop.squeeze(0))
-            accuracy = ocr_result.char_accuracy(target_text)
-            ocr_loss = torch.tensor(
-                (1.0 - accuracy) if self.impersonation_target else accuracy,
-                device=self.device,
-            )
-
-        return det_loss, ocr_loss
 
     def total_variation_loss(self, patch: torch.Tensor) -> torch.Tensor:
         """Isotropic L2 total variation loss on [C, H, W] or [1, C, H, W] patch,
@@ -1671,7 +1590,6 @@ def main():
     parser.add_argument("--use-all-for-train", action="store_true")
     parser.add_argument("--impersonation-target", default="SHX8459")
     parser.add_argument("--expected-plate", default="VRJ7774")
-    parser.add_argument("--disable-homography", action="store_true")
     parser.add_argument("--train-detector", action="store_true",
                         help="Allow detector backend weights to update during training.")
     parser.add_argument("--run-name", default=None)
@@ -1747,7 +1665,6 @@ def main():
         expected_plate_text  = args.expected_plate,
         training             = True,
         train_detector       = args.train_detector,
-        use_homography       = not args.disable_homography,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
         ocr_loss_scale       = args.ocr_loss_scale,
