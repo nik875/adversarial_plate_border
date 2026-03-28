@@ -594,20 +594,41 @@ class AdversarialPatchTrainer:
                             rim[:, 0].max(), rim[:, 1].max()])
 
     @staticmethod
-    def _top_extend_region_bbox(corners: torch.Tensor,
-                                border_scale: float = 1.4) -> torch.Tensor:
-        """Plate-sized target bbox centered in the extra attacker-controlled block.
+    def _top_extend_region_corners(corners: torch.Tensor) -> torch.Tensor:
+        """[4, 2] perspective-correct corners of the top target region.
 
-        The extra block spans [y1 - 1.6*ph, y1 - 0.2*ph] (height = 1.4*ph).
-        The target is a plate-sized (pw × ph) region centered in that block:
-          center_y = y1 - 0.9*ph  →  [y1 - 1.4*ph, y1 - 0.4*ph]
-        Same width as the real plate (px1 to px2).
+        The target is a plate-sized region in the extra attacker-controlled
+        block, parameterized by the plate's own column vectors so that the
+        target quad matches the perspective tilt of the plate.
+
+        corners[0]=TL, [1]=TR, [2]=BR, [3]=BL.
+        col_left  = TL - BL  (upward direction along left edge)
+        col_right = TR - BR  (upward direction along right edge)
+
+        Target spans 0.4–1.4 plate-heights above the plate top edge, which
+        centers it in the 1.4*ph extra block above the plate.
+        Ordering: TL, TR, BR, BL (matches plate corners ordering).
         """
-        x1 = corners[:, 0].min()
-        x2 = corners[:, 0].max()
-        y1 = corners[:, 1].min()
-        plate_h = corners[:, 1].max() - y1
-        return torch.stack([x1, y1 - 1.4 * plate_h, x2, y1 - 0.4 * plate_h])
+        col_left  = corners[0] - corners[3]   # TL - BL
+        col_right = corners[1] - corners[2]   # TR - BR
+        return torch.stack([
+            corners[0] + 1.4 * col_left,   # TL of target
+            corners[1] + 1.4 * col_right,  # TR of target
+            corners[1] + 0.4 * col_right,  # BR of target
+            corners[0] + 0.4 * col_left,   # BL of target
+        ])
+
+    @staticmethod
+    def _top_extend_region_bbox(corners: torch.Tensor) -> torch.Tensor:
+        """Axis-aligned bbox of the perspective-correct top target region.
+
+        Computes the 4 perspective-correct target corners (via column vectors),
+        then returns their axis-aligned bounding box for use in IoU computation
+        against axis-aligned detector output boxes.
+        """
+        quad = AdversarialPatchTrainer._top_extend_region_corners(corners)
+        return torch.stack([quad[:, 0].min(), quad[:, 1].min(),
+                            quad[:, 0].max(), quad[:, 1].max()])
 
     # ====================================================================
     # Patch application
@@ -732,18 +753,9 @@ class AdversarialPatchTrainer:
 
         if self.top_extend:
             top_region_box = self._top_extend_region_bbox(new_corners)
-            # Top-region OCR crop in original full-res image coords.
-            ox1 = orig_corners[:, 0].min();  ox2 = orig_corners[:, 0].max()
-            oy1 = orig_corners[:, 1].min();  oy2 = orig_corners[:, 1].max()
-            o_plate_h = oy2 - oy1
-            # Fake-plate target: plate-sized, centered in the extra block.
-            # Matches _top_extend_region_bbox: [ox1, oy1-1.4*ph, ox2, oy1-0.4*ph]
-            top_corners_orig = torch.stack([
-                torch.stack([ox1, oy1 - 1.4 * o_plate_h]),
-                torch.stack([ox2, oy1 - 1.4 * o_plate_h]),
-                torch.stack([ox2, oy1 - 0.4 * o_plate_h]),
-                torch.stack([ox1, oy1 - 0.4 * o_plate_h]),
-            ])
+            # OCR crop for the top target region, using perspective-correct corners
+            # in original full-res image coords (same column-vector parameterization).
+            top_corners_orig = self._top_extend_region_corners(orig_corners)
             top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
                                           self.ocr.ocr_crop_size)
         else:
@@ -1076,24 +1088,30 @@ class AdversarialPatchTrainer:
                     patch_norm=rand_patch,
                 )
             patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
-            # Real plate (green)
-            gx1, gy1, gx2, gy2 = target_box.int().tolist()
-            cv2.rectangle(patch_vis, (gx1, gy1), (gx2, gy2), color=(0, 255, 0), thickness=2)
-            # Outer patch boundary (yellow): true boundary differs in top-extend mode
-            _nc = new_corners
-            _x1 = _nc[:, 0].min(); _x2 = _nc[:, 0].max()
-            _y1 = _nc[:, 1].min(); _y2 = _nc[:, 1].max()
-            _pw = _x2 - _x1;       _ph = _y2 - _y1
-            _top = (_y1 - 1.6 * _ph) if self.top_extend else (_y1 - 0.2 * _ph)
-            _outer = torch.stack([_x1 - 0.2 * _pw, _top,
-                                  _x2 + 0.2 * _pw, _y2 + 0.2 * _ph])
-            rx1, ry1, rx2, ry2 = _outer.int().tolist()
-            cv2.rectangle(patch_vis, (rx1, ry1), (rx2, ry2), color=(0, 255, 255), thickness=2)
-            # Top-extend fake plate target (red)
+
+            def _draw_quad(img, corners_t, color):
+                pts = corners_t.detach().cpu().numpy().astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2)
+
+            # Plate quad (green) — the cut-out / suppress target
+            _draw_quad(patch_vis, new_corners, (0, 255, 0))
+            # Border quad (yellow) — actual patch footprint, perspective-correct
+            _cx = new_corners[:, 0].mean(); _cy = new_corners[:, 1].mean()
+            _ctr = torch.tensor([_cx, _cy], device=self.device)
             if self.top_extend:
-                top_box = self._top_extend_region_bbox(new_corners)
-                tx1, ty1, tx2, ty2 = top_box.int().tolist()
-                cv2.rectangle(patch_vis, (tx1, ty1), (tx2, ty2), color=(0, 0, 255), thickness=2)
+                _p1b = _ctr + (new_corners[0] - _ctr) * 1.4
+                _p2b = _ctr + (new_corners[1] - _ctr) * 1.4
+                _p3b = _ctr + (new_corners[2] - _ctr) * 1.4
+                _p4b = _ctr + (new_corners[3] - _ctr) * 1.4
+                _cl = new_corners[0] - new_corners[3]
+                _cr = new_corners[1] - new_corners[2]
+                _border_corners = torch.stack([_p1b + 1.4 * _cl, _p2b + 1.4 * _cr, _p3b, _p4b])
+            else:
+                _border_corners = _ctr.unsqueeze(0) + (new_corners - _ctr.unsqueeze(0)) * 1.4
+            _draw_quad(patch_vis, _border_corners, (0, 255, 255))
+            # Top target quad (red) — attract objective region, perspective-correct
+            if self.top_extend:
+                _draw_quad(patch_vis, self._top_extend_region_corners(new_corners), (0, 0, 255))
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"),
                         self._shrink_for_save(patch_vis))
 
