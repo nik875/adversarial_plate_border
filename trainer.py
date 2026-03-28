@@ -1077,17 +1077,20 @@ class AdversarialPatchTrainer:
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_b_ocr_crop.png"), crop_np)
 
             # (c) random patch applied with geometry annotations:
-            #   green  = real plate bbox (cut-out region)
-            #   yellow = outer patch boundary
-            #   red    = top-extend fake plate target (only in --top-extend mode)
+            #   green  = plate quad (suppress target)
+            #   yellow = border quad (full patch footprint)
+            #   red    = top target quad (attract objective, top-extend only)
+            # Pipeline matches _prepare_one exactly: patch applied to original
+            # full-res image first, then preprocessed — not patch-on-preprocessed.
             with torch.no_grad():
-                rand_seed  = torch.randn_like(self.seed)
-                rand_patch = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
-                patched, _ = self.apply_patch_to_image(
-                    prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
+                rand_seed    = torch.randn_like(self.seed)
+                rand_patch   = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
+                patched_orig, _ = self.apply_patch_to_image(
+                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
                     patch_norm=rand_patch,
                 )
-            patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
+                patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
+            patch_vis = (patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
             def _draw_quad(img, corners_t, color):
                 pts = corners_t.detach().cpu().numpy().astype(np.int32).reshape(-1, 1, 2)
