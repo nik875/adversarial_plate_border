@@ -916,15 +916,15 @@ class AdversarialPatchTrainer:
         else:
             diff_pos, same_pos = None, None
 
-        det_results = self.detector.differentiable_predict_box_batch(
-            batched_prep, target_boxes)
-
-        # Second detection pass for the top attacker-controlled region.
         if self.top_extend and self.impersonation_target:
             top_region_boxes = [x["top_region_box"] for x in items]
-            top_det_results = self.detector.differentiable_predict_box_batch(
-                batched_prep, top_region_boxes)
+            two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
+                batched_prep, target_boxes, top_region_boxes)
+            det_results = [r[0] for r in two_target_results]
+            top_det_results = [r[1] for r in two_target_results]
         else:
+            det_results = self.detector.differentiable_predict_box_batch(
+                batched_prep, target_boxes)
             top_det_results = None
 
         image_losses, det_l_list, ocr_l_list = [], [], []
@@ -1575,7 +1575,9 @@ class AdversarialPatchTrainer:
         dry_run:       bool  = False,
     ) -> dict:
         if dry_run:
-            print("\nDry run complete.")
+            print("\nDry run: saving debug images...")
+            self.save_debug_images()
+            print("Dry run complete.")
             return {}
 
         warmup_epochs = 10
