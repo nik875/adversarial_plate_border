@@ -1259,7 +1259,10 @@ class AdversarialPatchTrainer:
             crop_np = (crop.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_b_ocr_crop.png"), crop_np)
 
-            # (c) random patch applied — use a fresh random seed through the decoder
+            # (c) random patch applied with geometry annotations:
+            #   green  = real plate bbox (cut-out region)
+            #   yellow = outer patch boundary
+            #   red    = top-extend fake plate target (only in --top-extend mode)
             with torch.no_grad():
                 rand_seed  = torch.randn_like(self.seed)
                 rand_patch = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
@@ -1268,6 +1271,24 @@ class AdversarialPatchTrainer:
                     patch_norm=rand_patch,
                 )
             patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            # Real plate (green)
+            gx1, gy1, gx2, gy2 = target_box.int().tolist()
+            cv2.rectangle(patch_vis, (gx1, gy1), (gx2, gy2), color=(0, 255, 0), thickness=2)
+            # Outer patch boundary (yellow): true boundary differs in top-extend mode
+            _nc = new_corners
+            _x1 = _nc[:, 0].min(); _x2 = _nc[:, 0].max()
+            _y1 = _nc[:, 1].min(); _y2 = _nc[:, 1].max()
+            _pw = _x2 - _x1;       _ph = _y2 - _y1
+            _top = (_y1 - 1.6 * _ph) if self.top_extend else (_y1 - 0.2 * _ph)
+            _outer = torch.stack([_x1 - 0.2 * _pw, _top,
+                                  _x2 + 0.2 * _pw, _y2 + 0.2 * _ph])
+            rx1, ry1, rx2, ry2 = _outer.int().tolist()
+            cv2.rectangle(patch_vis, (rx1, ry1), (rx2, ry2), color=(0, 255, 255), thickness=2)
+            # Top-extend fake plate target (red)
+            if self.top_extend:
+                top_box = self._top_extend_region_bbox(new_corners)
+                tx1, ty1, tx2, ty2 = top_box.int().tolist()
+                cv2.rectangle(patch_vis, (tx1, ty1), (tx2, ty2), color=(0, 0, 255), thickness=2)
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"),
                         self._shrink_for_save(patch_vis))
 
