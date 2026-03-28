@@ -621,26 +621,12 @@ class AdversarialPatchTrainer:
         border_scale:   float = 1.4,
         augment:        bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Warp the patch onto the image using the plate corners.
+        """Warp the patch onto the image using the plate corners.
 
-        When augment=True the pipeline works in canonical (flat) space:
-          1. Warp the border+plate region of the image into patch canvas space.
-          2. Composite: patch fills the border ring, original plate pixels fill
-             the center.
-          3. Apply photometric augmentation to the composite in canonical space.
-          4. Warp the augmented canonical back to the full image.
-        This keeps augmentation physically localised to the plate+border area
-        and lets it interact realistically with the patch texture before
-        reprojection.
-
-        Parameters
-        ----------
-        patch_norm : torch.Tensor or None
-            Pre-generated [3, H, W] patch in [0, 1].  If None, calls
-            generate_patch(training_aug=self.training) internally.
-        augment : bool
-            Run _augment_image() in canonical space before reprojection.
+        Directly warps the patch to the border quadrilateral (M_border), warps a
+        ones mask to the plate region (M_plate), and composites as:
+            final_mask = clamp(border_mask - plate_mask, 0, 1)  # ring only
+            result     = image * (1 - final_mask) + warped_patch * final_mask
         """
         if patch_norm is None:
             patch_norm = self.generate_patch(training_aug=self.training)
@@ -648,91 +634,56 @@ class AdversarialPatchTrainer:
         B    = image.shape[0]
         H, W = image.shape[2], image.shape[3]
 
-        plate  = corners[0]
+        plate  = corners[0]   # [4, 2]: TL, TR, BR, BL
         cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
         center = torch.tensor([cx, cy], device=self.device)
-
-        if self.top_extend:
-            # Perspective-correct asymmetric border.
-            # Corners are ordered TL(0), TR(1), BR(2), BL(3).
-            # Bottom corners: normal 1.4× scale from center (0.2*ph margin below plate).
-            # Top corners: normal 1.4× scale PLUS an extra 1.4*col_vec shift upward
-            #   along each column direction, giving total top margin = 1.6*ph and
-            #   total border column height = 2.8*ph (vs 1.4*ph for normal border).
-            # This preserves the plate's perspective skew/tilt in the border region.
-            p1_b = center + (plate[0] - center) * border_scale  # TL border (normal)
-            p2_b = center + (plate[1] - center) * border_scale  # TR border (normal)
-            p3_b = center + (plate[2] - center) * border_scale  # BR border (normal)
-            p4_b = center + (plate[3] - center) * border_scale  # BL border (normal)
-            # Column vectors in image space: TL-BL and TR-BR (point "upward").
-            col_left  = plate[0] - plate[3]   # p1 - p4
-            col_right = plate[1] - plate[2]   # p2 - p3
-            new_tl = p1_b + 1.4 * col_left
-            new_tr = p2_b + 1.4 * col_right
-            border = torch.stack([new_tl, new_tr, p3_b, p4_b]).unsqueeze(0)  # [1, 4, 2]
-        else:
-            border = (center.unsqueeze(0) +
-                      (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
 
         ph, pw = self.patch_height, self.patch_width
         src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
                                dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 4, 2]
 
-        # src → border region in image space (used for final reprojection)
-        M_border       = K.get_perspective_transform(src, border)
-        # border region in image space → patch canvas (inverse direction)
-        M_to_canonical = K.get_perspective_transform(border, src)
+        if self.top_extend:
+            # Perspective-correct asymmetric border.
+            # Bottom corners: normal 1.4× scale from center.
+            # Top corners: normal scale + 1.4 × column vector (TL-BL / TR-BR),
+            # giving total column height = 2.8 × plate_h, tilt fully preserved.
+            p1_b = center + (plate[0] - center) * border_scale
+            p2_b = center + (plate[1] - center) * border_scale
+            p3_b = center + (plate[2] - center) * border_scale
+            p4_b = center + (plate[3] - center) * border_scale
+            col_left  = plate[0] - plate[3]   # TL - BL
+            col_right = plate[1] - plate[2]   # TR - BR
+            border = torch.stack([p1_b + 1.4 * col_left,
+                                   p2_b + 1.4 * col_right,
+                                   p3_b, p4_b]).unsqueeze(0)   # [1, 4, 2]
+        else:
+            border = (center.unsqueeze(0) +
+                      (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
+
+        # Patch space → border quad in image space
+        M_border = K.get_perspective_transform(src, border)
+        # Patch space → plate quad in image space (for cut-out)
+        M_plate  = K.get_perspective_transform(src, plate.unsqueeze(0))
+
+        patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
+        if augment:
+            patch_batch = self._augment_image(patch_batch)
 
         ones = torch.ones(B, 1, ph, pw, device=self.device)
 
-        # ── Step 1: extract canonical view of the border+plate region ────
-        canonical = K.warp_perspective(image, M_to_canonical, (ph, pw),
-                                       mode="bilinear", padding_mode="zeros",
-                                       align_corners=True)   # [B, 3, ph, pw]
+        warped_patch       = K.warp_perspective(patch_batch, M_border, (H, W),
+                                                mode="bilinear", padding_mode="zeros",
+                                                align_corners=True)
+        warped_border_mask = K.warp_perspective(ones, M_border, (H, W),
+                                                mode="bilinear", padding_mode="zeros",
+                                                align_corners=True)
+        warped_plate_mask  = K.warp_perspective(ones, M_plate,  (H, W),
+                                                mode="bilinear", padding_mode="zeros",
+                                                align_corners=True)
 
-        # ── Step 2: plate mask in canonical space ─────────────────────────
-        # Transform the 4 plate corners through M_to_canonical to find where
-        # the plate lands inside the patch canvas.
-        M_c  = M_to_canonical[0]                                    # [3, 3]
-        ph4  = torch.cat([plate, plate.new_ones(4, 1)], dim=1).T   # [3, 4]
-        pc_h = M_c @ ph4                                            # [3, 4]
-        plate_canonical = (pc_h[:2] / pc_h[2:3]).T.contiguous().unsqueeze(0)    # [1, 4, 2]
-
-        M_plate_in_canonical = K.get_perspective_transform(src, plate_canonical)
-        plate_mask = K.warp_perspective(ones, M_plate_in_canonical, (ph, pw),
-                                        mode="bilinear", padding_mode="zeros",
-                                        align_corners=True)          # [B, 1, ph, pw]
-        plate_mask_3 = plate_mask.expand(-1, 3, -1, -1)
-
-        # ── Step 3: composite — patch ring + original plate pixels ────────
-        patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
-
-        # Scale patch brightness to match the plate region before compositing.
-        # Computed under no_grad: the scale is a normalising constant, not a
-        # gradient pathway we want the optimiser to exploit.
-        with torch.no_grad():
-            plate_brightness = ((canonical * plate_mask_3).sum()
-                                / plate_mask_3.sum().clamp(min=1e-6))
-            patch_brightness = patch_batch.mean().clamp(min=1e-6)
-            brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
-        patch_batch = patch_batch * brightness_scale
-
-        composite   = patch_batch * (1 - plate_mask_3) + canonical * plate_mask_3
-
-        # ── Step 4: optional augmentation in canonical space ──────────────
-        if augment:
-            composite = self._augment_image(composite)
-
-        # ── Step 5: warp augmented canonical back to image space ──────────
-        warped_back = K.warp_perspective(composite, M_border, (H, W),
-                                         mode="bilinear", padding_mode="zeros",
-                                         align_corners=True)
-        border_mask = K.warp_perspective(ones, M_border, (H, W),
-                                         mode="bilinear", padding_mode="zeros",
-                                         align_corners=True).expand(-1, 3, -1, -1)
-
-        result = image * (1 - border_mask) + warped_back * border_mask
-        return torch.clamp(result, 0, 1), border_mask
+        final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1).expand(-1, 3, -1, -1)
+        result = image * (1 - final_mask) + warped_patch * final_mask
+        return torch.clamp(result, 0, 1), final_mask
 
     # ====================================================================
     # Loss

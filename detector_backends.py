@@ -126,8 +126,7 @@ def _select_best_from_scores_boxes(
     # Outside no_grad: gradient flows through scores.
     if proximity_weights is not None:
         return (scores * proximity_weights).sum(), None
-    if scores[best_idx].detach().item() < conf_threshold:
-        return scores[best_idx], None
+    # Any overlapping box is used regardless of confidence.
     return scores[best_idx], boxes_xyxy[best_idx]
 
 
