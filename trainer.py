@@ -1270,7 +1270,7 @@ class AdversarialPatchTrainer:
                     prep_tensor.unsqueeze(0), new_corners.unsqueeze(0),
                     patch_norm=rand_patch,
                 )
-            patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            patch_vis = (patched.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
             # Real plate (green)
             gx1, gy1, gx2, gy2 = target_box.int().tolist()
             cv2.rectangle(patch_vis, (gx1, gy1), (gx2, gy2), color=(0, 255, 0), thickness=2)
