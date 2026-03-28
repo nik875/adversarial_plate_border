@@ -893,7 +893,7 @@ class AdversarialPatchTrainer:
                 top_crop = None
 
             ocr_parts = []
-            for crop in filter(None, [real_crop, top_crop]):
+            for crop in [c for c in [real_crop, top_crop] if c is not None]:
                 if diff_pos is not None:
                     loss_d = self.ocr.differentiable_loss_batch(
                         [crop], self.impersonation_target,
