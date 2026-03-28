@@ -369,6 +369,7 @@ class AdversarialPatchTrainer:
         sam_rho:              float          = 0.025,
         skip_sanity:          bool           = False,
         augment:              bool           = False,
+        top_extend:           bool           = False,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -380,6 +381,7 @@ class AdversarialPatchTrainer:
         self.sam_rho              = sam_rho
         self.print_blur           = print_blur
         self.augment              = augment
+        self.top_extend           = top_extend
         self.use_homography       = use_homography
         self.grad_accumulate      = grad_accumulate
         self.impersonation_target = impersonation_target
@@ -593,6 +595,23 @@ class AdversarialPatchTrainer:
         return torch.stack([rim[:, 0].min(), rim[:, 1].min(),
                             rim[:, 0].max(), rim[:, 1].max()])
 
+    @staticmethod
+    def _top_extend_region_bbox(corners: torch.Tensor,
+                                border_scale: float = 1.4) -> torch.Tensor:
+        """Bbox [x1, y1, x2, y2] of the attacker-controlled region above the plate.
+
+        Same horizontal extent as the normal border, but extends upward by one
+        full plate height instead of the usual symmetric top margin.
+        """
+        x1 = corners[:, 0].min()
+        x2 = corners[:, 0].max()
+        y1 = corners[:, 1].min()
+        y2 = corners[:, 1].max()
+        plate_w = x2 - x1
+        plate_h = y2 - y1
+        margin_x = plate_w * (border_scale - 1) / 2
+        return torch.stack([x1 - margin_x, y1 - plate_h, x2 + margin_x, y1])
+
     # ====================================================================
     # Patch application
     # ====================================================================
@@ -608,12 +627,16 @@ class AdversarialPatchTrainer:
 
         bx1 = torch.clamp(border[:, 0].min(), 0, W).int()
         bx2 = torch.clamp(border[:, 0].max(), 0, W).int()
-        by1 = torch.clamp(border[:, 1].min(), 0, H).int()
         by2 = torch.clamp(border[:, 1].max(), 0, H).int()
         px1 = torch.clamp(plate[:, 0].min(),  0, W).int()
         px2 = torch.clamp(plate[:, 0].max(),  0, W).int()
         py1 = torch.clamp(plate[:, 1].min(),  0, H).int()
         py2 = torch.clamp(plate[:, 1].max(),  0, H).int()
+        if self.top_extend:
+            # Extend top by one full plate height instead of the normal border margin.
+            by1 = torch.clamp(py1 - (py2 - py1), torch.tensor(0), torch.tensor(H)).int()
+        else:
+            by1 = torch.clamp(border[:, 1].min(), 0, H).int()
 
         result = image.clone()
         mask   = torch.zeros(B, 3, H, W, device=self.device)
@@ -670,8 +693,29 @@ class AdversarialPatchTrainer:
         plate  = corners[0]
         cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
         center = torch.tensor([cx, cy], device=self.device)
-        border = (center.unsqueeze(0) +
-                  (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
+
+        if self.top_extend:
+            # Axis-aligned asymmetric border: same x/bottom extent as normal
+            # border_scale, but top extended by one full plate height.
+            px1_ = plate[:, 0].min();  px2_ = plate[:, 0].max()
+            py1_ = plate[:, 1].min();  py2_ = plate[:, 1].max()
+            plate_w_ = px2_ - px1_;    plate_h_ = py2_ - py1_
+            margin_x_   = plate_w_ * (border_scale - 1) / 2
+            margin_bot_ = plate_h_ * (border_scale - 1) / 2
+            bx1_ = (px1_ - margin_x_).clamp(0, W)
+            bx2_ = (px2_ + margin_x_).clamp(0, W)
+            by2_ = (py2_ + margin_bot_).clamp(0, H)
+            top_ = (py1_ - plate_h_).clamp(0, H)
+            # TL, TR, BR, BL — matches src ordering below
+            border = torch.stack([
+                torch.stack([bx1_, top_]),
+                torch.stack([bx2_, top_]),
+                torch.stack([bx2_, by2_]),
+                torch.stack([bx1_, by2_]),
+            ]).to(dtype=torch.float32).unsqueeze(0)
+        else:
+            border = (center.unsqueeze(0) +
+                      (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
 
         ph, pw = self.patch_height, self.patch_width
         src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
@@ -813,11 +857,32 @@ class AdversarialPatchTrainer:
         rim_box     = self._rim_bbox(new_corners)
         ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
 
+        if self.top_extend:
+            top_region_box = self._top_extend_region_bbox(new_corners)
+            # Top-region OCR crop in original full-res image coords.
+            ox1 = orig_corners[:, 0].min();  ox2 = orig_corners[:, 0].max()
+            oy1 = orig_corners[:, 1].min();  oy2 = orig_corners[:, 1].max()
+            o_plate_w = ox2 - ox1;           o_plate_h = oy2 - oy1
+            o_margin_x = o_plate_w * 0.2    # (border_scale 1.4 - 1) / 2 = 0.2
+            top_corners_orig = torch.stack([
+                torch.stack([ox1 - o_margin_x, oy1 - o_plate_h]),
+                torch.stack([ox2 + o_margin_x, oy1 - o_plate_h]),
+                torch.stack([ox2 + o_margin_x, oy1]),
+                torch.stack([ox1 - o_margin_x, oy1]),
+            ])
+            top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
+                                          self.ocr.ocr_crop_size)
+        else:
+            top_region_box = None
+            top_ocr_crop   = None
+
         return {
-            "patched_prep": patched_prep_chw,   # [C, H_p, W_p]
-            "target_box":   target_box,          # [4]
-            "rim_box":      rim_box,             # [4]
-            "ocr_crop":     ocr_crop,            # [1, 3, H_c, W_c]
+            "patched_prep":  patched_prep_chw,   # [C, H_p, W_p]
+            "target_box":    target_box,          # [4]
+            "rim_box":       rim_box,             # [4]
+            "ocr_crop":      ocr_crop,            # [1, 3, H_c, W_c]
+            "top_region_box": top_region_box,     # [4] or None
+            "top_ocr_crop":   top_ocr_crop,       # [1, 3, H_c, W_c] or None
         }
 
     def compute_loss_batch(self, items: list) -> tuple:
@@ -850,8 +915,85 @@ class AdversarialPatchTrainer:
         det_results = self.detector.differentiable_predict_box_batch(
             batched_prep, target_boxes)
 
+        # Second detection pass for the top attacker-controlled region.
+        if self.top_extend and self.impersonation_target:
+            top_region_boxes = [x["top_region_box"] for x in items]
+            top_det_results = self.detector.differentiable_predict_box_batch(
+                batched_prep, top_region_boxes)
+        else:
+            top_det_results = None
+
         image_losses, det_l_list, ocr_l_list = [], [], []
         for i, (conf_loss, pred_box) in enumerate(det_results):
+            if self.top_extend and self.impersonation_target:
+                # ── Dual-flow impersonation ─────────────────────────────────
+                # Flow 1 (real plate): suppress — minimize IoU with plate bbox.
+                #   Missed detection counts as success (loss = 0).
+                # Flow 2 (top region): attract — maximize IoU of the best
+                #   top-region detection. No detection → no loss from this flow
+                #   (gradient signal comes from flow 1 shifting detections away).
+                top_conf_loss, top_pred_box = top_det_results[i]
+
+                if pred_box is not None:
+                    target_box_t = items[i]["target_box"].to(self.device)
+                    iou_real = self._boxes_iou(
+                        pred_box.unsqueeze(0), target_box_t.unsqueeze(0)).squeeze()
+                    det_real = iou_real
+                else:
+                    det_real = torch.tensor(0.0, device=self.device)
+
+                if top_pred_box is not None:
+                    top_box_t = items[i]["top_region_box"].to(self.device)
+                    iou_top = self._boxes_iou(
+                        top_pred_box.unsqueeze(0), top_box_t.unsqueeze(0)).squeeze()
+                    det_top = -iou_top
+                else:
+                    det_top = torch.tensor(0.0, device=self.device)
+
+                det_i = det_real + det_top
+
+                # OCR: average impersonation loss over real plate crop and top crop.
+                if pred_box is not None:
+                    real_crop = _bbox_ocr_crop_diff(
+                        items[i]["patched_prep"].unsqueeze(0),
+                        pred_box.to(self.device), self.ocr.ocr_crop_size)
+                else:
+                    real_crop = items[i]["ocr_crop"]
+
+                if top_pred_box is not None:
+                    top_crop = _bbox_ocr_crop_diff(
+                        items[i]["patched_prep"].unsqueeze(0),
+                        top_pred_box.to(self.device), self.ocr.ocr_crop_size)
+                else:
+                    top_crop = items[i]["top_ocr_crop"]
+
+                if diff_pos is not None:
+                    ocr_real_d = self.ocr.differentiable_loss_batch(
+                        [real_crop], self.impersonation_target,
+                        impersonation=True, diff_positions=diff_pos)[0]
+                    ocr_real_s = self.ocr.differentiable_loss_batch(
+                        [real_crop], self.expected_plate_text,
+                        impersonation=True, diff_positions=same_pos)[0]
+                    ocr_top_d  = self.ocr.differentiable_loss_batch(
+                        [top_crop], self.impersonation_target,
+                        impersonation=True, diff_positions=diff_pos)[0]
+                    ocr_top_s  = self.ocr.differentiable_loss_batch(
+                        [top_crop], self.expected_plate_text,
+                        impersonation=True, diff_positions=same_pos)[0]
+                    ocr_real_i = (0.8 * ocr_real_d + 0.2 * ocr_real_s) * self.ocr_loss_scale
+                    ocr_top_i  = (0.8 * ocr_top_d  + 0.2 * ocr_top_s)  * self.ocr_loss_scale
+                else:
+                    ocr_real_i = self.ocr.differentiable_loss_batch(
+                        [real_crop], target_text, impersonation=True)[0] * self.ocr_loss_scale
+                    ocr_top_i  = self.ocr.differentiable_loss_batch(
+                        [top_crop], target_text, impersonation=True)[0] * self.ocr_loss_scale
+
+                ocr_i = (ocr_real_i + ocr_top_i) / 2
+                image_losses.append((det_i + ocr_i) / 2)
+                det_l_list.append(det_i.detach())
+                ocr_l_list.append(ocr_i.detach())
+                continue
+
             if self.impersonation_target:
                 if pred_box is not None:
                     # Impersonation detection objective: minimise IoU with the
@@ -1593,6 +1735,9 @@ def main():
     parser.add_argument("--sam-rho", type=float, default=0.025,
                         help="SAM perturbation radius rho (default 0.025). "
                              "Only used when --sam-m is set.")
+    parser.add_argument("--top-extend", action="store_true",
+                        help="Double patch height upward: suppress real-plate detection "
+                             "and attract detection into the attacker-controlled top region.")
     parser.add_argument("--augment", action="store_true",
                         help="Apply differentiable photometric augmentations (brightness, "
                              "contrast, saturation, color temperature, directional shadow) "
@@ -1651,6 +1796,7 @@ def main():
         sam_rho              = args.sam_rho,
         skip_sanity          = args.skip_sanity,
         augment              = args.augment,
+        top_extend           = args.top_extend,
     )
 
     trainer.train(
