@@ -213,6 +213,7 @@ fi
 if $AUGMENT; then
     BASE_ARGS+=(--augment)
 fi
+BASE_ARGS+=(--top-extend)
 
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights
