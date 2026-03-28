@@ -598,10 +598,11 @@ class AdversarialPatchTrainer:
     @staticmethod
     def _top_extend_region_bbox(corners: torch.Tensor,
                                 border_scale: float = 1.4) -> torch.Tensor:
-        """Bbox [x1, y1, x2, y2] of the attacker-controlled region above the plate.
+        """Bbox [x1, y1, x2, y2] of the extra attacker-controlled block above the plate.
 
-        Same horizontal extent as the normal border, but extends upward by one
-        full plate height instead of the usual symmetric top margin.
+        The normal 1.4x border has a top margin of 0.2*ph. The doubled-height
+        border adds another 1.4*ph above that, spanning from (y1 - 1.6*ph) to
+        (y1 - 0.2*ph). That extra block is fully attacker-controlled.
         """
         x1 = corners[:, 0].min()
         x2 = corners[:, 0].max()
@@ -609,8 +610,10 @@ class AdversarialPatchTrainer:
         y2 = corners[:, 1].max()
         plate_w = x2 - x1
         plate_h = y2 - y1
-        margin_x = plate_w * (border_scale - 1) / 2
-        return torch.stack([x1 - margin_x, y1 - plate_h, x2 + margin_x, y1])
+        margin_x     = plate_w * (border_scale - 1) / 2   # 0.2 * pw
+        orig_top     = y1 - plate_h * (border_scale - 1) / 2  # y1 - 0.2*ph (original border top)
+        new_top      = y1 - 1.6 * plate_h                     # new top after doubling
+        return torch.stack([x1 - margin_x, new_top, x2 + margin_x, orig_top])
 
     # ====================================================================
     # Patch application
@@ -633,8 +636,12 @@ class AdversarialPatchTrainer:
         py1 = torch.clamp(plate[:, 1].min(),  0, H).int()
         py2 = torch.clamp(plate[:, 1].max(),  0, H).int()
         if self.top_extend:
-            # Extend top by one full plate height instead of the normal border margin.
-            by1 = torch.clamp(py1 - (py2 - py1), torch.tensor(0), torch.tensor(H)).int()
+            # Double the border's vertical size, all extra on top.
+            # Normal border: total height = 1.4 * ph, so top margin = 0.2 * ph.
+            # Doubled: total height = 2.8 * ph → new top margin = 1.6 * ph.
+            plate_h_px = (py2 - py1).float()
+            by1 = torch.clamp((py1.float() - 1.6 * plate_h_px).int(),
+                               torch.tensor(0), torch.tensor(H))
         else:
             by1 = torch.clamp(border[:, 1].min(), 0, H).int()
 
@@ -701,11 +708,11 @@ class AdversarialPatchTrainer:
             py1_ = plate[:, 1].min();  py2_ = plate[:, 1].max()
             plate_w_ = px2_ - px1_;    plate_h_ = py2_ - py1_
             margin_x_   = plate_w_ * (border_scale - 1) / 2
-            margin_bot_ = plate_h_ * (border_scale - 1) / 2
+            margin_bot_ = plate_h_ * (border_scale - 1) / 2  # 0.2 * ph
             bx1_ = (px1_ - margin_x_).clamp(0, W)
             bx2_ = (px2_ + margin_x_).clamp(0, W)
             by2_ = (py2_ + margin_bot_).clamp(0, H)
-            top_ = (py1_ - plate_h_).clamp(0, H)
+            top_ = (py1_ - 1.6 * plate_h_).clamp(0, H)  # doubled height, all extra on top
             # TL, TR, BR, BL — matches src ordering below
             border = torch.stack([
                 torch.stack([bx1_, top_]),
@@ -862,13 +869,15 @@ class AdversarialPatchTrainer:
             # Top-region OCR crop in original full-res image coords.
             ox1 = orig_corners[:, 0].min();  ox2 = orig_corners[:, 0].max()
             oy1 = orig_corners[:, 1].min();  oy2 = orig_corners[:, 1].max()
-            o_plate_w = ox2 - ox1;           o_plate_h = oy2 - oy1
-            o_margin_x = o_plate_w * 0.2    # (border_scale 1.4 - 1) / 2 = 0.2
+            o_plate_w = ox2 - ox1;  o_plate_h = oy2 - oy1
+            o_margin_x  = o_plate_w * 0.2        # (1.4 - 1) / 2 = 0.2
+            o_orig_top  = oy1 - o_plate_h * 0.2  # original border top edge
+            o_new_top   = oy1 - 1.6 * o_plate_h  # new top after doubling
             top_corners_orig = torch.stack([
-                torch.stack([ox1 - o_margin_x, oy1 - o_plate_h]),
-                torch.stack([ox2 + o_margin_x, oy1 - o_plate_h]),
-                torch.stack([ox2 + o_margin_x, oy1]),
-                torch.stack([ox1 - o_margin_x, oy1]),
+                torch.stack([ox1 - o_margin_x, o_new_top]),
+                torch.stack([ox2 + o_margin_x, o_new_top]),
+                torch.stack([ox2 + o_margin_x, o_orig_top]),
+                torch.stack([ox1 - o_margin_x, o_orig_top]),
             ])
             top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
                                           self.ocr.ocr_crop_size)
