@@ -598,22 +598,18 @@ class AdversarialPatchTrainer:
     @staticmethod
     def _top_extend_region_bbox(corners: torch.Tensor,
                                 border_scale: float = 1.4) -> torch.Tensor:
-        """Bbox [x1, y1, x2, y2] of the extra attacker-controlled block above the plate.
+        """Plate-sized target bbox centered in the extra attacker-controlled block.
 
-        The normal 1.4x border has a top margin of 0.2*ph. The doubled-height
-        border adds another 1.4*ph above that, spanning from (y1 - 1.6*ph) to
-        (y1 - 0.2*ph). That extra block is fully attacker-controlled.
+        The extra block spans [y1 - 1.6*ph, y1 - 0.2*ph] (height = 1.4*ph).
+        The target is a plate-sized (pw × ph) region centered in that block:
+          center_y = y1 - 0.9*ph  →  [y1 - 1.4*ph, y1 - 0.4*ph]
+        Same width as the real plate (px1 to px2).
         """
         x1 = corners[:, 0].min()
         x2 = corners[:, 0].max()
         y1 = corners[:, 1].min()
-        y2 = corners[:, 1].max()
-        plate_w = x2 - x1
-        plate_h = y2 - y1
-        margin_x     = plate_w * (border_scale - 1) / 2   # 0.2 * pw
-        orig_top     = y1 - plate_h * (border_scale - 1) / 2  # y1 - 0.2*ph (original border top)
-        new_top      = y1 - 1.6 * plate_h                     # new top after doubling
-        return torch.stack([x1 - margin_x, new_top, x2 + margin_x, orig_top])
+        plate_h = corners[:, 1].max() - y1
+        return torch.stack([x1, y1 - 1.4 * plate_h, x2, y1 - 0.4 * plate_h])
 
     # ====================================================================
     # Patch application
@@ -869,15 +865,14 @@ class AdversarialPatchTrainer:
             # Top-region OCR crop in original full-res image coords.
             ox1 = orig_corners[:, 0].min();  ox2 = orig_corners[:, 0].max()
             oy1 = orig_corners[:, 1].min();  oy2 = orig_corners[:, 1].max()
-            o_plate_w = ox2 - ox1;  o_plate_h = oy2 - oy1
-            o_margin_x  = o_plate_w * 0.2        # (1.4 - 1) / 2 = 0.2
-            o_orig_top  = oy1 - o_plate_h * 0.2  # original border top edge
-            o_new_top   = oy1 - 1.6 * o_plate_h  # new top after doubling
+            o_plate_h = oy2 - oy1
+            # Fake-plate target: plate-sized, centered in the extra block.
+            # Matches _top_extend_region_bbox: [ox1, oy1-1.4*ph, ox2, oy1-0.4*ph]
             top_corners_orig = torch.stack([
-                torch.stack([ox1 - o_margin_x, o_new_top]),
-                torch.stack([ox2 + o_margin_x, o_new_top]),
-                torch.stack([ox2 + o_margin_x, o_orig_top]),
-                torch.stack([ox1 - o_margin_x, o_orig_top]),
+                torch.stack([ox1, oy1 - 1.4 * o_plate_h]),
+                torch.stack([ox2, oy1 - 1.4 * o_plate_h]),
+                torch.stack([ox2, oy1 - 0.4 * o_plate_h]),
+                torch.stack([ox1, oy1 - 0.4 * o_plate_h]),
             ])
             top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
                                           self.ocr.ocr_crop_size)
