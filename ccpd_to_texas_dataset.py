@@ -36,6 +36,8 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing
+import os
 import random
 import re
 import sys
@@ -564,6 +566,27 @@ def write_metadata(records: List[dict], output_root: Path) -> Tuple[Path, Path]:
 
 
 
+def _process_worker(packed: tuple):
+    """Top-level worker for multiprocessing.Pool (must be picklable)."""
+    image_path, input_root, output_root, seed, font_path, pattern, fixed_plate, alpha_blend, plate_scale = packed
+    rng = random.Random(seed)
+    try:
+        record = process_one_image(
+            image_path=image_path,
+            input_root=input_root,
+            output_root=output_root,
+            rng=rng,
+            font_path=font_path,
+            pattern=pattern,
+            fixed_plate=fixed_plate,
+            alpha_blend=alpha_blend,
+            plate_scale=plate_scale,
+        )
+        return record, None
+    except Exception as exc:
+        return None, f"FAILED: {image_path} -> {exc}"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert CCPD images into a Texas-style synthetic plate dataset.")
     parser.add_argument("--input", required=True, type=Path, help="Input CCPD root directory or a CCPD subset directory.")
@@ -600,6 +623,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--skip-errors",
         action="store_true",
         help="Skip malformed/unreadable images instead of stopping.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count(),
+        help=f"Number of parallel worker processes. Default: nproc ({os.cpu_count()})",
     )
     return parser
 
@@ -640,8 +669,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"--fixed-plate is invalid: {exc}", file=sys.stderr)
             return 2
 
-    rng = random.Random(args.seed)
-
     image_paths = list(iter_images(input_root, recursive=args.recursive))
     if args.limit is not None:
         image_paths = image_paths[: args.limit]
@@ -650,35 +677,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("No images found.", file=sys.stderr)
         return 1
 
+    # Build per-image args; seed each image independently so results are
+    # deterministic regardless of worker order.
+    worker_args = [
+        (p, input_root, output_root, args.seed + i, args.font_path,
+         args.pattern, fixed_plate, args.alpha_blend, args.plate_scale)
+        for i, p in enumerate(image_paths)
+    ]
+
     records: List[dict] = []
     failures = 0
 
-    with tqdm(total=len(image_paths), unit="img") as pbar:
-        for idx, image_path in enumerate(image_paths, start=1):
-            try:
-                record = process_one_image(
-                    image_path=image_path,
-                    input_root=input_root,
-                    output_root=output_root,
-                    rng=rng,
-                    font_path=args.font_path,
-                    pattern=args.pattern,
-                    fixed_plate=fixed_plate,
-                    alpha_blend=args.alpha_blend,
-                    plate_scale=args.plate_scale,
-                )
+    with multiprocessing.Pool(processes=args.workers) as pool:
+        with tqdm(total=len(image_paths), unit="img") as pbar:
+            for record, err in pool.imap_unordered(_process_worker, worker_args):
+                if err is not None:
+                    failures += 1
+                    if args.skip_errors:
+                        tqdm.write(err, file=sys.stderr)
+                        pbar.update(1)
+                        continue
+                    tqdm.write(err, file=sys.stderr)
+                    return 1
                 records.append(record)
-            except Exception as exc:
-                failures += 1
-                msg = f"FAILED: {image_path} -> {exc}"
-                if args.skip_errors:
-                    tqdm.write(msg, file=sys.stderr)
-                    pbar.update(1)
-                    continue
-                tqdm.write(msg, file=sys.stderr)
-                return 1
-
-            pbar.update(1)
+                pbar.update(1)
 
     jsonl_path, csv_path = write_metadata(records, output_root)
 
