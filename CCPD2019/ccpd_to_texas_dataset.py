@@ -222,6 +222,9 @@ def find_font(font_path: Optional[str], target_px: int) -> ImageFont.FreeTypeFon
     candidates.extend([
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+        Path("/usr/share/fonts/open-sans/OpenSans-Bold.ttf"),
+        Path("/usr/share/fonts/google-droid-sans-fonts/DroidSans-Bold.ttf"),
+        Path("/usr/share/fonts/google-carlito-fonts/Carlito-Bold.ttf"),
         Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
         Path("/Library/Fonts/Arial Bold.ttf"),
         Path("/System/Library/Fonts/SFNS.ttf"),
@@ -334,7 +337,7 @@ def warp_plate_into_image(
         plate_bgra,
         H,
         (base_bgr.shape[1], base_bgr.shape[0]),
-        flags=cv2.INTER_LANCZOS4,
+        flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )
@@ -391,9 +394,8 @@ def process_one_image(
     quad = order_points_clockwise(ann.vertices_raw)
     quad_w, quad_h = quadrilateral_size(quad)
 
-    oversample = 4
-    render_w = max(200 * oversample, int(round(quad_w * plate_scale * oversample)))
-    render_h = max(70 * oversample, int(round(quad_h * plate_scale * oversample)))
+    render_w = max(200, int(round(quad_w * plate_scale)))
+    render_h = max(70, int(round(quad_h * plate_scale)))
 
     texas_plate_raw = fixed_plate if fixed_plate is not None else generate_plate_string(rng, pattern=pattern)
     texas_plate_img = render_texas_plate(texas_plate_raw, render_w, render_h, font_path=font_path)
