@@ -672,20 +672,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"--fixed-plate is invalid: {exc}", file=sys.stderr)
             return 2
 
-    image_paths = list(iter_images(input_root, recursive=args.recursive))
+    all_image_paths = list(iter_images(input_root, recursive=args.recursive))
     if args.limit is not None:
-        image_paths = image_paths[: args.limit]
+        all_image_paths = all_image_paths[: args.limit]
 
-    if not image_paths:
+    if not all_image_paths:
         print("No images found.", file=sys.stderr)
         return 1
 
+    # Resume: skip images whose output already exists.
+    path_to_idx  = {p: i for i, p in enumerate(all_image_paths)}
+    image_paths  = [p for p in all_image_paths if not make_output_path(output_root, input_root, p).exists()]
+    n_skipped    = len(all_image_paths) - len(image_paths)
+    if n_skipped:
+        print(f"Resuming: skipping {n_skipped} already-processed image(s).")
+    if not image_paths:
+        print("All images already processed — nothing to do.")
+        return 0
+
+    # Load existing metadata records so the final write is complete.
+    existing_records: List[dict] = []
+    existing_jsonl = output_root / "metadata.jsonl"
+    if existing_jsonl.exists():
+        with existing_jsonl.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        existing_records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
     # Build per-image args; seed each image independently so results are
-    # deterministic regardless of worker order.
+    # deterministic regardless of worker order.  Use the original index so
+    # seeds stay stable across resume runs.
     worker_args = [
-        (p, input_root, output_root, args.seed + i, args.font_path,
+        (p, input_root, output_root, args.seed + path_to_idx[p], args.font_path,
          args.pattern, fixed_plate, args.alpha_blend, args.plate_scale)
-        for i, p in enumerate(image_paths)
+        for p in image_paths
     ]
 
     records: List[dict] = []
@@ -705,10 +729,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 records.append(record)
                 pbar.update(1)
 
-    jsonl_path, csv_path = write_metadata(records, output_root)
+    all_records = existing_records + records
+    jsonl_path, csv_path = write_metadata(all_records, output_root)
 
     print("Done.")
-    print(f"Processed images: {len(records)}")
+    print(f"Newly processed: {len(records)}")
+    print(f"Previously done: {len(existing_records)}")
     print(f"Failures: {failures}")
     print(f"Metadata JSONL: {jsonl_path}")
     print(f"Metadata CSV:   {csv_path}")
