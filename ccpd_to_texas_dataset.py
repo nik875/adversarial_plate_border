@@ -469,11 +469,14 @@ def process_one_image(
     alpha_blend: float,
     plate_scale: float,
 ) -> dict:
-    ann = parse_ccpd_filename(image_path)
+    try:
+        ann = parse_ccpd_filename(image_path)
+    except ValueError as exc:
+        raise PlateGenerationError(f"CCPD filename format mismatch: {image_path} -> {exc}")
 
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
-        raise PlateGenerationError(f"Could not read image: {image_path}")
+        raise PlateGenerationError(f"Could not read image or unsupported format: {image_path}")
 
     quad = order_points_clockwise(ann.vertices_raw)
     quad_w, quad_h = quadrilateral_size(quad)
