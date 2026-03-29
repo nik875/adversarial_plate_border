@@ -249,6 +249,52 @@ def draw_round_rect(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], r
     draw.rounded_rectangle(box, radius=radius, outline=outline, width=width, fill=fill)
 
 
+def _spaced_text_width(draw: ImageDraw.ImageDraw, font, text: str, spacing: int) -> int:
+    """Total pixel width of text with custom inter-character spacing."""
+    total = 0
+    for i, ch in enumerate(text):
+        bb = draw.textbbox((0, 0), ch, font=font)
+        total += bb[2] - bb[0]
+        if i < len(text) - 1:
+            total += spacing
+    return total
+
+
+def _draw_spaced_text(
+    draw: ImageDraw.ImageDraw, font, text: str,
+    x: int, y: int, spacing: int, fill,
+) -> None:
+    """Draw text with custom inter-character spacing."""
+    cx = x
+    for ch in text:
+        draw.text((cx, y), ch, font=font, fill=fill)
+        bb = draw.textbbox((0, 0), ch, font=font)
+        cx += (bb[2] - bb[0]) + spacing
+
+
+def _draw_char_in_cell(
+    draw: ImageDraw.ImageDraw, font, ch: str,
+    cell_x: int, cell_y: int, cell_w: int, cell_h: int, fill,
+) -> None:
+    """Draw a single character centered within a fixed-width cell."""
+    bb = draw.textbbox((0, 0), ch, font=font)
+    ch_w = bb[2] - bb[0]
+    ch_h = bb[3] - bb[1]
+    x = cell_x + (cell_w - ch_w) // 2 - bb[0]
+    y = cell_y + (cell_h - ch_h) // 2 - bb[1]
+    draw.text((x, y), ch, font=font, fill=fill)
+
+
+def _draw_star(draw: ImageDraw.ImageDraw, cx: float, cy: float, r_outer: float, fill) -> None:
+    """Draw a 5-pointed star centered at (cx, cy)."""
+    r_inner = r_outer * 0.382  # classic pentagram inner radius ratio
+    points = []
+    for i in range(10):
+        angle = -math.pi / 2 + i * math.pi / 5
+        r = r_outer if i % 2 == 0 else r_inner
+        points.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    draw.polygon(points, fill=fill)
+
 
 def render_texas_plate(
     plate_text: str,
@@ -257,66 +303,97 @@ def render_texas_plate(
     font_path: Optional[str] = None,
 ) -> np.ndarray:
     """
-    Render a simple Texas-inspired synthetic plate.
+    Render a Texas general-issue passenger plate per TxDMV spec (August 2016).
 
-    The result is intentionally generic enough for synthetic augmentation:
-    - white background
-    - black border
-    - TEXAS title
-    - centered plate number
-    - small slogan line
+    Plate dimensions: 12" × 6" (aspect ratio 2:1, enforced internally).
+    All proportions derived from the official spec:
+      - TEXAS header:  max 1"×1" chars, 0.125" inter-char spacing
+      - Primary ROI:   1"×2.5625" chars, 0.375" inter-char spacing,
+                       Texas silhouette between char 3 and char 4
+      - Legend:        "THE LONE STAR STATE", max 5/16"×5/16" chars
+      - Bolt holes:    7" horizontal × 4.75" vertical spacing, centered
     """
-    width = max(width, 200)
-    height = max(height, 70)
+    # Enforce 2:1 aspect ratio (12" × 6") using width as the authority.
+    width  = max(200, width)
+    height = width // 2          # always 2:1
+    W, H   = width, height
 
-    img = Image.new("RGBA", (width, height), (250, 250, 248, 255))
-    draw = ImageDraw.Draw(img)
+    # ── Background & border ───────────────────────────────────────────────────
+    img      = Image.new("RGBA", (W, H), (252, 252, 250, 255))
+    draw     = ImageDraw.Draw(img)
+    border_w = max(2, W // 120)
+    radius   = max(4, min(W, H) // 15)
+    draw_round_rect(draw, (1, 1, W - 2, H - 2),
+                    radius=radius, outline=(30, 30, 30, 255),
+                    width=border_w, fill=(252, 252, 250, 255))
 
-    border_w = max(2, width // 120)
-    pad = max(4, width // 50)
-    radius = max(6, min(width, height) // 12)
-    draw_round_rect(draw, (1, 1, width - 2, height - 2), radius=radius, outline=(30, 30, 30, 255), width=border_w, fill=(252, 252, 250, 255))
+    # ── Bolt-hole reference positions ─────────────────────────────────────────
+    # Horizontal: 7" apart on 12" plate → left=2.5", right=9.5" from left edge
+    # Vertical:   4.75" apart on 6" plate → top=0.625", bottom=5.375" from top
+    bx_l = int(W * 2.5  / 12)
+    bx_r = int(W * 9.5  / 12)
+    by_t = int(H * 0.625 / 6)
+    by_b = int(H * 5.375 / 6)
+    # Elongated hole: ½" wide × 0.28" tall
+    bh_w = max(3, int(W * 0.5  / 12))
+    bh_h = max(2, int(H * 0.28 / 6))
+    for bx, by in [(bx_l, by_t), (bx_r, by_t), (bx_l, by_b), (bx_r, by_b)]:
+        draw.ellipse(
+            (bx - bh_w // 2, by - bh_h // 2, bx + bh_w // 2, by + bh_h // 2),
+            fill=(180, 180, 180, 255), outline=(120, 120, 120, 255),
+        )
 
-    # Light top banner to make the plate visually distinct.
-    banner_h = max(12, int(height * 0.18))
-    draw.rectangle((pad, pad, width - pad, pad + banner_h), fill=(235, 242, 255, 255))
+    # ── "TEXAS" jurisdiction header ───────────────────────────────────────────
+    # Max char height: 1" on 6" plate → H/6; inter-char spacing: 0.125" → W*0.125/12
+    texas_h  = max(8, int(H / 6))
+    texas_sp = max(1, int(W * 0.125 / 12))
+    title_font = find_font(font_path, texas_h)
+    tx_w = _spaced_text_width(draw, title_font, "TEXAS", texas_sp)
+    tx_x = (W - tx_w) // 2
+    tx_y = max(border_w + 2, (by_t - texas_h) // 2)
+    _draw_spaced_text(draw, title_font, "TEXAS", tx_x, tx_y, texas_sp,
+                      fill=(10, 40, 100, 255))
 
-    title_font = find_font(font_path, max(10, int(height * 0.14)))
-    serial_font = find_font(font_path, max(20, int(height * 0.42)))
-    slogan_font = find_font(font_path, max(8, int(height * 0.10)))
+    # ── Primary ROI — fixed-width character cells with silhouette separator ───
+    # Char cell: 1" wide × 2.5625" tall; inter-cell gap: 0.375"
+    # Layout: [C][g][C][g][C] [g][star][g] [C][g][C][g][C][g][C]
+    #           ←── group 1 ──→              ←──── group 2 ───────→
+    cell_w = max(8,  int(W / 12))
+    char_h = max(20, int(H * 2.5625 / 6))
+    gap    = max(2,  int(W * 0.375 / 12))
+    # Silhouette occupies one cell_w slot between the two groups
+    sil_w  = cell_w
+    # Total ROI width: 7 cells + 6 inter-char gaps + 2 flanking gaps around silhouette + silhouette
+    roi_w  = 7 * cell_w + (6 + 2) * gap + sil_w
+    roi_x  = (W - roi_w) // 2
+    # Vertical center between the two bolt-hole rows
+    char_y = (by_t + by_b - char_h) // 2
 
-    title = "TEXAS"
-    slogan = "The Lone Star State"
-    display_text = display_plate_string(plate_text)
+    serial_font = find_font(font_path, char_h)
+    x = roi_x
+    for i, ch in enumerate(plate_text[:7]):
+        if i == 3:
+            # Gap + Texas silhouette (star) + gap between char groups
+            x += gap
+            _draw_star(draw, x + sil_w / 2, char_y + char_h / 2,
+                       min(sil_w, char_h) * 0.38, fill=(10, 40, 100, 255))
+            x += sil_w + gap
+        elif i > 0:
+            x += gap
+        _draw_char_in_cell(draw, serial_font, ch, x, char_y, cell_w, char_h,
+                           fill=(20, 20, 20, 255))
+        x += cell_w
 
-    # Text placement helpers.
-    def text_bbox(font, text: str):
-        return draw.textbbox((0, 0), text, font=font)
-
-    tb = text_bbox(title_font, title)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    draw.text(((width - tw) / 2, pad + max(0, (banner_h - th) / 2) - 1), title, fill=(10, 40, 100, 255), font=title_font)
-
-    sb = text_bbox(serial_font, display_text)
-    sw, sh = sb[2] - sb[0], sb[3] - sb[1]
-    serial_y = int(height * 0.30)
-    draw.text(((width - sw) / 2, serial_y), display_text, fill=(20, 20, 20, 255), font=serial_font)
-
-    gb = text_bbox(slogan_font, slogan)
-    gw, gh = gb[2] - gb[0], gb[3] - gb[1]
-    slogan_y = height - gh - pad - 1
-    draw.text(((width - gw) / 2, slogan_y), slogan, fill=(60, 60, 60, 255), font=slogan_font)
-
-    # A small central star for visual realism.
-    cx, cy = width // 2, height - pad - gh - max(3, height // 18)
-    r_outer = max(3, min(width, height) // 35)
-    r_inner = max(2, r_outer // 2)
-    star_points = []
-    for i in range(10):
-        angle = -math.pi / 2 + i * math.pi / 5
-        r = r_outer if i % 2 == 0 else r_inner
-        star_points.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
-    draw.polygon(star_points, fill=(10, 40, 100, 255))
+    # ── Legend: "THE LONE STAR STATE" ────────────────────────────────────────
+    # Max char height: 5/16" on 6" plate → H * 5/96; centered between bottom bolt row and edge
+    leg_h  = max(6, int(H * 5 / 96))
+    leg_sp = max(1, int(W / 150))
+    legend_font = find_font(font_path, leg_h)
+    lg_w = _spaced_text_width(draw, legend_font, "THE LONE STAR STATE", leg_sp)
+    lg_x = (W - lg_w) // 2
+    lg_y = by_b + (H - by_b - leg_h) // 2
+    _draw_spaced_text(draw, legend_font, "THE LONE STAR STATE", lg_x, lg_y, leg_sp,
+                      fill=(60, 60, 60, 255))
 
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGRA)
 
