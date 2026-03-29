@@ -590,6 +590,57 @@ def _process_worker(packed: tuple):
         return None, f"FAILED: {image_path} -> {exc}"
 
 
+def rebuild_metadata_records(
+    output_root: Path,
+    input_root: Path,
+    path_to_idx: dict,
+    seed: int,
+    pattern: str,
+    fixed_plate: Optional[str],
+) -> List[dict]:
+    """Reconstruct metadata records for output images that already exist on disk."""
+    records: List[dict] = []
+    skipped = 0
+    for out_path in sorted(output_root.rglob("*")):
+        if not out_path.is_file() or out_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        if not out_path.stem.endswith("_texas"):
+            continue
+        orig_stem = out_path.stem[: -len("_texas")]
+        rel = out_path.relative_to(output_root)
+        image_path = input_root / rel.parent / (orig_stem + out_path.suffix)
+        if image_path not in path_to_idx:
+            skipped += 1
+            continue
+        idx = path_to_idx[image_path]
+        rng = random.Random(seed + idx)
+        try:
+            ann = parse_ccpd_filename(image_path)
+        except ValueError:
+            skipped += 1
+            continue
+        quad = order_points_clockwise(ann.vertices_raw)
+        texas_plate_raw = fixed_plate if fixed_plate is not None else generate_plate_string(rng, pattern=pattern)
+        x1, y1, x2, y2 = ann.bbox_xyxy
+        records.append({
+            "source_image": str(image_path),
+            "output_image": str(out_path),
+            "generated_plate": texas_plate_raw,
+            "generated_plate_display": display_plate_string(texas_plate_raw),
+            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            "vertices_tl_tr_br_bl": quad.astype(int).tolist(),
+            "vertices_raw_ccpd_order": [list(p) for p in ann.vertices_raw],
+            "area_ratio": ann.area_ratio,
+            "tilt": ann.tilt,
+            "brightness": ann.brightness,
+            "blurriness": ann.blurriness,
+            "original_ccpd_plate_code": ann.plate_code,
+        })
+    if skipped:
+        print(f"  (skipped {skipped} output file(s) with no matching input entry)")
+    return records
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert CCPD images into a Texas-style synthetic plate dataset.")
     parser.add_argument("--input", required=True, type=Path, help="Input CCPD root directory or a CCPD subset directory.")
@@ -632,6 +683,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=os.cpu_count(),
         help=f"Number of parallel worker processes. Default: nproc ({os.cpu_count()})",
+    )
+    parser.add_argument(
+        "--rebuild-metadata",
+        action="store_true",
+        help=(
+            "Scan the output directory for already-processed images and reconstruct "
+            "their metadata records from the deterministic seed before continuing. "
+            "Use this after a crashed run to recover metadata for completed images."
+        ),
     )
     return parser
 
@@ -690,18 +750,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("All images already processed — nothing to do.")
         return 0
 
-    # Load existing metadata records so the final write is complete.
+    # Recover metadata for already-processed images.
     existing_records: List[dict] = []
-    existing_jsonl = output_root / "metadata.jsonl"
-    if existing_jsonl.exists():
-        with existing_jsonl.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        existing_records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
+    if args.rebuild_metadata and n_skipped > 0:
+        print(f"Rebuilding metadata for {n_skipped} existing output(s)...")
+        existing_records = rebuild_metadata_records(
+            output_root=output_root,
+            input_root=input_root,
+            path_to_idx=path_to_idx,
+            seed=args.seed,
+            pattern=args.pattern,
+            fixed_plate=fixed_plate,
+        )
+        print(f"  Rebuilt {len(existing_records)} record(s).")
+    else:
+        existing_jsonl = output_root / "metadata.jsonl"
+        if existing_jsonl.exists():
+            with existing_jsonl.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            existing_records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
 
     # Build per-image args; seed each image independently so results are
     # deterministic regardless of worker order.  Use the original index so
