@@ -256,8 +256,11 @@ def write_yolo_dataset(records: List[dict], out_dir: Path,
             if lbl.exists():
                 continue
 
-            img = cv2.imread(str(src))
-            if img is None:
+            try:
+                img = cv2.imread(str(src))
+                if img is None:
+                    continue
+            except Exception:
                 continue
             oh, ow = img.shape[:2]
             x1, y1, x2, y2 = rec["bbox"]
