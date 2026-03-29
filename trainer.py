@@ -795,6 +795,14 @@ class AdversarialPatchTrainer:
             minimize conf score — gradient always flows.
           Flow 2 (top region, attract): maximize IoU when detected, else
             maximize conf score — gradient always flows.
+
+        Mutual-exclusion in the no-overlap case:
+          When exactly one target has an overlapping predicted box, the other
+          target's proximity-weighted confidence (used as the no-overlap
+          gradient signal) excludes the boxes that overlap the detected target.
+          This prevents the already-claimed box from dominating the proximity
+          weighting for the non-detected target.
+
         OCR: differentiable crop from predicted box when available; GT crop
           fallback only when --no-disruption; otherwise that flow is skipped.
         """

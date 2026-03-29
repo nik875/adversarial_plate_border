@@ -94,6 +94,8 @@ def _select_best_from_scores_boxes(
     target_box: torch.Tensor,
     conf_threshold: float,
     device: str,
+    *,
+    exclude_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Select (score, pred_box) for target_box from pre-computed scores/boxes.
 
@@ -102,6 +104,10 @@ def _select_best_from_scores_boxes(
     If no box overlaps: return proximity-weighted sum of scores (weights by
     distance from each box center to target center, softmax-normalized by
     target size) with pred_box=None. Gradient always flows through scores.
+
+    exclude_mask: optional boolean tensor [N] — boxes marked True are excluded
+    from proximity weighting (their distances are set to inf before softmax,
+    yielding zero weight). Only applies in the no-overlap branch.
     """
     tb = target_box.to(device)
     proximity_weights = None
@@ -115,6 +121,9 @@ def _select_best_from_scores_boxes(
             target_center = torch.stack([(tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2])
             dists         = ((box_centers - target_center) ** 2).sum(-1).sqrt()
             target_size   = max((tb[2] - tb[0]).item(), (tb[3] - tb[1]).item(), 1.0)
+            if exclude_mask is not None and exclude_mask.any():
+                dists = dists.clone()
+                dists[exclude_mask.to(device)] = float('inf')
             proximity_weights = torch.softmax(-dists / target_size, dim=0)
         else:
             best_idx = int((ious * scores.detach()).argmax().item())
@@ -124,6 +133,43 @@ def _select_best_from_scores_boxes(
         return (scores * proximity_weights).sum(), None
     # Any overlapping box is used regardless of confidence.
     return scores[best_idx], boxes_xyxy[best_idx]
+
+
+def _select_two_targets(
+    scores: torch.Tensor,
+    boxes_xyxy: torch.Tensor,
+    target_box1: torch.Tensor,
+    target_box2: torch.Tensor,
+    conf_threshold: float,
+    device: str,
+) -> Tuple[
+    Tuple[torch.Tensor, Optional[torch.Tensor]],
+    Tuple[torch.Tensor, Optional[torch.Tensor]],
+]:
+    """Select best (score, box) for two targets with mutual exclusion.
+
+    Calls _select_best_from_scores_boxes for each target. When exactly one
+    target has an overlapping box and the other does not, the no-overlap
+    target's proximity-weighted confidence excludes the boxes that overlap
+    the other target — preventing the already-claimed box from dominating
+    the gradient signal for the non-detected target.
+    """
+    with torch.no_grad():
+        ious1 = _box_iou_vectorized(target_box1.to(device), boxes_xyxy.detach())
+        ious2 = _box_iou_vectorized(target_box2.to(device), boxes_xyxy.detach())
+        has_overlap1 = ious1.max().item() >= 1e-6
+        has_overlap2 = ious2.max().item() >= 1e-6
+
+    # Exclusion mask for target1's proximity: exclude boxes overlapping target2,
+    # but only when target1 has no overlap and target2 does (and vice versa).
+    exclude1 = (ious2 > 1e-6) if (not has_overlap1 and has_overlap2) else None
+    exclude2 = (ious1 > 1e-6) if (not has_overlap2 and has_overlap1) else None
+
+    r1 = _select_best_from_scores_boxes(
+        scores, boxes_xyxy, target_box1, conf_threshold, device, exclude_mask=exclude1)
+    r2 = _select_best_from_scores_boxes(
+        scores, boxes_xyxy, target_box2, conf_threshold, device, exclude_mask=exclude2)
+    return r1, r2
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +391,7 @@ class DetectorBackend(abc.ABC):
                 continue
             sc = torch.stack([d.conf.to(self.device) for d in dets])
             bx = torch.stack([d.box.to(self.device) for d in dets])
-            r1 = _select_best_from_scores_boxes(sc, bx, target_boxes1[i], thresh, self.device)
-            r2 = _select_best_from_scores_boxes(sc, bx, target_boxes2[i], thresh, self.device)
+            r1, r2 = _select_two_targets(sc, bx, target_boxes1[i], target_boxes2[i], thresh, self.device)
             results.append((r1, r2))
         return results
 
@@ -886,8 +931,7 @@ class RTDETRBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device, requires_grad=True)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores_i, boxes_xyxy_i, target_boxes2[i], self.conf_threshold, self.device)
+            r1, r2 = _select_two_targets(scores_i, boxes_xyxy_i, target_boxes1[i], target_boxes2[i], self.conf_threshold, self.device)
             results.append((r1, r2))
         return results
 
@@ -1310,8 +1354,7 @@ class FasterRCNNBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores_i, boxes_i, target_boxes2[i], self.conf_threshold, self.device)
+            r1, r2 = _select_two_targets(scores_i, boxes_i, target_boxes1[i], target_boxes2[i], self.conf_threshold, self.device)
             results.append((r1, r2))
         return results
 
@@ -1832,8 +1875,7 @@ class YOLOv11Backend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores[i], boxes_xyxy[i], target_boxes2[i], self.conf_threshold, self.device)
+            r1, r2 = _select_two_targets(scores[i], boxes_xyxy[i], target_boxes1[i], target_boxes2[i], self.conf_threshold, self.device)
             results.append((r1, r2))
         return results
 
@@ -2068,8 +2110,7 @@ class Yolov9TorchBackend(DetectorBackend):
                 zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
                 continue
-            r1 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes1[i], self.conf_threshold, self.device)
-            r2 = _select_best_from_scores_boxes(scores[i], boxes[i], target_boxes2[i], self.conf_threshold, self.device)
+            r1, r2 = _select_two_targets(scores[i], boxes[i], target_boxes1[i], target_boxes2[i], self.conf_threshold, self.device)
             results.append((r1, r2))
         return results
 
