@@ -218,6 +218,10 @@ def find_font(font_path: Optional[str], target_px: int) -> ImageFont.FreeTypeFon
     if font_path:
         candidates.append(Path(font_path))
 
+    # Bundled font (relative to this script).
+    _here = Path(__file__).parent
+    candidates.append(_here / "Zurich Extra Condensed Regular" / "Zurich Extra Condensed Regular.otf")
+
     # Common Linux/macOS locations.
     candidates.extend([
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
