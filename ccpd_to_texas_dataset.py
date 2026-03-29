@@ -46,6 +46,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from tqdm import tqdm
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -652,31 +653,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     records: List[dict] = []
     failures = 0
 
-    for idx, image_path in enumerate(image_paths, start=1):
-        try:
-            record = process_one_image(
-                image_path=image_path,
-                input_root=input_root,
-                output_root=output_root,
-                rng=rng,
-                font_path=args.font_path,
-                pattern=args.pattern,
-                fixed_plate=fixed_plate,
-                alpha_blend=args.alpha_blend,
-                plate_scale=args.plate_scale,
-            )
-            records.append(record)
-        except Exception as exc:
-            failures += 1
-            msg = f"[{idx}/{len(image_paths)}] FAILED: {image_path} -> {exc}"
-            if args.skip_errors:
-                print(msg, file=sys.stderr)
-                continue
-            print(msg, file=sys.stderr)
-            return 1
+    with tqdm(total=len(image_paths), unit="img") as pbar:
+        for idx, image_path in enumerate(image_paths, start=1):
+            try:
+                record = process_one_image(
+                    image_path=image_path,
+                    input_root=input_root,
+                    output_root=output_root,
+                    rng=rng,
+                    font_path=args.font_path,
+                    pattern=args.pattern,
+                    fixed_plate=fixed_plate,
+                    alpha_blend=args.alpha_blend,
+                    plate_scale=args.plate_scale,
+                )
+                records.append(record)
+            except Exception as exc:
+                failures += 1
+                msg = f"FAILED: {image_path} -> {exc}"
+                if args.skip_errors:
+                    tqdm.write(msg, file=sys.stderr)
+                    pbar.update(1)
+                    continue
+                tqdm.write(msg, file=sys.stderr)
+                return 1
 
-        if idx % 100 == 0 or idx == len(image_paths):
-            print(f"Processed {idx}/{len(image_paths)} images")
+            pbar.update(1)
 
     jsonl_path, csv_path = write_metadata(records, output_root)
 
