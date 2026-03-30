@@ -1293,24 +1293,34 @@ class AdversarialPatchTrainer:
 
         def _accumulate(indices, weight) -> Tuple[float, float, float, float]:
             """
-            Generate patch, detach → leaf, accumulate item gradients one-by-one
-            (no retain_graph), then backprop once through the generator.
-            Returns (total_loss, det_sum, ocr_sum, tv_sum) scaled by weight.
+            Generate patch, detach → leaf, accumulate gradients in batches of B,
+            then backprop once through the generator.
+            Returns (total_loss, det_sum, ocr_sum, tv_sum) as a sum over all items
+            (consistent with the /B normalisation applied by the caller).
+
+            compute_loss_batch returns the mean over its batch, so to reproduce
+            the same gradient as processing items individually we scale the
+            backward by len(chunk): mean * len(chunk) * weight == sum * weight.
             """
             patch_with_graph = self.generate_patch(training_aug=self.training)
             patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
             total_loss = det_sum = ocr_sum = tv_sum = 0.0
-            for i in indices:
-                item = self._prepare_one(window_raw[i], patch_leaf)
-                item["_patch_norm"] = patch_leaf
-                loss, det_l, ocr_l, tv_l = self.compute_loss_batch([item])
-                (loss * weight).backward()   # frees item graph; accumulates patch_leaf.grad
-                total_loss += loss.item()
-                det_sum    += det_l.item()
-                ocr_sum    += ocr_l.item()
-                tv_sum     += tv_l.item()
-                del item
+            for chunk_start in range(0, len(indices), B):
+                chunk = indices[chunk_start:chunk_start + B]
+                items = []
+                for i in chunk:
+                    item = self._prepare_one(window_raw[i], patch_leaf)
+                    item["_patch_norm"] = patch_leaf
+                    items.append(item)
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
+                # loss is mean over len(chunk); scale back to sum for grad equivalence
+                (loss * weight * len(chunk)).backward()
+                total_loss += loss.item() * len(chunk)
+                det_sum    += det_l.item() * len(chunk)
+                ocr_sum    += ocr_l.item() * len(chunk)
+                tv_sum     += tv_l.item() * len(chunk)
+                del items
 
             # Propagate accumulated patch gradient through the generator graph.
             patch_with_graph.backward(patch_leaf.grad)
