@@ -14,7 +14,7 @@
 #   chmod +x run_paired_experiments.sh
 #   ./run_paired_experiments.sh
 #   ./run_paired_experiments.sh --epochs 20 --device cuda --limit 64
-#   ./run_paired_experiments.sh --eval-batch-size 8 --compile   # batch GPU evals + compiled models
+#   ./run_paired_experiments.sh --eval-batch-size 8
 #   ./run_paired_experiments.sh --dry-run   # sanity check + debug images only, no training
 #   ./run_paired_experiments.sh --sam        # enable m-SAM (m=8, rho=0.025 by default)
 #   ./run_paired_experiments.sh --sam --sam-rho 0.05  # custom rho
@@ -57,7 +57,6 @@ EVAL_BATCH_SIZE_TROCR=1
 EVAL_BATCH_SIZE_CCT=1
 EVAL_BATCH_SIZE_LPRNET=1
 EVAL_BATCH_SIZE_VITSTR=1
-COMPILE=true
 IMPERSONATION_TARGET=""
 SKIP_PAIRS=()
 SAM_M=8
@@ -107,8 +106,6 @@ while [[ $# -gt 0 ]]; do
         --skip-sanity)     SKIP_SANITY=true; shift ;;
         --gpu-preload)     GPU_PRELOAD=true; shift ;;
         --eval-batch-size) EVAL_BATCH_SIZE_TROCR="$2"; EVAL_BATCH_SIZE_CCT="$2"; EVAL_BATCH_SIZE_LPRNET="$2"; EVAL_BATCH_SIZE_VITSTR="$2"; shift 2 ;;
-        --compile)         COMPILE=true; shift ;;
-        --no-compile)      COMPILE=false; shift ;;
         --impersonation)   IMPERSONATION_TARGET="$2"; shift 2 ;;
         --skip)            shift; while [[ $# -gt 0 && "$1" != --* ]]; do SKIP_PAIRS+=("$1"); shift; done ;;
         --sam)             SAM_M=8; shift ;;
@@ -200,9 +197,6 @@ if $SKIP_SANITY; then
 fi
 if $GPU_PRELOAD; then
     BASE_ARGS+=(--gpu-preload)
-fi
-if $COMPILE; then
-    BASE_ARGS+=(--compile)
 fi
 if [[ -n "$IMPERSONATION_TARGET" ]]; then
     BASE_ARGS+=(--impersonation-target "$IMPERSONATION_TARGET" --no-disruption)
