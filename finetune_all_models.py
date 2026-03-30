@@ -1281,6 +1281,20 @@ def main():
     if checked is None:
         sys.exit(1)
 
+    # ── Detectors (longest first) ─────────────────────────────────────────────
+    if "fasterrcnn" in checked:
+        print("\n=== Faster R-CNN ===")
+        train_fasterrcnn(build_fasterrcnn(args.device), all_records, args,
+                         batch_size=checked["fasterrcnn"])
+
+    if "owlvit" in checked:
+        print("\n=== OWL-ViT ===")
+        train_owlvit(all_records, args, batch_size=checked["owlvit"])
+
+    if "rtdetr" in checked:
+        print("\n=== RT-DETR ===")
+        train_rtdetr(all_records, args, batch_size=checked["rtdetr"])
+
     # ── OCR ───────────────────────────────────────────────────────────────────
     if "lprnet" in checked:
         print("\n=== LPRNet ===")
@@ -1297,20 +1311,6 @@ def main():
         print("\n=== doctr-vitstr ===")
         train_vitstr(build_vitstr(args.device), all_records, args,
                      batch_size=checked["vitstr"])
-
-    # ── Detectors ─────────────────────────────────────────────────────────────
-    if "owlvit" in checked:
-        print("\n=== OWL-ViT ===")
-        train_owlvit(all_records, args, batch_size=checked["owlvit"])
-
-    if "rtdetr" in checked:
-        print("\n=== RT-DETR ===")
-        train_rtdetr(all_records, args, batch_size=checked["rtdetr"])
-
-    if "fasterrcnn" in checked:
-        print("\n=== Faster R-CNN ===")
-        train_fasterrcnn(build_fasterrcnn(args.device), all_records, args,
-                         batch_size=checked["fasterrcnn"])
 
     print("\nAll done.")
 
