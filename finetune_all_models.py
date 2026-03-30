@@ -292,87 +292,6 @@ def write_yolo_dataset(records: List[dict], out_dir: Path,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CRNN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_crnn(weights_path: Path, device: str) -> nn.Module:
-    from ocr_backends import CRNNBackend
-    backend = CRNNBackend(model_path=str(weights_path), device="cpu")
-    backend.load()
-    model = backend._model
-
-    # Two CRNN variants ship different head locations.
-    if hasattr(model, "dense"):
-        # _CRNNMapToSeq: head is model.dense
-        old = model.dense
-        n_in = old.in_features
-        new  = nn.Linear(n_in, NUM_CLASSES)
-        nn.init.xavier_uniform_(new.weight)
-        nn.init.zeros_(new.bias)
-        model.dense = new
-    else:
-        # _CRNN (GitYCC): head is model.rnn[1].embedding
-        old = model.rnn[1].embedding
-        n_in = old.in_features
-        new  = nn.Linear(n_in, NUM_CLASSES)
-        nn.init.xavier_uniform_(new.weight)
-        nn.init.zeros_(new.bias)
-        model.rnn[1].embedding = new
-    print(f"[crnn] head: Linear({n_in},{old.out_features}) → Linear({n_in},{NUM_CLASSES})")
-    return model.to(device).train()
-
-
-def train_crnn(model: nn.Module, records: List[dict], args) -> None:
-    device = args.device
-    ds = OCRCropDataset(records, crop_hw=(32, 100), grayscale=True)
-    n_val = max(1, int(len(ds) * 0.1))
-    train_ds, val_ds = random_split(ds, [len(ds) - n_val, n_val])
-
-    pm = pin_memory(device)
-    kw = dict(num_workers=args.workers, pin_memory=pm)
-    train_dl = DataLoader(train_ds, args.batch_size, shuffle=True,  drop_last=True,  **kw)
-    val_dl   = DataLoader(val_ds,   args.batch_size, shuffle=False, **kw)
-
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
-
-    for ep in range(1, args.epochs + 1):
-        model.train()
-        tl = 0.0
-        for imgs, labels in tqdm(train_dl, desc=f"CRNN {ep}", leave=False):
-            imgs = imgs.to(device)
-            logits = model(imgs)                          # [T, B, NUM_CLASSES]
-            lp  = F.log_softmax(logits, dim=2)
-            T, B, _ = lp.shape
-            ilen = torch.full((B,), T, dtype=torch.long)
-            tgt, tlen = encode_ctc(labels)
-            loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step(); tl += loss.item()
-        sched.step()
-
-        model.eval(); vl = 0.0
-        with torch.no_grad():
-            for imgs, labels in val_dl:
-                imgs = imgs.to(device)
-                lp   = F.log_softmax(model(imgs), dim=2)
-                T, B, _ = lp.shape
-                ilen = torch.full((B,), T, dtype=torch.long)
-                tgt, tlen = encode_ctc(labels)
-                vl  += F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX,
-                                  zero_infinity=True).item()
-        vl /= max(1, len(val_dl))
-        print(f"  CRNN ep{ep}: train={tl/len(train_dl):.4f}  val={vl:.4f}")
-        if vl < best:
-            best = vl
-            out  = Path(args.output_dir) / "crnn_finetuned.pt"
-            torch.save(model.state_dict(), out)
-            print(f"    → {out}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LPRNet
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -386,7 +305,8 @@ def build_lprnet(onnx_path: Path, device: str) -> nn.Module:
     nn.init.xavier_uniform_(new.weight)
     nn.init.zeros_(new.bias)
     model.dense = new
-    print(f"[lprnet] head: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})")
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[lprnet] head: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})  |  {n:,} params")
     return model.to(device).train()
 
 
@@ -454,7 +374,8 @@ def build_trocr(device: str):
     model.config.decoder_start_token_id = processor.tokenizer.bos_token_id
     model.config.pad_token_id           = processor.tokenizer.pad_token_id
     model.to(device)
-    print("[trocr] Loaded microsoft/trocr-small-printed (pretrained base)")
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[trocr] Loaded microsoft/trocr-small-printed  |  {n:,} params")
     return model, processor
 
 
@@ -540,6 +461,7 @@ def build_vitstr(device: str) -> nn.Module:
         print(f"[vitstr] head: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})")
         replaced = True
 
+
     if not replaced:
         # Walk named modules to find the last Linear and replace it
         last_name = last_mod = None
@@ -559,6 +481,8 @@ def build_vitstr(device: str) -> nn.Module:
         else:
             print("[vitstr] WARNING: no Linear head found to replace")
 
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[vitstr] {n:,} params")
     return model.to(device).train()
 
 
@@ -647,37 +571,6 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YOLOv8 / YOLOv10  (ultralytics)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def train_yolo(weights_path: Path, records: List[dict], args,
-               tag: str = "yolov8") -> None:
-    from ultralytics import YOLO
-
-    yolo_dir  = Path(args.output_dir) / f"{tag}_dataset"
-    yaml_path = write_yolo_dataset(records, yolo_dir)
-
-    model = YOLO(str(weights_path))
-    model.train(
-        data=str(yaml_path),
-        epochs=args.epochs,
-        batch=args.batch_size,
-        imgsz=640,
-        lr0=args.lr,
-        device=args.device,
-        project=str(Path(args.output_dir) / tag),
-        name="run",
-        exist_ok=True,
-        verbose=False,
-    )
-    best = Path(args.output_dir) / tag / "run" / "weights" / "best.pt"
-    if best.exists():
-        out = Path(args.output_dir) / f"{tag}_finetuned.pt"
-        shutil.copy(best, out)
-        print(f"  [{tag}] Saved → {out}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # RT-DETR  (HuggingFace transformers)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -751,6 +644,115 @@ def train_rtdetr(records: List[dict], args) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OWL-ViT  (CLIP backbone, open-vocab detector fine-tuned for LP detection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OWLVIT_MODEL_ID = "google/owlvit-base-patch32"
+_OWLVIT_QUERY    = ["a license plate"]
+
+
+def train_owlvit(records: List[dict], args) -> None:
+    from transformers import OwlViTProcessor, OwlViTForObjectDetection
+
+    device    = args.device
+    processor = OwlViTProcessor.from_pretrained(_OWLVIT_MODEL_ID)
+    model     = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(device)
+    n_params  = sum(p.numel() for p in model.parameters())
+    print(f"[owlvit] {_OWLVIT_MODEL_ID} — {n_params:,} params")
+
+    rng = random.Random(42)
+    shuffled = list(records); rng.shuffle(shuffled)
+    n_val     = max(1, int(len(shuffled) * 0.1))
+    train_recs = shuffled[n_val:]
+
+    # Pre-tokenise the fixed text query once.
+    text_inputs = processor(text=_OWLVIT_QUERY, return_tensors="pt", padding=True)
+    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+
+    class _DS(Dataset):
+        def __init__(self, recs): self.recs = recs
+        def __len__(self):        return len(self.recs)
+        def __getitem__(self, i):
+            rec = self.recs[i]
+            x1, y1, x2, y2 = rec["bbox"]
+            try:
+                img = Image.open(rec["image"]).convert("RGB")
+                W, H = img.size
+            except Exception:
+                img = Image.new("RGB", (640, 480)); W, H = 640, 480
+                x1, y1, x2, y2 = 0, 0, 100, 50
+            # OWL-ViT expects normalized cx,cy,w,h
+            cx = (x1 + x2) / 2 / W; cy = (y1 + y2) / 2 / H
+            bw = (x2 - x1) / W;     bh = (y2 - y1) / H
+            return img, torch.tensor([cx, cy, bw, bh], dtype=torch.float32)
+
+    def _col(batch):
+        imgs, boxes = zip(*batch)
+        pv = processor(images=list(imgs), return_tensors="pt")["pixel_values"]
+        return pv, torch.stack(boxes)
+
+    bs = max(1, args.batch_size // 4)
+    dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
+                    num_workers=args.workers)
+
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    best  = float("inf")
+    out_dir = Path(args.output_dir) / "owlvit_finetuned"
+
+    for ep in range(1, args.epochs + 1):
+        model.train(); tl = 0.0
+        for pixel_values, gt_boxes in tqdm(dl, desc=f"OWL-ViT {ep}", leave=False):
+            pixel_values = pixel_values.to(device)
+            gt_boxes     = gt_boxes.to(device)          # [B, 4] normalized cxcywh
+
+            # Expand text inputs to match batch size
+            batch_text = {k: v.expand(pixel_values.shape[0], -1)
+                          for k, v in text_inputs.items()}
+            out = model(pixel_values=pixel_values, **batch_text)
+
+            # pred_boxes: [B, num_patches, 4] normalized cxcywh
+            pred_boxes  = out.pred_boxes                 # [B, N, 4]
+            pred_logits = out.logits.squeeze(-1)         # [B, N]
+
+            # Match each image to the single highest-IoU predicted box
+            B, N, _ = pred_boxes.shape
+            box_loss = torch.tensor(0.0, device=device)
+            cls_loss = torch.tensor(0.0, device=device)
+            for b in range(B):
+                pb  = pred_boxes[b]                      # [N, 4]
+                gb  = gt_boxes[b].unsqueeze(0)           # [1, 4]
+                # IoU in cxcywh space (convert to xyxy for torchvision)
+                pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                       pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+                gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                       gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+                from torchvision.ops import box_iou
+                iou     = box_iou(pb_xyxy, gb_xyxy).squeeze(1)  # [N]
+                best_i  = iou.argmax()
+                box_loss += F.l1_loss(pb[best_i], gt_boxes[b])
+                # Focal-style binary CE: positive for best match, neg for rest
+                lbl = torch.zeros(N, device=device)
+                lbl[best_i] = 1.0
+                cls_loss += F.binary_cross_entropy_with_logits(
+                    pred_logits[b], lbl, pos_weight=torch.tensor(N - 1.0, device=device))
+
+            loss = (box_loss + cls_loss) / B
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+            opt.step(); tl += loss.item()
+        sched.step()
+        avg = tl / max(1, len(dl))
+        print(f"  OWL-ViT ep{ep}: train={avg:.4f}")
+        if avg < best:
+            best = avg
+            out_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(out_dir))
+            processor.save_pretrained(str(out_dir))
+            print(f"    → {out_dir}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Faster R-CNN  (torchvision, COCO pretrained → 2-class LP head)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -761,7 +763,8 @@ def build_fasterrcnn(device: str) -> nn.Module:
     model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
     in_f  = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_f, num_classes=2)
-    print(f"[fasterrcnn] COCO pretrained, head replaced for 2 classes (bg + plate)")
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[fasterrcnn] COCO pretrained, head replaced for 2 classes  |  {n:,} params")
     return model.to(device).train()
 
 
@@ -836,24 +839,6 @@ def run_sanity_checks(args, records: List[dict],
     """
     print("\n=== Sanity checks (1 batch each) ===")
     results = {}
-
-    # ── CRNN ──────────────────────────────────────────────────────────────────
-    if "crnn" in todo:
-        p = weights_dir / "crnn_synth90k.pt"
-        if not p.exists():
-            print(f"  [SKIP] crnn: {p} not found")
-        else:
-            def _crnn():
-                m = build_crnn(p, args.device)
-                imgs, labels = _ocr_mini_batch(records, (32, 100), grayscale=True)
-                imgs = imgs.to(args.device)
-                lp = F.log_softmax(m(imgs), dim=2)
-                T, B, _ = lp.shape
-                ilen = torch.full((B,), T, dtype=torch.long)
-                tgt, tlen = encode_ctc(labels)
-                F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX,
-                           zero_infinity=True).backward()
-            results["crnn"] = _check("crnn", _crnn)
 
     # ── LPRNet ────────────────────────────────────────────────────────────────
     if "lprnet" in todo:
@@ -936,35 +921,51 @@ def run_sanity_checks(args, records: List[dict],
                             ignore_index=0).backward()
         results["vitstr"] = _check("vitstr", _vitstr)
 
-    # ── YOLOv8 ────────────────────────────────────────────────────────────────
-    if "yolov8" in todo:
-        p = weights_dir / "lp_yolov8.pt"
-        if not p.exists():
-            print(f"  [SKIP] yolov8: {p} not found")
-        else:
-            def _yolov8():
-                from ultralytics import YOLO
-                model = YOLO(str(p))
-                # Ultralytics YOLO.train() is the only supported fine-tuning path;
-                # verify the model loads and can run a prediction as smoke test
-                imgs, _ = _det_mini_batch(records, n=2)
-                img_np = (imgs[0].permute(1,2,0).numpy() * 255).astype(np.uint8)
-                model.predict(img_np, verbose=False)
-            results["yolov8"] = _check("yolov8 (predict smoke-test)", _yolov8)
-
-    # ── YOLOv10 ───────────────────────────────────────────────────────────────
-    if "yolov10" in todo:
-        p = weights_dir / "lp_yolov10.pt"
-        if not p.exists():
-            print(f"  [SKIP] yolov10: {p} not found")
-        else:
-            def _yolov10():
-                from ultralytics import YOLO
-                model = YOLO(str(p))
-                imgs, _ = _det_mini_batch(records, n=2)
-                img_np = (imgs[0].permute(1,2,0).numpy() * 255).astype(np.uint8)
-                model.predict(img_np, verbose=False)
-            results["yolov10"] = _check("yolov10 (predict smoke-test)", _yolov10)
+    # ── OWL-ViT ───────────────────────────────────────────────────────────────
+    if "owlvit" in todo:
+        def _owlvit():
+            from transformers import OwlViTProcessor, OwlViTForObjectDetection
+            from torchvision.ops import box_iou
+            proc  = OwlViTProcessor.from_pretrained(_OWLVIT_MODEL_ID)
+            model = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(args.device)
+            model.train()
+            recs  = records[:2]
+            imgs_pil = []
+            gt_boxes = []
+            for rec in recs:
+                x1, y1, x2, y2 = rec["bbox"]
+                try:
+                    img = Image.open(rec["image"]).convert("RGB")
+                    W, H = img.size
+                except Exception:
+                    img = Image.new("RGB", (640, 480)); W, H = 640, 480
+                    x1, y1, x2, y2 = 0, 0, 100, 50
+                imgs_pil.append(img)
+                cx = (x1+x2)/2/W; cy = (y1+y2)/2/H
+                bw = (x2-x1)/W;   bh = (y2-y1)/H
+                gt_boxes.append(torch.tensor([cx, cy, bw, bh]))
+            pv   = proc(images=imgs_pil, return_tensors="pt")["pixel_values"].to(args.device)
+            text = proc(text=_OWLVIT_QUERY, return_tensors="pt", padding=True)
+            text = {k: v.expand(pv.shape[0], -1).to(args.device) for k, v in text.items()}
+            out  = model(pixel_values=pv, **text)
+            pred_boxes  = out.pred_boxes
+            pred_logits = out.logits.squeeze(-1)
+            B, N, _ = pred_boxes.shape
+            gt = torch.stack(gt_boxes).to(args.device)
+            loss = torch.tensor(0.0, device=args.device)
+            for b in range(B):
+                pb = pred_boxes[b]
+                pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                       pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+                gb = gt[b].unsqueeze(0)
+                gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                       gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+                best_i = box_iou(pb_xyxy, gb_xyxy).squeeze(1).argmax()
+                lbl = torch.zeros(N, device=args.device); lbl[best_i] = 1.0
+                loss += F.l1_loss(pb[best_i], gt[b])
+                loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
+            (loss / B).backward()
+        results["owlvit"] = _check("owlvit", _owlvit)
 
     # ── RT-DETR ───────────────────────────────────────────────────────────────
     if "rtdetr" in todo:
@@ -1021,8 +1022,8 @@ def run_sanity_checks(args, records: List[dict],
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-ALL_MODELS = ["crnn", "lprnet", "trocr", "vitstr",
-              "yolov8", "yolov10", "rtdetr", "fasterrcnn"]
+ALL_MODELS = ["lprnet", "trocr", "vitstr",
+              "owlvit", "rtdetr", "fasterrcnn"]
 
 
 def parse_args():
@@ -1079,14 +1080,6 @@ def main():
         sys.exit(1)
 
     # ── OCR ───────────────────────────────────────────────────────────────────
-    if "crnn" in todo:
-        print("=== CRNN ===")
-        p = weights_dir / "crnn_synth90k.pt"
-        if not p.exists():
-            print(f"  SKIP: {p} not found")
-        else:
-            train_crnn(build_crnn(p, args.device), all_records, args)
-
     if "lprnet" in todo:
         print("\n=== LPRNet ===")
         p = weights_dir / "lprnet_deployable_onnx_v1.1" / "us_lprnet_baseline18_deployable.onnx"
@@ -1111,27 +1104,12 @@ def main():
             print(f"  SKIP: {e}")
 
     # ── Detectors ─────────────────────────────────────────────────────────────
-    if "yolov8" in todo:
-        print("\n=== YOLOv8 ===")
-        p = weights_dir / "lp_yolov8.pt"
-        if not p.exists():
-            print(f"  SKIP: {p} not found")
-        else:
-            try:
-                train_yolo(p, all_records, args, tag="yolov8")
-            except ImportError as e:
-                print(f"  SKIP: {e}")
-
-    if "yolov10" in todo:
-        print("\n=== YOLOv10 ===")
-        p = weights_dir / "lp_yolov10.pt"
-        if not p.exists():
-            print(f"  SKIP: {p} not found")
-        else:
-            try:
-                train_yolo(p, all_records, args, tag="yolov10")
-            except ImportError as e:
-                print(f"  SKIP: {e}")
+    if "owlvit" in todo:
+        print("\n=== OWL-ViT ===")
+        try:
+            train_owlvit(all_records, args)
+        except ImportError as e:
+            print(f"  SKIP: {e}")
 
     if "rtdetr" in todo:
         print("\n=== RT-DETR ===")
