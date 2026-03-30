@@ -26,11 +26,7 @@ def transform_path_for_user(filepath):
 
         if filepath.startswith(old_base):
             relative_path = filepath[len(old_base):].lstrip('/')
-            transformed_path = os.path.join(new_base, relative_path)
-            return transformed_path
-        else:
-            # If path doesn't start with old_base, assume it's already relative to new_base
-            return os.path.join(new_base, filepath.lstrip('/'))
+            return os.path.join(new_base, relative_path)
 
     # For non-ubuntu users, return path as-is
     return filepath
