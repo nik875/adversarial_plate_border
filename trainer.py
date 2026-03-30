@@ -363,8 +363,6 @@ class AdversarialPatchTrainer:
         train_detector:       bool           = False,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
-        ocr_loss_scale:       float          = 1.0,
-        det_loss_scale:       float          = 1.0,
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
@@ -376,8 +374,6 @@ class AdversarialPatchTrainer:
     ):
         self.training             = training
         self.tv_weight            = tv_weight
-        self.ocr_loss_scale       = ocr_loss_scale
-        self.det_loss_scale       = det_loss_scale
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.sam_m                = sam_m
@@ -849,19 +845,19 @@ class AdversarialPatchTrainer:
                 iou_real = self._boxes_iou(
                     pred_box.unsqueeze(0),
                     items[i]["target_box"].to(self.device).unsqueeze(0)).squeeze()
-                det_real = iou_real * self.det_loss_scale
+                det_real = iou_real
             else:
-                det_real = conf_real * self.det_loss_scale
+                det_real = conf_real
 
             if top_pred_box is not None:
                 iou_top = self._boxes_iou(
                     top_pred_box.unsqueeze(0),
                     items[i]["top_region_box"].to(self.device).unsqueeze(0)).squeeze()
-                det_top = -iou_top * self.det_loss_scale
+                det_top = -iou_top
             else:
-                det_top = -conf_top * self.det_loss_scale
+                det_top = -conf_top
 
-            det_losses.append(det_real + det_top)
+            det_losses.append((det_real, det_top))
 
             if pred_box is not None:
                 real_crop = _bbox_ocr_crop_diff(
@@ -884,7 +880,8 @@ class AdversarialPatchTrainer:
             crop_info.append((real_crop, top_crop))
 
         # ── Pass 2: batch OCR — one model call for all crops ──────────────
-        image_losses, det_l_list, ocr_l_list = [], [], []
+        image_losses = []
+        det_real_l_list, det_top_l_list, ocr_real_l_list, ocr_top_l_list = [], [], [], []
         use_encode = hasattr(self.ocr, 'encode_batch')
 
         if use_encode:
@@ -895,34 +892,57 @@ class AdversarialPatchTrainer:
                 crop_idx_per_item.append((ri, ti))
             raw_all = self.ocr.encode_batch(flat_crops) if flat_crops else None
 
+        _zero = torch.tensor(0.0, device=self.device)
         for i, (real_crop, top_crop) in enumerate(crop_info):
+            det_real_i, det_top_i = det_losses[i]
+
             if use_encode:
                 ri, ti = crop_idx_per_item[i]
-                ocr_parts = [
-                    self.ocr.loss_from_raw(raw_all[crop_idx], self.impersonation_target,
-                                           True, None) * self.ocr_loss_scale
-                    for crop_idx in [x for x in [ri, ti] if x is not None]
-                ]
+                ocr_real_i = (self.ocr.loss_from_raw(raw_all[ri], self.impersonation_target,
+                                                      True, None)                              if ri is not None else None)
+                ocr_top_i  = (self.ocr.loss_from_raw(raw_all[ti], self.impersonation_target,
+                                                      True, None)                              if ti is not None else None)
             else:
-                # Fallback: per-item sequential calls (backends without encode_batch)
-                ocr_parts = [
-                    self.ocr.differentiable_loss_batch(
-                        [crop], self.impersonation_target, impersonation=True)[0] * self.ocr_loss_scale
-                    for crop in [c for c in [real_crop, top_crop] if c is not None]
-                ]
+                ocr_real_i = (self.ocr.differentiable_loss_batch(
+                                  [real_crop], self.impersonation_target,
+                                  impersonation=True)[0]                              if real_crop is not None else None)
+                ocr_top_i  = (self.ocr.differentiable_loss_batch(
+                                  [top_crop], self.impersonation_target,
+                                  impersonation=True)[0]                              if top_crop is not None else None)
 
-            det_i = det_losses[i]
-            ocr_i = (sum(ocr_parts) / len(ocr_parts)) if ocr_parts \
-                else torch.tensor(0.0, device=self.device)
-            image_losses.append((det_i + ocr_i) / 2)
-            det_l_list.append(det_i.detach())
-            ocr_l_list.append(ocr_i.detach())
+            # Weights: proportional to each detection term's magnitude (detached —
+            # weights are fixed scalars; gradients flow only through ocr values).
+            det_real_mag = det_real_i.detach().clamp(min=0)
+            det_top_mag  = (-det_top_i).detach().clamp(min=0)
+            total_mag    = det_real_mag + det_top_mag + 1e-6
 
-        total = torch.stack(image_losses).mean() + self.tv_weight * tv_l
-        det_l = torch.stack(det_l_list).mean()
-        ocr_l = torch.stack(ocr_l_list).mean()
+            if ocr_real_i is not None and ocr_top_i is not None:
+                w_real = det_real_mag / total_mag
+                w_top  = det_top_mag  / total_mag
+                ocr_i  = w_real * ocr_real_i + w_top * ocr_top_i
+            elif ocr_real_i is not None:
+                ocr_i = ocr_real_i
+            elif ocr_top_i is not None:
+                ocr_i = ocr_top_i
+            else:
+                ocr_i = _zero
 
-        return total, det_l.detach(), ocr_l.detach(), (self.tv_weight * tv_l).detach()
+            image_losses.append(ocr_i)
+            det_real_l_list.append(det_real_i.detach())
+            det_top_l_list.append(det_top_i.detach())
+            ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
+            ocr_top_l_list.append(ocr_top_i.detach()  if ocr_top_i  is not None else _zero)
+
+        total      = torch.stack(image_losses).mean() + self.tv_weight * tv_l
+        det_real_l = torch.stack(det_real_l_list).mean()
+        det_top_l  = torch.stack(det_top_l_list).mean()
+        ocr_real_l = torch.stack(ocr_real_l_list).mean()
+        ocr_top_l  = torch.stack(ocr_top_l_list).mean()
+
+        return (total,
+                det_real_l, det_top_l,
+                ocr_real_l, ocr_top_l,
+                (self.tv_weight * tv_l).detach())
 
     def compute_loss(self, batch: dict) -> tuple:
         """Thin wrapper: B=1 case, for backward compatibility."""
@@ -982,7 +1002,7 @@ class AdversarialPatchTrainer:
             probe_patch = self.generate_patch(training_aug=False).detach().requires_grad_(True)
             item = self._prepare_one(sample_raw, probe_patch)
             item["_patch_norm"] = probe_patch
-            loss, _, _, _ = self.compute_loss_batch([item])
+            loss, *_ = self.compute_loss_batch([item])
             (loss / 4).backward()
             torch.cuda.synchronize()
             peak = torch.cuda.max_memory_allocated()
@@ -1291,12 +1311,12 @@ class AdversarialPatchTrainer:
         M = len(window_raw)
         m = min(self.sam_m, M)
 
-        def _accumulate(indices, weight) -> Tuple[float, float, float, float]:
+        def _accumulate(indices, weight):
             """
             Generate patch, detach → leaf, accumulate gradients in batches of B,
             then backprop once through the generator.
-            Returns (total_loss, det_sum, ocr_sum, tv_sum) as a sum over all items
-            (consistent with the /B normalisation applied by the caller).
+            Returns (total_loss, det_real_sum, det_top_sum, ocr_real_sum, ocr_top_sum, tv_sum)
+            as a sum over all items (consistent with the /B normalisation applied by the caller).
 
             compute_loss_batch returns the mean over its batch, so to reproduce
             the same gradient as processing items individually we scale the
@@ -1305,7 +1325,7 @@ class AdversarialPatchTrainer:
             patch_with_graph = self.generate_patch(training_aug=self.training)
             patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
-            total_loss = det_sum = ocr_sum = tv_sum = 0.0
+            total_loss = det_real_sum = det_top_sum = ocr_real_sum = ocr_top_sum = tv_sum = 0.0
             for chunk_start in range(0, len(indices), B):
                 chunk = indices[chunk_start:chunk_start + B]
                 items = []
@@ -1313,18 +1333,20 @@ class AdversarialPatchTrainer:
                     item = self._prepare_one(window_raw[i], patch_leaf)
                     item["_patch_norm"] = patch_leaf
                     items.append(item)
-                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(items)
+                loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(items)
                 # loss is mean over len(chunk); scale back to sum for grad equivalence
                 (loss * weight * len(chunk)).backward()
-                total_loss += loss.item() * len(chunk)
-                det_sum    += det_l.item() * len(chunk)
-                ocr_sum    += ocr_l.item() * len(chunk)
-                tv_sum     += tv_l.item() * len(chunk)
+                total_loss    += loss.item()       * len(chunk)
+                det_real_sum  += det_real_l.item() * len(chunk)
+                det_top_sum   += det_top_l.item()  * len(chunk)
+                ocr_real_sum  += ocr_real_l.item() * len(chunk)
+                ocr_top_sum   += ocr_top_l.item()  * len(chunk)
+                tv_sum        += tv_l.item()        * len(chunk)
                 del items
 
             # Propagate accumulated patch gradient through the generator graph.
             patch_with_graph.backward(patch_leaf.grad)
-            return total_loss, det_sum, ocr_sum, tv_sum
+            return total_loss, det_real_sum, det_top_sum, ocr_real_sum, ocr_top_sum, tv_sum
 
         # ── ASCENT: gradients from m random items ────────────────────────
         optimizer.zero_grad()
@@ -1335,12 +1357,13 @@ class AdversarialPatchTrainer:
         optimizer.first_step(zero_grad=True)
 
         # ── DESCENT: gradients from all M items, perturbed patch ─────────
-        total_loss, det_sum, ocr_sum, tv_sum = _accumulate(range(M), 1.0 / M)
+        total_loss, det_real_sum, det_top_sum, ocr_real_sum, ocr_top_sum, tv_sum = \
+            _accumulate(range(M), 1.0 / M)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
         optimizer.second_step(zero_grad=True)
 
-        return total_loss, det_sum, ocr_sum, tv_sum
+        return total_loss, det_real_sum, det_top_sum, ocr_real_sum, ocr_top_sum, tv_sum
 
     def train_epoch(self, optimizer, epoch: int, scheduler=None,
                     update_log: Optional[list] = None,
@@ -1353,9 +1376,9 @@ class AdversarialPatchTrainer:
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
         total_loss = accum_loss = 0.0
-        total_det  = total_ocr  = total_tv = 0.0
+        total_det_real = total_det_top = total_ocr_real = total_ocr_top = total_tv = 0.0
         # Per-update accumulators (reset after each optimizer step, like accum_loss)
-        _upd_det = _upd_ocr = _upd_tv = 0.0
+        _upd_det_real = _upd_det_top = _upd_ocr_real = _upd_ocr_top = _upd_tv = 0.0
         step = num_updates = 0
         buffer: list = []
         use_sam = isinstance(optimizer, SAM)
@@ -1384,37 +1407,44 @@ class AdversarialPatchTrainer:
                         if not window_full:
                             continue
 
-                        loss_t, det_t, ocr_t, tv_t = self._msam_step(
-                            optimizer, window_raw, B, update_every)
+                        loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
+                            self._msam_step(optimizer, window_raw, B, update_every)
                         window_raw = []
                         step       += update_every
                         num_updates += 1
                         # _msam_step sums losses over all M=B*update_every items
                         # individually; divide by B so the scale matches the
                         # non-SAM path (which averages over B inside compute_loss_batch).
-                        total_loss += loss_t / B
-                        total_det  += det_t  / B
-                        total_ocr  += ocr_t  / B
-                        total_tv   += tv_t   / B
+                        total_loss     += loss_t      / B
+                        total_det_real += det_real_t  / B
+                        total_det_top  += det_top_t   / B
+                        total_ocr_real += ocr_real_t  / B
+                        total_ocr_top  += ocr_top_t   / B
+                        total_tv       += tv_t        / B
                         if scheduler is not None:
                             scheduler.step()
+                        _lr_now = optimizer.base_optimizer.param_groups[0]["lr"]
                         if update_log is not None:
-                            _opt = optimizer.base_optimizer
                             update_log.append({
                                 "global_update": update_offset + num_updates,
-                                "epoch": epoch + 1,
-                                "loss":  loss_t / B / update_every,
-                                "det":   det_t  / B / update_every,
-                                "ocr":   ocr_t  / B / update_every,
-                                "tv":    tv_t   / B / update_every,
-                                "lr":    _opt.param_groups[0]["lr"],
+                                "epoch":    epoch + 1,
+                                "loss":     loss_t     / B / update_every,
+                                "det_real": det_real_t / B / update_every,
+                                "det_top":  det_top_t  / B / update_every,
+                                "ocr_real": ocr_real_t / B / update_every,
+                                "ocr_top":  ocr_top_t  / B / update_every,
+                                "tv":       tv_t       / B / update_every,
+                                "lr":       _lr_now,
                             })
                         pbar.update(1)
                         pbar.set_postfix({
-                            "loss": f"{total_loss/step:.4f}",
-                            "det":  f"{total_det/step:.4f}",
-                            "ocr":  f"{total_ocr/step:.4f}",
-                            "tv":   f"{total_tv/step:.4f}",
+                            "loss":   f"{total_loss/step:.4f}",
+                            "det_r":  f"{total_det_real/step:.4f}",
+                            "det_t":  f"{total_det_top/step:.4f}",
+                            "ocr_r":  f"{total_ocr_real/step:.4f}",
+                            "ocr_t":  f"{total_ocr_top/step:.4f}",
+                            "tv":     f"{total_tv/step:.4f}",
+                            "lr":     f"{_lr_now:.2e}",
                         })
                         patch_with_graph = self.generate_patch(training_aug=self.training)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
@@ -1430,19 +1460,24 @@ class AdversarialPatchTrainer:
                     if len(buffer) < B:
                         continue
 
-                    loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                    loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
+                        self.compute_loss_batch(buffer)
                     buffer = []
                     scaled_loss = loss / update_every
                     step += 1
                     scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
 
-                    accum_loss += loss.item()
-                    total_det  += det_l.item()
-                    total_ocr  += ocr_l.item()
-                    total_tv   += tv_l.item()
-                    _upd_det   += det_l.item()
-                    _upd_ocr   += ocr_l.item()
-                    _upd_tv    += tv_l.item()
+                    accum_loss     += loss.item()
+                    total_det_real += det_real_l.item()
+                    total_det_top  += det_top_l.item()
+                    total_ocr_real += ocr_real_l.item()
+                    total_ocr_top  += ocr_top_l.item()
+                    total_tv       += tv_l.item()
+                    _upd_det_real  += det_real_l.item()
+                    _upd_det_top   += det_top_l.item()
+                    _upd_ocr_real  += ocr_real_l.item()
+                    _upd_ocr_top   += ocr_top_l.item()
+                    _upd_tv        += tv_l.item()
                     del loss, scaled_loss
 
                     if step % update_every == 0:
@@ -1455,23 +1490,30 @@ class AdversarialPatchTrainer:
                             scheduler.step()
                         total_loss  += accum_loss
                         num_updates += 1
+                        _lr_now = optimizer.param_groups[0]["lr"]
                         if update_log is not None:
                             update_log.append({
                                 "global_update": update_offset + num_updates,
-                                "epoch": epoch + 1,
-                                "loss":  accum_loss / update_every,
-                                "det":   _upd_det   / update_every,
-                                "ocr":   _upd_ocr   / update_every,
-                                "tv":    _upd_tv    / update_every,
-                                "lr":    optimizer.param_groups[0]["lr"],
+                                "epoch":    epoch + 1,
+                                "loss":     accum_loss     / update_every,
+                                "det_real": _upd_det_real  / update_every,
+                                "det_top":  _upd_det_top   / update_every,
+                                "ocr_real": _upd_ocr_real  / update_every,
+                                "ocr_top":  _upd_ocr_top   / update_every,
+                                "tv":       _upd_tv        / update_every,
+                                "lr":       _lr_now,
                             })
-                        accum_loss = _upd_det = _upd_ocr = _upd_tv = 0.0
+                        accum_loss = _upd_det_real = _upd_det_top = \
+                            _upd_ocr_real = _upd_ocr_top = _upd_tv = 0.0
                         pbar.update(1)
                         pbar.set_postfix({
-                            "loss": f"{total_loss/step:.4f}",
-                            "det":  f"{total_det/step:.4f}",
-                            "ocr":  f"{total_ocr/step:.4f}",
-                            "tv":   f"{total_tv/step:.4f}",
+                            "loss":  f"{total_loss/step:.4f}",
+                            "det_r": f"{total_det_real/step:.4f}",
+                            "det_t": f"{total_det_top/step:.4f}",
+                            "ocr_r": f"{total_ocr_real/step:.4f}",
+                            "ocr_t": f"{total_ocr_top/step:.4f}",
+                            "tv":    f"{total_tv/step:.4f}",
+                            "lr":    f"{_lr_now:.2e}",
                         })
                         # New patch for next accumulation window
                         patch_with_graph = self.generate_patch(training_aug=self.training)
@@ -1491,41 +1533,50 @@ class AdversarialPatchTrainer:
             if use_sam and len(window_raw) >= B:
                 # Partial window: trim to a multiple of B, then do m-SAM update
                 n_complete = (len(window_raw) // B) * B
-                loss_t, det_t, ocr_t, tv_t = self._msam_step(
-                    optimizer, window_raw[:n_complete], B, n_complete // B)
-                step       += n_complete // B
-                num_updates += 1
-                total_loss += loss_t / B
-                total_det  += det_t  / B
-                total_ocr  += ocr_t  / B
-                total_tv   += tv_t   / B
+                loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
+                    self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B)
+                step           += n_complete // B
+                num_updates    += 1
+                total_loss     += loss_t      / B
+                total_det_real += det_real_t  / B
+                total_det_top  += det_top_t   / B
+                total_ocr_real += ocr_real_t  / B
+                total_ocr_top  += ocr_top_t   / B
+                total_tv       += tv_t        / B
                 if update_log is not None:
                     _n = n_complete // B
                     _opt = optimizer.base_optimizer
                     update_log.append({
                         "global_update": update_offset + num_updates,
-                        "epoch": epoch + 1,
-                        "loss":  loss_t / B / _n,
-                        "det":   det_t  / B / _n,
-                        "ocr":   ocr_t  / B / _n,
-                        "tv":    tv_t   / B / _n,
-                        "lr":    _opt.param_groups[0]["lr"],
+                        "epoch":    epoch + 1,
+                        "loss":     loss_t     / B / _n,
+                        "det_real": det_real_t / B / _n,
+                        "det_top":  det_top_t  / B / _n,
+                        "ocr_real": ocr_real_t / B / _n,
+                        "ocr_top":  ocr_top_t  / B / _n,
+                        "tv":       tv_t       / B / _n,
+                        "lr":       _opt.param_groups[0]["lr"],
                     })
             elif not use_sam:
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
-                    loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                    loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
+                        self.compute_loss_batch(buffer)
                     buffer = []
                     scaled_loss = loss / update_every
                     scaled_loss.backward()  # accumulates into patch_leaf.grad
-                    accum_loss += loss.item()
-                    total_det  += det_l.item()
-                    total_ocr  += ocr_l.item()
-                    total_tv   += tv_l.item()
-                    _upd_det   += det_l.item()
-                    _upd_ocr   += ocr_l.item()
-                    _upd_tv    += tv_l.item()
-                    step       += 1
+                    accum_loss     += loss.item()
+                    total_det_real += det_real_l.item()
+                    total_det_top  += det_top_l.item()
+                    total_ocr_real += ocr_real_l.item()
+                    total_ocr_top  += ocr_top_l.item()
+                    total_tv       += tv_l.item()
+                    _upd_det_real  += det_real_l.item()
+                    _upd_det_top   += det_top_l.item()
+                    _upd_ocr_real  += ocr_real_l.item()
+                    _upd_ocr_top   += ocr_top_l.item()
+                    _upd_tv        += tv_l.item()
+                    step           += 1
                     del loss, scaled_loss
 
                 if step % update_every != 0 and self.grad_accumulate is not None:
@@ -1542,16 +1593,21 @@ class AdversarialPatchTrainer:
                         _rem = step % update_every or update_every
                         update_log.append({
                             "global_update": update_offset + num_updates,
-                            "epoch": epoch + 1,
-                            "loss":  accum_loss / _rem,
-                            "det":   _upd_det   / _rem,
-                            "ocr":   _upd_ocr   / _rem,
-                            "tv":    _upd_tv    / _rem,
-                            "lr":    optimizer.param_groups[0]["lr"],
+                            "epoch":    epoch + 1,
+                            "loss":     accum_loss    / _rem,
+                            "det_real": _upd_det_real / _rem,
+                            "det_top":  _upd_det_top  / _rem,
+                            "ocr_real": _upd_ocr_real / _rem,
+                            "ocr_top":  _upd_ocr_top  / _rem,
+                            "tv":       _upd_tv       / _rem,
+                            "lr":       optimizer.param_groups[0]["lr"],
                         })
 
         n = max(step, 1)
-        return (total_loss / n, total_det / n, total_ocr / n, total_tv / n, num_updates)
+        return (total_loss / n,
+                total_det_real / n, total_det_top / n,
+                total_ocr_real / n, total_ocr_top / n,
+                total_tv / n, num_updates)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
@@ -1570,15 +1626,13 @@ class AdversarialPatchTrainer:
                 if len(buffer) < B:
                     continue
 
-                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
-                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
-                losses.append(val_loss.item())
+                total, *_ = self.compute_loss_batch(buffer)
+                losses.append(total.item())
                 buffer = []
 
             if buffer:
-                _, det_l, ocr_l, _ = self.compute_loss_batch(buffer)
-                val_loss = ocr_l if self.disable_disruption else (det_l + ocr_l) / 2
-                losses.append(val_loss.item())
+                total, *_ = self.compute_loss_batch(buffer)
+                losses.append(total.item())
 
         return float(np.mean(losses)) if losses else 0.0
 
@@ -1645,7 +1699,8 @@ class AdversarialPatchTrainer:
             milestones=[max(1, warmup_updates)],
         )
 
-        history    = {"loss": [], "val_score": [], "learning_rate": []}
+        history    = {"loss": [], "val_score": [], "learning_rate": [],
+                      "det_real": [], "det_top": [], "ocr_real": [], "ocr_top": [], "tv": []}
         best_loss  = float("inf")
         best_epoch = -1
 
@@ -1689,7 +1744,8 @@ class AdversarialPatchTrainer:
         log_path      = self.run_dir / "training_log.txt"
         log_file      = open(log_path, "w")
         batch_log_path = self.run_dir / "batch_log.csv"
-        _batch_log_fields = ["global_update", "epoch", "loss", "det", "ocr", "tv", "lr"]
+        _batch_log_fields = ["global_update", "epoch", "loss",
+                             "det_real", "det_top", "ocr_real", "ocr_top", "tv", "lr"]
         batch_log_file = open(batch_log_path, "w", newline="")
         batch_log_writer = csv.writer(batch_log_file)
         batch_log_writer.writerow(_batch_log_fields)
@@ -1704,7 +1760,10 @@ class AdversarialPatchTrainer:
             if global_updates < tv_warmup_updates:
                 self.tv_weight = 0.0
             epoch_update_records: list = []
-            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(
+            (train_loss,
+             train_det_real, train_det_top,
+             train_ocr_real, train_ocr_top,
+             train_tv, epoch_updates) = self.train_epoch(
                 optimizer, epoch, scheduler,
                 update_log=epoch_update_records,
                 update_offset=global_updates,
@@ -1722,6 +1781,11 @@ class AdversarialPatchTrainer:
             history["loss"].append(train_loss)
             history["val_score"].append(val_loss)
             history["learning_rate"].append(lr)
+            history["det_real"].append(train_det_real)
+            history["det_top"].append(train_det_top)
+            history["ocr_real"].append(train_ocr_real)
+            history["ocr_top"].append(train_ocr_top)
+            history["tv"].append(train_tv)
 
             init_val    = history["val_score"][0]
             change      = (val_loss / (init_val + 1e-9) - 1) * 100
@@ -1735,8 +1799,10 @@ class AdversarialPatchTrainer:
 
             line = (f"Epoch {epoch+1:3d}/{num_epochs} "
                     f"[{self.detector.name}/{self.ocr.name}] | "
-                    f"loss: {train_loss:.4f}  det: {train_det:.4f}  "
-                    f"ocr: {train_ocr:.4f}  tv: {train_tv:.4f} | "
+                    f"loss: {train_loss:.4f}  "
+                    f"det_r: {train_det_real:.4f}  det_t: {train_det_top:.4f}  "
+                    f"ocr_r: {train_ocr_real:.4f}  ocr_t: {train_ocr_top:.4f}  "
+                    f"tv: {train_tv:.4f} | "
                     f"val: {val_loss:.4f} Δ{change:+.1f}% | "
                     f"lr: {lr:.2e} | "
                     f"time: {epoch_time:.1f}s{best_marker}")
@@ -1817,10 +1883,6 @@ def main():
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
                              "Set to 0 to disable TV warmup entirely.")
-    parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
-                        help="Scalar multiplier on OCR loss (default: 1.0).")
-    parser.add_argument("--det-loss-scale", type=float, default=1.0,
-                        help="Scalar multiplier on detection loss (default: 1.0).")
     parser.add_argument("--no-disruption", action="store_true",
                         help="Disable the detection (disruption) loss component entirely. "
                              "Detection is still computed for pipeline purposes but contributes "
@@ -1882,8 +1944,6 @@ def main():
         train_detector       = args.train_detector,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
-        ocr_loss_scale       = args.ocr_loss_scale,
-        det_loss_scale       = args.det_loss_scale,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
