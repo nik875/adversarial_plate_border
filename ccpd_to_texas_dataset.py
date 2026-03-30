@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import multiprocessing
@@ -569,6 +570,18 @@ def write_metadata(records: List[dict], output_root: Path) -> Tuple[Path, Path]:
 
 
 
+def _image_seed(base_seed: int, image_path: Path, input_root: Path) -> int:
+    """Stable per-image seed derived from the relative path, not directory position.
+
+    Using the path rather than an enumeration index means the seed for a given
+    image is the same regardless of what other files are present in the input
+    directory — so labels don't shift when the dataset grows or changes.
+    """
+    rel = str(image_path.relative_to(input_root))
+    h   = int(hashlib.sha1(rel.encode()).hexdigest()[:8], 16)  # 32-bit digest slice
+    return (base_seed + h) & 0xFFFFFFFF
+
+
 def _process_worker(packed: tuple):
     """Top-level worker for multiprocessing.Pool (must be picklable)."""
     image_path, input_root, output_root, seed, font_path, pattern, fixed_plate, alpha_blend, plate_scale = packed
@@ -612,8 +625,7 @@ def rebuild_metadata_records(
         if image_path not in path_to_idx:
             skipped += 1
             continue
-        idx = path_to_idx[image_path]
-        rng = random.Random(seed + idx)
+        rng = random.Random(_image_seed(seed, image_path, input_root))
         try:
             ann = parse_ccpd_filename(image_path)
         except ValueError:
@@ -779,7 +791,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # deterministic regardless of worker order.  Use the original index so
     # seeds stay stable across resume runs.
     worker_args = [
-        (p, input_root, output_root, args.seed + path_to_idx[p], args.font_path,
+        (p, input_root, output_root, _image_seed(args.seed, p, input_root), args.font_path,
          args.pattern, fixed_plate, args.alpha_blend, args.plate_scale)
         for p in image_paths
     ]
