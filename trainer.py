@@ -1597,14 +1597,6 @@ class AdversarialPatchTrainer:
 
                         if self.profiling:
                             self._prof.setdefault("step/optimizer", []).append(_pt() - _topt0)
-                            _t_step_end = _pt()
-                            _t_step_start = _t_step_end - (
-                                self._prof["step/dataloader"][-1]
-                                + self._prof["prepare/total"][-1] * B
-                                + self._prof["step/loss_batch"][-1]
-                                + self._prof["step/backward"][-1]
-                                + self._prof["step/optimizer"][-1]
-                            ) if False else None   # use direct accumulation below
                             # Step total = dataloader + B*prepare + loss + backward + opt
                             _step_t = (
                                 self._prof["step/dataloader"][-1]
