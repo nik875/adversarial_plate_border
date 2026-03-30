@@ -56,7 +56,7 @@ import kornia.geometry as K
 from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
-from ocr_backends import OCRBackend, OCRResult, build_ocr_backend, _diff_char_positions
+from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import (create_dataloaders, create_ccpd_dataloaders,
                      make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
@@ -842,14 +842,6 @@ class AdversarialPatchTrainer:
         # ── Pass 1: detection losses + crop extraction (no OCR calls) ────
         det_losses, crop_info = [], []
         for i, ((conf_real, pred_box), (conf_top, top_pred_box)) in enumerate(two_target_results):
-            item_plate_text = items[i].get("label") or self.expected_plate_text
-            if item_plate_text:
-                diff_pos = _diff_char_positions(self.impersonation_target, item_plate_text)
-                n        = max(len(self.impersonation_target), len(item_plate_text))
-                same_pos = [j for j in range(n) if j not in diff_pos]
-            else:
-                diff_pos, same_pos = None, None
-
             if pred_box is not None:
                 iou_real = self._boxes_iou(
                     pred_box.unsqueeze(0),
@@ -886,52 +878,35 @@ class AdversarialPatchTrainer:
             else:
                 top_crop = None
 
-            crop_info.append((real_crop, top_crop, item_plate_text, diff_pos, same_pos))
+            crop_info.append((real_crop, top_crop))
 
         # ── Pass 2: batch OCR — one model call for all crops ──────────────
-        # Collect each unique crop once; multiple losses (loss_d, loss_s) are
-        # computed from the same raw encoder output so the model runs only once.
         image_losses, det_l_list, ocr_l_list = [], [], []
         use_encode = hasattr(self.ocr, 'encode_batch')
 
         if use_encode:
             flat_crops, crop_idx_per_item = [], []
-            for real_crop, top_crop, *_ in crop_info:
+            for real_crop, top_crop in crop_info:
                 ri = (len(flat_crops), flat_crops.append(real_crop))[0] if real_crop is not None else None
                 ti = (len(flat_crops), flat_crops.append(top_crop))[0]  if top_crop  is not None else None
                 crop_idx_per_item.append((ri, ti))
             raw_all = self.ocr.encode_batch(flat_crops) if flat_crops else None
 
-        for i, (real_crop, top_crop, item_plate_text, diff_pos, same_pos) in enumerate(crop_info):
+        for i, (real_crop, top_crop) in enumerate(crop_info):
             if use_encode:
                 ri, ti = crop_idx_per_item[i]
-                ocr_parts = []
-                for crop_idx in [x for x in [ri, ti] if x is not None]:
-                    raw = raw_all[crop_idx]
-                    if diff_pos is not None:
-                        loss_d = self.ocr.loss_from_raw(raw, self.impersonation_target,
-                                                        True, diff_pos)
-                        loss_s = self.ocr.loss_from_raw(raw, item_plate_text, True, same_pos)
-                        ocr_parts.append((0.8 * loss_d + 0.2 * loss_s) * self.ocr_loss_scale)
-                    else:
-                        ocr_parts.append(self.ocr.loss_from_raw(
-                            raw, self.impersonation_target, True, None) * self.ocr_loss_scale)
+                ocr_parts = [
+                    self.ocr.loss_from_raw(raw_all[crop_idx], self.impersonation_target,
+                                           True, None) * self.ocr_loss_scale
+                    for crop_idx in [x for x in [ri, ti] if x is not None]
+                ]
             else:
                 # Fallback: per-item sequential calls (backends without encode_batch)
-                ocr_parts = []
-                for crop in [c for c in [real_crop, top_crop] if c is not None]:
-                    if diff_pos is not None:
-                        loss_d = self.ocr.differentiable_loss_batch(
-                            [crop], self.impersonation_target,
-                            impersonation=True, diff_positions=diff_pos)[0]
-                        loss_s = self.ocr.differentiable_loss_batch(
-                            [crop], item_plate_text,
-                            impersonation=True, diff_positions=same_pos)[0]
-                        ocr_parts.append((0.8 * loss_d + 0.2 * loss_s) * self.ocr_loss_scale)
-                    else:
-                        ocr_parts.append(self.ocr.differentiable_loss_batch(
-                            [crop], self.impersonation_target,
-                            impersonation=True)[0] * self.ocr_loss_scale)
+                ocr_parts = [
+                    self.ocr.differentiable_loss_batch(
+                        [crop], self.impersonation_target, impersonation=True)[0] * self.ocr_loss_scale
+                    for crop in [c for c in [real_crop, top_crop] if c is not None]
+                ]
 
             det_i = det_losses[i]
             ocr_i = (sum(ocr_parts) / len(ocr_parts)) if ocr_parts \
