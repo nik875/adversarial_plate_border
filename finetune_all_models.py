@@ -34,10 +34,12 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import math
 import os
 import random
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -123,6 +125,31 @@ def find_batch_size(
         f"  →  batch_size={bs}  (cap={cap_str})"
     )
     return bs
+
+
+def time_probe(probe_fn, bs: int, device: str) -> float:
+    """
+    Time one forward+backward pass of probe_fn(bs) in seconds.
+    Does one warmup pass first to ensure GPU kernels are loaded.
+    """
+    probe_fn(bs)  # warmup
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    t0 = time.perf_counter()
+    probe_fn(bs)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return elapsed
+
+
+def fmt_duration(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m {int(seconds % 60):02d}s"
 
 
 def encode_ctc(labels: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -926,9 +953,22 @@ def run_sanity_checks(args, records: List[dict],
     the optimal batch size for each.  Returns a dict mapping model name → batch
     size on success, or None if any check fails.
     """
-    print("\n=== Sanity checks (1 batch + batch-size probe each) ===")
+    print("\n=== Sanity checks (1 batch + batch-size probe + time estimate each) ===")
     results  = {}   # name → True/False
     bsizes   = {}   # name → int
+    etimes   = {}   # name → estimated total training seconds
+    n_total  = len(records)
+
+    def _record_estimate(name: str, probe_fn, bs: int, label: str) -> None:
+        """Time probe_fn(bs), compute epoch/total estimates, store in etimes."""
+        t_batch = time_probe(probe_fn, bs, args.device)
+        n_train = int(n_total * 0.9)
+        batches_ep = math.ceil(n_train / bs)
+        est = args.epochs * batches_ep * t_batch
+        etimes[name] = est
+        print(f"  [{label}] bs={bs}  {t_batch:.2f}s/batch  "
+              f"→ ~{batches_ep} batches/ep × {args.epochs} ep "
+              f"= {fmt_duration(est)}")
 
     # ── LPRNet ────────────────────────────────────────────────────────────────
     if "lprnet" in todo:
@@ -958,6 +998,7 @@ def run_sanity_checks(args, records: List[dict],
                     tlen = torch.full((B2,), 4, dtype=torch.long)
                     F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True).backward()
                 bsizes["lprnet"] = find_batch_size(_lprnet_probe, args.device, max_bs=args.batch_size)
+                _record_estimate("lprnet", _lprnet_probe, bsizes["lprnet"], "lprnet")
 
     # ── TrOCR ─────────────────────────────────────────────────────────────────
     if "trocr" in todo:
@@ -998,6 +1039,7 @@ def run_sanity_checks(args, records: List[dict],
                 lbl = torch.ones(bs, 8, dtype=torch.long, device=args.device)
                 m_trocr(pixel_values=pv, labels=lbl).loss.backward()
             bsizes["trocr"] = find_batch_size(_trocr_probe, args.device, max_bs=args.batch_size)
+            _record_estimate("trocr", _trocr_probe, bsizes["trocr"], "trocr")
 
     # ── doctr-vitstr ──────────────────────────────────────────────────────────
     if "vitstr" in todo:
@@ -1014,6 +1056,7 @@ def run_sanity_checks(args, records: List[dict],
                 x = torch.randn(bs, 3, 32, 128, device=args.device)
                 m_vitstr(x, target=["abc"] * bs)["loss"].backward()
             bsizes["vitstr"] = find_batch_size(_vitstr_probe, args.device, max_bs=args.batch_size)
+            _record_estimate("vitstr", _vitstr_probe, bsizes["vitstr"], "vitstr")
 
     # ── OWL-ViT ───────────────────────────────────────────────────────────────
     if "owlvit" in todo:
@@ -1088,6 +1131,7 @@ def run_sanity_checks(args, records: List[dict],
                     loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
                 (loss / bs).backward()
             bsizes["owlvit"] = find_batch_size(_owlvit_probe, args.device, max_bs=args.batch_size)
+            _record_estimate("owlvit", _owlvit_probe, bsizes["owlvit"], "owlvit")
 
     # ── RT-DETR ───────────────────────────────────────────────────────────────
     if "rtdetr" in todo:
@@ -1128,6 +1172,7 @@ def run_sanity_checks(args, records: List[dict],
                        for _ in range(bs)]
                 m_rtdetr(pixel_values=pv, labels=lbl).loss.backward()
             bsizes["rtdetr"] = find_batch_size(_rtdetr_probe, args.device, max_bs=args.batch_size)
+            _record_estimate("rtdetr", _rtdetr_probe, bsizes["rtdetr"], "rtdetr")
 
     # ── Faster R-CNN ──────────────────────────────────────────────────────────
     if "fasterrcnn" in todo:
@@ -1148,6 +1193,7 @@ def run_sanity_checks(args, records: List[dict],
                            for _ in range(bs)]
                 sum(m_fasterrcnn(imgs, targets).values()).backward()
             bsizes["fasterrcnn"] = find_batch_size(_frcnn_probe, args.device, max_bs=args.batch_size)
+            _record_estimate("fasterrcnn", _frcnn_probe, bsizes["fasterrcnn"], "fasterrcnn")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     failed = [k for k, v in results.items() if not v]
@@ -1155,6 +1201,19 @@ def run_sanity_checks(args, records: List[dict],
         print(f"\n  ✗ Sanity check FAILED for: {failed}")
         print("  Fix the issues above before running full training.")
         return None
+
+    total_est = sum(etimes.values())
+    print(f"\n  Per-model estimates:")
+    for name, secs in etimes.items():
+        print(f"    {name:12s}  {fmt_duration(secs)}")
+    print(f"  Total estimated training time: {fmt_duration(total_est)}")
+
+    limit = 72 * 3600
+    if total_est > limit:
+        print(f"\n  ✗ Estimated time ({fmt_duration(total_est)}) exceeds 72h limit.")
+        print("  Reduce --epochs, use --models to select a subset, or use --batch-size to raise throughput.")
+        return None
+
     print(f"  ✓ All {len(results)} checks passed.  Batch sizes: {bsizes}\n")
     return bsizes
 
