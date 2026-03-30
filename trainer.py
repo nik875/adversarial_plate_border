@@ -227,8 +227,10 @@ def _bbox_ocr_crop(
     y1 = int(corners[:, 1].min().clamp(0, H).item())
     x2 = int(corners[:, 0].max().clamp(0, W).item())
     y2 = int(corners[:, 1].max().clamp(0, H).item())
-    crop = img[..., y1:y2, x1:x2]
     th, tw = target_size
+    if x2 <= x1 or y2 <= y1:
+        return torch.zeros(img.shape[0], img.shape[1], th, tw or 128, device=img.device)
+    crop = img[..., y1:y2, x1:x2]
     if tw is None:
         crop_h, crop_w = crop.shape[-2], crop.shape[-1]
         tw = max(1, int(crop_w * th / max(crop_h, 1)))
