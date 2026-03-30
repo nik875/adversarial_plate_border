@@ -960,11 +960,58 @@ class AdversarialPatchTrainer:
     # Pre-training sanity check
     # ====================================================================
 
+    def _probe_eval_batch_size(self, sample_raw: dict) -> int:
+        """
+        Estimate the optimal eval_batch_size by running one real item through
+        _prepare_one + compute_loss_batch + backward, measuring peak GPU memory,
+        and scaling to available free memory with a 0.70 safety margin.
+
+        Only meaningful on CUDA; returns the current eval_batch_size unchanged
+        on other devices.
+        """
+        if not self.device.startswith("cuda"):
+            return self.eval_batch_size
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+
+        try:
+            probe_patch = self.generate_patch(training_aug=False).detach().requires_grad_(True)
+            item = self._prepare_one(sample_raw, probe_patch)
+            item["_patch_norm"] = probe_patch
+            loss, _, _, _ = self.compute_loss_batch([item])
+            (loss / 4).backward()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+            per_sample_mem = max(1, peak - baseline)
+        except Exception as e:
+            print(f"  [auto-batch] probe failed ({e}) — keeping eval_batch_size=1")
+            return 1
+        finally:
+            torch.cuda.empty_cache()
+
+        free_after = torch.cuda.mem_get_info()[0]
+        safety = 0.70
+        bs = max(1, int(free_after * safety / per_sample_mem))
+        print(
+            f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
+            f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
+            f"  →  eval_batch_size={bs}"
+        )
+        return bs
+
     def validate_pipeline(self, loader=None) -> None:
         """
         Run one full gradient-accumulation cycle (B * update_every items) through
         the training forward+backward path to verify the pipeline end-to-end.
         Raises on any crash.
+
+        When eval_batch_size==1 (the default) and running on CUDA, automatically
+        probes peak memory cost per sample and sets eval_batch_size to fill the
+        available GPU memory (same approach as finetune_all_models.find_batch_size).
         """
         print("\n── Pre-training sanity check ──────────────────────────────")
         _loader = loader if loader is not None else self.train_loader
@@ -972,15 +1019,36 @@ class AdversarialPatchTrainer:
         update_every = (self.grad_accumulate
                         if self.grad_accumulate is not None
                         else min(4, len(_loader)))
+
+        # Load the first item so we can probe memory cost before committing to
+        # a batch size (and therefore a total item count to load).
+        _iter = iter(_loader)
+        try:
+            first_batch = next(_iter)
+        except StopIteration:
+            raise RuntimeError("No training data found for sanity check.")
+        items_raw = [{k: v[0] for k, v in first_batch.items()}]
+
+        # Auto-detect batch size when using the default of 1.
+        if B == 1:
+            self.detector.train_mode()
+            self.ocr.train()
+            try:
+                B = self._probe_eval_batch_size(items_raw[0])
+            finally:
+                self.detector.eval()
+                self.detector.freeze()
+                self.ocr.eval()
+                self.ocr.freeze()
+            self.eval_batch_size = B
+
         need = B * update_every
 
-        items_raw = []
-        for batch in _loader:
+        # Load remaining items to fill one full accumulation window.
+        for batch in _iter:
             items_raw.append({k: v[0] for k, v in batch.items()})
             if len(items_raw) >= need:
                 break
-        if not items_raw:
-            raise RuntimeError("No training data found for sanity check.")
 
         # Models must be in training mode for cuDNN RNN backward to work
         self.detector.train_mode()
