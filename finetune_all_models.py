@@ -515,25 +515,19 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
     best  = float("inf")
 
     def _compute_loss(imgs, labels):
-        # Try doctr's built-in loss path (works if internal vocab still aligns)
+        # Capture the output of our replacement head directly via a forward hook.
+        # This bypasses doctr's internal forward logic which assumes the original
+        # vocab size and would fail with our 37-class head.
+        captured = []
+        handle = model.head.register_forward_hook(lambda m, i, o: captured.append(o))
         try:
-            out  = model(imgs, target=[l.lower() for l in labels])
-            return out["loss"]
+            model(imgs, target=["x"] * imgs.shape[0])
         except Exception:
             pass
-        # Fallback: doctr raises if labels absent in train mode. Temporarily
-        # set training=False on the top-level module only so gradients still
-        # flow, then restore before the backward pass.
-        model.training = False
-        out = model(imgs)
-        model.training = True
-        if isinstance(out, dict):
-            logits = out.get("logits", out.get("out", None))
-        else:
-            logits = out
-        if logits is None:
+        handle.remove()
+        if not captured or captured[0].dim() != 3:
             return None
-        # logits: [B, T, C]  — pad/truncate labels to T
+        logits = captured[0]                         # [B, T, NUM_CLASSES]
         B, T, C = logits.shape
         target_seq = torch.zeros(B, T, dtype=torch.long, device=imgs.device)
         for b, lbl in enumerate(labels):
@@ -895,22 +889,16 @@ def run_sanity_checks(args, records: List[dict],
             m = build_vitstr(args.device)
             imgs, labels = _ocr_mini_batch(records, (32, 128), grayscale=False)
             imgs = imgs.to(args.device)
+            captured = []
+            handle = m.head.register_forward_hook(lambda mod, i, o: captured.append(o))
             try:
-                out = m(imgs, target=[l.lower() for l in labels])
-                out["loss"].backward()
-                return
+                m(imgs, target=["x"] * imgs.shape[0])
             except Exception:
                 pass
-            # Fallback CE path — bypass doctr's train-mode label requirement
-            m.training = False
-            out = m(imgs)
-            m.training = True
-            if isinstance(out, dict):
-                logits = out.get("logits", out.get("out", None))
-            else:
-                logits = out
-            if logits is None:
-                raise RuntimeError("vitstr returned no usable logits")
+            handle.remove()
+            if not captured or captured[0].dim() != 3:
+                raise RuntimeError("vitstr: could not capture head output")
+            logits = captured[0]
             B, T, C = logits.shape
             tgt = torch.zeros(B, T, dtype=torch.long, device=args.device)
             for b, lbl in enumerate(labels):
