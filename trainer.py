@@ -1364,7 +1364,7 @@ class AdversarialPatchTrainer:
 
         return total_loss, det_sum, ocr_sum, tv_sum
 
-    def train_epoch(self, optimizer, epoch: int) -> Tuple[float, float, float, float]:
+    def train_epoch(self, optimizer, epoch: int, scheduler=None) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -1413,6 +1413,8 @@ class AdversarialPatchTrainer:
                     total_det  += det_t  / B
                     total_ocr  += ocr_t  / B
                     total_tv   += tv_t   / B
+                    if scheduler is not None:
+                        scheduler.step()
                     if self.device == "cuda":
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
@@ -1456,6 +1458,8 @@ class AdversarialPatchTrainer:
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
                     total_loss  += accum_loss
                     num_updates += 1
                     accum_loss   = 0.0
@@ -1506,6 +1510,8 @@ class AdversarialPatchTrainer:
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+                    if scheduler is not None:
+                        scheduler.step()
                     total_loss  += accum_loss
                     num_updates += 1
 
@@ -1580,20 +1586,29 @@ class AdversarialPatchTrainer:
                 self._trainable_params(), lr=learning_rate, weight_decay=1e-4
             )
             sched_optimizer = optimizer
-        cosine_epochs = num_epochs - warmup_epochs
+        # Scheduler counts are in gradient updates, not epochs.
+        # _updates_per_epoch is computed below alongside tv_warmup; duplicate
+        # the formula here so we can build the scheduler before the print block.
+        _ue_update_every = (len(self.train_loader)
+                            if self.grad_accumulate is None
+                            else self.grad_accumulate)
+        _ue_per_epoch = max(1, len(self.train_loader) //
+                            (self.eval_batch_size * _ue_update_every))
+        warmup_updates = warmup_epochs * _ue_per_epoch
+        cosine_updates = num_epochs * _ue_per_epoch - warmup_updates
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             sched_optimizer,
             start_factor=eta_min / learning_rate,
             end_factor=1.0,
-            total_iters=warmup_epochs,
+            total_iters=max(1, warmup_updates),
         )
         cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            sched_optimizer, T_max=cosine_epochs, eta_min=eta_min,
+            sched_optimizer, T_max=max(1, cosine_updates), eta_min=eta_min,
         )
         scheduler = optim.lr_scheduler.SequentialLR(
             sched_optimizer,
             schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_epochs],
+            milestones=[max(1, warmup_updates)],
         )
 
         history    = {"loss": [], "val_score": [], "learning_rate": []}
@@ -1619,7 +1634,7 @@ class AdversarialPatchTrainer:
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Epochs    : {num_epochs}  |  LR warmup: {warmup_epochs} epochs  |  "
+        print(f"  Epochs    : {num_epochs}  |  LR warmup: {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         if tv_warmup_updates > 0:
             print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
@@ -1645,12 +1660,11 @@ class AdversarialPatchTrainer:
             saved_tv = self.tv_weight
             if global_updates < tv_warmup_updates:
                 self.tv_weight = 0.0
-            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(optimizer, epoch)
+            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(optimizer, epoch, scheduler)
             self.tv_weight  = saved_tv
             global_updates += epoch_updates
             self.training  = False
             val_loss       = self.validate()
-            scheduler.step()
             lr = optimizer.param_groups[0]["lr"]
             epoch_time     = time.time() - epoch_start
 
