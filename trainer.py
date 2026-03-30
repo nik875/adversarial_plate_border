@@ -1708,7 +1708,7 @@ def main():
     parser.add_argument("--lr",       type=float, default=5e-4)
     parser.add_argument("--lr-min",   type=float, default=1e-5,
                         help="Minimum LR for cosine annealing (and warmup start). Default: 1e-5.")
-    parser.add_argument("--grad-accumulate", type=int, default=64)
+    parser.add_argument("--grad-accumulate", type=int, default=1)
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
                         help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
