@@ -515,7 +515,8 @@ def train_rtdetr(records: List[dict], args) -> None:
     processor = AutoImageProcessor.from_pretrained(model_id)
     model     = AutoModelForObjectDetection.from_pretrained(model_id)
     model.to(device)
-    print(f"[rtdetr] Loaded {model_id}")
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[rtdetr] Loaded {model_id}  |  {n:,} params")
 
     rng = random.Random(42)
     shuffled = list(records); rng.shuffle(shuffled)
