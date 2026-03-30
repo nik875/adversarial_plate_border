@@ -319,7 +319,7 @@ def build_crnn(weights_path: Path, device: str) -> nn.Module:
         nn.init.zeros_(new.bias)
         model.rnn[1].embedding = new
     print(f"[crnn] head: Linear({n_in},{old.out_features}) → Linear({n_in},{NUM_CLASSES})")
-    return model.to(device)
+    return model.to(device).train()
 
 
 def train_crnn(model: nn.Module, records: List[dict], args) -> None:
@@ -387,7 +387,7 @@ def build_lprnet(onnx_path: Path, device: str) -> nn.Module:
     nn.init.zeros_(new.bias)
     model.dense = new
     print(f"[lprnet] head: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})")
-    return model.to(device)
+    return model.to(device).train()
 
 
 def train_lprnet(model: nn.Module, records: List[dict], args) -> None:
@@ -559,7 +559,7 @@ def build_vitstr(device: str) -> nn.Module:
         else:
             print("[vitstr] WARNING: no Linear head found to replace")
 
-    return model.to(device)
+    return model.to(device).train()
 
 
 def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
@@ -759,7 +759,7 @@ def build_fasterrcnn(device: str) -> nn.Module:
     in_f  = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_f, num_classes=2)
     print(f"[fasterrcnn] COCO pretrained, head replaced for 2 classes (bg + plate)")
-    return model.to(device)
+    return model.to(device).train()
 
 
 def train_fasterrcnn(model: nn.Module, records: List[dict], args) -> None:
