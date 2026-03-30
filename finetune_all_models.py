@@ -434,6 +434,12 @@ def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -
                 pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
                                  lr=f"{sched.get_last_lr()[0]:.2e}")
 
+        if args.epochs == 1:
+            print(f"  LPRNet ep{ep}: train={tl/len(train_dl):.4f}  (val skipped, epochs=1)")
+            out = Path(args.output_dir) / "lprnet_finetuned.pt"
+            torch.save(model.state_dict(), out)
+            print(f"    → {out}")
+            continue
         model.eval(); vl = 0.0
         with torch.no_grad():
             for imgs, labels in val_dl:
@@ -528,6 +534,12 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
                 pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
                                  lr=f"{sched.get_last_lr()[0]:.2e}")
 
+        if args.epochs == 1:
+            print(f"  TrOCR ep{ep}: train={tl/len(train_dl):.4f}  (val skipped, epochs=1)")
+            out = Path(args.output_dir) / "trocr_small_finetuned.pt"
+            torch.save(model.state_dict(), out)
+            print(f"    → {out}")
+            continue
         model.eval(); vl = 0.0
         with torch.no_grad():
             for pv, ids in val_dl:
@@ -598,6 +610,12 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
                 pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
                                  lr=f"{sched.get_last_lr()[0]:.2e}")
 
+        if args.epochs == 1:
+            print(f"  ViTSTR ep{ep}: train={tl/max(1,n):.4f}  (val skipped, epochs=1)")
+            out_path = Path(args.output_dir) / "vitstr_small_finetuned.pt"
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
+            continue
         model.eval(); vl = 0; m = 0
         with torch.no_grad():
             for imgs, labels in val_dl:
@@ -694,6 +712,13 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
                     postfix.update(ld)
                 pbar.set_postfix(**postfix)
 
+        if args.epochs == 1:
+            print(f"  RT-DETR ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(out_dir))
+            processor.save_pretrained(str(out_dir))
+            print(f"    → {out_dir}")
+            continue
         model.eval(); vl = 0.0
         with torch.no_grad():
             for enc in val_dl:
@@ -822,6 +847,13 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
                     lr=f"{sched.get_last_lr()[0]:.2e}",
                 )
 
+        if args.epochs == 1:
+            print(f"  OWL-ViT ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(out_dir))
+            processor.save_pretrained(str(out_dir))
+            print(f"    → {out_dir}")
+            continue
         model.eval(); vl = 0.0
         with torch.no_grad():
             for pixel_values, gt_boxes in val_dl:
@@ -894,6 +926,12 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
                     lr=f"{sched.get_last_lr()[0]:.2e}",
                 )
 
+        if args.epochs == 1:
+            print(f"  FasterRCNN ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
+            out = Path(args.output_dir) / "fasterrcnn_finetuned.pt"
+            torch.save(model.state_dict(), out)
+            print(f"    → {out}")
+            continue
         model.eval(); vl = 0.0
         with torch.no_grad():
             for imgs, targets in val_dl:
