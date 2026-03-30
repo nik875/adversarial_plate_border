@@ -64,6 +64,16 @@ from dataset import (create_dataloaders, create_ccpd_dataloaders,
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
+# Profiling helper
+# ---------------------------------------------------------------------------
+
+def _pt() -> float:
+    """Return current wall-clock time in seconds, syncing CUDA first if available."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+# ---------------------------------------------------------------------------
 # Differentiable detector preprocessing
 # ---------------------------------------------------------------------------
 
@@ -475,6 +485,8 @@ class AdversarialPatchTrainer:
             )
 
         self.epoch_stats: list = []
+        self.profiling: bool = False
+        self._prof: Dict[str, list] = {}
 
     # ====================================================================
     # Patch generation
@@ -763,8 +775,15 @@ class AdversarialPatchTrainer:
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
                      augment: Optional[bool] = None) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
+        _prof = self.profiling
+        if _prof: _t0 = _pt()
+
         orig_tensor  = batch_item["orig_image"].to(self.device)   # [C, H, W]
         orig_corners = batch_item["orig_corners"].to(self.device)  # [4, 2]
+
+        if _prof:
+            self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
+            _t1 = _pt()
 
         # Halve images that are too large to keep GPU memory manageable
         _, H, W = orig_tensor.shape
@@ -778,7 +797,14 @@ class AdversarialPatchTrainer:
             patch_norm=patch_norm,
             augment=self.augment if augment is None else augment)
 
+        if _prof:
+            self._prof.setdefault("prepare/patch_apply", []).append(_pt() - _t1)
+            _t2 = _pt()
+
         patched_prep_chw, new_corners = self.diff_prep(patched_orig.squeeze(0), orig_corners)
+
+        if _prof:
+            self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
         target_box  = self.corners_to_bbox(new_corners)
         rim_box     = self._rim_bbox(new_corners)
         ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
@@ -838,8 +864,15 @@ class AdversarialPatchTrainer:
         top_region_boxes = [x["top_region_box"] for x in items]
         tv_l             = self.total_variation_loss(patch_norm)
 
+        _prof = self.profiling
+        if _prof: _t0 = _pt()
+
         two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
             batched_prep, target_boxes, top_region_boxes)
+
+        if _prof:
+            self._prof.setdefault("loss/detector", []).append(_pt() - _t0)
+            _t1 = _pt()
 
         # ── Pass 1: detection losses + crop extraction (no OCR calls) ────
         det_losses, crop_info = [], []
@@ -882,6 +915,10 @@ class AdversarialPatchTrainer:
 
             crop_info.append((real_crop, top_crop))
 
+        if _prof:
+            self._prof.setdefault("loss/pass1_loop", []).append(_pt() - _t1)
+            _t2 = _pt()
+
         # ── Pass 2: batch OCR — one model call for all crops ──────────────
         image_losses = []
         det_real_l_list, det_top_l_list, ocr_real_l_list, ocr_top_l_list = [], [], [], []
@@ -894,6 +931,10 @@ class AdversarialPatchTrainer:
                 ti = (len(flat_crops), flat_crops.append(top_crop))[0]  if top_crop  is not None else None
                 crop_idx_per_item.append((ri, ti))
             raw_all = self.ocr.encode_batch(flat_crops) if flat_crops else None
+
+        if _prof:
+            self._prof.setdefault("loss/ocr_encode", []).append(_pt() - _t2)
+            _t3 = _pt()
 
         _zero = torch.tensor(0.0, device=self.device)
         for i, (real_crop, top_crop) in enumerate(crop_info):
@@ -937,6 +978,9 @@ class AdversarialPatchTrainer:
             det_top_l_list.append(det_top_i.detach())
             ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
             ocr_top_l_list.append(ocr_top_i.detach()  if ocr_top_i  is not None else _zero)
+
+        if _prof:
+            self._prof.setdefault("loss/pass2_loop", []).append(_pt() - _t3)
 
         det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
         total      = (torch.stack(image_losses).mean()
@@ -1372,7 +1416,9 @@ class AdversarialPatchTrainer:
 
     def train_epoch(self, optimizer, epoch: int, scheduler=None,
                     update_log: Optional[list] = None,
-                    update_offset: int = 0) -> Tuple[float, float, float, float]:
+                    update_offset: int = 0,
+                    tv_warmup_updates: int = 0) -> Tuple[float, float, float, float]:
+        _saved_tv = self.tv_weight
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -1401,12 +1447,19 @@ class AdversarialPatchTrainer:
         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
         # Progress bar tracks optimizer updates, not individual images.
+        profile_steps = 20 if self.profiling else 0
+        _prof_completed = 0   # optimizer steps finished so far (profiling)
+        _t_iter_end = _pt() if self.profiling else 0.0   # for dataloader fetch timing
+
         updates_per_epoch = max(1, len(self.train_loader) // (B * update_every))
         with tqdm(total=updates_per_epoch,
                   desc=f"Epoch {epoch+1}",
                   leave=False) as pbar:
             for idx, batch in enumerate(self.train_loader):
                 try:
+                    if self.profiling:
+                        self._prof.setdefault("step/dataloader", []).append(_pt() - _t_iter_end)
+
                     raw_item = {k: v[0] for k, v in batch.items()}
 
                     if use_sam:
@@ -1415,6 +1468,7 @@ class AdversarialPatchTrainer:
                         if not window_full:
                             continue
 
+                        self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                         loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
                             self._msam_step(optimizer, window_raw, B, update_every)
                         window_raw = []
@@ -1461,19 +1515,30 @@ class AdversarialPatchTrainer:
                     # ── Standard (non-SAM) accumulation path ─────────────────
                     # Use the detached patch_leaf so each backward frees its
                     # detector/OCR graph immediately (no retain_graph).
+                    if self.profiling: _tp0 = _pt()
                     item = self._prepare_one(raw_item, patch_leaf)
+                    if self.profiling:
+                        self._prof.setdefault("prepare/total", []).append(_pt() - _tp0)
                     item["_patch_norm"] = patch_leaf
                     buffer.append(item)
 
                     if len(buffer) < B:
+                        if self.profiling: _t_iter_end = _pt()
                         continue
 
+                    self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
+                    if self.profiling: _tlb0 = _pt()
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
+                    if self.profiling:
+                        self._prof.setdefault("step/loss_batch", []).append(_pt() - _tlb0)
                     buffer = []
                     scaled_loss = loss / update_every
                     step += 1
+                    if self.profiling: _tbw0 = _pt()
                     scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
+                    if self.profiling:
+                        self._prof.setdefault("step/backward", []).append(_pt() - _tbw0)
 
                     _loss_accum_t.add_(torch.stack(
                         [loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l]
@@ -1481,6 +1546,7 @@ class AdversarialPatchTrainer:
                     del loss, scaled_loss
 
                     if step % update_every == 0:
+                        if self.profiling: _topt0 = _pt()
                         # Propagate accumulated patch gradient through generator.
                         patch_with_graph.backward(patch_leaf.grad)
                         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
@@ -1529,6 +1595,31 @@ class AdversarialPatchTrainer:
                         patch_with_graph = self.generate_patch(training_aug=self.training)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
+                        if self.profiling:
+                            self._prof.setdefault("step/optimizer", []).append(_pt() - _topt0)
+                            _t_step_end = _pt()
+                            _t_step_start = _t_step_end - (
+                                self._prof["step/dataloader"][-1]
+                                + self._prof["prepare/total"][-1] * B
+                                + self._prof["step/loss_batch"][-1]
+                                + self._prof["step/backward"][-1]
+                                + self._prof["step/optimizer"][-1]
+                            ) if False else None   # use direct accumulation below
+                            # Step total = dataloader + B*prepare + loss + backward + opt
+                            _step_t = (
+                                self._prof["step/dataloader"][-1]
+                                + sum(self._prof["prepare/total"][-B:])
+                                + self._prof["step/loss_batch"][-1]
+                                + self._prof["step/backward"][-1]
+                                + self._prof["step/optimizer"][-1]
+                            )
+                            self._prof.setdefault("step/total", []).append(_step_t)
+                            _prof_completed += 1
+                            _t_iter_end = _pt()
+                            if _prof_completed >= profile_steps:
+                                self._print_profile_report(profile_steps, B, update_every)
+                                return
+
                 except Exception:
                     print(f"\n[WARNING] Skipping batch {idx} due to error:")
                     traceback.print_exc()
@@ -1538,11 +1629,13 @@ class AdversarialPatchTrainer:
                     optimizer.zero_grad()
                     patch_with_graph = self.generate_patch(training_aug=self.training)
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
+                if self.profiling: _t_iter_end = _pt()
 
             # ── Flush remainder at end of epoch ──────────────────────────
             if use_sam and len(window_raw) >= B:
                 # Partial window: trim to a multiple of B, then do m-SAM update
                 n_complete = (len(window_raw) // B) * B
+                self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                 loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
                     self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B)
                 step           += n_complete // B
@@ -1570,6 +1663,7 @@ class AdversarialPatchTrainer:
             elif not use_sam:
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
+                    self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
                     buffer = []
@@ -1613,11 +1707,88 @@ class AdversarialPatchTrainer:
                             "lr":       optimizer.param_groups[0]["lr"],
                         })
 
+        self.tv_weight = _saved_tv
         n = max(step, 1)
         return (total_loss / n,
                 total_det_real / n, total_det_top / n,
                 total_ocr_real / n, total_ocr_top / n,
                 total_tv / n, num_updates)
+
+    def _print_profile_report(self, n_steps: int, B: int, update_every: int) -> None:
+        """Print a formatted profiling report and clear accumulated data."""
+        p = self._prof
+        # Keys in display order.  prepare/* are per-call (B calls/step); others are per-step.
+        sections = [
+            ("DataLoader fetch",          "step/dataloader",     False),
+            ("  prepare/to_gpu",          "prepare/to_gpu",      True),
+            ("  apply_patch_to_image",    "prepare/patch_apply", True),
+            ("  diff_prep",               "prepare/diff_prep",   True),
+            ("  ─ prepare_one total",     "prepare/total",       False),
+            ("compute_loss_batch",        "step/loss_batch",     False),
+            ("  detector forward",        "loss/detector",       False),
+            ("  pass1 loop (IoU+crops)",  "loss/pass1_loop",     False),
+            ("  OCR encode",              "loss/ocr_encode",     False),
+            ("  pass2 loop (OCR loss)",   "loss/pass2_loop",     False),
+            ("backward()",                "step/backward",       False),
+            ("optimizer step",            "step/optimizer",      False),
+        ]
+
+        # Aggregate prepare/* per-call times into per-step totals
+        for key in ("prepare/to_gpu", "prepare/patch_apply", "prepare/diff_prep"):
+            if key in p:
+                vals = p[key]
+                # Each step has B entries; sum B entries into one per-step value
+                per_step = [sum(vals[i*B:(i+1)*B]) for i in range(len(vals)//B)]
+                p[key + "_step"] = per_step   # keep original per-call for display
+        p.setdefault("prepare/total", [])
+        if "step/loss_batch" in p:
+            pass  # already per step
+
+        # Build per-step total from outer loop timing
+        step_total = p.get("step/total", [])
+
+        W_label = 30
+        print("\n" + "═"*72)
+        print(f"  PROFILE REPORT  ({n_steps} steps, eval_batch_size={B}, update_every={update_every})")
+        print("═"*72)
+        print(f"  {'Section':<{W_label}} {'Mean':>9}  {'Std':>8}  {'%step':>7}")
+        print("  " + "─"*68)
+
+        def _fmt(vals, total_mean):
+            if not vals:
+                return f"{'N/A':>9}  {'':>8}  {'':>7}"
+            a = np.array(vals) * 1000  # → ms
+            m, s = a.mean(), a.std()
+            pct = (m / (total_mean * 1000) * 100) if total_mean > 0 else 0
+            return f"{m:>8.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%"
+
+        total_mean = np.mean(step_total) if step_total else 0.0
+
+        for label, key, per_call in sections:
+            if per_call:
+                # Show mean per individual call, not per step
+                vals = p.get(key, [])
+                step_vals = p.get(key + "_step", [])
+                if not vals:
+                    continue
+                a = np.array(vals) * 1000
+                m, s = a.mean(), a.std()
+                # % is relative to step total using the per-step sum
+                step_a = np.array(step_vals) * 1000 if step_vals else a * B
+                pct = (step_a.mean() / (total_mean * 1000) * 100) if total_mean > 0 else 0
+                print(f"  {label:<{W_label}} {m:>8.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%  (×{B}/step)")
+            else:
+                vals = p.get(key, [])
+                if not vals:
+                    continue
+                print(f"  {label:<{W_label}} {_fmt(vals, total_mean)}")
+
+        print("  " + "─"*68)
+        if step_total:
+            a = np.array(step_total) * 1000
+            print(f"  {'Step total':<{W_label}} {a.mean():>8.1f}ms  {a.std():>7.1f}ms  {'100.0%':>7}")
+        print("═"*72 + "\n")
+        self._prof.clear()
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
@@ -1653,6 +1824,7 @@ class AdversarialPatchTrainer:
         lr_min:        float = 1e-5,
         dry_run:       bool  = False,
         tv_warmup:     float = 0.1,
+        profile:       bool  = False,
     ) -> dict:
         """
         tv_warmup: fraction of total gradient updates during which TV loss is
@@ -1760,15 +1932,15 @@ class AdversarialPatchTrainer:
         batch_log_writer = csv.writer(batch_log_file)
         batch_log_writer.writerow(_batch_log_fields)
 
+        if profile:
+            self.profiling = True
+            print(f"\n[profile] Running {20} steps to collect timing data …")
+
         global_updates        = 0
         _last_save_milestone  = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
-            # Suppress TV loss until we've passed the warmup budget of updates.
-            saved_tv = self.tv_weight
-            if global_updates < tv_warmup_updates:
-                self.tv_weight = 0.0
             epoch_update_records: list = []
             (train_loss,
              train_det_real, train_det_top,
@@ -1777,11 +1949,13 @@ class AdversarialPatchTrainer:
                 optimizer, epoch, scheduler,
                 update_log=epoch_update_records,
                 update_offset=global_updates,
+                tv_warmup_updates=tv_warmup_updates,
             )
+            if profile:
+                return {}  # _print_profile_report already called inside train_epoch
             for rec in epoch_update_records:
                 batch_log_writer.writerow([rec[f] for f in _batch_log_fields])
             batch_log_file.flush()
-            self.tv_weight  = saved_tv
             global_updates += epoch_updates
             self.training  = False
             val_loss       = self.validate()
@@ -1885,6 +2059,8 @@ def main():
                         help="Allow detector backend weights to update during training.")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dry-run",    action="store_true")
+    parser.add_argument("--profile",    action="store_true",
+                        help="Run 20 training steps with detailed timing output, then exit.")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
@@ -1974,6 +2150,7 @@ def main():
         lr_min        = args.lr_min,
         dry_run       = args.dry_run,
         tv_warmup     = args.tv_warmup,
+        profile       = args.profile,
     )
 
 
