@@ -534,7 +534,7 @@ class AdversarialPatchTrainer:
                 return img_chw, corners_np.astype(np.float32).copy()
         elif name == "yolo-v9-608":
             def fn(img_chw, corners_np):
-                img, r, dw, dh = _diff_letterbox(img_chw, 384)
+                img, r, dw, dh = _diff_letterbox(img_chw, 608)
                 return img, _corners_letterbox(corners_np, r, dw, dh)
         else:
             def fn(img_chw, corners_np):
@@ -1415,10 +1415,6 @@ class AdversarialPatchTrainer:
                     total_tv   += tv_t   / B
                     if scheduler is not None:
                         scheduler.step()
-                    if self.device == "cuda":
-                        torch.cuda.empty_cache()
-                    elif self.device == "mps":
-                        torch.mps.empty_cache()
                     pbar.update(1)
                     pbar.set_postfix({
                         "loss": f"{total_loss/step:.4f}",
@@ -1463,10 +1459,6 @@ class AdversarialPatchTrainer:
                     total_loss  += accum_loss
                     num_updates += 1
                     accum_loss   = 0.0
-                    if self.device == "cuda":
-                        torch.cuda.empty_cache()
-                    elif self.device == "mps":
-                        torch.mps.empty_cache()
                     pbar.update(1)
                     pbar.set_postfix({
                         "loss": f"{total_loss/step:.4f}",
@@ -1567,7 +1559,6 @@ class AdversarialPatchTrainer:
             print("Dry run complete.")
             return {}
 
-        warmup_epochs = 10
         eta_min       = lr_min
 
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
@@ -1594,8 +1585,9 @@ class AdversarialPatchTrainer:
                             else self.grad_accumulate)
         _ue_per_epoch = max(1, len(self.train_loader) //
                             (self.eval_batch_size * _ue_update_every))
-        warmup_updates = warmup_epochs * _ue_per_epoch
-        cosine_updates = num_epochs * _ue_per_epoch - warmup_updates
+        total_updates_sched = num_epochs * _ue_per_epoch
+        warmup_updates = max(1, int(0.1 * total_updates_sched))
+        cosine_updates = total_updates_sched - warmup_updates
         warmup_scheduler = optim.lr_scheduler.LinearLR(
             sched_optimizer,
             start_factor=eta_min / learning_rate,
