@@ -38,6 +38,7 @@ import csv
 import random
 import re
 import time
+import traceback
 import warnings
 import argparse
 from datetime import datetime
@@ -1370,80 +1371,91 @@ class AdversarialPatchTrainer:
                   desc=f"Epoch {epoch+1}",
                   leave=False) as pbar:
             for idx, batch in enumerate(self.train_loader):
-                raw_item = {k: v[0] for k, v in batch.items()}
+                try:
+                    raw_item = {k: v[0] for k, v in batch.items()}
 
-                if use_sam:
-                    window_raw.append(raw_item)
-                    window_full = len(window_raw) == B * update_every
-                    if not window_full:
+                    if use_sam:
+                        window_raw.append(raw_item)
+                        window_full = len(window_raw) == B * update_every
+                        if not window_full:
+                            continue
+
+                        loss_t, det_t, ocr_t, tv_t = self._msam_step(
+                            optimizer, window_raw, B, update_every)
+                        window_raw = []
+                        step       += update_every
+                        num_updates += 1
+                        # _msam_step sums losses over all M=B*update_every items
+                        # individually; divide by B so the scale matches the
+                        # non-SAM path (which averages over B inside compute_loss_batch).
+                        total_loss += loss_t / B
+                        total_det  += det_t  / B
+                        total_ocr  += ocr_t  / B
+                        total_tv   += tv_t   / B
+                        if scheduler is not None:
+                            scheduler.step()
+                        pbar.update(1)
+                        pbar.set_postfix({
+                            "loss": f"{total_loss/step:.4f}",
+                            "det":  f"{total_det/step:.4f}",
+                            "ocr":  f"{total_ocr/step:.4f}",
+                            "tv":   f"{total_tv/step:.4f}",
+                        })
+                        patch_with_graph = self.generate_patch(training_aug=self.training)
+                        patch_leaf = patch_with_graph.detach().requires_grad_(True)
                         continue
 
-                    loss_t, det_t, ocr_t, tv_t = self._msam_step(
-                        optimizer, window_raw, B, update_every)
+                    # ── Standard (non-SAM) accumulation path ─────────────────
+                    # Use the detached patch_leaf so each backward frees its
+                    # detector/OCR graph immediately (no retain_graph).
+                    item = self._prepare_one(raw_item, patch_leaf)
+                    item["_patch_norm"] = patch_leaf
+                    buffer.append(item)
+
+                    if len(buffer) < B:
+                        continue
+
+                    loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                    buffer = []
+                    scaled_loss = loss / update_every
+                    step += 1
+                    scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
+
+                    accum_loss += loss.item()
+                    total_det  += det_l.item()
+                    total_ocr  += ocr_l.item()
+                    total_tv   += tv_l.item()
+                    del loss, scaled_loss
+
+                    if step % update_every == 0:
+                        # Propagate accumulated patch gradient through generator.
+                        patch_with_graph.backward(patch_leaf.grad)
+                        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        if scheduler is not None:
+                            scheduler.step()
+                        total_loss  += accum_loss
+                        num_updates += 1
+                        accum_loss   = 0.0
+                        pbar.update(1)
+                        pbar.set_postfix({
+                            "loss": f"{total_loss/step:.4f}",
+                            "det":  f"{total_det/step:.4f}",
+                            "ocr":  f"{total_ocr/step:.4f}",
+                            "tv":   f"{total_tv/step:.4f}",
+                        })
+                        # New patch for next accumulation window
+                        patch_with_graph = self.generate_patch(training_aug=self.training)
+                        patch_leaf = patch_with_graph.detach().requires_grad_(True)
+
+                except Exception:
+                    print(f"\n[WARNING] Skipping batch {idx} due to error:")
+                    traceback.print_exc()
+                    # Reset batch state so the next iteration starts clean
+                    buffer = []
                     window_raw = []
-                    step       += update_every
-                    num_updates += 1
-                    # _msam_step sums losses over all M=B*update_every items
-                    # individually; divide by B so the scale matches the
-                    # non-SAM path (which averages over B inside compute_loss_batch).
-                    total_loss += loss_t / B
-                    total_det  += det_t  / B
-                    total_ocr  += ocr_t  / B
-                    total_tv   += tv_t   / B
-                    if scheduler is not None:
-                        scheduler.step()
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        "loss": f"{total_loss/step:.4f}",
-                        "det":  f"{total_det/step:.4f}",
-                        "ocr":  f"{total_ocr/step:.4f}",
-                        "tv":   f"{total_tv/step:.4f}",
-                    })
-                    patch_with_graph = self.generate_patch(training_aug=self.training)
-                    patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                    continue
-
-                # ── Standard (non-SAM) accumulation path ─────────────────
-                # Use the detached patch_leaf so each backward frees its
-                # detector/OCR graph immediately (no retain_graph).
-                item = self._prepare_one(raw_item, patch_leaf)
-                item["_patch_norm"] = patch_leaf
-                buffer.append(item)
-
-                if len(buffer) < B:
-                    continue
-
-                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
-                buffer = []
-                scaled_loss = loss / update_every
-                step += 1
-                scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
-
-                accum_loss += loss.item()
-                total_det  += det_l.item()
-                total_ocr  += ocr_l.item()
-                total_tv   += tv_l.item()
-                del loss, scaled_loss
-
-                if step % update_every == 0:
-                    # Propagate accumulated patch gradient through generator.
-                    patch_with_graph.backward(patch_leaf.grad)
-                    torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
-                    optimizer.step()
                     optimizer.zero_grad()
-                    if scheduler is not None:
-                        scheduler.step()
-                    total_loss  += accum_loss
-                    num_updates += 1
-                    accum_loss   = 0.0
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        "loss": f"{total_loss/step:.4f}",
-                        "det":  f"{total_det/step:.4f}",
-                        "ocr":  f"{total_ocr/step:.4f}",
-                        "tv":   f"{total_tv/step:.4f}",
-                    })
-                    # New patch for next accumulation window
                     patch_with_graph = self.generate_patch(training_aug=self.training)
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
 

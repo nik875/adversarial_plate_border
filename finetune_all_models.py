@@ -40,6 +40,7 @@ import random
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -420,18 +421,23 @@ def train_lprnet(model: nn.Module, train_records: List[dict], val_records: List[
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"LPRNet {ep}", leave=False) as pbar:
             for imgs, labels in pbar:
-                imgs = imgs.to(device)
-                lp   = _lp(imgs).permute(1, 0, 2)   # [T, B, C]
-                T, B, _ = lp.shape
-                ilen = torch.full((B,), T, dtype=torch.long)
-                tgt, tlen = encode_ctc(labels)
-                loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step(); sched.step(); tl += loss.item()
-                window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
-                                 lr=f"{sched.get_last_lr()[0]:.2e}")
+                try:
+                    imgs = imgs.to(device)
+                    lp   = _lp(imgs).permute(1, 0, 2)   # [T, B, C]
+                    T, B, _ = lp.shape
+                    ilen = torch.full((B,), T, dtype=torch.long)
+                    tgt, tlen = encode_ctc(labels)
+                    loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                     lr=f"{sched.get_last_lr()[0]:.2e}")
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  LPRNet ep{ep}: train={tl/len(train_dl):.4f}  (val skipped, epochs=1)")
@@ -521,14 +527,19 @@ def train_trocr(model, processor, train_records: List[dict], val_records: List[d
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"TrOCR {ep}", leave=False) as pbar:
             for pv, ids in pbar:
-                pv, ids = pv.to(device), ids.to(device)
-                loss = model(pixel_values=pv, labels=ids).loss
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step(); sched.step(); tl += loss.item()
-                window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
-                                 lr=f"{sched.get_last_lr()[0]:.2e}")
+                try:
+                    pv, ids = pv.to(device), ids.to(device)
+                    loss = model(pixel_values=pv, labels=ids).loss
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                     lr=f"{sched.get_last_lr()[0]:.2e}")
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  TrOCR ep{ep}: train={tl/len(train_dl):.4f}  (val skipped, epochs=1)")
@@ -594,16 +605,21 @@ def train_vitstr(model: nn.Module, train_records: List[dict], val_records: List[
         model.train(); tl = 0; n = 0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"ViTSTR {ep}", leave=False) as pbar:
             for imgs, labels in pbar:
-                imgs   = imgs.to(device)
-                target = [l.lower() for l in labels]
-                out    = model(imgs, target=target)
-                loss   = out["loss"]
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step(); sched.step(); tl += loss.item(); n += 1
-                window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
-                                 lr=f"{sched.get_last_lr()[0]:.2e}")
+                try:
+                    imgs   = imgs.to(device)
+                    target = [l.lower() for l in labels]
+                    out    = model(imgs, target=target)
+                    loss   = out["loss"]
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    opt.step(); sched.step(); tl += loss.item(); n += 1
+                    window.append(loss.item())
+                    pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                     lr=f"{sched.get_last_lr()[0]:.2e}")
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  ViTSTR ep{ep}: train={tl/max(1,n):.4f}  (val skipped, epochs=1)")
@@ -684,22 +700,27 @@ def train_rtdetr(train_records: List[dict], val_records: List[dict], args, batch
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"RT-DETR {ep}", leave=False) as pbar:
             for enc in pbar:
-                labels = enc.pop("labels", None)
-                enc    = {k: v.to(device) for k, v in enc.items()}
-                if labels is not None:
-                    labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
-                out  = model(**enc, labels=labels)
-                loss = out.loss
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-                opt.step(); sched.step(); tl += loss.item()
-                window.append(loss.item())
-                postfix: dict = {"loss": f"{sum(window)/len(window):.4f}",
-                                 "lr": f"{sched.get_last_lr()[0]:.2e}"}
-                if hasattr(out, "loss_dict") and out.loss_dict:
-                    ld = {k: f"{v.item():.4f}" for k, v in out.loss_dict.items()}
-                    postfix.update(ld)
-                pbar.set_postfix(**postfix)
+                try:
+                    labels = enc.pop("labels", None)
+                    enc    = {k: v.to(device) for k, v in enc.items()}
+                    if labels is not None:
+                        labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
+                    out  = model(**enc, labels=labels)
+                    loss = out.loss
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    postfix: dict = {"loss": f"{sum(window)/len(window):.4f}",
+                                     "lr": f"{sched.get_last_lr()[0]:.2e}"}
+                    if hasattr(out, "loss_dict") and out.loss_dict:
+                        ld = {k: f"{v.item():.4f}" for k, v in out.loss_dict.items()}
+                        postfix.update(ld)
+                    pbar.set_postfix(**postfix)
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  RT-DETR ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
@@ -815,20 +836,25 @@ def train_owlvit(train_records: List[dict], val_records: List[dict], args, batch
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"OWL-ViT {ep}", leave=False) as pbar:
             for pixel_values, gt_boxes in pbar:
-                pixel_values = pixel_values.to(device)
-                gt_boxes     = gt_boxes.to(device)
-                loss, box_loss, cls_loss = _owlvit_loss(pixel_values, gt_boxes)
-                B = pixel_values.shape[0]
-                opt.zero_grad(); loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-                opt.step(); sched.step(); tl += loss.item()
-                window.append(loss.item())
-                pbar.set_postfix(
-                    loss=f"{sum(window)/len(window):.4f}",
-                    box=f"{box_loss.item()/B:.4f}",
-                    cls=f"{cls_loss.item()/B:.4f}",
-                    lr=f"{sched.get_last_lr()[0]:.2e}",
-                )
+                try:
+                    pixel_values = pixel_values.to(device)
+                    gt_boxes     = gt_boxes.to(device)
+                    loss, box_loss, cls_loss = _owlvit_loss(pixel_values, gt_boxes)
+                    B = pixel_values.shape[0]
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(
+                        loss=f"{sum(window)/len(window):.4f}",
+                        box=f"{box_loss.item()/B:.4f}",
+                        cls=f"{cls_loss.item()/B:.4f}",
+                        lr=f"{sched.get_last_lr()[0]:.2e}",
+                    )
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  OWL-ViT ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
@@ -892,21 +918,26 @@ def train_fasterrcnn(model: nn.Module, train_records: List[dict], val_records: L
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
         with tqdm(train_dl, desc=f"FasterRCNN {ep}", leave=False) as pbar:
             for imgs, targets in pbar:
-                imgs    = [i.to(device) for i in imgs]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                losses  = model(imgs, targets)
-                loss    = sum(losses.values())
-                opt.zero_grad(); loss.backward(); opt.step(); sched.step()
-                tl += loss.item()
-                window.append(loss.item())
-                pbar.set_postfix(
-                    loss=f"{sum(window)/len(window):.4f}",
-                    cls=f"{losses.get('loss_classifier', 0.):.4f}",
-                    box=f"{losses.get('loss_box_reg', 0.):.4f}",
-                    obj=f"{losses.get('loss_objectness', 0.):.4f}",
-                    rpn=f"{losses.get('loss_rpn_box_reg', 0.):.4f}",
-                    lr=f"{sched.get_last_lr()[0]:.2e}",
-                )
+                try:
+                    imgs    = [i.to(device) for i in imgs]
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    losses  = model(imgs, targets)
+                    loss    = sum(losses.values())
+                    opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+                    tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(
+                        loss=f"{sum(window)/len(window):.4f}",
+                        cls=f"{losses.get('loss_classifier', 0.):.4f}",
+                        box=f"{losses.get('loss_box_reg', 0.):.4f}",
+                        obj=f"{losses.get('loss_objectness', 0.):.4f}",
+                        rpn=f"{losses.get('loss_rpn_box_reg', 0.):.4f}",
+                        lr=f"{sched.get_last_lr()[0]:.2e}",
+                    )
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
 
         if args.epochs == 1:
             print(f"  FasterRCNN ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
