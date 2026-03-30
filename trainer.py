@@ -518,7 +518,7 @@ class AdversarialPatchTrainer:
         elif name == "fasterrcnn":
             def fn(img_chw, corners_np):
                 return img_chw, corners_np.astype(np.float32).copy()
-        elif name == "yolo-v9-384":
+        elif name == "yolo-v9-608":
             def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, 384)
                 return img, _corners_letterbox(corners_np, r, dw, dh)
@@ -541,7 +541,7 @@ class AdversarialPatchTrainer:
             return make_resize_prep(640, 640)
         elif name == "fasterrcnn":
             return make_passthrough_prep()
-        elif name == "yolo-v9-384":
+        elif name == "yolo-v9-608":
             return make_letterbox_prep(384)
         else:
             return make_letterbox_prep(384)
@@ -1558,7 +1558,7 @@ def main():
     )
     parser.add_argument("--csv", default="preproc_labels.csv")
 
-    TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-384"]
+    TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-608"]
     TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)

@@ -1915,11 +1915,11 @@ class Yolov9TorchBackend(DetectorBackend):
     the model into the input image / adversarial patch.
     """
 
-    name = "yolo-v9-384"
+    name = "yolo-v9-608"
 
     ONNX_PATH = ("~/.cache/open-image-models/"
-                 "yolo-v9-t-384-license-plate-end2end/"
-                 "yolo-v9-t-384-license-plates-end2end.onnx")
+                 "yolo-v9-s-608-license-plate-end2end/"
+                 "yolo-v9-s-608-license-plates-end2end.onnx")
 
     def __init__(self, model_path: str = "none", device: str = "cpu",
                  conf_threshold: float = 0.25, iou_threshold: float = 0.45):
@@ -1931,21 +1931,21 @@ class Yolov9TorchBackend(DetectorBackend):
     def load(self) -> None:
         import sys, os
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from yolov9_torch import load_yolov9t_from_onnx
+        from yolov9_torch import load_yolov9s_from_onnx
 
         onnx_path = Path(self.ONNX_PATH).expanduser()
 
         if not onnx_path.exists():
             print(f"[{self.name}] ONNX model not found — downloading via open-image-models…")
             from open_image_models import LicensePlateDetector
-            LicensePlateDetector(detection_model="yolo-v9-t-384-license-plate-end2end")
+            LicensePlateDetector(detection_model="yolo-v9-s-608-license-plate-end2end")
 
         if not onnx_path.exists():
             raise FileNotFoundError(
                 f"[{self.name}] ONNX model still not found after download attempt: {onnx_path}"
             )
 
-        self._model = load_yolov9t_from_onnx(str(onnx_path), nc=1)
+        self._model = load_yolov9s_from_onnx(str(onnx_path), nc=1)
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
@@ -1954,7 +1954,7 @@ class Yolov9TorchBackend(DetectorBackend):
         print(f"[{self.name}] Loaded from {onnx_path}")
 
     # Fixed input size this model was trained on.
-    INPUT_SIZE: int = 384
+    INPUT_SIZE: int = 608
 
     @staticmethod
     def _letterbox(image: torch.Tensor, size: int) -> Tuple[torch.Tensor, float, int, int]:
@@ -2137,7 +2137,7 @@ TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
     "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
     "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
     "rtdetr":      RTDETRBackend,            # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
-    "yolo-v9-384": Yolov9TorchBackend,       # pip install onnx open-image-models  |  auto-downloaded
+    "yolo-v9-608": Yolov9TorchBackend,       # pip install onnx open-image-models  |  auto-downloaded
 }
 
 # Backends that run through ONNX / external C++ / numpy — no autograd.

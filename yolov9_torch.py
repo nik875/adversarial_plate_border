@@ -44,6 +44,19 @@ _YAML_FALLBACK = os.path.join(
     "cfg", "models", "v9", "yolov9t.yaml",
 )
 
+# Path to ultralytics YOLOv9-s config
+_YAML_PATH_S = os.path.join(
+    os.path.dirname(__file__),
+    "yolov9s.yaml",  # local copy (optional)
+)
+# Fallback to ultralytics built-in location
+_YAML_FALLBACK_S = os.path.join(
+    os.path.dirname(
+        __import__("ultralytics", fromlist=[""]).__file__
+    ),
+    "cfg", "models", "v9", "yolov9s.yaml",
+)
+
 
 # ---------------------------------------------------------------------------
 # Detection head fix: cv2 uses groups=4 for its 2nd and 3rd convolutions
@@ -136,6 +149,65 @@ def load_yolov9t_from_onnx(onnx_path: str, nc: int = 1) -> DetectionModel:
             continue
         # Strip one 'model.' prefix: 'model.model.X...' → 'model.X...'
         pt_key = onnx_key[len("model."):]   # removes first 'model.'
+        if pt_key in sd:
+            sd[pt_key] = torch.from_numpy(arr.copy())
+        else:
+            unexpected.append(onnx_key)
+
+    for k in sd:
+        pt_onnx_key = "model." + k
+        if pt_onnx_key not in W:
+            missing.append(k)
+
+    if missing:
+        print(f"[yolov9_torch] Warning: {len(missing)} PyTorch keys not found in ONNX:")
+        for k in missing[:10]:
+            print(f"  {k}")
+    if unexpected:
+        print(f"[yolov9_torch] Warning: {len(unexpected)} ONNX keys not found in PyTorch:")
+        for k in unexpected[:10]:
+            print(f"  {k}")
+
+    model.load_state_dict(sd)
+    return model
+
+
+def load_yolov9s_from_onnx(onnx_path: str, nc: int = 1) -> DetectionModel:
+    """
+    Build a YOLOv9-s DetectionModel, fuse BN, and load all Conv weights
+    from the ONNX file.  Mirrors load_yolov9t_from_onnx but uses yolov9s.yaml.
+
+    Args:
+        onnx_path: Path to the yolo-v9-s ONNX file.
+        nc:        Number of classes (default 1 for license plates).
+
+    Returns:
+        A fused, eval-mode DetectionModel with ONNX weights loaded.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    path = os.path.expanduser(onnx_path)
+
+    yaml = _YAML_PATH_S if os.path.exists(_YAML_PATH_S) else _YAML_FALLBACK_S
+    model = DetectionModel(yaml, nc=nc, verbose=False)
+
+    _fix_detect_cv2_groups(model)
+
+    model.fuse()
+    model.eval()
+
+    onnx_model = onnx.load(path)
+    W = {t.name: numpy_helper.to_array(t)
+         for t in onnx_model.graph.initializer}
+
+    sd = model.state_dict()
+    missing, unexpected = [], []
+
+    for onnx_key, arr in W.items():
+        if not onnx_key.startswith("model.model."):
+            continue
+        pt_key = onnx_key[len("model."):]
         if pt_key in sd:
             sd[pt_key] = torch.from_numpy(arr.copy())
         else:

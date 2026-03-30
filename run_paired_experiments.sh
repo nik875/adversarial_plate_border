@@ -5,7 +5,7 @@
 # Train one adversarial patch per explicit detector+OCR pairing.
 #
 # Pairings configured by default:
-#   1) yolo-v9-384 + cct (FastALPR / open-image-models + fast-plate-ocr)
+#   1) yolo-v9-608 + cct (FastALPR / open-image-models + fast-plate-ocr)
 #   2) rtdetr     + trocr
 #   3) yolov8     + lprnet
 #   4) fasterrcnn + doctr-vitstr (fine-tuned vitstr_small)
@@ -60,7 +60,7 @@ EVAL_BATCH_SIZE_VITSTR=1
 COMPILE=true
 IMPERSONATION_TARGET=""
 SKIP_PAIRS=()
-SAM_M=""
+SAM_M=8
 SAM_RHO=0.025
 AUGMENT=false
 
@@ -72,7 +72,7 @@ YOLOV8_WEIGHTS="weights/lp_yolov8.pt"
 FASTERRCNN_WEIGHTS="weights/model.pt"
 RTDETR_WEIGHTS="weights/rtdetr-v2-license-plates"
 RTDETR_WEIGHTS_FALLBACK="weights/rtdetr-v2-license-plate"
-YOLOV9_384_WEIGHTS="$HOME/.cache/open-image-models/yolo-v9-t-384-license-plate-end2end/yolo-v9-t-384-license-plates-end2end.onnx"
+YOLOV9_608_WEIGHTS="$HOME/.cache/open-image-models/yolo-v9-s-608-license-plate-end2end/yolo-v9-s-608-license-plates-end2end.onnx"
 CCT_WEIGHTS="$HOME/.cache/fast-plate-ocr/cct-s-v1-global-model/cct_s_v1_global.onnx"
 
 TROCR_WEIGHTS="none"
@@ -218,7 +218,7 @@ BASE_ARGS+=(--top-extend)
 # Pair rows:
 # label|detector|det_weights|ocr|ocr_weights
 PAIRS=(
-    "pair_fastalpr|yolo-v9-384|$YOLOV9_384_WEIGHTS|cct|$CCT_WEIGHTS"
+    "pair_fastalpr|yolo-v9-608|$YOLOV9_608_WEIGHTS|cct|$CCT_WEIGHTS"
     "pair_rtdetr_trocr|rtdetr|$RTDETR_WEIGHTS|trocr|$TROCR_WEIGHTS"
     "pair_yolov8_lprnet|yolov8|$YOLOV8_WEIGHTS|lprnet|$LPRNET_WEIGHTS"
     "pair_fasterrcnn_doctr_vitstr|fasterrcnn|$FASTERRCNN_WEIGHTS|doctr-vitstr|$DOCTR_VITSTR_WEIGHTS"

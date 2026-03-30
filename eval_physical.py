@@ -561,14 +561,14 @@ _DEFAULT_WEIGHTS: Dict[str, str] = {
     "rtdetr":       "weights/rtdetr-v2-license-plate",
     "yolov8":       "weights/lp_yolov8.pt",
     "yolov11":      "weights/yolov11s-license-plate.pt",
-    "yolo-v9-384":  "none",
+    "yolo-v9-608":  "none",
 }
 
 # Canonical detector→OCR pairings from run_paired_experiments.sh.
 # These are always loaded so every patch is evaluated across all backends.
 _CANONICAL_PAIRS: List[Tuple[str, str]] = [
     ("rtdetr",      "trocr"),
-    ("yolo-v9-384", "cct"),
+    ("yolo-v9-608", "cct"),
     ("yolov8",      "lprnet"),
     ("fasterrcnn",  "doctr-vitstr"),
 ]
@@ -701,7 +701,7 @@ def main() -> None:
         pairs.append((patch_path, det_name, det_weights, ocr_name, ocr_weights))
 
     def _make_det_backend(bname: str, bpath: str) -> DetectorBackend:
-        if bname == "yolo-v9-384":
+        if bname == "yolo-v9-608":
             # eval_physical doesn't need autograd — use the larger ONNX model
             # for better detection quality and lower OCR misread rate.
             return OpenImageModelsBackend(
