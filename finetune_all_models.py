@@ -394,14 +394,13 @@ def build_lprnet(onnx_path: Path, device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
+def train_lprnet(model: nn.Module, train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     device = args.device
     bs = batch_size
 
     # LPRNet input: [B, 3, 48, 96] RGB; model sums channels internally
-    ds = OCRCropDataset(records, crop_hw=(48, 96), grayscale=False)
-    n_val = max(1, int(len(ds) * 0.1))
-    train_ds, val_ds = random_split(ds, [len(ds) - n_val, n_val])
+    train_ds = OCRCropDataset(train_records, crop_hw=(48, 96), grayscale=False)
+    val_ds   = OCRCropDataset(val_records,   crop_hw=(48, 96), grayscale=False)
 
     pm = pin_memory(device)
     kw = dict(num_workers=args.workers, pin_memory=pm)
@@ -479,7 +478,7 @@ def build_trocr(device: str):
     return model, processor
 
 
-def train_trocr(model, processor, records: List[dict], args, batch_size: int) -> None:
+def train_trocr(model, processor, train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     device = args.device
     pad_id = processor.tokenizer.pad_token_id
 
@@ -510,12 +509,9 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
 
     bs = batch_size
 
-    ds    = _DS(records)
-    n_val = max(1, int(len(ds) * 0.1))
-    tr, va = random_split(ds, [len(ds) - n_val, n_val])
     kw = dict(collate_fn=_collate, num_workers=args.workers, pin_memory=pin_memory(device))
-    train_dl = DataLoader(tr, bs, shuffle=True,  **kw)
-    val_dl   = DataLoader(va, bs, shuffle=False, **kw)
+    train_dl = DataLoader(_DS(train_records), bs, shuffle=True,  **kw)
+    val_dl   = DataLoader(_DS(val_records),   bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
@@ -570,16 +566,15 @@ def build_vitstr(device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
+def train_vitstr(model: nn.Module, train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     """
     Fine-tune vitstr using doctr's built-in training loss.
     No head replacement — doctr's vocab already covers A-Z and 0-9.
     Labels are lowercased to match doctr's expected format.
     """
     device = args.device
-    ds    = OCRCropDataset(records, crop_hw=(32, 128), grayscale=False)
-    n_val = max(1, int(len(ds) * 0.1))
-    tr, va = random_split(ds, [len(ds) - n_val, n_val])
+    tr = OCRCropDataset(train_records, crop_hw=(32, 128), grayscale=False)
+    va = OCRCropDataset(val_records,   crop_hw=(32, 128), grayscale=False)
 
     def _col(batch):
         imgs, labels = zip(*batch)
@@ -639,7 +634,7 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
 # RT-DETR  (HuggingFace transformers)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
+def train_rtdetr(train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
     model_id  = "justjuu/rtdetr-v2-license-plate-detection"
@@ -649,12 +644,6 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
     model.to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f"[rtdetr] Loaded {model_id}  |  {n:,} params")
-
-    rng = random.Random(42)
-    shuffled = list(records); rng.shuffle(shuffled)
-    n_val = max(1, int(len(shuffled) * 0.1))
-    val_recs   = shuffled[:n_val]
-    train_recs = shuffled[n_val:]
 
     class _DS(Dataset):
         def __init__(self, recs):
@@ -681,9 +670,9 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
 
     bs = batch_size
 
-    train_dl = DataLoader(_DS(train_recs), bs, shuffle=True,  collate_fn=_col,
+    train_dl = DataLoader(_DS(train_records), bs, shuffle=True,  collate_fn=_col,
                           num_workers=args.workers)
-    val_dl   = DataLoader(_DS(val_recs),   bs, shuffle=False, collate_fn=_col,
+    val_dl   = DataLoader(_DS(val_records),   bs, shuffle=False, collate_fn=_col,
                           num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
@@ -750,7 +739,7 @@ _OWLVIT_MODEL_ID = "google/owlvit-base-patch32"
 _OWLVIT_QUERY    = ["a license plate"]
 
 
-def train_owlvit(records: List[dict], args, batch_size: int) -> None:
+def train_owlvit(train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     from transformers import OwlViTProcessor, OwlViTForObjectDetection
 
     device    = args.device
@@ -758,12 +747,6 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
     model     = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(device)
     n_params  = sum(p.numel() for p in model.parameters())
     print(f"[owlvit] {_OWLVIT_MODEL_ID} — {n_params:,} params")
-
-    rng = random.Random(42)
-    shuffled = list(records); rng.shuffle(shuffled)
-    n_val      = max(1, int(len(shuffled) * 0.1))
-    val_recs   = shuffled[:n_val]
-    train_recs = shuffled[n_val:]
 
     # Pre-tokenise the fixed text query once.
     text_inputs = processor(text=_OWLVIT_QUERY, return_tensors="pt", padding=True)
@@ -793,9 +776,9 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
 
     bs = batch_size
 
-    train_dl = DataLoader(_DS(train_recs), bs, shuffle=True,  collate_fn=_col,
+    train_dl = DataLoader(_DS(train_records), bs, shuffle=True,  collate_fn=_col,
                           num_workers=args.workers)
-    val_dl   = DataLoader(_DS(val_recs),   bs, shuffle=False, collate_fn=_col,
+    val_dl   = DataLoader(_DS(val_records),   bs, shuffle=False, collate_fn=_col,
                           num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
@@ -891,12 +874,11 @@ def build_fasterrcnn(device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
+def train_fasterrcnn(model: nn.Module, train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     device = args.device
     bs     = batch_size
-    ds     = DetectionDataset(records)
-    n_val  = max(1, int(len(ds) * 0.1))
-    tr, va = random_split(ds, [len(ds) - n_val, n_val])
+    tr = DetectionDataset(train_records)
+    va = DetectionDataset(val_records)
 
     kw = dict(collate_fn=_collate_det, num_workers=args.workers)
     train_dl = DataLoader(tr, bs, shuffle=True,  **kw)
@@ -1287,8 +1269,17 @@ def parse_args():
     return p.parse_args()
 
 
+def _seed_everything(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def main():
     args = parse_args()
+    _seed_everything(42)
     data_root   = Path(args.data_root)
     weights_dir = Path(args.weights_dir)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -1312,42 +1303,61 @@ def main():
     if not all_records:
         sys.exit("ERROR: no records found — check --data-root")
 
+    # ── Single shared 90/10 split (deterministic) ─────────────────────────────
+    rng = random.Random(42)
+    shuffled = list(all_records)
+    rng.shuffle(shuffled)
+    n_val         = max(1, int(len(shuffled) * 0.1))
+    val_records   = shuffled[:n_val]
+    train_records = shuffled[n_val:]
+
+    val_csv = Path(args.output_dir) / "val_split.csv"
+    val_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(val_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["image_path", "x1", "y1", "x2", "y2", "label"])
+        for r in val_records:
+            x1, y1, x2, y2 = r["bbox"]
+            w.writerow([str(r["image"]), x1, y1, x2, y2, r["label"]])
+    print(f"Val split:   {len(val_records):,} records → {val_csv}")
+    print(f"Train split: {len(train_records):,} records\n")
+
     todo = set(args.models)
 
     # ── Sanity checks + batch-size probe ──────────────────────────────────────
-    checked = run_sanity_checks(args, all_records, weights_dir, todo)
+    checked = run_sanity_checks(args, train_records, weights_dir, todo)
     if checked is None:
         sys.exit(1)
 
     # ── Detectors (longest first) ─────────────────────────────────────────────
     if "fasterrcnn" in checked:
         print("\n=== Faster R-CNN ===")
-        train_fasterrcnn(build_fasterrcnn(args.device), all_records, args,
+        train_fasterrcnn(build_fasterrcnn(args.device), train_records, val_records, args,
                          batch_size=checked["fasterrcnn"])
 
     if "owlvit" in checked:
         print("\n=== OWL-ViT ===")
-        train_owlvit(all_records, args, batch_size=checked["owlvit"])
+        train_owlvit(train_records, val_records, args, batch_size=checked["owlvit"])
 
     if "rtdetr" in checked:
         print("\n=== RT-DETR ===")
-        train_rtdetr(all_records, args, batch_size=checked["rtdetr"])
+        train_rtdetr(train_records, val_records, args, batch_size=checked["rtdetr"])
 
     # ── OCR ───────────────────────────────────────────────────────────────────
     if "lprnet" in checked:
         print("\n=== LPRNet ===")
         p = weights_dir / "lprnet_deployable_onnx_v1.1" / "us_lprnet_baseline18_deployable.onnx"
-        train_lprnet(build_lprnet(p, args.device), all_records, args,
+        train_lprnet(build_lprnet(p, args.device), train_records, val_records, args,
                      batch_size=checked["lprnet"])
 
     if "trocr" in checked:
         print("\n=== TrOCR ===")
         model, proc = build_trocr(args.device)
-        train_trocr(model, proc, all_records, args, batch_size=checked["trocr"])
+        train_trocr(model, proc, train_records, val_records, args, batch_size=checked["trocr"])
 
     if "vitstr" in checked:
         print("\n=== doctr-vitstr ===")
-        train_vitstr(build_vitstr(args.device), all_records, args,
+        train_vitstr(build_vitstr(args.device), train_records, val_records, args,
                      batch_size=checked["vitstr"])
 
     print("\nAll done.")
