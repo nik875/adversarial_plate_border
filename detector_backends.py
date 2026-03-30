@@ -2105,10 +2105,15 @@ class Yolov9TorchBackend(DetectorBackend):
         scores = output[:, 4]
         boxes = torch.stack([bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2], dim=-1)
         results = []
+        zero = torch.tensor(0.0, device=self.device)
         for i in range(images.shape[0]):
             if scores[i].numel() == 0:
-                zero = torch.tensor(0.0, device=self.device)
                 results.append(((zero, None), (zero, None)))
+                continue
+            if target_boxes2[i] is None:
+                r1 = _select_best_from_scores_boxes(
+                    scores[i], boxes[i], target_boxes1[i], self.conf_threshold, self.device)
+                results.append((r1, (zero, None)))
                 continue
             r1, r2 = _select_two_targets(scores[i], boxes[i], target_boxes1[i], target_boxes2[i], self.conf_threshold, self.device)
             results.append((r1, r2))
