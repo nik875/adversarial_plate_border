@@ -1746,9 +1746,10 @@ def main():
     parser.add_argument("--sam-rho", type=float, default=0.025,
                         help="SAM perturbation radius rho (default 0.025). "
                              "Only used when m-SAM is enabled.")
-    parser.add_argument("--top-extend", action="store_true",
+    parser.add_argument("--top-extend", action="store_true", default=True,
                         help="Double patch height upward: suppress real-plate detection "
                              "and attract detection into the attacker-controlled top region.")
+    parser.add_argument("--no-top-extend", dest="top_extend", action="store_false")
     parser.add_argument("--augment", action="store_true",
                         help="Apply differentiable photometric augmentations (brightness, "
                              "contrast, saturation, color temperature, directional shadow) "
