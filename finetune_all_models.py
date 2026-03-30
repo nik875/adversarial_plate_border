@@ -656,12 +656,17 @@ def train_rtdetr(records: List[dict], args) -> None:
                 enc    = {k: v.to(device) for k, v in enc.items()}
                 if labels is not None:
                     labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
-                loss = model(**enc, labels=labels).loss
+                out  = model(**enc, labels=labels)
+                loss = out.loss
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 opt.step(); tl += loss.item()
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
+                postfix: dict = {"loss": f"{sum(window)/len(window):.4f}"}
+                if hasattr(out, "loss_dict") and out.loss_dict:
+                    ld = {k: f"{v.item():.4f}" for k, v in out.loss_dict.items()}
+                    postfix.update(ld)
+                pbar.set_postfix(**postfix)
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  RT-DETR ep{ep}: train={avg:.4f}")
@@ -786,7 +791,11 @@ def train_owlvit(records: List[dict], args) -> None:
                 nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 opt.step(); tl += loss.item()
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
+                pbar.set_postfix(
+                    loss=f"{sum(window)/len(window):.4f}",
+                    box=f"{box_loss.item()/B:.4f}",
+                    cls=f"{cls_loss.item()/B:.4f}",
+                )
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  OWL-ViT ep{ep}: train={avg:.4f}")
@@ -847,7 +856,13 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args) -> None:
                 opt.zero_grad(); loss.backward(); opt.step()
                 tl += loss.item()
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
+                pbar.set_postfix(
+                    loss=f"{sum(window)/len(window):.4f}",
+                    cls=f"{losses.get('loss_classifier', 0.):.4f}",
+                    box=f"{losses.get('loss_box_reg', 0.):.4f}",
+                    obj=f"{losses.get('loss_objectness', 0.):.4f}",
+                    rpn=f"{losses.get('loss_rpn_box_reg', 0.):.4f}",
+                )
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  FasterRCNN ep{ep}: train={avg:.4f}")
