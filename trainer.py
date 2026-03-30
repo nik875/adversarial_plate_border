@@ -1454,9 +1454,6 @@ class AdversarialPatchTrainer:
         profile_steps = 10 if self.profiling else 0
         _prof_completed = 0   # optimizer steps finished so far (profiling)
         _t_iter_end = _pt() if self.profiling else 0.0   # for dataloader fetch timing
-        # SAM path has no profiling instrumentation — use standard path for profiling.
-        if self.profiling:
-            use_sam = False
 
         updates_per_epoch = max(1, len(self.train_loader) // (B * update_every))
         with tqdm(total=updates_per_epoch,
