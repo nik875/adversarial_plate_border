@@ -381,8 +381,8 @@ def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -
     train_dl = DataLoader(train_ds, bs, shuffle=True,  drop_last=True,  **kw)
     val_dl   = DataLoader(val_ds,   bs, shuffle=False, **kw)
 
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
 
     def _lp(imgs):
@@ -402,10 +402,10 @@ def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -
                 loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step(); tl += loss.item()
+                opt.step(); sched.step(); tl += loss.item()
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
-        sched.step()
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                 lr=f"{sched.get_last_lr()[0]:.2e}")
 
         model.eval(); vl = 0.0
         with torch.no_grad():
@@ -485,7 +485,7 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
     val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
@@ -496,10 +496,10 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
                 loss = model(pixel_values=pv, labels=ids).loss
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step(); tl += loss.item()
+                opt.step(); sched.step(); tl += loss.item()
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
-        sched.step()
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                 lr=f"{sched.get_last_lr()[0]:.2e}")
 
         model.eval(); vl = 0.0
         with torch.no_grad():
@@ -553,7 +553,7 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
     val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
@@ -566,10 +566,10 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
                 loss   = out["loss"]
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step(); tl += loss.item(); n += 1
+                opt.step(); sched.step(); tl += loss.item(); n += 1
                 window.append(loss.item())
-                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
-        sched.step()
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                 lr=f"{sched.get_last_lr()[0]:.2e}")
 
         model.eval(); vl = 0; m = 0
         with torch.no_grad():
@@ -642,7 +642,7 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
                           num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
     out_dir = Path(args.output_dir) / "rtdetr_finetuned"
 
@@ -658,14 +658,14 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
                 loss = out.loss
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-                opt.step(); tl += loss.item()
+                opt.step(); sched.step(); tl += loss.item()
                 window.append(loss.item())
-                postfix: dict = {"loss": f"{sum(window)/len(window):.4f}"}
+                postfix: dict = {"loss": f"{sum(window)/len(window):.4f}",
+                                 "lr": f"{sched.get_last_lr()[0]:.2e}"}
                 if hasattr(out, "loss_dict") and out.loss_dict:
                     ld = {k: f"{v.item():.4f}" for k, v in out.loss_dict.items()}
                     postfix.update(ld)
                 pbar.set_postfix(**postfix)
-        sched.step()
 
         model.eval(); vl = 0.0
         with torch.no_grad():
@@ -747,7 +747,7 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
                           num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
     out_dir = Path(args.output_dir) / "owlvit_finetuned"
 
@@ -786,14 +786,14 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
                 B = pixel_values.shape[0]
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-                opt.step(); tl += loss.item()
+                opt.step(); sched.step(); tl += loss.item()
                 window.append(loss.item())
                 pbar.set_postfix(
                     loss=f"{sum(window)/len(window):.4f}",
                     box=f"{box_loss.item()/B:.4f}",
                     cls=f"{cls_loss.item()/B:.4f}",
+                    lr=f"{sched.get_last_lr()[0]:.2e}",
                 )
-        sched.step()
 
         model.eval(); vl = 0.0
         with torch.no_grad():
@@ -843,10 +843,9 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
     train_dl = DataLoader(tr, bs, shuffle=True,  **kw)
     val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt    = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best   = float("inf"); no_improve = 0
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
+    best  = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
@@ -856,7 +855,7 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                 losses  = model(imgs, targets)
                 loss    = sum(losses.values())
-                opt.zero_grad(); loss.backward(); opt.step()
+                opt.zero_grad(); loss.backward(); opt.step(); sched.step()
                 tl += loss.item()
                 window.append(loss.item())
                 pbar.set_postfix(
@@ -865,8 +864,8 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
                     box=f"{losses.get('loss_box_reg', 0.):.4f}",
                     obj=f"{losses.get('loss_objectness', 0.):.4f}",
                     rpn=f"{losses.get('loss_rpn_box_reg', 0.):.4f}",
+                    lr=f"{sched.get_last_lr()[0]:.2e}",
                 )
-        sched.step()
 
         model.eval(); vl = 0.0
         with torch.no_grad():
