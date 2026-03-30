@@ -808,6 +808,20 @@ class LPRNetBackend(OCRBackend):
             losses.append(base if impersonation else -base)
         return losses
 
+    def encode_batch(self, crops: list) -> torch.Tensor:
+        """Run encoder on all crops; return [B, 24, 36] softmax probs."""
+        self.ensure_loaded()
+        inp = torch.cat([self._preprocess(c) for c in crops], dim=0)
+        return self._model(inp)  # [B, 24, 36]
+
+    def loss_from_raw(self, probs: torch.Tensor, target_text: str,
+                      impersonation: bool = True,
+                      diff_positions: Optional[List[int]] = None) -> torch.Tensor:
+        """Compute loss from one item's [24, 36] softmax probs."""
+        log_probs = torch.log(probs.clamp(min=1e-8))
+        base = self.ctc_loss(log_probs, target_text, diff_positions=diff_positions)
+        return base if impersonation else -base
+
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
             yield from self._model.parameters()
@@ -1600,6 +1614,20 @@ class CCTOCRBackend(OCRBackend):
         log_probs = torch.log(output.clamp(min=1e-8))   # [B, T, V]
         losses = [F.nll_loss(log_probs[i], target_ids) for i in range(output.shape[0])]
         return [l if impersonation else -l for l in losses]
+
+    def encode_batch(self, crops: list) -> torch.Tensor:
+        """Run encoder on all crops; return [B, 9, 37] softmax probs."""
+        self.ensure_loaded()
+        batched = torch.cat([c.to(self.device) for c in crops], dim=0)
+        preprocessed = self._preprocess(batched)
+        return self._model(preprocessed)  # [B, 9, 37]
+
+    def loss_from_raw(self, probs: torch.Tensor, target_text: str,
+                      impersonation: bool = True,
+                      diff_positions: Optional[List[int]] = None) -> torch.Tensor:
+        """Compute loss from one item's [9, 37] softmax probs."""
+        base = self.ce_loss(probs, target_text, diff_positions=diff_positions)
+        return base if impersonation else -base
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
