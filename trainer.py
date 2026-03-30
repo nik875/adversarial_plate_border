@@ -1471,7 +1471,7 @@ class AdversarialPatchTrainer:
                     num_updates += 1
 
         n = max(step, 1)
-        return (total_loss / n, total_det / n, total_ocr / n, total_tv / n)
+        return (total_loss / n, total_det / n, total_ocr / n, total_tv / n, num_updates)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
@@ -1509,7 +1509,13 @@ class AdversarialPatchTrainer:
         lr_min:        float = 1e-5,
         save_interval: int   = 10,
         dry_run:       bool  = False,
+        tv_warmup:     float = 0.1,
     ) -> dict:
+        """
+        tv_warmup: fraction of total gradient updates during which TV loss is
+        suppressed so the patch can move freely early on.  Set to 0.0 to
+        disable TV warmup entirely.
+        """
         if dry_run:
             print("\nDry run: saving debug images...")
             self.save_debug_images()
@@ -1555,6 +1561,16 @@ class AdversarialPatchTrainer:
         best_loss  = float("inf")
         best_epoch = -1
 
+        # Estimate total gradient updates for tv_warmup_updates calculation.
+        # update_every mirrors the logic inside train_epoch.
+        _update_every = (len(self.train_loader)
+                         if self.grad_accumulate is None
+                         else self.grad_accumulate)
+        _updates_per_epoch = max(1, len(self.train_loader) //
+                                 (self.eval_batch_size * _update_every))
+        total_updates    = num_epochs * _updates_per_epoch
+        tv_warmup_updates = int(tv_warmup * total_updates)
+
         n_params = sum(p.numel() for p in self._trainable_params())
         print(f"\n{'='*60}")
         print(f"  Adversarial Patch Training")
@@ -1564,8 +1580,12 @@ class AdversarialPatchTrainer:
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Epochs    : {num_epochs}  |  Warmup: {warmup_epochs}  |  "
+        print(f"  Epochs    : {num_epochs}  |  LR warmup: {warmup_epochs} epochs  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        if tv_warmup_updates > 0:
+            print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
+        else:
+            print(f"  TV warmup : disabled")
         if self.sam_m is not None:
             print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
         _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
@@ -1578,15 +1598,17 @@ class AdversarialPatchTrainer:
         log_path = self.run_dir / "training_log.txt"
         log_file = open(log_path, "w")
 
+        global_updates = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
-            # Disable TV loss during warmup so the patch can move freely early on
+            # Suppress TV loss until we've passed the warmup budget of updates.
             saved_tv = self.tv_weight
-            if epoch < warmup_epochs:
+            if global_updates < tv_warmup_updates:
                 self.tv_weight = 0.0
-            train_loss, train_det, train_ocr, train_tv = self.train_epoch(optimizer, epoch)
-            self.tv_weight = saved_tv
+            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(optimizer, epoch)
+            self.tv_weight  = saved_tv
+            global_updates += epoch_updates
             self.training  = False
             val_loss       = self.validate()
             scheduler.step()
@@ -1683,7 +1705,11 @@ def main():
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
-                        help="Weight for total variation loss (default: 2.5).")
+                        help="Weight for total variation loss (default: 10.0).")
+    parser.add_argument("--tv-warmup", type=float, default=0.1,
+                        help="Fraction of total gradient updates to suppress TV loss "
+                             "so the patch can move freely early on (default: 0.1). "
+                             "Set to 0 to disable TV warmup entirely.")
     parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
                         help="Scalar multiplier on OCR loss (default: 1.0).")
     parser.add_argument("--det-loss-scale", type=float, default=1.0,
@@ -1771,6 +1797,7 @@ def main():
         lr_min        = args.lr_min,
         save_interval = 10,
         dry_run       = args.dry_run,
+        tv_warmup     = args.tv_warmup,
     )
 
 
