@@ -597,9 +597,12 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
             return out["loss"]
         except Exception:
             pass
-        # Fallback: raw forward → [B, T, NUM_CLASSES] logits via CE
-        # vitstr forward without target returns {"logits": ...} or similar
+        # Fallback: doctr raises if labels absent in train mode. Temporarily
+        # set training=False on the top-level module only so gradients still
+        # flow, then restore before the backward pass.
+        model.training = False
         out = model(imgs)
+        model.training = True
         if isinstance(out, dict):
             logits = out.get("logits", out.get("out", None))
         else:
@@ -913,8 +916,10 @@ def run_sanity_checks(args, records: List[dict],
                 return
             except Exception:
                 pass
-            # Fallback CE path
+            # Fallback CE path — bypass doctr's train-mode label requirement
+            m.training = False
             out = m(imgs)
+            m.training = True
             if isinstance(out, dict):
                 logits = out.get("logits", out.get("out", None))
             else:
