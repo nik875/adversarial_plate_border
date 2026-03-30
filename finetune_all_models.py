@@ -68,6 +68,60 @@ def pin_memory(device: str) -> bool:
     return device.startswith("cuda")
 
 
+def find_batch_size(
+    probe_fn,
+    device: str,
+    max_bs: int,
+    safety: float = 0.70,
+) -> int:
+    """
+    Estimate the optimal batch size for a model by probing with batch_size=1
+    and measuring peak GPU memory, then scaling to available free memory.
+
+    probe_fn(bs) must run a full forward+backward pass with the given batch
+    size using synthetic tensors (no real data loading). It should raise
+    RuntimeError on OOM.
+
+    Args:
+        probe_fn:  callable(bs) — runs forward+backward, may raise on OOM
+        device:    torch device string
+        max_bs:    hard upper cap (user's --batch-size)
+        safety:    fraction of estimated headroom to actually use (default 0.70)
+                   — leaves room for optimizer states and memory fragmentation
+
+    Returns:
+        Chosen batch size in [1, max_bs].
+    """
+    if not device.startswith("cuda"):
+        return max_bs
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    try:
+        probe_fn(1)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+        per_sample_mem = max(1, peak - baseline)
+    except Exception:
+        print(f"  [auto-batch] probe failed — using batch_size=1")
+        return 1
+    finally:
+        torch.cuda.empty_cache()
+
+    free_after = torch.cuda.mem_get_info()[0]
+    bs = max(1, min(int(free_after * safety / per_sample_mem), max_bs))
+    print(
+        f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
+        f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
+        f"  →  batch_size={bs}  (cap={max_bs})"
+    )
+    return bs
+
+
 def encode_ctc(labels: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
     """Encode a list of label strings for CTC loss (blank=0, chars 1-based)."""
     targets, lengths = [], []
@@ -312,6 +366,17 @@ def build_lprnet(onnx_path: Path, device: str) -> nn.Module:
 
 def train_lprnet(model: nn.Module, records: List[dict], args) -> None:
     device = args.device
+
+    def _probe(bs):
+        x = torch.randn(bs, 3, 48, 96, device=device)
+        lp = torch.log(model(x).clamp(min=1e-9)).permute(1, 0, 2)
+        T, B, _ = lp.shape
+        ilen = torch.full((B,), T, dtype=torch.long)
+        tgt  = torch.ones(B * 4, dtype=torch.long)
+        tlen = torch.full((B,), 4, dtype=torch.long)
+        F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True).backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     # LPRNet input: [B, 3, 48, 96] RGB; model sums channels internally
     ds = OCRCropDataset(records, crop_hw=(48, 96), grayscale=False)
     n_val = max(1, int(len(ds) * 0.1))
@@ -319,8 +384,8 @@ def train_lprnet(model: nn.Module, records: List[dict], args) -> None:
 
     pm = pin_memory(device)
     kw = dict(num_workers=args.workers, pin_memory=pm)
-    train_dl = DataLoader(train_ds, args.batch_size, shuffle=True,  drop_last=True,  **kw)
-    val_dl   = DataLoader(val_ds,   args.batch_size, shuffle=False, **kw)
+    train_dl = DataLoader(train_ds, bs, shuffle=True,  drop_last=True,  **kw)
+    val_dl   = DataLoader(val_ds,   bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -408,12 +473,18 @@ def train_trocr(model, processor, records: List[dict], args) -> None:
             ids = ids.masked_fill(ids == pad_id, -100)
         return pv, ids
 
+    def _probe(bs):
+        pv  = torch.randn(bs, 3, 384, 384, device=device)
+        lbl = torch.ones(bs, 8, dtype=torch.long, device=device)
+        model(pixel_values=pv, labels=lbl).loss.backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     ds    = _DS(records)
     n_val = max(1, int(len(ds) * 0.1))
     tr, va = random_split(ds, [len(ds) - n_val, n_val])
     kw = dict(collate_fn=_collate, num_workers=args.workers, pin_memory=pin_memory(device))
-    train_dl = DataLoader(tr, args.batch_size, shuffle=True,  **kw)
-    val_dl   = DataLoader(va, args.batch_size, shuffle=False, **kw)
+    train_dl = DataLoader(tr, bs, shuffle=True,  **kw)
+    val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -469,9 +540,14 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
         imgs, labels = zip(*batch)
         return torch.stack(imgs), list(labels)
 
+    def _probe(bs):
+        x = torch.randn(bs, 3, 32, 128, device=device)
+        model(x, target=["abc"] * bs)["loss"].backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     kw = dict(collate_fn=_col, num_workers=args.workers, pin_memory=pin_memory(device))
-    train_dl = DataLoader(tr, args.batch_size, shuffle=True,  drop_last=True, **kw)
-    val_dl   = DataLoader(va, args.batch_size, shuffle=False, **kw)
+    train_dl = DataLoader(tr, bs, shuffle=True,  drop_last=True, **kw)
+    val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -546,7 +622,14 @@ def train_rtdetr(records: List[dict], args) -> None:
         imgs, anns = zip(*batch)
         return processor(images=list(imgs), annotations=list(anns), return_tensors="pt")
 
-    bs = max(1, args.batch_size // 4)
+    def _probe(bs):
+        pv  = torch.randn(bs, 3, 640, 640, device=device)
+        lbl = [{"class_labels": torch.zeros(1, dtype=torch.long, device=device),
+                "boxes": torch.tensor([[0.5, 0.5, 0.3, 0.2]], device=device)}
+               for _ in range(bs)]
+        model(pixel_values=pv, labels=lbl).loss.backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
                     num_workers=args.workers)
 
@@ -625,7 +708,30 @@ def train_owlvit(records: List[dict], args) -> None:
         pv = processor(images=list(imgs), return_tensors="pt")["pixel_values"]
         return pv, torch.stack(boxes)
 
-    bs = max(1, args.batch_size // 4)
+    def _probe(bs):
+        from torchvision.ops import box_iou
+        pv   = torch.randn(bs, 3, 768, 768, device=device)
+        txt  = {k: v.expand(bs, -1) for k, v in text_inputs.items()}
+        out  = model(pixel_values=pv, **txt)
+        pred_boxes  = out.pred_boxes
+        pred_logits = out.logits.squeeze(-1)
+        N = pred_boxes.shape[1]
+        gt = torch.tensor([0.5, 0.5, 0.3, 0.1], device=device).unsqueeze(0).expand(bs, -1)
+        loss = torch.tensor(0.0, device=device)
+        for b in range(bs):
+            pb = pred_boxes[b]
+            pb_x = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                 pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+            gb   = gt[b:b+1]
+            gb_x = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                 gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+            best_i = box_iou(pb_x, gb_x).squeeze(1).argmax()
+            lbl = torch.zeros(N, device=device); lbl[best_i] = 1.0
+            loss += F.l1_loss(pb[best_i], gt[b])
+            loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
+        (loss / bs).backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
                     num_workers=args.workers)
 
@@ -708,7 +814,14 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args) -> None:
     n_val  = max(1, int(len(ds) * 0.1))
     tr, _  = random_split(ds, [len(ds) - n_val, n_val])
 
-    bs = max(1, args.batch_size // 8)   # detection batches are memory-heavy
+    def _probe(bs):
+        imgs    = [torch.randn(3, 640, 640, device=device) for _ in range(bs)]
+        targets = [{"boxes":  torch.tensor([[10., 10., 200., 100.]], device=device),
+                    "labels": torch.zeros(1, dtype=torch.long, device=device)}
+                   for _ in range(bs)]
+        sum(model(imgs, targets).values()).backward()
+    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+
     dl = DataLoader(tr, bs, shuffle=True, collate_fn=_collate_det,
                     num_workers=args.workers)
 
