@@ -449,53 +449,16 @@ def train_trocr(model, processor, records: List[dict], args) -> None:
 def build_vitstr(device: str) -> nn.Module:
     from doctr.models import vitstr_small
     model = vitstr_small(pretrained=True)
-
-    # Find and replace the classification head (last Linear in the model)
-    # doctr's ViTSTR head is model.head: Linear(embed_dim, vocab_size + special_tokens)
-    replaced = False
-    if hasattr(model, "head") and isinstance(model.head, nn.Linear):
-        old = model.head
-        new = nn.Linear(old.in_features, NUM_CLASSES)
-        nn.init.xavier_uniform_(new.weight); nn.init.zeros_(new.bias)
-        model.head = new
-        print(f"[vitstr] head: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})")
-        replaced = True
-
-
-    if not replaced:
-        # Walk named modules to find the last Linear and replace it
-        last_name = last_mod = None
-        for name, mod in model.named_modules():
-            if isinstance(mod, nn.Linear):
-                last_name, last_mod = name, mod
-        if last_name:
-            parent = model
-            *path, attr = last_name.split(".")
-            for p in path:
-                parent = getattr(parent, p)
-            old = last_mod
-            new = nn.Linear(old.in_features, NUM_CLASSES)
-            nn.init.xavier_uniform_(new.weight); nn.init.zeros_(new.bias)
-            setattr(parent, attr, new)
-            print(f"[vitstr] {last_name}: Linear({old.in_features},{old.out_features}) → Linear({old.in_features},{NUM_CLASSES})")
-        else:
-            print("[vitstr] WARNING: no Linear head found to replace")
-
     n = sum(p.numel() for p in model.parameters())
-    print(f"[vitstr] {n:,} params")
+    print(f"[vitstr] pretrained vitstr_small  |  {n:,} params")
     return model.to(device).train()
 
 
 def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
     """
-    Manual CE training loop for vitstr after head replacement.
-    Since we replaced the head, doctr's internal vocab-based loss no longer
-    applies cleanly, so we compute CE directly against our CHARS alphabet.
-
-    For CE we need the model to output per-position logits [B, T, NUM_CLASSES].
-    doctr's ViTSTR forward without target= returns a dict; we extract the raw
-    logits if available, otherwise fall back to doctr's built-in loss with
-    lowercase labels.
+    Fine-tune vitstr using doctr's built-in training loss.
+    No head replacement — doctr's vocab already covers A-Z and 0-9.
+    Labels are lowercased to match doctr's expected format.
     """
     device = args.device
     ds    = OCRCropDataset(records, crop_hw=(32, 128), grayscale=False)
@@ -514,36 +477,13 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     best  = float("inf")
 
-    def _compute_loss(imgs, labels):
-        # Capture the output of our replacement head directly via a forward hook.
-        # This bypasses doctr's internal forward logic which assumes the original
-        # vocab size and would fail with our 37-class head.
-        captured = []
-        handle = model.head.register_forward_hook(lambda m, i, o: captured.append(o))
-        try:
-            model(imgs, target=["x"] * imgs.shape[0])
-        except Exception:
-            pass
-        handle.remove()
-        if not captured or captured[0].dim() != 3:
-            return None
-        logits = captured[0]                         # [B, T, NUM_CLASSES]
-        B, T, C = logits.shape
-        target_seq = torch.zeros(B, T, dtype=torch.long, device=imgs.device)
-        for b, lbl in enumerate(labels):
-            for t, ch in enumerate(lbl[:T]):
-                if ch in CHARS:
-                    target_seq[b, t] = char_to_idx(ch)
-        return F.cross_entropy(logits.reshape(B*T, C), target_seq.reshape(B*T),
-                               ignore_index=0)
-
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0; n = 0
         for imgs, labels in tqdm(train_dl, desc=f"ViTSTR {ep}", leave=False):
-            imgs = imgs.to(device)
-            loss = _compute_loss(imgs, labels)
-            if loss is None:
-                continue
+            imgs   = imgs.to(device)
+            target = [l.lower() for l in labels]
+            out    = model(imgs, target=target)
+            loss   = out["loss"]
             opt.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step(); tl += loss.item(); n += 1
@@ -552,16 +492,15 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
         model.eval(); vl = 0; m = 0
         with torch.no_grad():
             for imgs, labels in val_dl:
-                loss = _compute_loss(imgs.to(device), labels)
-                if loss is not None:
-                    vl += loss.item(); m += 1
+                out = model(imgs.to(device), target=[l.lower() for l in labels])
+                vl += out["loss"].item(); m += 1
         vl /= max(1, m)
         print(f"  ViTSTR ep{ep}: train={tl/max(1,n):.4f}  val={vl:.4f}")
         if vl < best:
             best = vl
-            out  = Path(args.output_dir) / "vitstr_small_finetuned.pt"
-            torch.save(model.state_dict(), out)
-            print(f"    → {out}")
+            out_path = Path(args.output_dir) / "vitstr_small_finetuned.pt"
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -888,25 +827,10 @@ def run_sanity_checks(args, records: List[dict],
         def _vitstr():
             m = build_vitstr(args.device)
             imgs, labels = _ocr_mini_batch(records, (32, 128), grayscale=False)
-            imgs = imgs.to(args.device)
-            captured = []
-            handle = m.head.register_forward_hook(lambda mod, i, o: captured.append(o))
-            try:
-                m(imgs, target=["x"] * imgs.shape[0])
-            except Exception:
-                pass
-            handle.remove()
-            if not captured or captured[0].dim() != 3:
-                raise RuntimeError("vitstr: could not capture head output")
-            logits = captured[0]
-            B, T, C = logits.shape
-            tgt = torch.zeros(B, T, dtype=torch.long, device=args.device)
-            for b, lbl in enumerate(labels):
-                for t, ch in enumerate(lbl[:T]):
-                    if ch in CHARS:
-                        tgt[b, t] = char_to_idx(ch)
-            F.cross_entropy(logits.reshape(B*T, C), tgt.reshape(B*T),
-                            ignore_index=0).backward()
+            imgs   = imgs.to(args.device)
+            target = [l.lower() for l in labels]
+            out    = m(imgs, target=target)
+            out["loss"].backward()
         results["vitstr"] = _check("vitstr", _vitstr)
 
     # ── OWL-ViT ───────────────────────────────────────────────────────────────
