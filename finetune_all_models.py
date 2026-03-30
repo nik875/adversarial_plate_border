@@ -365,18 +365,9 @@ def build_lprnet(onnx_path: Path, device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_lprnet(model: nn.Module, records: List[dict], args) -> None:
+def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
     device = args.device
-
-    def _probe(bs):
-        x = torch.randn(bs, 3, 48, 96, device=device)
-        lp = torch.log(model(x).clamp(min=1e-9)).permute(1, 0, 2)
-        T, B, _ = lp.shape
-        ilen = torch.full((B,), T, dtype=torch.long)
-        tgt  = torch.ones(B * 4, dtype=torch.long)
-        tlen = torch.full((B,), 4, dtype=torch.long)
-        F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True).backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+    bs = batch_size
 
     # LPRNet input: [B, 3, 48, 96] RGB; model sums channels internally
     ds = OCRCropDataset(records, crop_hw=(48, 96), grayscale=False)
@@ -448,7 +439,7 @@ def build_trocr(device: str):
     return model, processor
 
 
-def train_trocr(model, processor, records: List[dict], args) -> None:
+def train_trocr(model, processor, records: List[dict], args, batch_size: int) -> None:
     device = args.device
     pad_id = processor.tokenizer.pad_token_id
 
@@ -477,11 +468,7 @@ def train_trocr(model, processor, records: List[dict], args) -> None:
             ids = ids.masked_fill(ids == pad_id, -100)
         return pv, ids
 
-    def _probe(bs):
-        pv  = torch.randn(bs, 3, 384, 384, device=device)
-        lbl = torch.ones(bs, 8, dtype=torch.long, device=device)
-        model(pixel_values=pv, labels=lbl).loss.backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+    bs = batch_size
 
     ds    = _DS(records)
     n_val = max(1, int(len(ds) * 0.1))
@@ -532,7 +519,7 @@ def build_vitstr(device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
+def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
     """
     Fine-tune vitstr using doctr's built-in training loss.
     No head replacement — doctr's vocab already covers A-Z and 0-9.
@@ -547,10 +534,7 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
         imgs, labels = zip(*batch)
         return torch.stack(imgs), list(labels)
 
-    def _probe(bs):
-        x = torch.randn(bs, 3, 32, 128, device=device)
-        model(x, target=["abc"] * bs)["loss"].backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+    bs = batch_size
 
     kw = dict(collate_fn=_col, num_workers=args.workers, pin_memory=pin_memory(device))
     train_dl = DataLoader(tr, bs, shuffle=True,  drop_last=True, **kw)
@@ -593,7 +577,7 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
 # RT-DETR  (HuggingFace transformers)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_rtdetr(records: List[dict], args) -> None:
+def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
     from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
     model_id  = "justjuu/rtdetr-v2-license-plate-detection"
@@ -632,13 +616,7 @@ def train_rtdetr(records: List[dict], args) -> None:
         imgs, anns = zip(*batch)
         return processor(images=list(imgs), annotations=list(anns), return_tensors="pt")
 
-    def _probe(bs):
-        pv  = torch.randn(bs, 3, 640, 640, device=device)
-        lbl = [{"class_labels": torch.zeros(1, dtype=torch.long, device=device),
-                "boxes": torch.tensor([[0.5, 0.5, 0.3, 0.2]], device=device)}
-               for _ in range(bs)]
-        model(pixel_values=pv, labels=lbl).loss.backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+    bs = batch_size
 
     dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
                     num_workers=args.workers)
@@ -686,7 +664,7 @@ _OWLVIT_MODEL_ID = "google/owlvit-base-patch32"
 _OWLVIT_QUERY    = ["a license plate"]
 
 
-def train_owlvit(records: List[dict], args) -> None:
+def train_owlvit(records: List[dict], args, batch_size: int) -> None:
     from transformers import OwlViTProcessor, OwlViTForObjectDetection
 
     device    = args.device
@@ -726,29 +704,7 @@ def train_owlvit(records: List[dict], args) -> None:
         pv = processor(images=list(imgs), return_tensors="pt")["pixel_values"]
         return pv, torch.stack(boxes)
 
-    def _probe(bs):
-        from torchvision.ops import box_iou
-        pv   = torch.randn(bs, 3, 768, 768, device=device)
-        txt  = {k: v.expand(bs, -1) for k, v in text_inputs.items()}
-        out  = model(pixel_values=pv, **txt)
-        pred_boxes  = out.pred_boxes
-        pred_logits = out.logits.squeeze(-1)
-        N = pred_boxes.shape[1]
-        gt = torch.tensor([0.5, 0.5, 0.3, 0.1], device=device).unsqueeze(0).expand(bs, -1)
-        loss = torch.tensor(0.0, device=device)
-        for b in range(bs):
-            pb = pred_boxes[b]
-            pb_x = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
-                                 pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
-            gb   = gt[b:b+1]
-            gb_x = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
-                                 gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
-            best_i = box_iou(pb_x, gb_x).squeeze(1).argmax()
-            lbl = torch.zeros(N, device=device); lbl[best_i] = 1.0
-            loss += F.l1_loss(pb[best_i], gt[b])
-            loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
-        (loss / bs).backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
+    bs = batch_size
 
     dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
                     num_workers=args.workers)
@@ -823,19 +779,12 @@ def build_fasterrcnn(device: str) -> nn.Module:
     return model.to(device).train()
 
 
-def train_fasterrcnn(model: nn.Module, records: List[dict], args) -> None:
+def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: int) -> None:
     device = args.device
+    bs     = batch_size
     ds     = DetectionDataset(records)
     n_val  = max(1, int(len(ds) * 0.1))
     tr, _  = random_split(ds, [len(ds) - n_val, n_val])
-
-    def _probe(bs):
-        imgs    = [torch.randn(3, 640, 640, device=device) for _ in range(bs)]
-        targets = [{"boxes":  torch.tensor([[10., 10., 200., 100.]], device=device),
-                    "labels": torch.zeros(1, dtype=torch.long, device=device)}
-                   for _ in range(bs)]
-        sum(model(imgs, targets).values()).backward()
-    bs = find_batch_size(_probe, device, max_bs=args.batch_size)
 
     dl = DataLoader(tr, bs, shuffle=True, collate_fn=_collate_det,
                     num_workers=args.workers)
@@ -903,13 +852,15 @@ def _check(name: str, fn) -> bool:
 
 
 def run_sanity_checks(args, records: List[dict],
-                      weights_dir: Path, todo: set) -> bool:
+                      weights_dir: Path, todo: set):
     """
-    Attempts one forward+backward step for every model in `todo`.
-    Returns True only if all checks pass.
+    Attempts one forward+backward step for every model in `todo` and determines
+    the optimal batch size for each.  Returns a dict mapping model name → batch
+    size on success, or None if any check fails.
     """
-    print("\n=== Sanity checks (1 batch each) ===")
-    results = {}
+    print("\n=== Sanity checks (1 batch + batch-size probe each) ===")
+    results  = {}   # name → True/False
+    bsizes   = {}   # name → int
 
     # ── LPRNet ────────────────────────────────────────────────────────────────
     if "lprnet" in todo:
@@ -917,31 +868,42 @@ def run_sanity_checks(args, records: List[dict],
         if not p.exists():
             print(f"  [SKIP] lprnet: {p} not found")
         else:
+            m_lprnet = build_lprnet(p, args.device)
             def _lprnet():
-                m = build_lprnet(p, args.device)
                 imgs, labels = _ocr_mini_batch(records, (48, 96), grayscale=False)
                 imgs = imgs.to(args.device)
-                lp = torch.log(m(imgs).clamp(min=1e-9)).permute(1, 0, 2)
+                lp = torch.log(m_lprnet(imgs).clamp(min=1e-9)).permute(1, 0, 2)
                 T, B, _ = lp.shape
                 ilen = torch.full((B,), T, dtype=torch.long)
                 tgt, tlen = encode_ctc(labels)
                 F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX,
                            zero_infinity=True).backward()
-            results["lprnet"] = _check("lprnet", _lprnet)
+            ok = _check("lprnet", _lprnet)
+            results["lprnet"] = ok
+            if ok:
+                def _lprnet_probe(bs):
+                    x = torch.randn(bs, 3, 48, 96, device=args.device)
+                    lp = torch.log(m_lprnet(x).clamp(min=1e-9)).permute(1, 0, 2)
+                    T, B2, _ = lp.shape
+                    ilen = torch.full((B2,), T, dtype=torch.long)
+                    tgt  = torch.ones(B2 * 4, dtype=torch.long)
+                    tlen = torch.full((B2,), 4, dtype=torch.long)
+                    F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True).backward()
+                bsizes["lprnet"] = find_batch_size(_lprnet_probe, args.device, max_bs=args.batch_size)
 
     # ── TrOCR ─────────────────────────────────────────────────────────────────
     if "trocr" in todo:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        m_trocr_proc  = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+        m_trocr = VisionEncoderDecoderModel.from_pretrained(
+                    "microsoft/trocr-small-printed").to(args.device)
+        m_trocr.config.decoder_start_token_id = m_trocr_proc.tokenizer.bos_token_id
+        m_trocr.config.pad_token_id           = m_trocr_proc.tokenizer.pad_token_id
+        n = sum(p.numel() for p in m_trocr.parameters())
+        print(f"  [trocr] {n:,} params")
         def _trocr():
-            from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-            proc  = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
-            model = VisionEncoderDecoderModel.from_pretrained(
-                        "microsoft/trocr-small-printed").to(args.device)
-            model.config.decoder_start_token_id = proc.tokenizer.bos_token_id
-            model.config.pad_token_id           = proc.tokenizer.pad_token_id
-            n = sum(p.numel() for p in model.parameters())
-            print(f"  [trocr] {n:,} params")
-            recs  = records[:4]
-            imgs  = []
+            recs   = records[:4]
+            imgs   = []
             labels = []
             for rec in recs:
                 x1, y1, x2, y2 = rec["bbox"]
@@ -952,37 +914,52 @@ def run_sanity_checks(args, records: List[dict],
                     img = Image.new("RGB", (384, 384))
                 imgs.append(img)
                 labels.append(rec["label"])
-            pv  = proc(images=imgs, return_tensors="pt").pixel_values.to(args.device)
-            tok = proc.tokenizer(labels, padding=True, truncation=True,
-                                 max_length=16, return_tensors="pt")
+            pv  = m_trocr_proc(images=imgs, return_tensors="pt").pixel_values.to(args.device)
+            tok = m_trocr_proc.tokenizer(labels, padding=True, truncation=True,
+                                         max_length=16, return_tensors="pt")
             ids = tok.input_ids
-            pad_id = proc.tokenizer.pad_token_id
+            pad_id = m_trocr_proc.tokenizer.pad_token_id
             if pad_id is not None:
                 ids = ids.masked_fill(ids == pad_id, -100)
-            model(pixel_values=pv, labels=ids.to(args.device)).loss.backward()
-        results["trocr"] = _check("trocr", _trocr)
+            m_trocr(pixel_values=pv, labels=ids.to(args.device)).loss.backward()
+        ok = _check("trocr", _trocr)
+        results["trocr"] = ok
+        if ok:
+            def _trocr_probe(bs):
+                pv  = torch.randn(bs, 3, 384, 384, device=args.device)
+                lbl = torch.ones(bs, 8, dtype=torch.long, device=args.device)
+                m_trocr(pixel_values=pv, labels=lbl).loss.backward()
+            bsizes["trocr"] = find_batch_size(_trocr_probe, args.device, max_bs=args.batch_size)
 
     # ── doctr-vitstr ──────────────────────────────────────────────────────────
     if "vitstr" in todo:
+        m_vitstr = build_vitstr(args.device)
         def _vitstr():
-            m = build_vitstr(args.device)
             imgs, labels = _ocr_mini_batch(records, (32, 128), grayscale=False)
             imgs   = imgs.to(args.device)
             target = [l.lower() for l in labels]
-            out    = m(imgs, target=target)
-            out["loss"].backward()
-        results["vitstr"] = _check("vitstr", _vitstr)
+            m_vitstr(imgs, target=target)["loss"].backward()
+        ok = _check("vitstr", _vitstr)
+        results["vitstr"] = ok
+        if ok:
+            def _vitstr_probe(bs):
+                x = torch.randn(bs, 3, 32, 128, device=args.device)
+                m_vitstr(x, target=["abc"] * bs)["loss"].backward()
+            bsizes["vitstr"] = find_batch_size(_vitstr_probe, args.device, max_bs=args.batch_size)
 
     # ── OWL-ViT ───────────────────────────────────────────────────────────────
     if "owlvit" in todo:
+        from transformers import OwlViTProcessor, OwlViTForObjectDetection
+        from torchvision.ops import box_iou
+        m_owlvit_proc = OwlViTProcessor.from_pretrained(_OWLVIT_MODEL_ID)
+        m_owlvit = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(args.device)
+        n = sum(p.numel() for p in m_owlvit.parameters())
+        print(f"  [owlvit] {n:,} params")
+        m_owlvit.train()
+        _owlvit_text = {k: v.expand(1, -1).to(args.device)
+                        for k, v in m_owlvit_proc(text=_OWLVIT_QUERY, return_tensors="pt",
+                                                   padding=True).items()}
         def _owlvit():
-            from transformers import OwlViTProcessor, OwlViTForObjectDetection
-            from torchvision.ops import box_iou
-            proc  = OwlViTProcessor.from_pretrained(_OWLVIT_MODEL_ID)
-            model = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(args.device)
-            n = sum(p.numel() for p in model.parameters())
-            print(f"  [owlvit] {n:,} params")
-            model.train()
             recs  = records[:2]
             imgs_pil = []
             gt_boxes = []
@@ -998,10 +975,9 @@ def run_sanity_checks(args, records: List[dict],
                 cx = (x1+x2)/2/W; cy = (y1+y2)/2/H
                 bw = (x2-x1)/W;   bh = (y2-y1)/H
                 gt_boxes.append(torch.tensor([cx, cy, bw, bh]))
-            pv   = proc(images=imgs_pil, return_tensors="pt")["pixel_values"].to(args.device)
-            text = proc(text=_OWLVIT_QUERY, return_tensors="pt", padding=True)
-            text = {k: v.expand(pv.shape[0], -1).to(args.device) for k, v in text.items()}
-            out  = model(pixel_values=pv, **text)
+            pv   = m_owlvit_proc(images=imgs_pil, return_tensors="pt")["pixel_values"].to(args.device)
+            text = {k: v.expand(pv.shape[0], -1) for k, v in _owlvit_text.items()}
+            out  = m_owlvit(pixel_values=pv, **text)
             pred_boxes  = out.pred_boxes
             pred_logits = out.logits.squeeze(-1)
             B, N, _ = pred_boxes.shape
@@ -1019,17 +995,41 @@ def run_sanity_checks(args, records: List[dict],
                 loss += F.l1_loss(pb[best_i], gt[b])
                 loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
             (loss / B).backward()
-        results["owlvit"] = _check("owlvit", _owlvit)
+        ok = _check("owlvit", _owlvit)
+        results["owlvit"] = ok
+        if ok:
+            def _owlvit_probe(bs):
+                pv   = torch.randn(bs, 3, 768, 768, device=args.device)
+                txt  = {k: v.expand(bs, -1) for k, v in _owlvit_text.items()}
+                out  = m_owlvit(pixel_values=pv, **txt)
+                pred_boxes  = out.pred_boxes
+                pred_logits = out.logits.squeeze(-1)
+                N = pred_boxes.shape[1]
+                gt = torch.tensor([0.5, 0.5, 0.3, 0.1], device=args.device).unsqueeze(0).expand(bs, -1)
+                loss = torch.tensor(0.0, device=args.device)
+                for b in range(bs):
+                    pb = pred_boxes[b]
+                    pb_x = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                        pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+                    gb   = gt[b:b+1]
+                    gb_x = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                        gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+                    best_i = box_iou(pb_x, gb_x).squeeze(1).argmax()
+                    lbl = torch.zeros(N, device=args.device); lbl[best_i] = 1.0
+                    loss += F.l1_loss(pb[best_i], gt[b])
+                    loss += F.binary_cross_entropy_with_logits(pred_logits[b], lbl)
+                (loss / bs).backward()
+            bsizes["owlvit"] = find_batch_size(_owlvit_probe, args.device, max_bs=args.batch_size)
 
     # ── RT-DETR ───────────────────────────────────────────────────────────────
     if "rtdetr" in todo:
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        _rtdetr_model_id = "justjuu/rtdetr-v2-license-plate-detection"
+        m_rtdetr_proc = AutoImageProcessor.from_pretrained(_rtdetr_model_id)
+        m_rtdetr = AutoModelForObjectDetection.from_pretrained(_rtdetr_model_id).to(args.device)
+        n = sum(p.numel() for p in m_rtdetr.parameters())
+        print(f"  [rtdetr] {n:,} params")
         def _rtdetr():
-            from transformers import AutoImageProcessor, AutoModelForObjectDetection
-            model_id  = "justjuu/rtdetr-v2-license-plate-detection"
-            proc  = AutoImageProcessor.from_pretrained(model_id)
-            model = AutoModelForObjectDetection.from_pretrained(model_id).to(args.device)
-            n = sum(p.numel() for p in model.parameters())
-            print(f"  [rtdetr] {n:,} params")
             recs  = records[:2]
             imgs_pil, anns = [], []
             for i, rec in enumerate(recs):
@@ -1045,33 +1045,50 @@ def run_sanity_checks(args, records: List[dict],
                     {"id": i, "image_id": i, "category_id": 0,
                      "bbox": [x1, y1, x2-x1, y2-y1],
                      "area": max(1,(x2-x1)*(y2-y1)), "iscrowd": 0}]})
-            enc    = proc(images=imgs_pil, annotations=anns, return_tensors="pt")
+            enc    = m_rtdetr_proc(images=imgs_pil, annotations=anns, return_tensors="pt")
             labels = enc.pop("labels")
             enc    = {k: v.to(args.device) for k, v in enc.items()}
             labels = [{k: v.to(args.device) for k, v in lbl.items()} for lbl in labels]
-            model(**enc, labels=labels).loss.backward()
-        results["rtdetr"] = _check("rtdetr", _rtdetr)
+            m_rtdetr(**enc, labels=labels).loss.backward()
+        ok = _check("rtdetr", _rtdetr)
+        results["rtdetr"] = ok
+        if ok:
+            def _rtdetr_probe(bs):
+                pv  = torch.randn(bs, 3, 640, 640, device=args.device)
+                lbl = [{"class_labels": torch.zeros(1, dtype=torch.long, device=args.device),
+                        "boxes": torch.tensor([[0.5, 0.5, 0.3, 0.2]], device=args.device)}
+                       for _ in range(bs)]
+                m_rtdetr(pixel_values=pv, labels=lbl).loss.backward()
+            bsizes["rtdetr"] = find_batch_size(_rtdetr_probe, args.device, max_bs=args.batch_size)
 
     # ── Faster R-CNN ──────────────────────────────────────────────────────────
     if "fasterrcnn" in todo:
+        m_fasterrcnn = build_fasterrcnn(args.device)
         def _frcnn():
-            model = build_fasterrcnn(args.device)
-            model.train()
+            m_fasterrcnn.train()
             imgs, targets = _det_mini_batch(records, n=2)
             imgs    = [i.to(args.device) for i in imgs]
             targets = [{k: v.to(args.device) for k, v in t.items()} for t in targets]
-            losses  = model(imgs, targets)
-            sum(losses.values()).backward()
-        results["fasterrcnn"] = _check("fasterrcnn", _frcnn)
+            sum(m_fasterrcnn(imgs, targets).values()).backward()
+        ok = _check("fasterrcnn", _frcnn)
+        results["fasterrcnn"] = ok
+        if ok:
+            def _frcnn_probe(bs):
+                imgs    = [torch.randn(3, 640, 640, device=args.device) for _ in range(bs)]
+                targets = [{"boxes":  torch.tensor([[10., 10., 200., 100.]], device=args.device),
+                            "labels": torch.zeros(1, dtype=torch.long, device=args.device)}
+                           for _ in range(bs)]
+                sum(m_fasterrcnn(imgs, targets).values()).backward()
+            bsizes["fasterrcnn"] = find_batch_size(_frcnn_probe, args.device, max_bs=args.batch_size)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     failed = [k for k, v in results.items() if not v]
     if failed:
         print(f"\n  ✗ Sanity check FAILED for: {failed}")
         print("  Fix the issues above before running full training.")
-        return False
-    print(f"  ✓ All {len(results)} sanity checks passed.\n")
-    return True
+        return None
+    print(f"  ✓ All {len(results)} checks passed.  Batch sizes: {bsizes}\n")
+    return bsizes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1131,55 +1148,41 @@ def main():
 
     todo = set(args.models)
 
-    # ── Sanity checks ─────────────────────────────────────────────────────────
-    if not run_sanity_checks(args, all_records, weights_dir, todo):
+    # ── Sanity checks + batch-size probe ──────────────────────────────────────
+    checked = run_sanity_checks(args, all_records, weights_dir, todo)
+    if checked is None:
         sys.exit(1)
 
     # ── OCR ───────────────────────────────────────────────────────────────────
-    if "lprnet" in todo:
+    if "lprnet" in checked:
         print("\n=== LPRNet ===")
         p = weights_dir / "lprnet_deployable_onnx_v1.1" / "us_lprnet_baseline18_deployable.onnx"
-        if not p.exists():
-            print(f"  SKIP: {p} not found")
-        else:
-            train_lprnet(build_lprnet(p, args.device), all_records, args)
+        train_lprnet(build_lprnet(p, args.device), all_records, args,
+                     batch_size=checked["lprnet"])
 
-    if "trocr" in todo:
+    if "trocr" in checked:
         print("\n=== TrOCR ===")
-        try:
-            model, proc = build_trocr(args.device)
-            train_trocr(model, proc, all_records, args)
-        except ImportError as e:
-            print(f"  SKIP: {e}")
+        model, proc = build_trocr(args.device)
+        train_trocr(model, proc, all_records, args, batch_size=checked["trocr"])
 
-    if "vitstr" in todo:
+    if "vitstr" in checked:
         print("\n=== doctr-vitstr ===")
-        try:
-            train_vitstr(build_vitstr(args.device), all_records, args)
-        except ImportError as e:
-            print(f"  SKIP: {e}")
+        train_vitstr(build_vitstr(args.device), all_records, args,
+                     batch_size=checked["vitstr"])
 
     # ── Detectors ─────────────────────────────────────────────────────────────
-    if "owlvit" in todo:
+    if "owlvit" in checked:
         print("\n=== OWL-ViT ===")
-        try:
-            train_owlvit(all_records, args)
-        except ImportError as e:
-            print(f"  SKIP: {e}")
+        train_owlvit(all_records, args, batch_size=checked["owlvit"])
 
-    if "rtdetr" in todo:
+    if "rtdetr" in checked:
         print("\n=== RT-DETR ===")
-        try:
-            train_rtdetr(all_records, args)
-        except ImportError as e:
-            print(f"  SKIP: {e}")
+        train_rtdetr(all_records, args, batch_size=checked["rtdetr"])
 
-    if "fasterrcnn" in todo:
+    if "fasterrcnn" in checked:
         print("\n=== Faster R-CNN ===")
-        try:
-            train_fasterrcnn(build_fasterrcnn(args.device), all_records, args)
-        except ImportError as e:
-            print(f"  SKIP: {e}")
+        train_fasterrcnn(build_fasterrcnn(args.device), all_records, args,
+                         batch_size=checked["fasterrcnn"])
 
     print("\nAll done.")
 
