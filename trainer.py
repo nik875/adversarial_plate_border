@@ -689,66 +689,58 @@ class AdversarialPatchTrainer:
         B    = image.shape[0]
         H, W = image.shape[2], image.shape[3]
 
-        plate  = corners[0]   # [4, 2]: TL, TR, BR, BL
-        cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
-        center = torch.tensor([cx, cy], device=self.device)
+        plates  = corners                                               # [B, 4, 2]
+        centers = plates.mean(dim=1, keepdim=True)                     # [B, 1, 2]
 
         ph, pw = self.patch_height, self.patch_width
-        src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
-                               dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 4, 2]
+        src = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
+                            dtype=torch.float32, device=self.device
+                            ).unsqueeze(0).expand(B, -1, -1)           # [B, 4, 2]
 
         if self.top_extend:
-            # Perspective-correct asymmetric border.
-            # Bottom corners: normal 1.4× scale from center.
-            # Top corners: normal scale + 1.4 × column vector (TL-BL / TR-BR),
-            # giving total column height = 2.8 × plate_h, tilt fully preserved.
-            p1_b = center + (plate[0] - center) * border_scale
-            p2_b = center + (plate[1] - center) * border_scale
-            p3_b = center + (plate[2] - center) * border_scale
-            p4_b = center + (plate[3] - center) * border_scale
-            col_left  = plate[0] - plate[3]   # TL - BL
-            col_right = plate[1] - plate[2]   # TR - BR
-            border = torch.stack([p1_b + 1.4 * col_left,
-                                   p2_b + 1.4 * col_right,
-                                   p3_b, p4_b]).unsqueeze(0)   # [1, 4, 2]
+            # Perspective-correct asymmetric border: bottom corners at normal
+            # 1.4× scale, top corners also shifted by 1.4 × column vector so
+            # total column height = 2.8 × plate_h with tilt fully preserved.
+            pts_b     = centers + (plates - centers) * border_scale    # [B, 4, 2]
+            col_left  = plates[:, 0:1, :] - plates[:, 3:4, :]         # [B, 1, 2] TL-BL
+            col_right = plates[:, 1:2, :] - plates[:, 2:3, :]         # [B, 1, 2] TR-BR
+            borders   = torch.cat([pts_b[:, 0:1, :] + 1.4 * col_left,
+                                    pts_b[:, 1:2, :] + 1.4 * col_right,
+                                    pts_b[:, 2:3, :], pts_b[:, 3:4, :]], dim=1)  # [B, 4, 2]
         else:
-            border = (center.unsqueeze(0) +
-                      (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
+            borders = centers + (plates - centers) * border_scale      # [B, 4, 2]
 
-        # Patch space → border quad in image space
-        M_border = K.get_perspective_transform(src, border)
-        # Patch space → plate quad in image space (for cut-out)
-        M_plate  = K.get_perspective_transform(src, plate.unsqueeze(0))
+        # Patch space → border/plate quads in image space
+        M_border = K.get_perspective_transform(src, borders)           # [B, 3, 3]
+        M_plate  = K.get_perspective_transform(src, plates)            # [B, 3, 3]
+
+        ones = torch.ones(B, 1, ph, pw, device=self.device)
+
+        # Compute plate mask first — used for per-image brightness (no .item() syncs).
+        warped_plate_mask = K.warp_perspective(ones, M_plate, (H, W),
+                                               mode="bilinear", padding_mode="zeros",
+                                               align_corners=True)    # [B, 1, H, W]
 
         patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
         if augment:
             patch_batch = self._augment_image(patch_batch)
 
-        # Brightness correction: scale patch to match the plate region's mean
-        # brightness, so it doesn't stand out against different lighting conditions.
+        # Brightness correction: scale each patch to match that image's plate
+        # brightness, so it doesn't stand out against different lighting.
         # During training, skipped with probability 0.2 so the model doesn't
         # learn to rely on it as a secondary activation.
-        if not (self.training and torch.rand(1, device=self.device).item() < 0.2):
+        if not (self.training and random.random() < 0.2):
             with torch.no_grad():
-                px1 = int(plate[:, 0].min().clamp(0, W - 1).item())
-                px2 = int(plate[:, 0].max().clamp(0, W).item())
-                py1 = int(plate[:, 1].min().clamp(0, H - 1).item())
-                py2 = int(plate[:, 1].max().clamp(0, H).item())
-                if px2 > px1 and py2 > py1:
-                    plate_brightness = image[0, :, py1:py2, px1:px2].mean().clamp(min=1e-6)
-                    patch_brightness = patch_batch.mean().clamp(min=1e-6)
-                    brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
-                    patch_batch = patch_batch * brightness_scale
-
-        ones = torch.ones(B, 1, ph, pw, device=self.device)
+                mask_sum    = warped_plate_mask.sum(dim=[2, 3], keepdim=True).clamp(min=1e-6)
+                plate_bright = (image * warped_plate_mask).sum(dim=[2, 3], keepdim=True) / mask_sum
+                plate_bright = plate_bright.mean(dim=1, keepdim=True).clamp(min=1e-6)  # [B,1,1,1]
+                patch_bright = patch_batch.mean(dim=[1, 2, 3], keepdim=True).clamp(min=1e-6)
+                patch_batch  = patch_batch * (plate_bright / patch_bright).clamp(0.2, 5.0)
 
         warped_patch       = K.warp_perspective(patch_batch, M_border, (H, W),
                                                 mode="bilinear", padding_mode="zeros",
                                                 align_corners=True)
         warped_border_mask = K.warp_perspective(ones, M_border, (H, W),
-                                                mode="bilinear", padding_mode="zeros",
-                                                align_corners=True)
-        warped_plate_mask  = K.warp_perspective(ones, M_plate,  (H, W),
                                                 mode="bilinear", padding_mode="zeros",
                                                 align_corners=True)
 
@@ -774,63 +766,87 @@ class AdversarialPatchTrainer:
     def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
         return augment_plate(image, self.device)
 
-    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
-                     augment: Optional[bool] = None) -> dict:
-        """Fast per-image ops: patch application + preprocessing. No model calls."""
-        _prof = self.profiling
-        if _prof: _t0 = _pt()
+    def _prepare_batch(self, raw_items: list, patch_norm: torch.Tensor,
+                       augment: Optional[bool] = None) -> list:
+        """Batch patch application + preprocessing for a list of raw items.
 
-        orig_tensor  = batch_item["orig_image"].to(self.device)   # [C, H, W]
-        orig_corners = batch_item["orig_corners"].to(self.device)  # [4, 2]
+        Groups images by spatial size so apply_patch_to_image can run as a
+        single batched warp call per size group (kornia requires uniform HxW).
+        diff_prep is still sequential (cheap; shapes differ after letterbox).
+        """
+        _prof = self.profiling
+        if _prof: _t_batch0 = _t0 = _pt()
+
+        loaded = []
+        for raw in raw_items:
+            t = raw["orig_image"].to(self.device)      # [C, H, W]
+            c = raw["orig_corners"].to(self.device)    # [4, 2]
+            _, H, W = t.shape
+            if max(H, W) > 2000:
+                t = F.interpolate(t.unsqueeze(0), scale_factor=0.5,
+                                  mode="bilinear", align_corners=False).squeeze(0)
+                c = c * 0.5
+            loaded.append((t, c, raw.get("label")))
 
         if _prof:
             self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
             _t1 = _pt()
 
-        # Halve images that are too large to keep GPU memory manageable
-        _, H, W = orig_tensor.shape
-        if max(H, W) > 2000:
-            orig_tensor  = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
-                                         mode="bilinear", align_corners=False).squeeze(0)
-            orig_corners = orig_corners * 0.5
+        aug = self.augment if augment is None else augment
 
-        patched_orig, _ = self.apply_patch_to_image(
-            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
-            patch_norm=patch_norm,
-            augment=self.augment if augment is None else augment)
+        # Group indices by image spatial size for batched warp.
+        by_size: Dict[Tuple[int, int], List[int]] = {}
+        for i, (t, _, _) in enumerate(loaded):
+            key = (int(t.shape[-2]), int(t.shape[-1]))
+            by_size.setdefault(key, []).append(i)
+
+        patched_orig = [None] * len(loaded)
+        for indices in by_size.values():
+            imgs    = torch.stack([loaded[i][0] for i in indices])       # [G, C, H, W]
+            corners = torch.stack([loaded[i][1] for i in indices])       # [G, 4, 2]
+            patched, _ = self.apply_patch_to_image(
+                imgs, corners, patch_norm=patch_norm, augment=aug)
+            for j, i in enumerate(indices):
+                patched_orig[i] = patched[j:j + 1]                       # [1, C, H, W]
 
         if _prof:
             self._prof.setdefault("prepare/patch_apply", []).append(_pt() - _t1)
             _t2 = _pt()
 
-        patched_prep_chw, new_corners = self.diff_prep(patched_orig.squeeze(0), orig_corners)
+        result = []
+        for i, (orig_tensor, orig_corners, label) in enumerate(loaded):
+            po = patched_orig[i]                                          # [1, C, H, W]
+            patched_prep_chw, new_corners = self.diff_prep(po.squeeze(0), orig_corners)
+            target_box = self.corners_to_bbox(new_corners)
+            rim_box    = self._rim_bbox(new_corners)
+            ocr_crop   = _bbox_ocr_crop(po, orig_corners, self.ocr.ocr_crop_size)
+            if self.top_extend:
+                top_region_box   = self._top_extend_region_bbox(new_corners)
+                top_corners_orig = self._top_extend_region_corners(orig_corners)
+                top_ocr_crop     = _bbox_ocr_crop(po, top_corners_orig, self.ocr.ocr_crop_size)
+            else:
+                top_region_box = None
+                top_ocr_crop   = None
+            result.append({
+                "patched_prep":   patched_prep_chw,
+                "target_box":     target_box,
+                "rim_box":        rim_box,
+                "new_corners":    new_corners,
+                "ocr_crop":       ocr_crop,
+                "top_region_box": top_region_box,
+                "top_ocr_crop":   top_ocr_crop,
+                "label":          label,
+            })
 
         if _prof:
             self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
-        target_box  = self.corners_to_bbox(new_corners)
-        rim_box     = self._rim_bbox(new_corners)
-        ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
+            self._prof.setdefault("prepare/total", []).append(_pt() - _t_batch0)
+        return result
 
-        if self.top_extend:
-            top_region_box = self._top_extend_region_bbox(new_corners)
-            # OCR crop for the top target region, using perspective-correct corners
-            # in original full-res image coords (same column-vector parameterization).
-            top_corners_orig = self._top_extend_region_corners(orig_corners)
-            top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
-                                          self.ocr.ocr_crop_size)
-        else:
-            top_region_box = None
-            top_ocr_crop   = None
-
-        return {
-            "patched_prep":  patched_prep_chw,   # [C, H_p, W_p]
-            "target_box":    target_box,          # [4]
-            "rim_box":       rim_box,             # [4]
-            "ocr_crop":      ocr_crop,            # [1, 3, H_c, W_c]
-            "top_region_box": top_region_box,     # [4] or None
-            "top_ocr_crop":   top_ocr_crop,       # [1, 3, H_c, W_c] or None
-            "label":         batch_item.get("label"),  # str or None
-        }
+    def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
+                     augment: Optional[bool] = None) -> dict:
+        """Single-image wrapper around _prepare_batch."""
+        return self._prepare_batch([batch_item], patch_norm, augment=augment)[0]
 
     def compute_loss_batch(self, items: list) -> tuple:
         """Batch the slow model-eval calls; average losses over B items.
@@ -1266,11 +1282,9 @@ class AdversarialPatchTrainer:
             with torch.no_grad():
                 rand_seed    = torch.randn_like(self.seed)
                 rand_patch   = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
-                patched_orig, _ = self.apply_patch_to_image(
-                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
-                    patch_norm=rand_patch,
-                )
-                patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners)
+                raw_item_debug = {k: v[0] for k, v in batch.items()}
+                _dbg_item    = self._prepare_one(raw_item_debug, rand_patch, augment=False)
+                patched_prep = _dbg_item["patched_prep"]
             patch_vis = (patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
             def _draw_quad(img, corners_t, color):
@@ -1379,11 +1393,9 @@ class AdversarialPatchTrainer:
             total_loss = det_real_sum = det_top_sum = ocr_real_sum = ocr_top_sum = tv_sum = 0.0
             for chunk_start in range(0, len(indices), B):
                 chunk = indices[chunk_start:chunk_start + B]
-                items = []
-                for i in chunk:
-                    item = self._prepare_one(window_raw[i], patch_leaf)
+                items = self._prepare_batch([window_raw[i] for i in chunk], patch_leaf)
+                for item in items:
                     item["_patch_norm"] = patch_leaf
-                    items.append(item)
                 loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(items)
                 # loss is mean over len(chunk); scale back to sum for grad equivalence
                 (loss * weight * len(chunk)).backward()
@@ -1439,6 +1451,7 @@ class AdversarialPatchTrainer:
         _loss_accum_t = torch.zeros(6, device=self.device)
         step = num_updates = 0
         buffer: list = []
+        buffer_raw: list = []   # accumulate raw items before batched _prepare_batch
         use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
 
@@ -1535,18 +1548,18 @@ class AdversarialPatchTrainer:
                         continue
 
                     # ── Standard (non-SAM) accumulation path ─────────────────
-                    # Use the detached patch_leaf so each backward frees its
-                    # detector/OCR graph immediately (no retain_graph).
-                    if self.profiling: _tp0 = _pt()
-                    item = self._prepare_one(raw_item, patch_leaf)
-                    if self.profiling:
-                        self._prof.setdefault("prepare/total", []).append(_pt() - _tp0)
-                    item["_patch_norm"] = patch_leaf
-                    buffer.append(item)
-
-                    if len(buffer) < B:
+                    # Collect raw items until we have a full batch of B, then
+                    # call _prepare_batch once so apply_patch_to_image runs as
+                    # a single batched warp for all B images at once.
+                    buffer_raw.append(raw_item)
+                    if len(buffer_raw) < B:
                         if self.profiling: _t_iter_end = _pt()
                         continue
+
+                    buffer = self._prepare_batch(buffer_raw, patch_leaf)
+                    buffer_raw = []
+                    for item in buffer:
+                        item["_patch_norm"] = patch_leaf
 
                     self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                     if self.profiling: _tlb0 = _pt()
@@ -1627,7 +1640,7 @@ class AdversarialPatchTrainer:
                             # Step total = dataloader + B*prepare + loss + backward + opt
                             _step_t = (
                                 self._prof["step/dataloader"][-1]
-                                + sum(self._prof["prepare/total"][-B:])
+                                + self._prof["prepare/total"][-1]
                                 + self._prof["step/loss_batch"][-1]
                                 + self._prof["step/backward"][-1]
                                 + self._prof["step/optimizer"][-1]
@@ -1644,6 +1657,7 @@ class AdversarialPatchTrainer:
                     traceback.print_exc()
                     # Reset batch state so the next iteration starts clean
                     buffer = []
+                    buffer_raw = []
                     window_raw = []
                     optimizer.zero_grad()
                     patch_with_graph = self.generate_patch(training_aug=self.training)
@@ -1685,6 +1699,12 @@ class AdversarialPatchTrainer:
                         "lr":       _opt.param_groups[0]["lr"],
                     })
             elif not use_sam:
+                # Flush any raw items not yet prepared
+                if buffer_raw:
+                    buffer = self._prepare_batch(buffer_raw, patch_leaf)
+                    buffer_raw = []
+                    for item in buffer:
+                        item["_patch_norm"] = patch_leaf
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
                     self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
@@ -1746,82 +1766,77 @@ class AdversarialPatchTrainer:
     def _print_profile_report(self, n_steps: int, B: int, update_every: int) -> None:
         """Print a formatted profiling report and clear accumulated data."""
         p = self._prof
-        # Keys in display order.  prepare/* are per-call (B calls/step); others are per-step.
         sam_mode = "step/sam_total" in p
-        sections = [
-            ("DataLoader fetch",          "step/dataloader",     False),
-            ("  prepare/to_gpu",          "prepare/to_gpu",      True),
-            ("  apply_patch_to_image",    "prepare/patch_apply", True),
-            ("  diff_prep",               "prepare/diff_prep",   True),
-            ("  ─ prepare_one total",     "prepare/total",       False),
-            ("compute_loss_batch",        "step/loss_batch",     False),
-            ("  detector forward",        "loss/detector",       False),
-            ("  pass1 loop (IoU+crops)",  "loss/pass1_loop",     False),
-            ("  OCR encode",              "loss/ocr_encode",     False),
-            ("  pass2 loop (OCR loss)",   "loss/pass2_loop",     False),
-            ("backward()",                "step/backward",       False),
-            ("optimizer step",            "step/optimizer",      False),
-            # SAM path: replaces the above with one aggregate entry
-            ("SAM step (ascent+descent)", "step/sam_total",      False),
-        ]
-        if sam_mode:
-            print(f"  [SAM mode: prepare/loss sub-timings cover both ascent+descent passes]")
 
-        # Aggregate prepare/* per-call times into per-step totals
-        for key in ("prepare/to_gpu", "prepare/patch_apply", "prepare/diff_prep"):
-            if key in p:
-                vals = p[key]
-                # Each step has B entries; sum B entries into one per-step value
-                per_step = [sum(vals[i*B:(i+1)*B]) for i in range(len(vals)//B)]
-                p[key + "_step"] = per_step   # keep original per-call for display
-        p.setdefault("prepare/total", [])
-        if "step/loss_batch" in p:
-            pass  # already per step
-
-        # Build per-step total from outer loop timing
         step_total = p.get("step/total", [])
+        step_ms    = np.array(step_total) * 1000 if step_total else np.array([1.0])
+        step_mean  = step_ms.mean()
 
-        W_label = 30
-        print("\n" + "═"*72)
-        print(f"  PROFILE REPORT  ({n_steps} steps, eval_batch_size={B}, update_every={update_every})")
-        print("═"*72)
-        print(f"  {'Section':<{W_label}} {'Mean':>9}  {'Std':>8}  {'%step':>7}")
-        print("  " + "─"*68)
-
-        def _fmt(vals, total_mean):
+        def _per_step_mean(key):
+            """Return total-per-step mean (ms) by summing all entries / n_steps."""
+            vals = p.get(key, [])
             if not vals:
-                return f"{'N/A':>9}  {'':>8}  {'':>7}"
-            a = np.array(vals) * 1000  # → ms
-            m, s = a.mean(), a.std()
-            pct = (m / (total_mean * 1000) * 100) if total_mean > 0 else 0
-            return f"{m:>8.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%"
+                return None, None
+            a = np.array(vals) * 1000
+            # Each prepare/* key may have multiple entries per step in SAM mode
+            # (one per chunk in each of ascent + descent).  Sum them per step.
+            n = n_steps if n_steps > 0 else 1
+            per_step_sum = a.sum() / n
+            # Rough std: std of individual entries scaled by entries-per-step
+            return per_step_sum, a.std() * (len(a) / n) ** 0.5
 
-        total_mean = np.mean(step_total) if step_total else 0.0
+        W = 36
+        print("\n" + "═"*76)
+        print(f"  PROFILE REPORT  ({n_steps} steps, eval_batch_size={B}, update_every={update_every})")
+        if sam_mode:
+            print(f"  [SAM mode — prepare/* and loss/* show total per optimizer step]")
+        print("═"*76)
+        print(f"  {'Section':<{W}} {'Mean/step':>10}  {'Std':>8}  {'%step':>7}")
+        print("  " + "─"*72)
 
-        for label, key, per_call in sections:
-            if per_call:
-                # Show mean per individual call, not per step
-                vals = p.get(key, [])
-                step_vals = p.get(key + "_step", [])
-                if not vals:
-                    continue
-                a = np.array(vals) * 1000
-                m, s = a.mean(), a.std()
-                # % is relative to step total using the per-step sum
-                step_a = np.array(step_vals) * 1000 if step_vals else a * B
-                pct = (step_a.mean() / (total_mean * 1000) * 100) if total_mean > 0 else 0
-                print(f"  {label:<{W_label}} {m:>8.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%  (×{B}/step)")
-            else:
-                vals = p.get(key, [])
-                if not vals:
-                    continue
-                print(f"  {label:<{W_label}} {_fmt(vals, total_mean)}")
+        def _row(label, key, ref=None, indent=0):
+            m, s = _per_step_mean(key)
+            if m is None:
+                return
+            ref_ms = ref if ref is not None else step_mean
+            pct = m / ref_ms * 100 if ref_ms > 0 else 0
+            pad = "  " * indent
+            lbl = pad + label
+            print(f"  {lbl:<{W}} {m:>9.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%")
 
-        print("  " + "─"*68)
-        if step_total:
-            a = np.array(step_total) * 1000
-            print(f"  {'Step total':<{W_label}} {a.mean():>8.1f}ms  {a.std():>7.1f}ms  {'100.0%':>7}")
-        print("═"*72 + "\n")
+        _row("DataLoader fetch",           "step/dataloader")
+
+        if sam_mode:
+            m_sam, s_sam = _per_step_mean("step/sam_total")
+            if m_sam is not None:
+                pct = m_sam / step_mean * 100 if step_mean > 0 else 0
+                print(f"  {'SAM step (ascent+descent)':<{W}} {m_sam:>9.1f}ms  {s_sam:>7.1f}ms  {pct:>6.1f}%")
+                # Sub-timings as fraction of sam_total
+                _row("_prepare_batch",              "prepare/total",       m_sam, indent=1)
+                _row("  image to GPU",              "prepare/to_gpu",      m_sam, indent=2)
+                _row("  apply_patch (batched)",     "prepare/patch_apply", m_sam, indent=2)
+                _row("  diff_prep (sequential)",    "prepare/diff_prep",   m_sam, indent=2)
+                _row("compute_loss_batch",          "step/loss_batch",     m_sam, indent=1)
+                _row("  detector forward",          "loss/detector",       m_sam, indent=2)
+                _row("  pass1 loop (IoU+crops)",    "loss/pass1_loop",     m_sam, indent=2)
+                _row("  OCR encode",                "loss/ocr_encode",     m_sam, indent=2)
+                _row("  pass2 loop (OCR loss)",     "loss/pass2_loop",     m_sam, indent=2)
+        else:
+            _row("_prepare_batch",              "prepare/total")
+            _row("  image to GPU",              "prepare/to_gpu",      step_mean, indent=1)
+            _row("  apply_patch (batched)",     "prepare/patch_apply", step_mean, indent=1)
+            _row("  diff_prep (sequential)",    "prepare/diff_prep",   step_mean, indent=1)
+            _row("compute_loss_batch",          "step/loss_batch")
+            _row("  detector forward",          "loss/detector",       step_mean, indent=1)
+            _row("  pass1 loop (IoU+crops)",    "loss/pass1_loop",     step_mean, indent=1)
+            _row("  OCR encode",                "loss/ocr_encode",     step_mean, indent=1)
+            _row("  pass2 loop (OCR loss)",     "loss/pass2_loop",     step_mean, indent=1)
+            _row("backward()",                  "step/backward")
+            _row("optimizer step",              "step/optimizer")
+
+        print("  " + "─"*72)
+        print(f"  {'Step total':<{W}} {step_ms.mean():>9.1f}ms  {step_ms.std():>7.1f}ms  {'100.0%':>7}")
+        print("═"*76 + "\n")
         self._prof.clear()
 
     def validate(self) -> float:
