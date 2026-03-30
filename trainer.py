@@ -363,6 +363,7 @@ class AdversarialPatchTrainer:
         train_detector:       bool           = False,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
+        det_loss_weight:      float          = 0.0,
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
@@ -374,6 +375,7 @@ class AdversarialPatchTrainer:
     ):
         self.training             = training
         self.tv_weight            = tv_weight
+        self.det_loss_weight      = det_loss_weight
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.sam_m                = sam_m
@@ -935,7 +937,10 @@ class AdversarialPatchTrainer:
             ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
             ocr_top_l_list.append(ocr_top_i.detach()  if ocr_top_i  is not None else _zero)
 
-        total      = torch.stack(image_losses).mean() + self.tv_weight * tv_l
+        det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
+        total      = (torch.stack(image_losses).mean()
+                      + self.tv_weight * tv_l
+                      + self.det_loss_weight * det_top_l_for_loss)
         det_real_l = torch.stack(det_real_l_list).mean()
         det_top_l  = torch.stack(det_top_l_list).mean()
         ocr_real_l = torch.stack(ocr_real_l_list).mean()
@@ -1881,6 +1886,9 @@ def main():
                         help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 10.0).")
+    parser.add_argument("--det-loss-weight", type=float, default=0.0,
+                        help="Weight for the impersonation-zone detection loss added directly "
+                             "to the total loss (default: 0.0, disabled).")
     parser.add_argument("--tv-warmup", type=float, default=0.1,
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
@@ -1946,6 +1954,7 @@ def main():
         train_detector       = args.train_detector,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
+        det_loss_weight      = args.det_loss_weight,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
