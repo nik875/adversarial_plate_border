@@ -1311,16 +1311,23 @@ def main():
     val_records   = shuffled[:n_val]
     train_records = shuffled[n_val:]
 
-    val_csv = Path(args.output_dir) / "val_split.csv"
-    val_csv.parent.mkdir(parents=True, exist_ok=True)
-    with open(val_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["image_path", "x1", "y1", "x2", "y2", "label"])
-        for r in val_records:
-            x1, y1, x2, y2 = r["bbox"]
-            w.writerow([str(r["image"]), x1, y1, x2, y2, r["label"]])
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_split(path: Path, records: list) -> None:
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["image_path", "x1", "y1", "x2", "y2", "label"])
+            for r in records:
+                x1, y1, x2, y2 = r["bbox"]
+                w.writerow([str(r["image"]), x1, y1, x2, y2, r["label"]])
+
+    val_csv   = out_dir / "val_split.csv"
+    train_csv = out_dir / "train_split.csv"
+    _write_split(val_csv,   val_records)
+    _write_split(train_csv, train_records)
     print(f"Val split:   {len(val_records):,} records → {val_csv}")
-    print(f"Train split: {len(train_records):,} records\n")
+    print(f"Train split: {len(train_records):,} records → {train_csv}\n")
 
     todo = set(args.models)
 

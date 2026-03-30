@@ -409,6 +409,76 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
     return train_loader, val_loader
 
 
+class CCPDBboxDataset(Dataset):
+    """Reads a CCPD-format CSV (image_path,x1,y1,x2,y2,label).
+
+    Returns items compatible with the trainer's use_original=True mode:
+      orig_image      CHW float32 [0,1]
+      orig_corners    [4,2] float32  (TL, TR, BR, BL of the bbox)
+      orig_homography [3,3] identity (bbox is already axis-aligned)
+      filename        str
+      label           str  ground-truth plate text
+    """
+
+    def __init__(self, csv_path: str, limit: int = 0):
+        import csv as _csv
+        self.records: list = []
+        with open(csv_path, newline="") as f:
+            for row in _csv.DictReader(f):
+                self.records.append({
+                    "image_path": row["image_path"],
+                    "x1": int(row["x1"]), "y1": int(row["y1"]),
+                    "x2": int(row["x2"]), "y2": int(row["y2"]),
+                    "label": row["label"],
+                })
+                if limit and len(self.records) >= limit:
+                    break
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> dict:
+        rec = self.records[idx]
+        img = load_image(rec["image_path"])          # HWC uint8 RGB
+        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+
+        x1, y1, x2, y2 = rec["x1"], rec["y1"], rec["x2"], rec["y2"]
+        corners = torch.tensor(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=torch.float32
+        )
+        return {
+            "orig_image":      img_t,
+            "orig_corners":    corners,
+            "orig_homography": torch.eye(3, dtype=torch.float32),
+            "filename":        rec["image_path"],
+            "label":           rec["label"],
+        }
+
+
+def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
+                            n_jobs: int = 0, pin_memory: bool = False,
+                            limit: int = 0):
+    """DataLoaders for a CCPD-format split CSV (train_split.csv / val_split.csv).
+
+    Returns (train_loader, val_loader).  The val_loader is an empty stub —
+    the split is expected to have been done externally by finetune_all_models.py.
+    """
+    ds = CCPDBboxDataset(csv_path, limit=limit)
+    print(f"Loaded {len(ds)} samples from {csv_path}")
+    train_loader = DataLoader(
+        ds, batch_size=batch_size, shuffle=True,
+        num_workers=n_jobs, pin_memory=pin_memory,
+    )
+    # Empty val loader (split already done on disk)
+    empty_ds = CCPDBboxDataset.__new__(CCPDBboxDataset)
+    empty_ds.records = []
+    val_loader = DataLoader(
+        empty_ds, batch_size=batch_size, shuffle=False,
+        num_workers=n_jobs, pin_memory=pin_memory,
+    )
+    return train_loader, val_loader
+
+
 if __name__ == '__main__':
     # Usage examples:
     # Default (load from disk each time):

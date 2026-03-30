@@ -57,7 +57,7 @@ from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend, _diff_char_positions
-from dataset import (create_dataloaders,
+from dataset import (create_dataloaders, create_ccpd_dataloaders,
                      make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
 warnings.filterwarnings("ignore")
@@ -369,6 +369,7 @@ class AdversarialPatchTrainer:
         skip_sanity:          bool           = False,
         augment:              bool           = False,
         top_extend:           bool           = False,
+        ccpd_csv:             Optional[str]  = None,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -430,34 +431,47 @@ class AdversarialPatchTrainer:
         if not skip_sanity:
             _sanity_accum = grad_accumulate if grad_accumulate is not None else 4
             _sanity_limit = eval_batch_size * _sanity_accum
-            _sanity_loader, _ = create_dataloaders(
-                csv_path,
-                transform=self.transform,
-                preload=False,
-                gpu_device=None,
-                batch_size=1,
-                n_jobs=0,
-                pin_memory=False,
-                limit=_sanity_limit,
-                use_all_for_train=True,
-                use_original=True,
-            )
+            if ccpd_csv:
+                _sanity_loader, _ = create_ccpd_dataloaders(
+                    ccpd_csv, batch_size=1, n_jobs=0, pin_memory=False,
+                    limit=_sanity_limit,
+                )
+            else:
+                _sanity_loader, _ = create_dataloaders(
+                    csv_path,
+                    transform=self.transform,
+                    preload=False,
+                    gpu_device=None,
+                    batch_size=1,
+                    n_jobs=0,
+                    pin_memory=False,
+                    limit=_sanity_limit,
+                    use_all_for_train=True,
+                    use_original=True,
+                )
             self.validate_pipeline(_sanity_loader)
             del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
-        self.train_loader, self.val_loader = create_dataloaders(
-            csv_path,
-            transform=self.transform,
-            preload=preload_images,
-            gpu_device=self.device if gpu_preload else None,
-            batch_size=1,
-            n_jobs=0 if (gpu_preload or preload_images) else num_workers,
-            pin_memory=False if (gpu_preload or preload_images) else pin_memory,
-            limit=limit,
-            use_all_for_train=use_all_for_train,
-            use_original=True,
-        )
+        if ccpd_csv:
+            self.train_loader, self.val_loader = create_ccpd_dataloaders(
+                ccpd_csv, batch_size=1,
+                n_jobs=num_workers, pin_memory=pin_memory,
+                limit=limit,
+            )
+        else:
+            self.train_loader, self.val_loader = create_dataloaders(
+                csv_path,
+                transform=self.transform,
+                preload=preload_images,
+                gpu_device=self.device if gpu_preload else None,
+                batch_size=1,
+                n_jobs=0 if (gpu_preload or preload_images) else num_workers,
+                pin_memory=False if (gpu_preload or preload_images) else pin_memory,
+                limit=limit,
+                use_all_for_train=use_all_for_train,
+                use_original=True,
+            )
 
         self.epoch_stats: list = []
 
@@ -785,6 +799,7 @@ class AdversarialPatchTrainer:
             "ocr_crop":      ocr_crop,            # [1, 3, H_c, W_c]
             "top_region_box": top_region_box,     # [4] or None
             "top_ocr_crop":   top_ocr_crop,       # [1, 3, H_c, W_c] or None
+            "label":         batch_item.get("label"),  # str or None
         }
 
     def compute_loss_batch(self, items: list) -> tuple:
@@ -821,20 +836,22 @@ class AdversarialPatchTrainer:
         top_region_boxes = [x["top_region_box"] for x in items]
         tv_l             = self.total_variation_loss(patch_norm)
 
-        # Positional OCR weights: diff chars get 4× emphasis over same chars.
-        if self.expected_plate_text:
-            diff_pos = _diff_char_positions(self.impersonation_target,
-                                            self.expected_plate_text)
-            n        = max(len(self.impersonation_target), len(self.expected_plate_text))
-            same_pos = [i for i in range(n) if i not in diff_pos]
-        else:
-            diff_pos, same_pos = None, None
-
         two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
             batched_prep, target_boxes, top_region_boxes)
 
         image_losses, det_l_list, ocr_l_list = [], [], []
         for i, ((conf_real, pred_box), (conf_top, top_pred_box)) in enumerate(two_target_results):
+            # Positional OCR weights: diff chars get 4× emphasis over same chars.
+            # Use per-item ground-truth label when available (CCPD data), else
+            # fall back to the global expected_plate_text set at init.
+            item_plate_text = items[i].get("label") or self.expected_plate_text
+            if item_plate_text:
+                diff_pos = _diff_char_positions(self.impersonation_target,
+                                                item_plate_text)
+                n        = max(len(self.impersonation_target), len(item_plate_text))
+                same_pos = [j for j in range(n) if j not in diff_pos]
+            else:
+                diff_pos, same_pos = None, None
             # ── Detection ─────────────────────────────────────────────────
             # Real plate (suppress): if detected use IoU, else use conf.
             # Both are in [0, det_loss_scale]; gradient flows either way.
@@ -886,7 +903,7 @@ class AdversarialPatchTrainer:
                         [crop], self.impersonation_target,
                         impersonation=True, diff_positions=diff_pos)[0]
                     loss_s = self.ocr.differentiable_loss_batch(
-                        [crop], self.expected_plate_text,
+                        [crop], item_plate_text,
                         impersonation=True, diff_positions=same_pos)[0]
                     ocr_parts.append((0.8 * loss_d + 0.2 * loss_s) * self.ocr_loss_scale)
                 else:
@@ -1075,7 +1092,8 @@ class AdversarialPatchTrainer:
 
             text       = ocr_result.text or ""
             conf       = ocr_result.confidence
-            is_correct = self._plate_text_matches(text, self.expected_plate_text)
+            img_plate_text = (batch.get("label", [None])[0]) or self.expected_plate_text
+            is_correct = self._plate_text_matches(text, img_plate_text)
 
             vis = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
@@ -1159,7 +1177,7 @@ class AdversarialPatchTrainer:
             }
 
             if hasattr(self.ocr, "_sequence_log_prob"):
-                target_text = self.expected_plate_text
+                target_text = img_plate_text
                 with torch.no_grad():
                     pixel_values = (crop - 0.5) / 0.5
                     log_prob     = self.ocr._sequence_log_prob(pixel_values, target_text)
@@ -1557,6 +1575,10 @@ def main():
         description="Adversarial patch trainer — ConvTranspose decoder + pluggable backends"
     )
     parser.add_argument("--csv", default="preproc_labels.csv")
+    parser.add_argument("--ccpd-train-csv", default=None,
+                        help="Path to train_split.csv written by finetune_all_models.py. "
+                             "When set, overrides --csv and uses CCPD data with per-image "
+                             "ground-truth labels.")
 
     TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-608"]
     TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
@@ -1672,6 +1694,7 @@ def main():
         skip_sanity          = args.skip_sanity,
         augment              = args.augment,
         top_extend           = args.top_extend,
+        ccpd_csv             = args.ccpd_train_csv,
     )
 
     trainer.train(
