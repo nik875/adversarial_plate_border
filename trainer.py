@@ -1533,7 +1533,6 @@ class AdversarialPatchTrainer:
         num_epochs:    int   = 100,
         learning_rate: float = 5e-4,
         lr_min:        float = 1e-5,
-        save_interval: int   = 10,
         dry_run:       bool  = False,
         tv_warmup:     float = 0.1,
     ) -> dict:
@@ -1603,8 +1602,9 @@ class AdversarialPatchTrainer:
                          else self.grad_accumulate)
         _updates_per_epoch = max(1, len(self.train_loader) //
                                  (self.eval_batch_size * _update_every))
-        total_updates    = num_epochs * _updates_per_epoch
+        total_updates     = num_epochs * _updates_per_epoch
         tv_warmup_updates = int(tv_warmup * total_updates)
+        save_every        = max(1, total_updates // 10)   # checkpoint every 10% of updates
 
         n_params = sum(p.numel() for p in self._trainable_params())
         print(f"\n{'='*60}")
@@ -1615,7 +1615,9 @@ class AdversarialPatchTrainer:
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
-        print(f"  Epochs    : {num_epochs}  |  LR warmup: {warmup_updates} updates  |  "
+        print(f"  Epochs    : {num_epochs}  |  Updates: {total_updates}  |  "
+              f"Save every: {save_every} updates (~10%)")
+        print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         if tv_warmup_updates > 0:
             print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
@@ -1633,7 +1635,8 @@ class AdversarialPatchTrainer:
         log_path = self.run_dir / "training_log.txt"
         log_file = open(log_path, "w")
 
-        global_updates = 0
+        global_updates        = 0
+        _last_save_milestone  = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
@@ -1674,7 +1677,9 @@ class AdversarialPatchTrainer:
             log_file.write(line + "\n")
             log_file.flush()
 
-            if (epoch + 1) % save_interval == 0:
+            milestone = global_updates // save_every
+            if milestone > _last_save_milestone:
+                _last_save_milestone = milestone
                 self.save_patch(epoch, "patches")
 
         log_file.close()
@@ -1825,7 +1830,6 @@ def main():
         num_epochs    = args.epochs,
         learning_rate = args.lr,
         lr_min        = args.lr_min,
-        save_interval = 10,
         dry_run       = args.dry_run,
         tv_warmup     = args.tv_warmup,
     )
