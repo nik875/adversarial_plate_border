@@ -138,6 +138,8 @@ def load_texas_records(texas_root: Path, limit: Optional[int] = None) -> List[di
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             img_path = Path(row["output_image"])
+            if not img_path.is_absolute():
+                img_path = (texas_root.parent / img_path).resolve()
             if not img_path.exists():
                 continue
             bbox = (int(row["bbox_x1"]), int(row["bbox_y1"]),
