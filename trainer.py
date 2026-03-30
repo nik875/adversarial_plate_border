@@ -1721,12 +1721,11 @@ def main():
     parser.add_argument("--eval-batch-size", type=int, default=1,
                         help="Number of images to batch for detector/OCR evaluation (default 1).")
     parser.add_argument("--sam-m", type=int, default=None,
-                        help="Enable m-SAM: number of images for the ascent step. "
-                             "Recommended: ~25%% of --grad-accumulate (e.g. 8 for accum=32). "
-                             "Disabled by default.")
+                        help="m-SAM ascent step size.  Defaults to grad-accumulate//4 "
+                             "(auto).  Set to 0 to disable m-SAM entirely.")
     parser.add_argument("--sam-rho", type=float, default=0.025,
                         help="SAM perturbation radius rho (default 0.025). "
-                             "Only used when --sam-m is set.")
+                             "Only used when m-SAM is enabled.")
     parser.add_argument("--top-extend", action="store_true",
                         help="Double patch height upward: suppress real-plate detection "
                              "and attract detection into the attacker-controlled top region.")
@@ -1760,6 +1759,13 @@ def main():
         if hasattr(ocr, "_model") and ocr._model is not None:
             print(f"[compile] Compiling OCR ({ocr.name})...")
             ocr._model = torch.compile(ocr._model)
+
+    # Auto-set sam_m to grad_accumulate//4 unless the user explicitly passed 0 (disable).
+    if args.sam_m is None:
+        args.sam_m = max(1, (args.grad_accumulate or 64) // 4)
+        print(f"[m-SAM] auto sam_m={args.sam_m}  (grad_accumulate={args.grad_accumulate or 64}//4)")
+    elif args.sam_m == 0:
+        args.sam_m = None   # None is the internal sentinel for "disabled"
 
     trainer = AdversarialPatchTrainer(
         detector             = backend,
