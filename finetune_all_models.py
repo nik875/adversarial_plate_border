@@ -32,6 +32,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import os
 import random
@@ -397,17 +398,20 @@ def train_lprnet(model: nn.Module, records: List[dict], args) -> None:
         return torch.log(out.clamp(min=1e-9)) # [B, T, C] log-probs
 
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0.0
-        for imgs, labels in tqdm(train_dl, desc=f"LPRNet {ep}", leave=False):
-            imgs = imgs.to(device)
-            lp   = _lp(imgs).permute(1, 0, 2)   # [T, B, C]
-            T, B, _ = lp.shape
-            ilen = torch.full((B,), T, dtype=torch.long)
-            tgt, tlen = encode_ctc(labels)
-            loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step(); tl += loss.item()
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(train_dl, desc=f"LPRNet {ep}", leave=False) as pbar:
+            for imgs, labels in pbar:
+                imgs = imgs.to(device)
+                lp   = _lp(imgs).permute(1, 0, 2)   # [T, B, C]
+                T, B, _ = lp.shape
+                ilen = torch.full((B,), T, dtype=torch.long)
+                tgt, tlen = encode_ctc(labels)
+                loss = F.ctc_loss(lp, tgt, ilen, tlen, blank=BLANK_IDX, zero_infinity=True)
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                opt.step(); tl += loss.item()
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
 
         model.eval(); vl = 0.0
@@ -491,13 +495,16 @@ def train_trocr(model, processor, records: List[dict], args) -> None:
     best  = float("inf")
 
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0.0
-        for pv, ids in tqdm(train_dl, desc=f"TrOCR {ep}", leave=False):
-            pv, ids = pv.to(device), ids.to(device)
-            loss = model(pixel_values=pv, labels=ids).loss
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); tl += loss.item()
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(train_dl, desc=f"TrOCR {ep}", leave=False) as pbar:
+            for pv, ids in pbar:
+                pv, ids = pv.to(device), ids.to(device)
+                loss = model(pixel_values=pv, labels=ids).loss
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step(); tl += loss.item()
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
 
         model.eval(); vl = 0.0
@@ -554,15 +561,18 @@ def train_vitstr(model: nn.Module, records: List[dict], args) -> None:
     best  = float("inf")
 
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0; n = 0
-        for imgs, labels in tqdm(train_dl, desc=f"ViTSTR {ep}", leave=False):
-            imgs   = imgs.to(device)
-            target = [l.lower() for l in labels]
-            out    = model(imgs, target=target)
-            loss   = out["loss"]
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step(); tl += loss.item(); n += 1
+        model.train(); tl = 0; n = 0; window = collections.deque(maxlen=100)
+        with tqdm(train_dl, desc=f"ViTSTR {ep}", leave=False) as pbar:
+            for imgs, labels in pbar:
+                imgs   = imgs.to(device)
+                target = [l.lower() for l in labels]
+                out    = model(imgs, target=target)
+                loss   = out["loss"]
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                opt.step(); tl += loss.item(); n += 1
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
 
         model.eval(); vl = 0; m = 0
@@ -639,16 +649,19 @@ def train_rtdetr(records: List[dict], args) -> None:
     out_dir = Path(args.output_dir) / "rtdetr_finetuned"
 
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0.0
-        for enc in tqdm(dl, desc=f"RT-DETR {ep}", leave=False):
-            labels = enc.pop("labels", None)
-            enc    = {k: v.to(device) for k, v in enc.items()}
-            if labels is not None:
-                labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
-            loss = model(**enc, labels=labels).loss
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-            opt.step(); tl += loss.item()
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(dl, desc=f"RT-DETR {ep}", leave=False) as pbar:
+            for enc in pbar:
+                labels = enc.pop("labels", None)
+                enc    = {k: v.to(device) for k, v in enc.items()}
+                if labels is not None:
+                    labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
+                loss = model(**enc, labels=labels).loss
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                opt.step(); tl += loss.item()
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  RT-DETR ep{ep}: train={avg:.4f}")
@@ -740,47 +753,40 @@ def train_owlvit(records: List[dict], args) -> None:
     best  = float("inf")
     out_dir = Path(args.output_dir) / "owlvit_finetuned"
 
+    from torchvision.ops import box_iou
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0.0
-        for pixel_values, gt_boxes in tqdm(dl, desc=f"OWL-ViT {ep}", leave=False):
-            pixel_values = pixel_values.to(device)
-            gt_boxes     = gt_boxes.to(device)          # [B, 4] normalized cxcywh
-
-            # Expand text inputs to match batch size
-            batch_text = {k: v.expand(pixel_values.shape[0], -1)
-                          for k, v in text_inputs.items()}
-            out = model(pixel_values=pixel_values, **batch_text)
-
-            # pred_boxes: [B, num_patches, 4] normalized cxcywh
-            pred_boxes  = out.pred_boxes                 # [B, N, 4]
-            pred_logits = out.logits.squeeze(-1)         # [B, N]
-
-            # Match each image to the single highest-IoU predicted box
-            B, N, _ = pred_boxes.shape
-            box_loss = torch.tensor(0.0, device=device)
-            cls_loss = torch.tensor(0.0, device=device)
-            for b in range(B):
-                pb  = pred_boxes[b]                      # [N, 4]
-                gb  = gt_boxes[b].unsqueeze(0)           # [1, 4]
-                # IoU in cxcywh space (convert to xyxy for torchvision)
-                pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
-                                       pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
-                gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
-                                       gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
-                from torchvision.ops import box_iou
-                iou     = box_iou(pb_xyxy, gb_xyxy).squeeze(1)  # [N]
-                best_i  = iou.argmax()
-                box_loss += F.l1_loss(pb[best_i], gt_boxes[b])
-                # Focal-style binary CE: positive for best match, neg for rest
-                lbl = torch.zeros(N, device=device)
-                lbl[best_i] = 1.0
-                cls_loss += F.binary_cross_entropy_with_logits(
-                    pred_logits[b], lbl, pos_weight=torch.tensor(N - 1.0, device=device))
-
-            loss = (box_loss + cls_loss) / B
-            opt.zero_grad(); loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.1)
-            opt.step(); tl += loss.item()
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(dl, desc=f"OWL-ViT {ep}", leave=False) as pbar:
+            for pixel_values, gt_boxes in pbar:
+                pixel_values = pixel_values.to(device)
+                gt_boxes     = gt_boxes.to(device)
+                batch_text   = {k: v.expand(pixel_values.shape[0], -1)
+                                for k, v in text_inputs.items()}
+                out = model(pixel_values=pixel_values, **batch_text)
+                pred_boxes  = out.pred_boxes
+                pred_logits = out.logits.squeeze(-1)
+                B, N, _ = pred_boxes.shape
+                box_loss = torch.tensor(0.0, device=device)
+                cls_loss = torch.tensor(0.0, device=device)
+                for b in range(B):
+                    pb  = pred_boxes[b]
+                    gb  = gt_boxes[b].unsqueeze(0)
+                    pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                           pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+                    gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                           gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+                    iou    = box_iou(pb_xyxy, gb_xyxy).squeeze(1)
+                    best_i = iou.argmax()
+                    box_loss += F.l1_loss(pb[best_i], gt_boxes[b])
+                    lbl = torch.zeros(N, device=device); lbl[best_i] = 1.0
+                    cls_loss += F.binary_cross_entropy_with_logits(
+                        pred_logits[b], lbl, pos_weight=torch.tensor(N - 1.0, device=device))
+                loss = (box_loss + cls_loss) / B
+                opt.zero_grad(); loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                opt.step(); tl += loss.item()
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  OWL-ViT ep{ep}: train={avg:.4f}")
@@ -831,14 +837,17 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args) -> None:
     best   = float("inf")
 
     for ep in range(1, args.epochs + 1):
-        model.train(); tl = 0.0
-        for imgs, targets in tqdm(dl, desc=f"FasterRCNN {ep}", leave=False):
-            imgs    = [i.to(device) for i in imgs]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            losses  = model(imgs, targets)
-            loss    = sum(losses.values())
-            opt.zero_grad(); loss.backward(); opt.step()
-            tl += loss.item()
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(dl, desc=f"FasterRCNN {ep}", leave=False) as pbar:
+            for imgs, targets in pbar:
+                imgs    = [i.to(device) for i in imgs]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                losses  = model(imgs, targets)
+                loss    = sum(losses.values())
+                opt.zero_grad(); loss.backward(); opt.step()
+                tl += loss.item()
+                window.append(loss.item())
+                pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}")
         sched.step()
         avg = tl / max(1, len(dl))
         print(f"  FasterRCNN ep{ep}: train={avg:.4f}")
