@@ -801,6 +801,8 @@ def run_sanity_checks(args, records: List[dict],
                         "microsoft/trocr-small-printed").to(args.device)
             model.config.decoder_start_token_id = proc.tokenizer.bos_token_id
             model.config.pad_token_id           = proc.tokenizer.pad_token_id
+            n = sum(p.numel() for p in model.parameters())
+            print(f"  [trocr] {n:,} params")
             recs  = records[:4]
             imgs  = []
             labels = []
@@ -841,6 +843,8 @@ def run_sanity_checks(args, records: List[dict],
             from torchvision.ops import box_iou
             proc  = OwlViTProcessor.from_pretrained(_OWLVIT_MODEL_ID)
             model = OwlViTForObjectDetection.from_pretrained(_OWLVIT_MODEL_ID).to(args.device)
+            n = sum(p.numel() for p in model.parameters())
+            print(f"  [owlvit] {n:,} params")
             model.train()
             recs  = records[:2]
             imgs_pil = []
@@ -887,6 +891,8 @@ def run_sanity_checks(args, records: List[dict],
             model_id  = "justjuu/rtdetr-v2-license-plate-detection"
             proc  = AutoImageProcessor.from_pretrained(model_id)
             model = AutoModelForObjectDetection.from_pretrained(model_id).to(args.device)
+            n = sum(p.numel() for p in model.parameters())
+            print(f"  [rtdetr] {n:,} params")
             recs  = records[:2]
             imgs_pil, anns = [], []
             for i, rec in enumerate(recs):
