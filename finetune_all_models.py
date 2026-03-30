@@ -16,7 +16,11 @@ Standard alphabet (37 classes):
     '0'-'9' → indices 1-10
     'A'-'Z' → indices 11-36
 
-CCT (fast-plate-ocr ONNX) is not fine-tunable via this script.
+CCT-S:      fine-tuned end-to-end via CCTOCRTorch (cross-entropy at 9 slots)
+
+Detector additions
+------------------
+YOLO 608:   YOLOv9-s-608 from fast-alpr / open-image-models, manual v8DetectionLoss loop
 
 Usage
 -----
@@ -24,7 +28,7 @@ Usage
         --data-root /path/to/dir \\        # must contain CCPD2019/ and optionally CCPD2019_TEXAS/
         [--output-dir  weights/finetuned] \\
         [--weights-dir weights] \\
-        [--models crnn lprnet trocr vitstr yolov8 yolov10 rtdetr fasterrcnn] \\
+        [--models crnn lprnet trocr vitstr yolov8 yolov10 rtdetr fasterrcnn yolo608 cct_s] \\
         [--epochs 10] [--batch-size 32] [--lr 1e-4] [--device cuda] \\
         [--limit 50000]
 """
@@ -61,6 +65,9 @@ from tqdm import tqdm
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"   # 36 printable chars
 BLANK_IDX = 0        # CTC blank / sequence padding
 NUM_CLASSES = 37     # len(CHARS) + 1
+
+_CCT_BLANK = 36      # CCT blank token (chars are 0-indexed 0-35)
+_CCT_SLOTS = 9       # CCT output positions
 
 
 def char_to_idx(c: str) -> int:
@@ -162,6 +169,20 @@ def encode_ctc(labels: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         lengths.append(len(ids))
     return (torch.tensor(targets, dtype=torch.long),
             torch.tensor(lengths, dtype=torch.long))
+
+
+def encode_cct_targets(labels: List[str]) -> torch.Tensor:
+    """
+    Encode label strings to [N, 9] int64 targets for CCT cross-entropy.
+    CCT uses 0-indexed chars (0-35) and blank=36.
+    Labels longer than 9 chars are truncated; shorter are right-padded with blank.
+    """
+    tgts = []
+    for lbl in labels:
+        ids = [CHARS.index(c) for c in lbl if c in CHARS][:_CCT_SLOTS]
+        ids += [_CCT_BLANK] * (_CCT_SLOTS - len(ids))
+        tgts.append(ids)
+    return torch.tensor(tgts, dtype=torch.long)   # [N, 9]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +332,31 @@ class DetectionDataset(Dataset):
 def _collate_det(batch):
     imgs, targets = zip(*batch)
     return list(imgs), list(targets)
+
+
+class CCTOCRDataset(Dataset):
+    """Crops bbox, resizes to (64, 128) RGB, returns ([64, 128, 3] uint8, label_str)."""
+
+    def __init__(self, records: List[dict]):
+        self.records = records
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        rec = self.records[idx]
+        x1, y1, x2, y2 = rec["bbox"]
+        try:
+            img = cv2.imread(str(rec["image"]))
+            if img is None:
+                raise OSError("imread returned None")
+            crop = img[max(0, y1):max(y1+1, y2), max(0, x1):max(x1+1, x2)]
+            crop = cv2.resize(crop, (128, 64), interpolation=cv2.INTER_LINEAR)
+            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            t = torch.from_numpy(crop)   # [64, 128, 3] uint8
+        except Exception:
+            t = torch.zeros(64, 128, 3, dtype=torch.uint8)
+        return t, rec["label"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -759,6 +805,12 @@ def train_rtdetr(train_records: List[dict], val_records: List[dict], args, batch
 _OWLVIT_MODEL_ID = "google/owlvit-base-patch32"
 _OWLVIT_QUERY    = ["a license plate"]
 
+_YOLO608_ONNX_PATH = ("~/.cache/open-image-models/"
+                       "yolo-v9-s-608-license-plate-end2end/"
+                       "yolo-v9-s-608-license-plates-end2end.onnx")
+_CCT_S_ONNX_PATH = ("~/.cache/fast-plate-ocr/"
+                     "cct-s-v1-global-model/cct_s_v1_global.onnx")
+
 
 def train_owlvit(train_records: List[dict], val_records: List[dict], args, batch_size: int) -> None:
     from transformers import OwlViTProcessor, OwlViTForObjectDetection
@@ -961,6 +1013,198 @@ def train_fasterrcnn(model: nn.Module, train_records: List[dict], val_records: L
             out  = Path(args.output_dir) / "fasterrcnn_finetuned.pt"
             torch.save(model.state_dict(), out)
             print(f"    → {out}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YOLOv9-s-608  (fast-alpr / open-image-models)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_yolo608(onnx_path: Path, device: str):
+    from types import SimpleNamespace
+    from yolov9_torch import load_yolov9s_from_onnx
+
+    model = load_yolov9s_from_onnx(str(onnx_path), nc=1)
+    # Set loss hyper-params required by v8DetectionLoss
+    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[yolo608] Loaded YOLOv9-s-608  |  {n:,} params")
+    return model.to(device).train()
+
+
+def train_yolo608(model, train_records: List[dict], val_records: List[dict],
+                  args, batch_size: int) -> None:
+    from ultralytics.utils.loss import v8DetectionLoss
+
+    device = args.device
+    bs = batch_size
+
+    class _DS(Dataset):
+        def __init__(self, recs):
+            self.recs = recs
+        def __len__(self):
+            return len(self.recs)
+        def __getitem__(self, i):
+            rec = self.recs[i]
+            x1, y1, x2, y2 = rec["bbox"]
+            try:
+                img = cv2.imread(str(rec["image"]))
+                if img is None:
+                    raise OSError()
+                oh, ow = img.shape[:2]
+                img = cv2.resize(img, (608, 608))
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                t = torch.from_numpy(img.astype(np.float32) / 255.0).permute(2, 0, 1)
+                sx, sy = 608 / ow, 608 / oh
+                cx = ((x1 + x2) / 2 * sx) / 608
+                cy = ((y1 + y2) / 2 * sy) / 608
+                bw = (x2 - x1) * sx / 608
+                bh = (y2 - y1) * sy / 608
+                box = torch.tensor([cx, cy, bw, bh], dtype=torch.float32)
+            except Exception:
+                t   = torch.zeros(3, 608, 608)
+                box = torch.tensor([0.5, 0.5, 0.3, 0.2], dtype=torch.float32)
+            return t, box
+
+    def _col(batch):
+        imgs, boxes = zip(*batch)
+        B = len(imgs)
+        return {
+            "img":       torch.stack(imgs),
+            "cls":       torch.zeros(B, dtype=torch.float32),
+            "bboxes":    torch.stack(boxes),
+            "batch_idx": torch.arange(B, dtype=torch.float32),
+        }
+
+    kw = dict(collate_fn=_col, num_workers=args.workers, pin_memory=pin_memory(device))
+    train_dl = DataLoader(_DS(train_records), bs, shuffle=True,  drop_last=True, **kw)
+    val_dl   = DataLoader(_DS(val_records),   bs, shuffle=False, **kw)
+
+    criterion = v8DetectionLoss(model)
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
+    best  = float("inf"); no_improve = 0
+    out_path = Path(args.output_dir) / "yolo608_finetuned.pt"
+
+    for ep in range(1, args.epochs + 1):
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(train_dl, desc=f"YOLO608 {ep}", leave=False) as pbar:
+            for batch in pbar:
+                try:
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    preds = model(batch["img"])
+                    loss, _ = criterion(preds, batch)
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                     lr=f"{sched.get_last_lr()[0]:.2e}")
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
+
+        if args.epochs == 1:
+            print(f"  YOLO608 ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
+            continue
+        # Val loss: model must be in train mode for v8DetectionLoss
+        vl = 0.0
+        with torch.no_grad():
+            for batch in val_dl:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                model.train()
+                loss, _ = criterion(model(batch["img"]), batch)
+                vl += loss.item()
+                model.eval()
+        vl /= max(1, len(val_dl))
+        print(f"  YOLO608 ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
+        if vl < best:
+            best = vl; no_improve = 0
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CCT-S  (fast-plate-ocr, via CCTOCRTorch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_cct_s(onnx_path: Path, device: str) -> nn.Module:
+    from cct_ocr_torch import CCTOCRTorch
+    model = CCTOCRTorch.from_onnx(str(onnx_path))
+    n = sum(p.numel() for p in model.parameters())
+    print(f"[cct_s] Loaded CCT-S-V1-Global  |  {n:,} params")
+    return model.to(device).train()
+
+
+def train_cct_s(model: nn.Module, train_records: List[dict], val_records: List[dict],
+                args, batch_size: int) -> None:
+    device = args.device
+    bs = batch_size
+
+    train_ds = CCTOCRDataset(train_records)
+    val_ds   = CCTOCRDataset(val_records)
+
+    pm = pin_memory(device)
+    kw = dict(num_workers=args.workers, pin_memory=pm)
+    train_dl = DataLoader(train_ds, bs, shuffle=True,  drop_last=True,  **kw)
+    val_dl   = DataLoader(val_ds,   bs, shuffle=False, **kw)
+
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
+    best  = float("inf"); no_improve = 0
+    out_path = Path(args.output_dir) / "cct_s_finetuned.pt"
+
+    def _loss(imgs: torch.Tensor, labels: List[str]) -> torch.Tensor:
+        probs = model(imgs)                         # [B, 9, 37] softmax
+        log_p = torch.log(probs.clamp(min=1e-9))   # [B, 9, 37]
+        tgt   = encode_cct_targets(labels).to(device)  # [B, 9]
+        return F.nll_loss(log_p.reshape(-1, NUM_CLASSES), tgt.reshape(-1))
+
+    for ep in range(1, args.epochs + 1):
+        model.train(); tl = 0.0; window = collections.deque(maxlen=100)
+        with tqdm(train_dl, desc=f"CCT-S {ep}", leave=False) as pbar:
+            for imgs, labels in pbar:
+                try:
+                    imgs = imgs.to(device)
+                    loss = _loss(imgs, labels)
+                    opt.zero_grad(); loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    opt.step(); sched.step(); tl += loss.item()
+                    window.append(loss.item())
+                    pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
+                                     lr=f"{sched.get_last_lr()[0]:.2e}")
+                except Exception:
+                    print("\n[WARNING] Skipping batch due to error:")
+                    traceback.print_exc()
+                    opt.zero_grad()
+
+        if args.epochs == 1:
+            print(f"  CCT-S ep{ep}: train={tl/max(1,len(train_dl)):.4f}  (val skipped, epochs=1)")
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
+            continue
+        model.eval(); vl = 0.0
+        with torch.no_grad():
+            for imgs, labels in val_dl:
+                vl += _loss(imgs.to(device), labels).item()
+        vl /= max(1, len(val_dl))
+        print(f"  CCT-S ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
+        if vl < best:
+            best = vl; no_improve = 0
+            torch.save(model.state_dict(), out_path)
+            print(f"    → {out_path}")
         else:
             no_improve += 1
             if no_improve > 1:
@@ -1246,6 +1490,77 @@ def run_sanity_checks(args, records: List[dict],
             bsizes["fasterrcnn"] = find_batch_size(_frcnn_probe, args.device, max_bs=args.batch_size)
             _record_estimate("fasterrcnn", _frcnn_probe, bsizes["fasterrcnn"], "fasterrcnn")
 
+    # ── YOLO 608 ──────────────────────────────────────────────────────────────
+    if "yolo608" in todo:
+        from ultralytics.utils.loss import v8DetectionLoss
+        onnx_yolo = Path(_YOLO608_ONNX_PATH).expanduser()
+        if not onnx_yolo.exists():
+            print(f"  [SKIP] yolo608: ONNX not found at {onnx_yolo} — will download at training time")
+        else:
+            m_yolo608 = build_yolo608(onnx_yolo, args.device)
+            _yolo608_criterion = v8DetectionLoss(m_yolo608)
+            def _yolo608_check():
+                m_yolo608.train()
+                mini = _det_mini_batch(records, n=2)
+                imgs = [i.to(args.device) for i in mini[0]]
+                x = torch.stack(imgs)
+                x = F.interpolate(x, size=(608, 608), mode="bilinear", align_corners=False)
+                B = x.shape[0]
+                batch = {
+                    "img":       x,
+                    "cls":       torch.zeros(B, dtype=torch.float32, device=args.device),
+                    "bboxes":    torch.tensor([[0.5, 0.5, 0.3, 0.2]] * B,
+                                              dtype=torch.float32, device=args.device),
+                    "batch_idx": torch.arange(B, dtype=torch.float32, device=args.device),
+                }
+                loss, _ = _yolo608_criterion(m_yolo608(x), batch)
+                loss.backward()
+            ok = _check("yolo608", _yolo608_check)
+            results["yolo608"] = ok
+            if ok:
+                def _yolo608_probe(bs):
+                    m_yolo608.train()
+                    x = torch.randn(bs, 3, 608, 608, device=args.device)
+                    batch = {
+                        "img":       x,
+                        "cls":       torch.zeros(bs, dtype=torch.float32, device=args.device),
+                        "bboxes":    torch.tensor([[0.5, 0.5, 0.3, 0.2]] * bs,
+                                                  dtype=torch.float32, device=args.device),
+                        "batch_idx": torch.arange(bs, dtype=torch.float32, device=args.device),
+                    }
+                    loss, _ = _yolo608_criterion(m_yolo608(x), batch)
+                    loss.backward()
+                bsizes["yolo608"] = find_batch_size(_yolo608_probe, args.device, max_bs=args.batch_size)
+                _record_estimate("yolo608", _yolo608_probe, bsizes["yolo608"], "yolo608")
+
+    # ── CCT-S ─────────────────────────────────────────────────────────────────
+    if "cct_s" in todo:
+        onnx_cct = Path(_CCT_S_ONNX_PATH).expanduser()
+        if not onnx_cct.exists():
+            print(f"  [SKIP] cct_s: ONNX not found at {onnx_cct}")
+        else:
+            m_cct_s = build_cct_s(onnx_cct, args.device)
+            def _cct_check():
+                imgs, labels = _ocr_mini_batch(records, (64, 128), grayscale=False)
+                # CCTOCRDataset returns uint8 NHWC — simulate it from float NCHW
+                imgs_nhwc = (imgs * 255).byte().permute(0, 2, 3, 1).to(args.device)
+                probs = m_cct_s(imgs_nhwc)        # [B, 9, 37]
+                log_p = torch.log(probs.clamp(min=1e-9))
+                tgt   = encode_cct_targets(labels).to(args.device)
+                F.nll_loss(log_p.reshape(-1, NUM_CLASSES), tgt.reshape(-1)).backward()
+            ok = _check("cct_s", _cct_check)
+            results["cct_s"] = ok
+            if ok:
+                def _cct_probe(bs):
+                    x = torch.randint(0, 256, (bs, 64, 128, 3),
+                                      dtype=torch.uint8, device=args.device)
+                    probs = m_cct_s(x)
+                    log_p = torch.log(probs.clamp(min=1e-9))
+                    tgt = torch.zeros(bs, _CCT_SLOTS, dtype=torch.long, device=args.device)
+                    F.nll_loss(log_p.reshape(-1, NUM_CLASSES), tgt.reshape(-1)).backward()
+                bsizes["cct_s"] = find_batch_size(_cct_probe, args.device, max_bs=args.batch_size)
+                _record_estimate("cct_s", _cct_probe, bsizes["cct_s"], "cct_s")
+
     # ── Summary ───────────────────────────────────────────────────────────────
     failed = [k for k, v in results.items() if not v]
     if failed:
@@ -1274,7 +1589,8 @@ def run_sanity_checks(args, records: List[dict],
 # ─────────────────────────────────────────────────────────────────────────────
 
 ALL_MODELS = ["lprnet", "trocr", "vitstr",
-              "owlvit", "rtdetr", "fasterrcnn"]
+              "owlvit", "rtdetr", "fasterrcnn",
+              "yolo608", "cct_s"]
 
 
 def parse_args():
@@ -1397,6 +1713,24 @@ def main():
         print("\n=== doctr-vitstr ===")
         train_vitstr(build_vitstr(args.device), train_records, val_records, args,
                      batch_size=checked["vitstr"])
+
+    if "yolo608" in checked:
+        print("\n=== YOLO 608 ===")
+        onnx_yolo = Path(_YOLO608_ONNX_PATH).expanduser()
+        if not onnx_yolo.exists():
+            print(f"  [SKIP] ONNX not found: {onnx_yolo}")
+        else:
+            train_yolo608(build_yolo608(onnx_yolo, args.device), train_records, val_records,
+                          args, batch_size=checked["yolo608"])
+
+    if "cct_s" in checked:
+        print("\n=== CCT-S ===")
+        onnx_cct = Path(_CCT_S_ONNX_PATH).expanduser()
+        if not onnx_cct.exists():
+            print(f"  [SKIP] ONNX not found: {onnx_cct}")
+        else:
+            train_cct_s(build_cct_s(onnx_cct, args.device), train_records, val_records,
+                        args, batch_size=checked["cct_s"])
 
     print("\nAll done.")
 
