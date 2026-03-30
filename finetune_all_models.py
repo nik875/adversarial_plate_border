@@ -299,12 +299,23 @@ def build_crnn(weights_path: Path, device: str) -> nn.Module:
     backend.load()
     model = backend._model
 
-    old = model.rnn[1].embedding
-    n_in = old.in_features
-    new  = nn.Linear(n_in, NUM_CLASSES)
-    nn.init.xavier_uniform_(new.weight)
-    nn.init.zeros_(new.bias)
-    model.rnn[1].embedding = new
+    # Two CRNN variants ship different head locations.
+    if hasattr(model, "dense"):
+        # _CRNNMapToSeq: head is model.dense
+        old = model.dense
+        n_in = old.in_features
+        new  = nn.Linear(n_in, NUM_CLASSES)
+        nn.init.xavier_uniform_(new.weight)
+        nn.init.zeros_(new.bias)
+        model.dense = new
+    else:
+        # _CRNN (GitYCC): head is model.rnn[1].embedding
+        old = model.rnn[1].embedding
+        n_in = old.in_features
+        new  = nn.Linear(n_in, NUM_CLASSES)
+        nn.init.xavier_uniform_(new.weight)
+        nn.init.zeros_(new.bias)
+        model.rnn[1].embedding = new
     print(f"[crnn] head: Linear({n_in},{old.out_features}) → Linear({n_in},{NUM_CLASSES})")
     return model.to(device)
 
