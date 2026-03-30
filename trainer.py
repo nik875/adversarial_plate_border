@@ -1374,10 +1374,13 @@ class AdversarialPatchTrainer:
                     window_raw = []
                     step       += update_every
                     num_updates += 1
-                    total_loss += loss_t
-                    total_det  += det_t
-                    total_ocr  += ocr_t
-                    total_tv   += tv_t
+                    # _msam_step sums losses over all M=B*update_every items
+                    # individually; divide by B so the scale matches the
+                    # non-SAM path (which averages over B inside compute_loss_batch).
+                    total_loss += loss_t / B
+                    total_det  += det_t  / B
+                    total_ocr  += ocr_t  / B
+                    total_tv   += tv_t   / B
                     if self.device == "cuda":
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
@@ -1447,10 +1450,10 @@ class AdversarialPatchTrainer:
                     optimizer, window_raw[:n_complete], B, n_complete // B)
                 step       += n_complete // B
                 num_updates += 1
-                total_loss += loss_t
-                total_det  += det_t
-                total_ocr  += ocr_t
-                total_tv   += tv_t
+                total_loss += loss_t / B
+                total_det  += det_t  / B
+                total_ocr  += ocr_t  / B
+                total_tv   += tv_t   / B
             elif not use_sam:
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
