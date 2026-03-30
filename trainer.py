@@ -910,10 +910,12 @@ class AdversarialPatchTrainer:
                                   [top_crop], self.impersonation_target,
                                   impersonation=True)[0]                              if top_crop is not None else None)
 
-            # Weights: proportional to each detection term's magnitude (detached —
-            # weights are fixed scalars; gradients flow only through ocr values).
-            det_real_mag = det_real_i.detach().clamp(min=0)
-            det_top_mag  = (-det_top_i).detach().clamp(min=0)
+            # Weights: proportional to each detection term's magnitude.
+            # Not detached: gradients flow through the weights so that reducing
+            # det_top_mag (failing to attract detection) increases w_real and thus
+            # the weighted-average OCR loss, penalising poor top-region detection.
+            det_real_mag = det_real_i.clamp(min=0)
+            det_top_mag  = (-det_top_i).clamp(min=0)
             total_mag    = det_real_mag + det_top_mag + 1e-6
 
             if ocr_real_i is not None and ocr_top_i is not None:
