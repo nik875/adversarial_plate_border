@@ -1342,7 +1342,9 @@ class AdversarialPatchTrainer:
 
         return total_loss, det_sum, ocr_sum, tv_sum
 
-    def train_epoch(self, optimizer, epoch: int, scheduler=None) -> Tuple[float, float, float, float]:
+    def train_epoch(self, optimizer, epoch: int, scheduler=None,
+                    update_log: Optional[list] = None,
+                    update_offset: int = 0) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -1352,6 +1354,8 @@ class AdversarialPatchTrainer:
                         else self.grad_accumulate)
         total_loss = accum_loss = 0.0
         total_det  = total_ocr  = total_tv = 0.0
+        # Per-update accumulators (reset after each optimizer step, like accum_loss)
+        _upd_det = _upd_ocr = _upd_tv = 0.0
         step = num_updates = 0
         buffer: list = []
         use_sam = isinstance(optimizer, SAM)
@@ -1394,6 +1398,17 @@ class AdversarialPatchTrainer:
                         total_tv   += tv_t   / B
                         if scheduler is not None:
                             scheduler.step()
+                        if update_log is not None:
+                            _opt = optimizer.base_optimizer
+                            update_log.append({
+                                "global_update": update_offset + num_updates,
+                                "epoch": epoch + 1,
+                                "loss":  loss_t / B / update_every,
+                                "det":   det_t  / B / update_every,
+                                "ocr":   ocr_t  / B / update_every,
+                                "tv":    tv_t   / B / update_every,
+                                "lr":    _opt.param_groups[0]["lr"],
+                            })
                         pbar.update(1)
                         pbar.set_postfix({
                             "loss": f"{total_loss/step:.4f}",
@@ -1425,6 +1440,9 @@ class AdversarialPatchTrainer:
                     total_det  += det_l.item()
                     total_ocr  += ocr_l.item()
                     total_tv   += tv_l.item()
+                    _upd_det   += det_l.item()
+                    _upd_ocr   += ocr_l.item()
+                    _upd_tv    += tv_l.item()
                     del loss, scaled_loss
 
                     if step % update_every == 0:
@@ -1437,7 +1455,17 @@ class AdversarialPatchTrainer:
                             scheduler.step()
                         total_loss  += accum_loss
                         num_updates += 1
-                        accum_loss   = 0.0
+                        if update_log is not None:
+                            update_log.append({
+                                "global_update": update_offset + num_updates,
+                                "epoch": epoch + 1,
+                                "loss":  accum_loss / update_every,
+                                "det":   _upd_det   / update_every,
+                                "ocr":   _upd_ocr   / update_every,
+                                "tv":    _upd_tv    / update_every,
+                                "lr":    optimizer.param_groups[0]["lr"],
+                            })
+                        accum_loss = _upd_det = _upd_ocr = _upd_tv = 0.0
                         pbar.update(1)
                         pbar.set_postfix({
                             "loss": f"{total_loss/step:.4f}",
@@ -1471,6 +1499,18 @@ class AdversarialPatchTrainer:
                 total_det  += det_t  / B
                 total_ocr  += ocr_t  / B
                 total_tv   += tv_t   / B
+                if update_log is not None:
+                    _n = n_complete // B
+                    _opt = optimizer.base_optimizer
+                    update_log.append({
+                        "global_update": update_offset + num_updates,
+                        "epoch": epoch + 1,
+                        "loss":  loss_t / B / _n,
+                        "det":   det_t  / B / _n,
+                        "ocr":   ocr_t  / B / _n,
+                        "tv":    tv_t   / B / _n,
+                        "lr":    _opt.param_groups[0]["lr"],
+                    })
             elif not use_sam:
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
@@ -1482,6 +1522,9 @@ class AdversarialPatchTrainer:
                     total_det  += det_l.item()
                     total_ocr  += ocr_l.item()
                     total_tv   += tv_l.item()
+                    _upd_det   += det_l.item()
+                    _upd_ocr   += ocr_l.item()
+                    _upd_tv    += tv_l.item()
                     step       += 1
                     del loss, scaled_loss
 
@@ -1495,6 +1538,17 @@ class AdversarialPatchTrainer:
                         scheduler.step()
                     total_loss  += accum_loss
                     num_updates += 1
+                    if update_log is not None:
+                        _rem = step % update_every or update_every
+                        update_log.append({
+                            "global_update": update_offset + num_updates,
+                            "epoch": epoch + 1,
+                            "loss":  accum_loss / _rem,
+                            "det":   _upd_det   / _rem,
+                            "ocr":   _upd_ocr   / _rem,
+                            "tv":    _upd_tv    / _rem,
+                            "lr":    optimizer.param_groups[0]["lr"],
+                        })
 
         n = max(step, 1)
         return (total_loss / n, total_det / n, total_ocr / n, total_tv / n, num_updates)
@@ -1632,8 +1686,13 @@ class AdversarialPatchTrainer:
         print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
 
-        log_path = self.run_dir / "training_log.txt"
-        log_file = open(log_path, "w")
+        log_path      = self.run_dir / "training_log.txt"
+        log_file      = open(log_path, "w")
+        batch_log_path = self.run_dir / "batch_log.csv"
+        _batch_log_fields = ["global_update", "epoch", "loss", "det", "ocr", "tv", "lr"]
+        batch_log_file = open(batch_log_path, "w", newline="")
+        batch_log_writer = csv.writer(batch_log_file)
+        batch_log_writer.writerow(_batch_log_fields)
 
         global_updates        = 0
         _last_save_milestone  = 0
@@ -1644,7 +1703,15 @@ class AdversarialPatchTrainer:
             saved_tv = self.tv_weight
             if global_updates < tv_warmup_updates:
                 self.tv_weight = 0.0
-            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(optimizer, epoch, scheduler)
+            epoch_update_records: list = []
+            train_loss, train_det, train_ocr, train_tv, epoch_updates = self.train_epoch(
+                optimizer, epoch, scheduler,
+                update_log=epoch_update_records,
+                update_offset=global_updates,
+            )
+            for rec in epoch_update_records:
+                batch_log_writer.writerow([rec[f] for f in _batch_log_fields])
+            batch_log_file.flush()
             self.tv_weight  = saved_tv
             global_updates += epoch_updates
             self.training  = False
@@ -1683,6 +1750,7 @@ class AdversarialPatchTrainer:
                 self.save_patch(epoch, "patches")
 
         log_file.close()
+        batch_log_file.close()
 
         import pandas as pd
         hist_path = self.run_dir / "training_history.csv"
