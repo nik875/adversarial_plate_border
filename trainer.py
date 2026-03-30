@@ -1355,10 +1355,12 @@ class AdversarialPatchTrainer:
         patch_with_graph = self.generate_patch(training_aug=self.training)
         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
-        with tqdm(enumerate(self.train_loader),
+        # Progress bar tracks optimizer updates, not individual images.
+        updates_per_epoch = max(1, len(self.train_loader) // (B * update_every))
+        with tqdm(total=updates_per_epoch,
                   desc=f"Epoch {epoch+1}",
-                  total=len(self.train_loader), leave=False) as pbar:
-            for idx, batch in pbar:
+                  leave=False) as pbar:
+            for idx, batch in enumerate(self.train_loader):
                 raw_item = {k: v[0] for k, v in batch.items()}
 
                 if use_sam:
@@ -1380,6 +1382,7 @@ class AdversarialPatchTrainer:
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
                         torch.mps.empty_cache()
+                    pbar.update(1)
                     pbar.set_postfix({
                         "loss": f"{total_loss/step:.4f}",
                         "det":  f"{total_det/step:.4f}",
@@ -1425,6 +1428,7 @@ class AdversarialPatchTrainer:
                         torch.cuda.empty_cache()
                     elif self.device == "mps":
                         torch.mps.empty_cache()
+                    pbar.update(1)
                     pbar.set_postfix({
                         "loss": f"{total_loss/step:.4f}",
                         "det":  f"{total_det/step:.4f}",
