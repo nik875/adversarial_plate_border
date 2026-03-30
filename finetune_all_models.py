@@ -72,7 +72,7 @@ def pin_memory(device: str) -> bool:
 def find_batch_size(
     probe_fn,
     device: str,
-    max_bs: int,
+    max_bs: int | None = None,
     safety: float = 0.70,
 ) -> int:
     """
@@ -86,15 +86,15 @@ def find_batch_size(
     Args:
         probe_fn:  callable(bs) — runs forward+backward, may raise on OOM
         device:    torch device string
-        max_bs:    hard upper cap (user's --batch-size)
+        max_bs:    hard upper cap; None means no cap (use all available memory)
         safety:    fraction of estimated headroom to actually use (default 0.70)
                    — leaves room for optimizer states and memory fragmentation
 
     Returns:
-        Chosen batch size in [1, max_bs].
+        Chosen batch size (≥ 1).
     """
     if not device.startswith("cuda"):
-        return max_bs
+        return max_bs if max_bs is not None else 32
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -114,11 +114,13 @@ def find_batch_size(
         torch.cuda.empty_cache()
 
     free_after = torch.cuda.mem_get_info()[0]
-    bs = max(1, min(int(free_after * safety / per_sample_mem), max_bs))
+    uncapped = max(1, int(free_after * safety / per_sample_mem))
+    bs = uncapped if max_bs is None else min(uncapped, max_bs)
+    cap_str = "none" if max_bs is None else str(max_bs)
     print(
         f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
         f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
-        f"  →  batch_size={bs}  (cap={max_bs})"
+        f"  →  batch_size={bs}  (cap={cap_str})"
     )
     return bs
 
@@ -381,7 +383,7 @@ def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
+    best  = float("inf"); no_improve = 0
 
     def _lp(imgs):
         # forward() applies softmax; convert to log-probs for CTC
@@ -417,10 +419,15 @@ def train_lprnet(model: nn.Module, records: List[dict], args, batch_size: int) -
         vl /= max(1, len(val_dl))
         print(f"  LPRNet ep{ep}: train={tl/len(train_dl):.4f}  val={vl:.4f}")
         if vl < best:
-            best = vl
+            best = vl; no_improve = 0
             out  = Path(args.output_dir) / "lprnet_finetuned.pt"
             torch.save(model.state_dict(), out)
             print(f"    → {out}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,7 +486,7 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
+    best  = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
@@ -501,10 +508,15 @@ def train_trocr(model, processor, records: List[dict], args, batch_size: int) ->
         vl /= max(1, len(val_dl))
         print(f"  TrOCR ep{ep}: train={tl/len(train_dl):.4f}  val={vl:.4f}")
         if vl < best:
-            best = vl
+            best = vl; no_improve = 0
             out  = Path(args.output_dir) / "trocr_small_finetuned.pt"
             torch.save(model.state_dict(), out)
             print(f"    → {out}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -542,7 +554,7 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
+    best  = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0; n = 0; window = collections.deque(maxlen=100)
@@ -567,10 +579,15 @@ def train_vitstr(model: nn.Module, records: List[dict], args, batch_size: int) -
         vl /= max(1, m)
         print(f"  ViTSTR ep{ep}: train={tl/max(1,n):.4f}  val={vl:.4f}")
         if vl < best:
-            best = vl
+            best = vl; no_improve = 0
             out_path = Path(args.output_dir) / "vitstr_small_finetuned.pt"
             torch.save(model.state_dict(), out_path)
             print(f"    → {out_path}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -591,6 +608,7 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
     rng = random.Random(42)
     shuffled = list(records); rng.shuffle(shuffled)
     n_val = max(1, int(len(shuffled) * 0.1))
+    val_recs   = shuffled[:n_val]
     train_recs = shuffled[n_val:]
 
     class _DS(Dataset):
@@ -618,17 +636,19 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
 
     bs = batch_size
 
-    dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
-                    num_workers=args.workers)
+    train_dl = DataLoader(_DS(train_recs), bs, shuffle=True,  collate_fn=_col,
+                          num_workers=args.workers)
+    val_dl   = DataLoader(_DS(val_recs),   bs, shuffle=False, collate_fn=_col,
+                          num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
+    best  = float("inf"); no_improve = 0
     out_dir = Path(args.output_dir) / "rtdetr_finetuned"
 
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
-        with tqdm(dl, desc=f"RT-DETR {ep}", leave=False) as pbar:
+        with tqdm(train_dl, desc=f"RT-DETR {ep}", leave=False) as pbar:
             for enc in pbar:
                 labels = enc.pop("labels", None)
                 enc    = {k: v.to(device) for k, v in enc.items()}
@@ -646,14 +666,28 @@ def train_rtdetr(records: List[dict], args, batch_size: int) -> None:
                     postfix.update(ld)
                 pbar.set_postfix(**postfix)
         sched.step()
-        avg = tl / max(1, len(dl))
-        print(f"  RT-DETR ep{ep}: train={avg:.4f}")
-        if avg < best:
-            best = avg
+
+        model.eval(); vl = 0.0
+        with torch.no_grad():
+            for enc in val_dl:
+                labels = enc.pop("labels", None)
+                enc    = {k: v.to(device) for k, v in enc.items()}
+                if labels is not None:
+                    labels = [{k: v.to(device) for k, v in lbl.items()} for lbl in labels]
+                vl += model(**enc, labels=labels).loss.item()
+        vl /= max(1, len(val_dl))
+        print(f"  RT-DETR ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
+        if vl < best:
+            best = vl; no_improve = 0
             out_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(out_dir))
             processor.save_pretrained(str(out_dir))
             print(f"    → {out_dir}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -675,7 +709,8 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
 
     rng = random.Random(42)
     shuffled = list(records); rng.shuffle(shuffled)
-    n_val     = max(1, int(len(shuffled) * 0.1))
+    n_val      = max(1, int(len(shuffled) * 0.1))
+    val_recs   = shuffled[:n_val]
     train_recs = shuffled[n_val:]
 
     # Pre-tokenise the fixed text query once.
@@ -706,43 +741,49 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
 
     bs = batch_size
 
-    dl = DataLoader(_DS(train_recs), bs, shuffle=True, collate_fn=_col,
-                    num_workers=args.workers)
+    train_dl = DataLoader(_DS(train_recs), bs, shuffle=True,  collate_fn=_col,
+                          num_workers=args.workers)
+    val_dl   = DataLoader(_DS(val_recs),   bs, shuffle=False, collate_fn=_col,
+                          num_workers=args.workers)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best  = float("inf")
+    best  = float("inf"); no_improve = 0
     out_dir = Path(args.output_dir) / "owlvit_finetuned"
 
     from torchvision.ops import box_iou
+
+    def _owlvit_loss(pixel_values, gt_boxes):
+        batch_text = {k: v.expand(pixel_values.shape[0], -1) for k, v in text_inputs.items()}
+        out = model(pixel_values=pixel_values, **batch_text)
+        pred_boxes  = out.pred_boxes
+        pred_logits = out.logits.squeeze(-1)
+        B, N, _ = pred_boxes.shape
+        box_loss = torch.tensor(0.0, device=device)
+        cls_loss = torch.tensor(0.0, device=device)
+        for b in range(B):
+            pb  = pred_boxes[b]
+            gb  = gt_boxes[b].unsqueeze(0)
+            pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
+                                   pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
+            gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
+                                   gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
+            iou    = box_iou(pb_xyxy, gb_xyxy).squeeze(1)
+            best_i = iou.argmax()
+            box_loss += F.l1_loss(pb[best_i], gt_boxes[b])
+            lbl = torch.zeros(N, device=device); lbl[best_i] = 1.0
+            cls_loss += F.binary_cross_entropy_with_logits(
+                pred_logits[b], lbl, pos_weight=torch.tensor(N - 1.0, device=device))
+        return (box_loss + cls_loss) / B, box_loss, cls_loss
+
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
-        with tqdm(dl, desc=f"OWL-ViT {ep}", leave=False) as pbar:
+        with tqdm(train_dl, desc=f"OWL-ViT {ep}", leave=False) as pbar:
             for pixel_values, gt_boxes in pbar:
                 pixel_values = pixel_values.to(device)
                 gt_boxes     = gt_boxes.to(device)
-                batch_text   = {k: v.expand(pixel_values.shape[0], -1)
-                                for k, v in text_inputs.items()}
-                out = model(pixel_values=pixel_values, **batch_text)
-                pred_boxes  = out.pred_boxes
-                pred_logits = out.logits.squeeze(-1)
-                B, N, _ = pred_boxes.shape
-                box_loss = torch.tensor(0.0, device=device)
-                cls_loss = torch.tensor(0.0, device=device)
-                for b in range(B):
-                    pb  = pred_boxes[b]
-                    gb  = gt_boxes[b].unsqueeze(0)
-                    pb_xyxy = torch.stack([pb[:,0]-pb[:,2]/2, pb[:,1]-pb[:,3]/2,
-                                           pb[:,0]+pb[:,2]/2, pb[:,1]+pb[:,3]/2], dim=1)
-                    gb_xyxy = torch.stack([gb[:,0]-gb[:,2]/2, gb[:,1]-gb[:,3]/2,
-                                           gb[:,0]+gb[:,2]/2, gb[:,1]+gb[:,3]/2], dim=1)
-                    iou    = box_iou(pb_xyxy, gb_xyxy).squeeze(1)
-                    best_i = iou.argmax()
-                    box_loss += F.l1_loss(pb[best_i], gt_boxes[b])
-                    lbl = torch.zeros(N, device=device); lbl[best_i] = 1.0
-                    cls_loss += F.binary_cross_entropy_with_logits(
-                        pred_logits[b], lbl, pos_weight=torch.tensor(N - 1.0, device=device))
-                loss = (box_loss + cls_loss) / B
+                loss, box_loss, cls_loss = _owlvit_loss(pixel_values, gt_boxes)
+                B = pixel_values.shape[0]
                 opt.zero_grad(); loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 opt.step(); tl += loss.item()
@@ -753,14 +794,26 @@ def train_owlvit(records: List[dict], args, batch_size: int) -> None:
                     cls=f"{cls_loss.item()/B:.4f}",
                 )
         sched.step()
-        avg = tl / max(1, len(dl))
-        print(f"  OWL-ViT ep{ep}: train={avg:.4f}")
-        if avg < best:
-            best = avg
+
+        model.eval(); vl = 0.0
+        with torch.no_grad():
+            for pixel_values, gt_boxes in val_dl:
+                pixel_values = pixel_values.to(device)
+                gt_boxes     = gt_boxes.to(device)
+                vl += _owlvit_loss(pixel_values, gt_boxes)[0].item()
+        vl /= max(1, len(val_dl))
+        print(f"  OWL-ViT ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
+        if vl < best:
+            best = vl; no_improve = 0
             out_dir.mkdir(parents=True, exist_ok=True)
             model.save_pretrained(str(out_dir))
             processor.save_pretrained(str(out_dir))
             print(f"    → {out_dir}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -784,19 +837,20 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
     bs     = batch_size
     ds     = DetectionDataset(records)
     n_val  = max(1, int(len(ds) * 0.1))
-    tr, _  = random_split(ds, [len(ds) - n_val, n_val])
+    tr, va = random_split(ds, [len(ds) - n_val, n_val])
 
-    dl = DataLoader(tr, bs, shuffle=True, collate_fn=_collate_det,
-                    num_workers=args.workers)
+    kw = dict(collate_fn=_collate_det, num_workers=args.workers)
+    train_dl = DataLoader(tr, bs, shuffle=True,  **kw)
+    val_dl   = DataLoader(va, bs, shuffle=False, **kw)
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt    = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
     sched  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    best   = float("inf")
+    best   = float("inf"); no_improve = 0
 
     for ep in range(1, args.epochs + 1):
         model.train(); tl = 0.0; window = collections.deque(maxlen=100)
-        with tqdm(dl, desc=f"FasterRCNN {ep}", leave=False) as pbar:
+        with tqdm(train_dl, desc=f"FasterRCNN {ep}", leave=False) as pbar:
             for imgs, targets in pbar:
                 imgs    = [i.to(device) for i in imgs]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -813,13 +867,28 @@ def train_fasterrcnn(model: nn.Module, records: List[dict], args, batch_size: in
                     rpn=f"{losses.get('loss_rpn_box_reg', 0.):.4f}",
                 )
         sched.step()
-        avg = tl / max(1, len(dl))
-        print(f"  FasterRCNN ep{ep}: train={avg:.4f}")
-        if avg < best:
-            best = avg
+
+        model.eval(); vl = 0.0
+        with torch.no_grad():
+            for imgs, targets in val_dl:
+                imgs    = [i.to(device) for i in imgs]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                # Faster R-CNN only returns loss dict in train mode; switch temporarily
+                model.train()
+                vl += sum(model(imgs, targets).values()).item()
+                model.eval()
+        vl /= max(1, len(val_dl))
+        print(f"  FasterRCNN ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
+        if vl < best:
+            best = vl; no_improve = 0
             out  = Path(args.output_dir) / "fasterrcnn_finetuned.pt"
             torch.save(model.state_dict(), out)
             print(f"    → {out}")
+        else:
+            no_improve += 1
+            if no_improve > 1:
+                print(f"  Early stopping (patience=1) at ep{ep}")
+                break
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1111,7 +1180,8 @@ def parse_args():
                    choices=ALL_MODELS, metavar="MODEL",
                    help=f"Models to train (default: all). Choices: {ALL_MODELS}")
     p.add_argument("--epochs",      type=int,   default=10)
-    p.add_argument("--batch-size",  type=int,   default=32)
+    p.add_argument("--batch-size",  type=int,   default=None,
+                   help="Hard cap on batch size (default: no cap, use GPU memory optimally)")
     p.add_argument("--lr",          type=float, default=1e-4)
     p.add_argument("--workers",     type=int,   default=4)
     p.add_argument("--device",
