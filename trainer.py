@@ -1451,7 +1451,7 @@ class AdversarialPatchTrainer:
         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
         # Progress bar tracks optimizer updates, not individual images.
-        profile_steps = 20 if self.profiling else 0
+        profile_steps = 10 if self.profiling else 0
         _prof_completed = 0   # optimizer steps finished so far (profiling)
         _t_iter_end = _pt() if self.profiling else 0.0   # for dataloader fetch timing
         # SAM path has no profiling instrumentation — use standard path for profiling.
@@ -1971,7 +1971,7 @@ class AdversarialPatchTrainer:
 
         if profile:
             self.profiling = True
-            print(f"\n[profile] Running {20} steps to collect timing data …")
+            print(f"\n[profile] Running {10} steps to collect timing data …")
 
         global_updates        = 0
         _last_save_milestone  = 0
