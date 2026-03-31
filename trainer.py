@@ -2034,7 +2034,7 @@ class AdversarialPatchTrainer:
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
             self._peak_lr = learning_rate
-            self.sam_rho  = learning_rate
+            self.sam_rho  = 10 * learning_rate
             optimizer = SAM(
                 self._param_groups(learning_rate),
                 base_optimizer_cls=optim.AdamW,
