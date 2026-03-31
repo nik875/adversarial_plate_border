@@ -1374,7 +1374,9 @@ class AdversarialPatchTrainer:
 
     def train_epoch(self, optimizer, epoch: int, scheduler=None,
                     update_log: Optional[list] = None,
-                    update_offset: int = 0) -> Tuple[float, float, float, float]:
+                    update_offset: int = 0,
+                    save_every: int = 0,
+                    tv_warmup_updates: int = 0) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -1393,6 +1395,8 @@ class AdversarialPatchTrainer:
         buffer: list = []
         use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
+        _last_save_milestone = 0  # Track saved 10% milestones
+        _saved_tv_weight = self.tv_weight  # Save original TV weight for warmup scaling
 
         # Generate the first patch (with generator graph) for the accumulation window.
         # We use a detach-accumulate-backprop pattern: detach the patch into a
@@ -1416,6 +1420,14 @@ class AdversarialPatchTrainer:
                         window_full = len(window_raw) == B * update_every
                         if not window_full:
                             continue
+
+                        # Apply TV loss warmup: linearly scale from 0 to original weight
+                        global_update_before = update_offset + num_updates
+                        if tv_warmup_updates > 0 and global_update_before < tv_warmup_updates:
+                            tv_warmup_factor = min(1.0, global_update_before / tv_warmup_updates)
+                            self.tv_weight = _saved_tv_weight * tv_warmup_factor
+                        else:
+                            self.tv_weight = _saved_tv_weight
 
                         loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
                             self._msam_step(optimizer, window_raw, B, update_every)
@@ -1446,6 +1458,14 @@ class AdversarialPatchTrainer:
                                 "tv":       tv_t       / B / update_every,
                                 "lr":       _lr_now,
                             })
+                        # Check for 10% milestone checkpoint
+                        if save_every > 0:
+                            global_update = update_offset + num_updates
+                            milestone = global_update // save_every
+                            if milestone > _last_save_milestone:
+                                _last_save_milestone = milestone
+                                self.save_patch(epoch, "patches",
+                                               stem=f"patch_{self.detector.name}_update_{global_update:06d}")
                         pbar.update(1)
                         pbar.set_postfix({
                             "loss":   f"{total_loss/step:.4f}",
@@ -1469,6 +1489,15 @@ class AdversarialPatchTrainer:
 
                     if len(buffer) < B:
                         continue
+
+                    # Apply TV loss warmup: linearly scale from 0 to original weight
+                    # Check warmup at the start of the accumulation window
+                    global_update_for_batch = update_offset + num_updates + 1
+                    if tv_warmup_updates > 0 and global_update_for_batch <= tv_warmup_updates:
+                        tv_warmup_factor = min(1.0, global_update_for_batch / tv_warmup_updates)
+                        self.tv_weight = _saved_tv_weight * tv_warmup_factor
+                    else:
+                        self.tv_weight = _saved_tv_weight
 
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
@@ -1515,6 +1544,14 @@ class AdversarialPatchTrainer:
                                 "tv":       _upd_tv        / update_every,
                                 "lr":       _lr_now,
                             })
+                        # Check for 10% milestone checkpoint
+                        if save_every > 0:
+                            global_update = update_offset + num_updates
+                            milestone = global_update // save_every
+                            if milestone > _last_save_milestone:
+                                _last_save_milestone = milestone
+                                self.save_patch(epoch, "patches",
+                                               stem=f"patch_{self.detector.name}_update_{global_update:06d}")
                         accum_loss = _upd_det_real = _upd_det_top = \
                             _upd_ocr_real = _upd_ocr_top = _upd_tv = 0.0
                         pbar.update(1)
@@ -1572,6 +1609,14 @@ class AdversarialPatchTrainer:
             elif not use_sam:
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
+                    # Apply TV loss warmup for end-of-epoch flush
+                    global_update_for_flush = update_offset + num_updates + 1
+                    if tv_warmup_updates > 0 and global_update_for_flush <= tv_warmup_updates:
+                        tv_warmup_factor = min(1.0, global_update_for_flush / tv_warmup_updates)
+                        self.tv_weight = _saved_tv_weight * tv_warmup_factor
+                    else:
+                        self.tv_weight = _saved_tv_weight
+
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
                     buffer = []
@@ -1614,6 +1659,9 @@ class AdversarialPatchTrainer:
                             "tv":       _upd_tv       / _rem,
                             "lr":       optimizer.param_groups[0]["lr"],
                         })
+
+        # Restore original TV weight
+        self.tv_weight = _saved_tv_weight
 
         n = max(step, 1)
         return (total_loss / n,
@@ -1763,14 +1811,9 @@ class AdversarialPatchTrainer:
         batch_log_writer.writerow(_batch_log_fields)
 
         global_updates        = 0
-        _last_save_milestone  = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
-            # Suppress TV loss until we've passed the warmup budget of updates.
-            saved_tv = self.tv_weight
-            if global_updates < tv_warmup_updates:
-                self.tv_weight = 0.0
             epoch_update_records: list = []
             (train_loss,
              train_det_real, train_det_top,
@@ -1779,11 +1822,12 @@ class AdversarialPatchTrainer:
                 optimizer, epoch, scheduler,
                 update_log=epoch_update_records,
                 update_offset=global_updates,
+                save_every=save_every,
+                tv_warmup_updates=tv_warmup_updates,
             )
             for rec in epoch_update_records:
                 batch_log_writer.writerow([rec[f] for f in _batch_log_fields])
             batch_log_file.flush()
-            self.tv_weight  = saved_tv
             global_updates += epoch_updates
             self.training  = False
             val_loss       = self.validate()
@@ -1821,11 +1865,6 @@ class AdversarialPatchTrainer:
             print(line)
             log_file.write(line + "\n")
             log_file.flush()
-
-            milestone = global_updates // save_every
-            if milestone > _last_save_milestone:
-                _last_save_milestone = milestone
-                self.save_patch(epoch, "patches")
 
         log_file.close()
         batch_log_file.close()
