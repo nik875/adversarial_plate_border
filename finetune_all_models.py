@@ -138,26 +138,29 @@ def find_batch_size(
         torch.cuda.synchronize()
         peak           = torch.cuda.max_memory_allocated()
         per_sample_mem = max(1, peak - baseline)
-        per_sample_cpu = max(1, proc.memory_info().rss - cpu_baseline)
     except Exception:
         print(f"  [auto-batch] probe failed — using batch_size=1")
         return 1
     finally:
         torch.cuda.empty_cache()
 
-    free_after   = torch.cuda.mem_get_info()[0]
-    vm           = psutil.virtual_memory()
-    cpu_free     = vm.available
+    free_after = torch.cuda.mem_get_info()[0]
+    vm         = psutil.virtual_memory()
+    cpu_free   = vm.available
 
+    # During training, each sample's tensor data must pass through CPU RAM
+    # (DataLoader loading, preprocessing, pinned memory) before going to GPU.
+    # The RSS delta from a synthetic-tensor probe is nearly zero and does not
+    # capture this.  Use per_sample_mem (GPU tensor size) as the CPU cost proxy.
     gpu_uncapped = max(1, int(free_after * safety / per_sample_mem))
-    cpu_uncapped = max(1, int(cpu_free   * safety / per_sample_cpu))
+    cpu_uncapped = max(1, int(cpu_free   * safety / per_sample_mem))
     uncapped     = min(gpu_uncapped, cpu_uncapped)
     bs           = uncapped if max_bs is None else min(uncapped, max_bs)
     cap_str      = "none" if max_bs is None else str(max_bs)
     print(
         f"  [auto-batch] GPU {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
         f"  |  RAM {cpu_free/1024**3:.1f}/{vm.total/1024**3:.1f} GB free"
-        f"  |  {per_sample_mem/1024**2:.0f} MB GPU/sample  {per_sample_cpu/1024**2:.0f} MB RAM/sample"
+        f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
         f"  →  batch_size={bs}  (gpu_limit={gpu_uncapped}, ram_limit={cpu_uncapped}, cap={cap_str})"
     )
     return bs
