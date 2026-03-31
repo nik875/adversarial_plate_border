@@ -1474,11 +1474,8 @@ class AdversarialPatchTrainer:
         window_raw: list,
         B: int,
         update_every: int,
-        sam_m: Optional[int] = None,
     ) -> Tuple[float, float, float, float]:
         """One m-SAM update: ascent on sam_m random items, descent on all items.
-
-        sam_m overrides self.sam_m when provided (used for warmup scheduling).
 
         Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
         with the per-step accounting in train_epoch.
@@ -1491,7 +1488,7 @@ class AdversarialPatchTrainer:
         incoming gradient) propagates correctly to seed/decoder params.
         """
         M = len(window_raw)
-        m = min(sam_m if sam_m is not None else self.sam_m, M)
+        m = min(self.sam_m, M)
 
         def _accumulate(indices, weight):
             """
@@ -1549,7 +1546,6 @@ class AdversarialPatchTrainer:
                     update_log: Optional[list] = None,
                     update_offset: int = 0,
                     tv_warmup_updates: int = 0,
-                    sam_warmup_updates: int = 0,
                     save_every: int = 0,
                     last_save_milestone: int = 0) -> Tuple[float, float, float, float]:
         _saved_tv = self.tv_weight
@@ -1560,14 +1556,6 @@ class AdversarialPatchTrainer:
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
-
-        use_sam = isinstance(optimizer, SAM)
-        _target_sam_m = self.sam_m if use_sam else 1
-        def _effective_sam_m(global_update: int) -> int:
-            if not use_sam or sam_warmup_updates <= 0:
-                return _target_sam_m
-            t = min(1.0, global_update / sam_warmup_updates)
-            return max(1, round(1 + t * (_target_sam_m - 1)))
         total_loss = accum_loss = 0.0
         total_det_real = total_det_top = total_ocr_real = total_ocr_top = total_tv = 0.0
         # Per-update accumulators (reset after each optimizer step, like accum_loss)
@@ -1578,6 +1566,7 @@ class AdversarialPatchTrainer:
         step = num_updates = 0
         buffer: list = []
         buffer_raw: list = []   # accumulate raw items before batched _prepare_batch
+        use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
 
         # Generate the first patch (with generator graph) for the accumulation window.
@@ -1614,8 +1603,7 @@ class AdversarialPatchTrainer:
                         self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                         if self.profiling: _tsam0 = _pt()
                         loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
-                            self._msam_step(optimizer, window_raw, B, update_every,
-                                            sam_m=_effective_sam_m(update_offset + num_updates))
+                            self._msam_step(optimizer, window_raw, B, update_every)
                         if self.profiling:
                             _tsam_total = _pt() - _tsam0
                             self._prof.setdefault("step/sam_total", []).append(_tsam_total)
@@ -1796,8 +1784,7 @@ class AdversarialPatchTrainer:
                 n_complete = (len(window_raw) // B) * B
                 self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                 loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
-                    self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B,
-                                    sam_m=_effective_sam_m(update_offset + num_updates))
+                    self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B)
                 step           += n_complete // B
                 num_updates    += 1
                 if save_every > 0:
@@ -2084,7 +2071,6 @@ class AdversarialPatchTrainer:
                                  (self.eval_batch_size * _update_every))
         total_updates     = num_epochs * _updates_per_epoch
         tv_warmup_updates = int(tv_warmup * total_updates)
-        sam_warmup_updates = int(0.1 * total_updates) if self.sam_m is not None else 0
         save_every        = max(1, total_updates // 10)   # checkpoint every 10% of updates
 
         n_params = sum(p.numel() for p in self._trainable_params())
@@ -2106,7 +2092,7 @@ class AdversarialPatchTrainer:
         else:
             print(f"  TV warmup : disabled")
         if self.sam_m is not None:
-            print(f"  Optimizer : m-SAM  (m=1→{self.sam_m} over {sam_warmup_updates} updates, rho={self.sam_rho}, base=AdamW)")
+            print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
         _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
         if self.disable_disruption:
             _mode += '  [detection loss disabled]'
@@ -2138,7 +2124,6 @@ class AdversarialPatchTrainer:
                 update_log=epoch_update_records,
                 update_offset=global_updates,
                 tv_warmup_updates=tv_warmup_updates,
-                sam_warmup_updates=sam_warmup_updates,
                 save_every=save_every,
                 last_save_milestone=_last_save_milestone,
             )
