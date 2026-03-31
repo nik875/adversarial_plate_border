@@ -2018,6 +2018,14 @@ class AdversarialPatchTrainer:
                 self._trainable_params(), lr=learning_rate, weight_decay=1e-4
             )
             sched_optimizer = optimizer
+        # Cap eval_batch_size so total updates >= 10000.
+        _ga_cap = len(self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
+        _max_bs_for_min_updates = max(1, len(self.train_loader) * num_epochs // (10000 * _ga_cap))
+        if self.eval_batch_size > _max_bs_for_min_updates:
+            print(f"  [auto-batch] capping eval_batch_size {self.eval_batch_size} → "
+                  f"{_max_bs_for_min_updates} to ensure ≥10000 total updates")
+            self.eval_batch_size = _max_bs_for_min_updates
+
         # Scheduler counts are in gradient updates, not epochs.
         # _updates_per_epoch is computed below alongside tv_warmup; duplicate
         # the formula here so we can build the scheduler before the print block.
