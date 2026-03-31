@@ -32,6 +32,17 @@ def transform_path_for_user(filepath):
     return filepath
 
 
+def _chw_uint8(img: np.ndarray) -> "torch.Tensor":
+    """Convert HWC uint8 numpy array to CHW uint8 tensor (no float conversion).
+
+    Used as the DataLoader transform so images stay as uint8 over PCIe (4×
+    smaller than float32); the trainer casts to float32 on the GPU after transfer.
+    Must be a module-level function (not a lambda) so it is picklable by
+    DataLoader workers.
+    """
+    return torch.from_numpy(img).permute(2, 0, 1)
+
+
 def load_image(filepath):
     """Load image with support for HEIC files. Returns RGB HWC uint8."""
     filepath = transform_path_for_user(filepath)
@@ -480,7 +491,7 @@ class CCPDBboxDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         rec = self.records[idx]
         img = load_image(rec["image_path"])          # HWC uint8 RGB
-        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img_t = torch.from_numpy(img).permute(2, 0, 1)   # uint8 CHW; cast to float on GPU
 
         # Try to get actual plate polygon from CCPD filename
         corners = _parse_ccpd_polygon(rec["image_path"])
