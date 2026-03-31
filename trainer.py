@@ -413,7 +413,8 @@ class AdversarialPatchTrainer:
         train_detector:       bool           = False,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
-        det_loss_weight:      float          = 0.0,
+        ocr_loss_scale:       float          = 1.0,
+        det_loss_scale:       float          = 1.0,
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
@@ -425,7 +426,8 @@ class AdversarialPatchTrainer:
     ):
         self.training             = training
         self.tv_weight            = tv_weight
-        self.det_loss_weight      = det_loss_weight
+        self.ocr_loss_scale       = ocr_loss_scale
+        self.det_loss_scale       = det_loss_scale
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.sam_m                = sam_m
@@ -1082,26 +1084,13 @@ class AdversarialPatchTrainer:
                                   [top_crop], self.impersonation_target,
                                   impersonation=True)[0]                              if top_crop is not None else None)
 
-            # Weights: proportional to each detection term's magnitude.
-            # Not detached: gradients flow through the weights so that reducing
-            # det_top_mag (failing to attract detection) increases w_real and thus
-            # the weighted-average OCR loss, penalising poor top-region detection.
-            det_real_mag = det_real_i.clamp(min=0)
-            det_top_mag  = (-det_top_i).clamp(min=0)
-            total_mag    = det_real_mag + det_top_mag + 1e-6
+            det_i = (det_real_i + det_top_i) * self.det_loss_scale
 
-            if ocr_real_i is not None and ocr_top_i is not None:
-                w_real = det_real_mag / total_mag
-                w_top  = det_top_mag  / total_mag
-                ocr_i  = w_real * ocr_real_i + w_top * ocr_top_i
-            elif ocr_real_i is not None:
-                ocr_i = ocr_real_i
-            elif ocr_top_i is not None:
-                ocr_i = ocr_top_i
-            else:
-                ocr_i = _zero
+            ocr_parts = [o for o in [ocr_real_i, ocr_top_i] if o is not None]
+            ocr_i = (sum(ocr_parts) / len(ocr_parts) * self.ocr_loss_scale
+                     if ocr_parts else _zero)
 
-            image_losses.append(ocr_i)
+            image_losses.append((det_i + ocr_i) / 2)
             det_real_l_list.append(det_real_i.detach())
             det_top_l_list.append(det_top_i.detach())
             ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
@@ -1110,10 +1099,7 @@ class AdversarialPatchTrainer:
         if _prof:
             self._prof.setdefault("loss/pass2_loop", []).append(_pt() - _t3)
 
-        det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
-        total      = (torch.stack(image_losses).mean()
-                      + self.tv_weight * tv_l
-                      + self.det_loss_weight * det_top_l_for_loss)
+        total      = torch.stack(image_losses).mean() + self.tv_weight * tv_l
         det_real_l = torch.stack(det_real_l_list).mean()
         det_top_l  = torch.stack(det_top_l_list).mean()
         ocr_real_l = torch.stack(ocr_real_l_list).mean()
