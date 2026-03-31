@@ -398,6 +398,10 @@ class AdversarialPatchTrainer:
         self.expected_plate_text  = expected_plate_text
         self.train_detector       = train_detector
 
+        # ── Profiling (must be set before any method calls below) ──────
+        self.profiling: bool = False
+        self._prof: Dict[str, list] = {}
+
         # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
         self.device   = detector.device
@@ -485,8 +489,6 @@ class AdversarialPatchTrainer:
             )
 
         self.epoch_stats: list = []
-        self.profiling: bool = False
-        self._prof: Dict[str, list] = {}
 
     # ====================================================================
     # Patch generation
