@@ -2061,12 +2061,14 @@ class AdversarialPatchTrainer:
             _pw_ups_per_epoch = max(1, len(_pw_loader) //
                                     (self.eval_batch_size * _ue_pw))
             _pw_total_updates = pre_warmup_epochs * _pw_ups_per_epoch
-            # LambdaLR has no restriction on the multiplier range, so we can
-            # ramp from eta_min up to learning_rate (multiplier > 1 is fine).
-            # base_lr = learning_rate (optimizer was created with that value).
+            # Use a plain AdamW for pre-warmup (no m-SAM overhead).
+            pw_optimizer = optim.AdamW(
+                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+            )
+            # LambdaLR: ramp lr_min → learning_rate with no factor-range restriction.
             _pw_n = max(1, _pw_total_updates)
             prewarm_scheduler = optim.lr_scheduler.LambdaLR(
-                sched_optimizer,
+                pw_optimizer,
                 lr_lambda=lambda step: (
                     eta_min + min(step, _pw_n) / _pw_n * (learning_rate - eta_min)
                 ) / learning_rate,
@@ -2077,7 +2079,7 @@ class AdversarialPatchTrainer:
 
             print(f"\n{'='*60}")
             print(f"  Pre-warmup: {n_prewarm} images × {pre_warmup_epochs} epochs  "
-                  f"({_pw_total_updates} updates)")
+                  f"({_pw_total_updates} updates)  [AdamW, no m-SAM]")
             print(f"  LR: {eta_min:.0e} → {learning_rate:.0e} linearly")
             print(f"{'='*60}\n")
 
@@ -2085,7 +2087,7 @@ class AdversarialPatchTrainer:
             for pw_ep in range(pre_warmup_epochs):
                 self.training = True
                 _pw_result = self.train_epoch(
-                    optimizer, pw_ep, prewarm_scheduler,
+                    pw_optimizer, pw_ep, prewarm_scheduler,
                     update_offset=_pw_global,
                     tv_warmup_updates=_pw_total_updates + 1,  # suppress TV entirely
                     save_every=0,
@@ -2097,17 +2099,12 @@ class AdversarialPatchTrainer:
                 (_pw_loss, _pw_dr, _pw_dt, _pw_or, _pw_ot,
                  _pw_tv, _pw_ups, _) = _pw_result
                 _pw_global += _pw_ups
-                _pw_lr = sched_optimizer.param_groups[0]['lr']
+                _pw_lr = pw_optimizer.param_groups[0]['lr']
                 print(f"  Pre-warmup {pw_ep+1:2d}/{pre_warmup_epochs} | "
                       f"loss: {_pw_loss:.4f} | lr: {_pw_lr:.2e}")
 
             self.train_loader = _saved_train_loader
-
-            # Reset optimizer LR and clear initial_lr so the main scheduler
-            # below uses learning_rate as its base (same as the no-pre-warmup path).
-            for pg in sched_optimizer.param_groups:
-                pg['lr'] = learning_rate
-                pg.pop('initial_lr', None)
+            del pw_optimizer
             print()
 
         # Scheduler counts are in gradient updates, not epochs.
