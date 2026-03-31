@@ -7,16 +7,12 @@ pluggable detector + OCR backend pair.
 Patch parameterization
 ----------------------
 The patch is produced by a trainable ConvTranspose2d decoder that grows a
-compact seed tensor through six stride-2 layers.  Both the seed and the
-decoder weights are optimised jointly.
+compact seed tensor from [C, 4, 8] to [3, 256, 512] through six stride-2
+layers.  Both the seed and the decoder weights are optimised jointly.
 This replaces the direct pixel-level nn.Parameter used in earlier versions.
 
-Without --top-extend: seed [C, 4, 8] → [3, 256, 512]
-With    --top-extend: seed [C, 8, 8] → [3, 512, 512]  (double height for the
-  extra attacker-controlled region above the plate)
-
 The inductive bias imposed by the decoder:
-  * Early layers capture global structure (the seed operates on a small grid
+  * Early layers capture global structure (the seed operates on a 4×8 grid
     that sees the entire patch simultaneously).
   * Later layers add finer spatial detail at progressively higher resolution.
   * The convolutional weight sharing acts as a natural regulariser, making TV
@@ -289,13 +285,10 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Residual-stream decoder.  Six stages, each doubling spatial size.
+    Residual-stream decoder that maps [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Standard (no top-extend):  [1, C, 4, 8] → [1, 3, 256, 512]
+    Six stages, each doubling spatial size:
         4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
-
-    With top-extend:           [1, C, 8, 8] → [1, 3, 512, 512]
-        8×8 → 16×16 → 32×32 → 64×64 → 128×128 → 256×256 → 512×512
 
     All intermediate feature maps are kept at seed_channels (128) throughout,
     forming a flat residual stream. Each stage contributes two additive deltas:
@@ -322,7 +315,7 @@ class PatchDecoder(nn.Module):
         self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
-        """seed: [1, C, H_s, W_s]  →  patch: [1, 3, H_s*64, W_s*64] in [0, 1]"""
+        """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
         x = seed
         for deconv, conv in zip(self.deconvs, self.convs):
             x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
@@ -467,14 +460,11 @@ class AdversarialPatchTrainer:
 
         # ── Patch decoder (seed + decoder jointly optimised) ───────────
         self.patch_width   = PATCH_WIDTH
-        self.patch_height  = PATCH_HEIGHT * 2 if top_extend else PATCH_HEIGHT
+        self.patch_height  = PATCH_HEIGHT
         self.seed_channels = seed_channels
-        # Seed spatial size: 4×8 (standard) or 8×8 (top-extend, doubled height)
-        # Six stride-2 stages → output 256×512 or 512×512 respectively.
-        _seed_h = 8 if top_extend else 4
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
         self.seed    = nn.Parameter(
-            torch.randn(1, seed_channels, _seed_h, 8, device=self.device) * 0.1
+            torch.randn(1, seed_channels, 4, 8, device=self.device) * 0.1
         )
         self.decoder = PatchDecoder(seed_channels).to(self.device)
 
@@ -551,7 +541,7 @@ class AdversarialPatchTrainer:
             Shape [3, H, W], values in [0, 1], on self.device.
             Gradient graph is intact (suitable for loss.backward()).
         """
-        patch = self.decoder(self.seed).squeeze(0)   # [3, H, W]
+        patch = self.decoder(self.seed).squeeze(0)   # [3, 256, 512]
 
         if self.print_blur > 0:
             patch = kornia.filters.gaussian_blur2d(
@@ -559,7 +549,7 @@ class AdversarialPatchTrainer:
                 (self.print_blur, self.print_blur),
             ).squeeze(0)
 
-        return patch   # [3, H, W]
+        return patch   # [3, 256, 512]
 
     # ====================================================================
     # Detector preprocessing selection
@@ -2057,9 +2047,8 @@ class AdversarialPatchTrainer:
         print(f"\n{'='*60}")
         print(f"  Adversarial Patch Training")
         print(f"  Detector  : {self.detector.name}   OCR: {self.ocr.name}")
-        _sh, _sw = self.seed.shape[2], self.seed.shape[3]
         print(f"  Patch gen : ConvTranspose decoder  "
-              f"(seed {self.seed_channels}ch×{_sh}×{_sw} → 3×{self.patch_height}×{self.patch_width})")
+              f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
