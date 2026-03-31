@@ -1267,7 +1267,7 @@ class AdversarialPatchTrainer:
                 buffer.append(item)
                 if len(buffer) < B:
                     continue
-                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
+                loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(buffer)
                 buffer = []
                 step += 1
                 scaled = loss / update_every
