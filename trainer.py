@@ -1215,7 +1215,7 @@ class AdversarialPatchTrainer:
             else:
                 hi = mid
 
-        result = max(1, int(lo * 0.9))
+        result = max(1, lo - 1)
         free_after = torch.cuda.mem_get_info()[0]
         print(
             f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
@@ -1784,8 +1784,6 @@ class AdversarialPatchTrainer:
                                 self._print_profile_report(profile_steps, B, update_every)
                                 return
 
-                except torch.cuda.OutOfMemoryError:
-                    raise
                 except Exception:
                     print(f"\n[WARNING] Skipping batch {idx} due to error:")
                     traceback.print_exc()
