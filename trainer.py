@@ -547,6 +547,21 @@ class AdversarialPatchTrainer:
             params.extend(list(self.detector.parameters()))
         return params
 
+    def _param_groups(self, lr: float) -> list:
+        """Parameter groups with per-parameter learning rates.
+
+        The seed gets 10× lower LR than the decoder — it controls global
+        patch structure and should move more conservatively than the conv weights.
+        Detector params (if trained) use the full LR.
+        """
+        groups = [
+            {"params": list(self.decoder.parameters()), "lr": lr},
+            {"params": [self.seed],                     "lr": lr / 10},
+        ]
+        if self.train_detector:
+            groups.append({"params": list(self.detector.parameters()), "lr": lr})
+        return groups
+
     def generate_patch(self, training_aug: bool = False) -> torch.Tensor:
         """
         Run the decoder forward to produce the patch.
@@ -2005,7 +2020,7 @@ class AdversarialPatchTrainer:
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
             optimizer = SAM(
-                self._trainable_params(),
+                self._param_groups(learning_rate),
                 base_optimizer_cls=optim.AdamW,
                 rho=self.sam_rho,
                 lr=learning_rate,
@@ -2015,7 +2030,7 @@ class AdversarialPatchTrainer:
             sched_optimizer = optimizer.base_optimizer
         else:
             optimizer = optim.AdamW(
-                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+                self._param_groups(learning_rate), weight_decay=1e-4
             )
             sched_optimizer = optimizer
         # Cap eval_batch_size so total updates >= 10000.
@@ -2052,7 +2067,7 @@ class AdversarialPatchTrainer:
             _pw_total_updates = pre_warmup_epochs * _pw_ups_per_epoch
             # Use a plain AdamW for pre-warmup (no m-SAM overhead).
             pw_optimizer = optim.AdamW(
-                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+                self._param_groups(learning_rate), weight_decay=1e-4
             )
             # LambdaLR: ramp lr_min → learning_rate with no factor-range restriction.
             _pw_n = max(1, _pw_total_updates)
