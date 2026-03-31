@@ -35,6 +35,7 @@ Other design decisions
 from __future__ import annotations
 
 import csv
+import os
 import random
 import re
 import time
@@ -361,8 +362,8 @@ class AdversarialPatchTrainer:
         seed_channels:        int            = 128,
         preload_images:       bool           = False,
         gpu_preload:          bool           = False,
-        num_workers:          int            = 0,
-        pin_memory:           bool           = False,
+        num_workers:          int            = -1,
+        pin_memory:           bool           = True,
         limit:                int            = 0,
         use_all_for_train:    bool           = False,
         grad_accumulate:      Optional[int]  = None,
@@ -468,10 +469,11 @@ class AdversarialPatchTrainer:
             del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
+        _n_jobs = os.cpu_count() if num_workers < 0 else num_workers
         if ccpd_csv:
             self.train_loader, self.val_loader = create_ccpd_dataloaders(
                 ccpd_csv, batch_size=1,
-                n_jobs=num_workers, pin_memory=pin_memory,
+                n_jobs=_n_jobs, pin_memory=pin_memory,
                 limit=limit,
             )
         else:
@@ -481,7 +483,7 @@ class AdversarialPatchTrainer:
                 preload=preload_images,
                 gpu_device=self.device if gpu_preload else None,
                 batch_size=1,
-                n_jobs=0 if (gpu_preload or preload_images) else num_workers,
+                n_jobs=0 if (gpu_preload or preload_images) else _n_jobs,
                 pin_memory=False if (gpu_preload or preload_images) else pin_memory,
                 limit=limit,
                 use_all_for_train=use_all_for_train,
@@ -777,28 +779,40 @@ class AdversarialPatchTrainer:
         _prof = self.profiling
         if _prof: _t_batch0 = _t0 = _pt()
 
-        loaded = []
+        # ── CPU-side downscale + size grouping ──────────────────────────
+        # Downscale on CPU before transfer so we only move the smaller tensor.
+        loaded_cpu = []
         for raw in raw_items:
-            t = raw["orig_image"].to(self.device)      # [C, H, W]
-            c = raw["orig_corners"].to(self.device)    # [4, 2]
+            t = raw["orig_image"]       # [C, H, W] — stays on CPU
+            c = raw["orig_corners"]     # [4, 2]
             _, H, W = t.shape
             if max(H, W) > 2000:
                 t = F.interpolate(t.unsqueeze(0), scale_factor=0.5,
                                   mode="bilinear", align_corners=False).squeeze(0)
                 c = c * 0.5
-            loaded.append((t, c, raw.get("label")))
-
-        if _prof:
-            self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
-            _t1 = _pt()
+            loaded_cpu.append((t, c, raw.get("label")))
 
         aug = self.augment if augment is None else augment
 
         # Group indices by image spatial size for batched warp.
         by_size: Dict[Tuple[int, int], List[int]] = {}
-        for i, (t, _, _) in enumerate(loaded):
+        for i, (t, _, _) in enumerate(loaded_cpu):
             key = (int(t.shape[-2]), int(t.shape[-1]))
             by_size.setdefault(key, []).append(i)
+
+        # ── Batched GPU transfer: one .to() per size group ───────────────
+        # Stack images of the same spatial size and transfer in one call,
+        # reducing N individual transfers (one per image) to num_size_groups.
+        loaded = [None] * len(loaded_cpu)
+        for size, indices in by_size.items():
+            imgs_gpu    = torch.stack([loaded_cpu[i][0] for i in indices]).to(self.device)
+            corners_gpu = torch.stack([loaded_cpu[i][1] for i in indices]).to(self.device)
+            for j, i in enumerate(indices):
+                loaded[i] = (imgs_gpu[j], corners_gpu[j], loaded_cpu[i][2])
+
+        if _prof:
+            self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
+            _t1 = _pt()
 
         patched_orig = [None] * len(loaded)
         for indices in by_size.values():
@@ -2097,8 +2111,9 @@ def main():
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
                         help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
-    parser.add_argument("--num-workers",     type=int, default=0)
-    parser.add_argument("--pin-memory",      action="store_true")
+    parser.add_argument("--num-workers",     type=int, default=-1,
+                        help="DataLoader workers (-1 = os.cpu_count(), 0 = main process only)")
+    parser.add_argument("--pin-memory",      action="store_true", default=True)
     parser.add_argument("--limit",           type=int, default=0)
     parser.add_argument("--use-all-for-train", action="store_true")
     parser.add_argument("--impersonation-target", default="SHX8459")
