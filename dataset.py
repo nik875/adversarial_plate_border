@@ -32,17 +32,6 @@ def transform_path_for_user(filepath):
     return filepath
 
 
-def _chw_uint8(img: np.ndarray) -> "torch.Tensor":
-    """Convert HWC uint8 numpy array to CHW uint8 tensor (no float conversion).
-
-    Used as the DataLoader transform so images stay as uint8 over PCIe (4×
-    smaller than float32); the trainer casts to float32 on the GPU after transfer.
-    Must be a module-level function (not a lambda) so it is picklable by
-    DataLoader workers.
-    """
-    return torch.from_numpy(img).permute(2, 0, 1)
-
-
 def load_image(filepath):
     """Load image with support for HEIC files. Returns RGB HWC uint8."""
     filepath = transform_path_for_user(filepath)
@@ -396,18 +385,13 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
     train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, gpu_device=gpu_device, **kwargs)
     val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, gpu_device=gpu_device, **kwargs)
 
-    _persistent = n_jobs > 0
-    _prefetch   = 4 if n_jobs > 0 else None
-
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=n_jobs,
-        pin_memory=pin_memory,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
+        pin_memory=pin_memory
     )
 
     val_loader = DataLoader(
@@ -415,45 +399,10 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         batch_size=batch_size,
         shuffle=False,
         num_workers=n_jobs,
-        pin_memory=pin_memory,
-        persistent_workers=_persistent,
-        prefetch_factor=_prefetch,
+        pin_memory=pin_memory
     )
 
     return train_loader, val_loader
-
-
-def _parse_ccpd_polygon(filepath: str):
-    """Extract plate polygon vertices from a CCPD-format filename.
-
-    CCPD filenames encode four plate corners in the 4th ``-``-separated
-    field as ``x1&y1_x2&y2_x3&y3_x4&y4``.  The CCPD vertex order is
-    RB, LB, LT, RT.  We return them reordered to TL, TR, BR, BL to
-    match the convention used by ``apply_patch_to_image``.
-
-    Returns a [4, 2] float32 tensor, or *None* if parsing fails.
-    """
-    basename = os.path.basename(filepath)
-    stem = os.path.splitext(basename)[0]
-    # strip any suffix like "_texas"
-    parts = stem.split("-")
-    if len(parts) < 5:
-        return None
-    verts_str = parts[3]  # e.g. "628&575_455&440_452&335_625&470"
-    try:
-        verts = []
-        for pair in verts_str.split("_"):
-            x, y = pair.split("&")
-            verts.append((int(x), int(y)))
-        if len(verts) != 4:
-            return None
-    except (ValueError, IndexError):
-        return None
-    # CCPD order: RB(0), LB(1), LT(2), RT(3)
-    # Our order:  TL,    TR,    BR,    BL  = LT(2), RT(3), RB(0), LB(1)
-    return torch.tensor(
-        [verts[2], verts[3], verts[0], verts[1]], dtype=torch.float32
-    )
 
 
 class CCPDBboxDataset(Dataset):
@@ -461,14 +410,10 @@ class CCPDBboxDataset(Dataset):
 
     Returns items compatible with the trainer's use_original=True mode:
       orig_image      CHW float32 [0,1]
-      orig_corners    [4,2] float32  (TL, TR, BR, BL — plate polygon)
-      orig_homography [3,3] identity
+      orig_corners    [4,2] float32  (TL, TR, BR, BL of the bbox)
+      orig_homography [3,3] identity (bbox is already axis-aligned)
       filename        str
       label           str  ground-truth plate text
-
-    Plate polygon vertices are parsed from the CCPD filename.  If the
-    filename doesn't follow the CCPD naming convention, the axis-aligned
-    bbox corners are used as a fallback.
     """
 
     def __init__(self, csv_path: str, limit: int = 0):
@@ -491,16 +436,12 @@ class CCPDBboxDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         rec = self.records[idx]
         img = load_image(rec["image_path"])          # HWC uint8 RGB
-        img_t = torch.from_numpy(img).permute(2, 0, 1)   # uint8 CHW; cast to float on GPU
+        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
-        # Try to get actual plate polygon from CCPD filename
-        corners = _parse_ccpd_polygon(rec["image_path"])
-        if corners is None:
-            # Fallback: axis-aligned bbox corners
-            x1, y1, x2, y2 = rec["x1"], rec["y1"], rec["x2"], rec["y2"]
-            corners = torch.tensor(
-                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=torch.float32
-            )
+        x1, y1, x2, y2 = rec["x1"], rec["y1"], rec["x2"], rec["y2"]
+        corners = torch.tensor(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=torch.float32
+        )
         return {
             "orig_image":      img_t,
             "orig_corners":    corners,
@@ -518,15 +459,11 @@ def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
     Returns (train_loader, val_loader).  The val_loader is an empty stub —
     the split is expected to have been done externally by finetune_all_models.py.
     """
-    _persistent = n_jobs > 0
-    _prefetch   = 4 if n_jobs > 0 else None
-
     ds = CCPDBboxDataset(csv_path, limit=limit)
     print(f"Loaded {len(ds)} samples from {csv_path}")
     train_loader = DataLoader(
         ds, batch_size=batch_size, shuffle=True,
         num_workers=n_jobs, pin_memory=pin_memory,
-        persistent_workers=_persistent, prefetch_factor=_prefetch,
     )
     # Empty val loader (split already done on disk)
     empty_ds = CCPDBboxDataset.__new__(CCPDBboxDataset)
@@ -534,7 +471,6 @@ def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
     val_loader = DataLoader(
         empty_ds, batch_size=batch_size, shuffle=False,
         num_workers=n_jobs, pin_memory=pin_memory,
-        persistent_workers=_persistent, prefetch_factor=_prefetch,
     )
     return train_loader, val_loader
 

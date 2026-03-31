@@ -7,16 +7,12 @@ pluggable detector + OCR backend pair.
 Patch parameterization
 ----------------------
 The patch is produced by a trainable ConvTranspose2d decoder that grows a
-compact seed tensor through six stride-2 layers.  Both the seed and the
-decoder weights are optimised jointly.
+compact seed tensor from [C, 4, 8] to [3, 256, 512] through six stride-2
+layers.  Both the seed and the decoder weights are optimised jointly.
 This replaces the direct pixel-level nn.Parameter used in earlier versions.
 
-Without --top-extend: seed [C, 4, 8] → [3, 256, 512]
-With    --top-extend: seed [C, 8, 8] → [3, 512, 512]  (double height for the
-  extra attacker-controlled region above the plate)
-
 The inductive bias imposed by the decoder:
-  * Early layers capture global structure (the seed operates on a small grid
+  * Early layers capture global structure (the seed operates on a 4×8 grid
     that sees the entire patch simultaneously).
   * Later layers add finer spatial detail at progressively higher resolution.
   * The convolutional weight sharing acts as a natural regulariser, making TV
@@ -31,7 +27,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* LR schedule: warmup (10% of total updates, lr_min→lr) + CosineAnnealingLR (→lr_min), no early stopping.
+* LR schedule: 5-epoch linear warmup (1e-4→5e-4) + CosineAnnealingLR (→1e-4), 100 epochs, no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
@@ -39,7 +35,6 @@ Other design decisions
 from __future__ import annotations
 
 import csv
-import os
 import random
 import re
 import time
@@ -64,20 +59,9 @@ from tqdm import tqdm
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import (create_dataloaders, create_ccpd_dataloaders,
-                     make_letterbox_prep, make_resize_prep, make_passthrough_prep,
-                     _chw_uint8)
+                     make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
 warnings.filterwarnings("ignore")
-
-# ---------------------------------------------------------------------------
-# Profiling helper
-# ---------------------------------------------------------------------------
-
-def _pt() -> float:
-    """Return current wall-clock time in seconds, syncing CUDA first if available."""
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    return time.perf_counter()
 
 # ---------------------------------------------------------------------------
 # Differentiable detector preprocessing
@@ -109,34 +93,6 @@ def _diff_resize(
     img     = F.interpolate(img_chw.unsqueeze(0), size=(target_h, target_w),
                             mode="bilinear", align_corners=False).squeeze(0)
     return img, target_w / W, target_h / H
-
-
-def _diff_letterbox_batch(
-    imgs_bchw: torch.Tensor, target_size: int
-) -> Tuple[torch.Tensor, float, float, float]:
-    """Batched bilinear resize + grey pad — same logic as _diff_letterbox."""
-    B, C, H, W = imgs_bchw.shape
-    r      = min(target_size / H, target_size / W)
-    new_h  = int(round(H * r))
-    new_w  = int(round(W * r))
-    imgs   = F.interpolate(imgs_bchw, size=(new_h, new_w),
-                           mode="bilinear", align_corners=False)
-    dw     = (target_size - new_w) / 2
-    dh     = (target_size - new_h) / 2
-    top    = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
-    left   = int(round(dw - 0.1)); right  = int(round(dw + 0.1))
-    imgs   = F.pad(imgs, (left, right, top, bottom), value=114.0 / 255.0)
-    return imgs, r, dw, dh
-
-
-def _diff_resize_batch(
-    imgs_bchw: torch.Tensor, target_w: int, target_h: int
-) -> Tuple[torch.Tensor, float, float]:
-    """Batched bilinear hard-resize — same logic as _diff_resize."""
-    B, C, H, W = imgs_bchw.shape
-    imgs = F.interpolate(imgs_bchw, size=(target_h, target_w),
-                         mode="bilinear", align_corners=False)
-    return imgs, target_w / W, target_h / H
 
 
 def _corners_letterbox(corners: np.ndarray, r: float, dw: float, dh: float) -> np.ndarray:
@@ -290,36 +246,42 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Trainable ConvTranspose2d decoder that maps a compact seed tensor
-    [1, seed_channels, 4, 8] → [1, 3, 256, 512].
+    Residual-stream decoder that maps [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Six stride-2 layers double the spatial dimensions at each step:
+    Six stages, each doubling spatial size:
         4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
-    Channel schedule halves from seed_channels→256→128→64→32→16→3,
-    so the expensive (many-channel) work is done at small spatial grids.
-    Output is passed through tanh and scaled to [0, 1].
+    All intermediate feature maps are kept at seed_channels (128) throughout,
+    forming a flat residual stream. Each stage contributes two additive deltas:
+      1. ConvTranspose2d: nearest-neighbour upsample of stream + deconv delta
+      2. Conv2d 7×7:      stream + conv delta (same spatial size)
 
-    Both the seed and the decoder weights are optimised during training —
-    the seed controls global structure while the decoder weights determine
-    how that structure is elaborated into pixel-level detail.
+    This gives every layer — including those close to the seed — a short gradient
+    path back to the loss, since gradients flow through the addition operations
+    without passing through earlier transposed convs.
+
+    A final 1×1 conv projects the 128-channel stream to 3 channels (RGB).
+    Output is passed through tanh and scaled to [0, 1].
     """
 
     def __init__(self, seed_channels: int = 128):
         super().__init__()
-        c = seed_channels
-        self.net = nn.Sequential(
-            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
-        )
+        C = seed_channels
+        self.deconvs = nn.ModuleList([
+            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
+        ])
+        self.convs = nn.ModuleList([
+            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
+        ])
+        self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
         """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
-        return torch.tanh(self.net(seed)) * 0.5 + 0.5
+        x = seed
+        for deconv, conv in zip(self.deconvs, self.convs):
+            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
+            x = x + F.leaky_relu(conv(x), 0.2)
+        return torch.tanh(self.final(x)) * 0.5 + 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +351,8 @@ class AdversarialPatchTrainer:
         seed_channels:        int            = 128,
         preload_images:       bool           = False,
         gpu_preload:          bool           = False,
-        num_workers:          int            = -1,
-        pin_memory:           bool           = True,
+        num_workers:          int            = 0,
+        pin_memory:           bool           = False,
         limit:                int            = 0,
         use_all_for_train:    bool           = False,
         grad_accumulate:      Optional[int]  = None,
@@ -426,10 +388,6 @@ class AdversarialPatchTrainer:
         self.expected_plate_text  = expected_plate_text
         self.train_detector       = train_detector
 
-        # ── Profiling (must be set before any method calls below) ──────
-        self.profiling: bool = False
-        self._prof: Dict[str, list] = {}
-
         # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
         self.device   = detector.device
@@ -459,19 +417,16 @@ class AdversarialPatchTrainer:
 
         # ── Patch decoder (seed + decoder jointly optimised) ───────────
         self.patch_width   = PATCH_WIDTH
-        self.patch_height  = PATCH_HEIGHT * 2 if top_extend else PATCH_HEIGHT
+        self.patch_height  = PATCH_HEIGHT
         self.seed_channels = seed_channels
-        # Seed spatial size: 4×8 (standard) or 8×8 (top-extend, doubled height)
-        # Six stride-2 ConvTranspose2d stages → output 256×512 or 512×512 respectively.
-        _seed_h = 8 if top_extend else 4
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
         self.seed    = nn.Parameter(
-            torch.randn(1, seed_channels, _seed_h, 8, device=self.device) * 0.1
+            torch.randn(1, seed_channels, 4, 8, device=self.device) * 0.1
         )
         self.decoder = PatchDecoder(seed_channels).to(self.device)
 
         # ── Image transform ────────────────────────────────────────────
-        self.transform = _chw_uint8
+        self.transform = T.Compose([T.ToTensor()])
 
         # ── Sanity check (before any preloading) ───────────────────────
         if not skip_sanity:
@@ -499,11 +454,10 @@ class AdversarialPatchTrainer:
             del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
-        _n_jobs = os.cpu_count() if num_workers < 0 else num_workers
         if ccpd_csv:
             self.train_loader, self.val_loader = create_ccpd_dataloaders(
                 ccpd_csv, batch_size=1,
-                n_jobs=_n_jobs, pin_memory=pin_memory,
+                n_jobs=num_workers, pin_memory=pin_memory,
                 limit=limit,
             )
         else:
@@ -513,7 +467,7 @@ class AdversarialPatchTrainer:
                 preload=preload_images,
                 gpu_device=self.device if gpu_preload else None,
                 batch_size=1,
-                n_jobs=0 if (gpu_preload or preload_images) else _n_jobs,
+                n_jobs=0 if (gpu_preload or preload_images) else num_workers,
                 pin_memory=False if (gpu_preload or preload_images) else pin_memory,
                 limit=limit,
                 use_all_for_train=use_all_for_train,
@@ -533,16 +487,6 @@ class AdversarialPatchTrainer:
             params.extend(list(self.detector.parameters()))
         return params
 
-    def _param_groups(self, lr: float) -> list:
-        """Parameter groups. All params use the same LR."""
-        groups = [
-            {"params": list(self.decoder.parameters()), "lr": lr},
-            {"params": [self.seed],                     "lr": lr},
-        ]
-        if self.train_detector:
-            groups.append({"params": list(self.detector.parameters()), "lr": lr})
-        return groups
-
     def generate_patch(self, training_aug: bool = False) -> torch.Tensor:
         """
         Run the decoder forward to produce the patch.
@@ -553,7 +497,7 @@ class AdversarialPatchTrainer:
             Shape [3, H, W], values in [0, 1], on self.device.
             Gradient graph is intact (suitable for loss.backward()).
         """
-        patch = self.decoder(self.seed).squeeze(0)   # [3, H, W]
+        patch = self.decoder(self.seed).squeeze(0)   # [3, 256, 512]
 
         if self.print_blur > 0:
             patch = kornia.filters.gaussian_blur2d(
@@ -561,7 +505,7 @@ class AdversarialPatchTrainer:
                 (self.print_blur, self.print_blur),
             ).squeeze(0)
 
-        return patch   # [3, H, W]
+        return patch   # [3, 256, 512]
 
     # ====================================================================
     # Detector preprocessing selection
@@ -569,10 +513,9 @@ class AdversarialPatchTrainer:
 
     def _make_differentiable_prep(self):
         """
-        Return a callable  (img_chw: Tensor, corners: Tensor [4, 2])
-                        ->  (img_chw_prep: Tensor, new_corners: Tensor [4, 2])
+        Return a callable  (img_chw: Tensor, corners_np: ndarray)
+                        ->  (img_chw_prep: Tensor, new_corners_np: ndarray)
         that applies detector-specific preprocessing differentiably on the GPU.
-        Corners stay on the GPU throughout — no CPU round-trip.
         """
         name = self.detector.name
         if name in ("yolov8", "yolov11"):
@@ -580,67 +523,25 @@ class AdversarialPatchTrainer:
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
                 raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, imgsz)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         elif name == "rtdetr":
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, sx, sy = _diff_resize(img_chw, 640, 640)
-                c = corners.clone(); c[:, 0] = c[:, 0] * sx; c[:, 1] = c[:, 1] * sy
-                return img, c
+                return img, _corners_resize(corners_np, sx, sy)
         elif name == "fasterrcnn":
-            def fn(img_chw, corners):
-                return img_chw, corners.clone()
+            def fn(img_chw, corners_np):
+                return img_chw, corners_np.astype(np.float32).copy()
         elif name == "yolo-v9-608":
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, 608)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         else:
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, 384)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
-
-    def _diff_prep_batch(
-        self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched differentiable preprocessing.
-
-        imgs_bchw:     [B, C, H, W]
-        corners_batch: [B, 4, 2]
-        Returns:       (imgs_prep [B, C, H', W'], new_corners [B, 4, 2])
-
-        All images in the batch must have the same spatial size (caller's
-        responsibility — guaranteed by the by_size grouping in _prepare_batch).
-        """
-        name = self.detector.name
-        if name in ("yolov8", "yolov11"):
-            imgsz = 640
-            if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.overrides.get("imgsz", 640)
-                imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, imgsz)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        elif name == "rtdetr":
-            imgs, sx, sy = _diff_resize_batch(imgs_bchw, 640, 640)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * sx; c[..., 1] = c[..., 1] * sy
-        elif name == "fasterrcnn":
-            imgs = imgs_bchw
-            c = corners_batch.clone()
-        elif name == "yolo-v9-608":
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 608)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        else:
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 384)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        return imgs, c
 
     def _make_cv2_prep(self):
         """Return the equivalent cv2-based prep fn (for debug comparison only)."""
@@ -656,7 +557,7 @@ class AdversarialPatchTrainer:
         elif name == "fasterrcnn":
             return make_passthrough_prep()
         elif name == "yolo-v9-608":
-            return make_letterbox_prep(608)
+            return make_letterbox_prep(384)
         else:
             return make_letterbox_prep(384)
 
@@ -769,58 +670,66 @@ class AdversarialPatchTrainer:
         B    = image.shape[0]
         H, W = image.shape[2], image.shape[3]
 
-        plates  = corners                                               # [B, 4, 2]
-        centers = plates.mean(dim=1, keepdim=True)                     # [B, 1, 2]
+        plate  = corners[0]   # [4, 2]: TL, TR, BR, BL
+        cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
+        center = torch.tensor([cx, cy], device=self.device)
 
         ph, pw = self.patch_height, self.patch_width
-        src = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
-                            dtype=torch.float32, device=self.device
-                            ).unsqueeze(0).repeat(B, 1, 1)             # [B, 4, 2]
+        src    = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
+                               dtype=torch.float32, device=self.device).unsqueeze(0)  # [1, 4, 2]
 
         if self.top_extend:
-            # Perspective-correct asymmetric border: bottom corners at normal
-            # 1.4× scale, top corners also shifted by 1.4 × column vector so
-            # total column height = 2.8 × plate_h with tilt fully preserved.
-            pts_b     = centers + (plates - centers) * border_scale    # [B, 4, 2]
-            col_left  = plates[:, 0:1, :] - plates[:, 3:4, :]         # [B, 1, 2] TL-BL
-            col_right = plates[:, 1:2, :] - plates[:, 2:3, :]         # [B, 1, 2] TR-BR
-            borders   = torch.cat([pts_b[:, 0:1, :] + 1.4 * col_left,
-                                    pts_b[:, 1:2, :] + 1.4 * col_right,
-                                    pts_b[:, 2:3, :], pts_b[:, 3:4, :]], dim=1)  # [B, 4, 2]
+            # Perspective-correct asymmetric border.
+            # Bottom corners: normal 1.4× scale from center.
+            # Top corners: normal scale + 1.4 × column vector (TL-BL / TR-BR),
+            # giving total column height = 2.8 × plate_h, tilt fully preserved.
+            p1_b = center + (plate[0] - center) * border_scale
+            p2_b = center + (plate[1] - center) * border_scale
+            p3_b = center + (plate[2] - center) * border_scale
+            p4_b = center + (plate[3] - center) * border_scale
+            col_left  = plate[0] - plate[3]   # TL - BL
+            col_right = plate[1] - plate[2]   # TR - BR
+            border = torch.stack([p1_b + 1.4 * col_left,
+                                   p2_b + 1.4 * col_right,
+                                   p3_b, p4_b]).unsqueeze(0)   # [1, 4, 2]
         else:
-            borders = centers + (plates - centers) * border_scale      # [B, 4, 2]
+            border = (center.unsqueeze(0) +
+                      (plate - center.unsqueeze(0)) * border_scale).unsqueeze(0)  # [1, 4, 2]
 
-        # Patch space → border/plate quads in image space
-        M_border = K.get_perspective_transform(src, borders)           # [B, 3, 3]
-        M_plate  = K.get_perspective_transform(src, plates)            # [B, 3, 3]
-
-        ones = torch.ones(B, 1, ph, pw, device=self.device)
-
-        # Compute plate mask first — used for per-image brightness (no .item() syncs).
-        warped_plate_mask = K.warp_perspective(ones, M_plate, (H, W),
-                                               mode="bilinear", padding_mode="zeros",
-                                               align_corners=True)    # [B, 1, H, W]
+        # Patch space → border quad in image space
+        M_border = K.get_perspective_transform(src, border)
+        # Patch space → plate quad in image space (for cut-out)
+        M_plate  = K.get_perspective_transform(src, plate.unsqueeze(0))
 
         patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
         if augment:
             patch_batch = self._augment_image(patch_batch)
 
-        # Brightness correction: scale each patch to match that image's plate
-        # brightness, so it doesn't stand out against different lighting.
+        # Brightness correction: scale patch to match the plate region's mean
+        # brightness, so it doesn't stand out against different lighting conditions.
         # During training, skipped with probability 0.2 so the model doesn't
         # learn to rely on it as a secondary activation.
-        if not (self.training and random.random() < 0.2):
+        if not (self.training and torch.rand(1, device=self.device).item() < 0.2):
             with torch.no_grad():
-                mask_sum    = warped_plate_mask.sum(dim=[2, 3], keepdim=True).clamp(min=1e-6)
-                plate_bright = (image * warped_plate_mask).sum(dim=[2, 3], keepdim=True) / mask_sum
-                plate_bright = plate_bright.mean(dim=1, keepdim=True).clamp(min=1e-6)  # [B,1,1,1]
-                patch_bright = patch_batch.mean(dim=[1, 2, 3], keepdim=True).clamp(min=1e-6)
-                patch_batch  = patch_batch * (plate_bright / patch_bright).clamp(0.2, 5.0)
+                px1 = int(plate[:, 0].min().clamp(0, W - 1).item())
+                px2 = int(plate[:, 0].max().clamp(0, W).item())
+                py1 = int(plate[:, 1].min().clamp(0, H - 1).item())
+                py2 = int(plate[:, 1].max().clamp(0, H).item())
+                if px2 > px1 and py2 > py1:
+                    plate_brightness = image[0, :, py1:py2, px1:px2].mean().clamp(min=1e-6)
+                    patch_brightness = patch_batch.mean().clamp(min=1e-6)
+                    brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+                    patch_batch = patch_batch * brightness_scale
+
+        ones = torch.ones(B, 1, ph, pw, device=self.device)
 
         warped_patch       = K.warp_perspective(patch_batch, M_border, (H, W),
                                                 mode="bilinear", padding_mode="zeros",
                                                 align_corners=True)
         warped_border_mask = K.warp_perspective(ones, M_border, (H, W),
+                                                mode="bilinear", padding_mode="zeros",
+                                                align_corners=True)
+        warped_plate_mask  = K.warp_perspective(ones, M_plate,  (H, W),
                                                 mode="bilinear", padding_mode="zeros",
                                                 align_corners=True)
 
@@ -846,115 +755,53 @@ class AdversarialPatchTrainer:
     def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
         return augment_plate(image, self.device)
 
-    def _prepare_batch(self, raw_items: list, patch_norm: torch.Tensor,
-                       augment: Optional[bool] = None) -> list:
-        """Batch patch application + preprocessing for a list of raw items.
-
-        Groups images by spatial size so apply_patch_to_image can run as a
-        single batched warp call per size group (kornia requires uniform HxW).
-        diff_prep is still sequential (cheap; shapes differ after letterbox).
-        """
-        _prof = self.profiling
-        if _prof: _t_batch0 = _t0 = _pt()
-
-        # ── CPU-side downscale + size grouping ──────────────────────────
-        # Downscale on CPU before transfer so we only move the smaller tensor.
-        loaded_cpu = []
-        for raw in raw_items:
-            t = raw["orig_image"]       # [C, H, W] — stays on CPU
-            c = raw["orig_corners"]     # [4, 2]
-            _, H, W = t.shape
-            if max(H, W) > 2000:
-                t = F.interpolate(t.unsqueeze(0), scale_factor=0.5,
-                                  mode="bilinear", align_corners=False).squeeze(0)
-                c = c * 0.5
-            loaded_cpu.append((t, c, raw.get("label")))
-
-        aug = self.augment if augment is None else augment
-
-        # Group indices by image spatial size for batched warp.
-        by_size: Dict[Tuple[int, int], List[int]] = {}
-        for i, (t, _, _) in enumerate(loaded_cpu):
-            key = (int(t.shape[-2]), int(t.shape[-1]))
-            by_size.setdefault(key, []).append(i)
-
-        # ── Async GPU transfer + float cast ─────────────────────────────
-        # Images are uint8 from the DataLoader (4× smaller over PCIe than
-        # float32). Transfer async on pinned memory, then cast to float32 on
-        # the GPU immediately — all enqueued on the same CUDA stream so the
-        # cast runs only after each DMA transfer completes.
-        loaded = []
-        for t, c, label in loaded_cpu:
-            t_gpu = t.to(self.device, non_blocking=True)
-            if t_gpu.dtype == torch.uint8:
-                t_gpu = t_gpu.float().div_(255.0)
-            loaded.append((t_gpu, c.to(self.device, non_blocking=True), label))
-
-        if _prof:
-            self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
-            _t1 = _pt()
-
-        # ── Batched patch application ────────────────────────────────────
-        patched_orig = [None] * len(loaded)
-        for indices in by_size.values():
-            imgs    = torch.stack([loaded[i][0] for i in indices])       # [G, C, H, W]
-            corners = torch.stack([loaded[i][1] for i in indices])       # [G, 4, 2]
-            patched, _ = self.apply_patch_to_image(
-                imgs, corners, patch_norm=patch_norm, augment=aug)
-            for j, i in enumerate(indices):
-                patched_orig[i] = patched[j:j + 1]                       # [1, C, H, W]
-
-        if _prof:
-            self._prof.setdefault("prepare/patch_apply", []).append(_pt() - _t1)
-            _t2 = _pt()
-
-        # ── Batched diff_prep per size group ─────────────────────────────
-        # All images in a size group share the same H×W → same letterbox
-        # parameters → one F.interpolate call replaces N sequential calls.
-        prep_results = [None] * len(loaded)
-        for indices in by_size.values():
-            batch    = torch.cat([patched_orig[i] for i in indices])     # [G, C, H, W]
-            corners_b = torch.stack([loaded[i][1] for i in indices])     # [G, 4, 2]
-            prep_b, new_corners_b = self._diff_prep_batch(batch, corners_b)
-            for j, i in enumerate(indices):
-                prep_results[i] = (prep_b[j], new_corners_b[j])
-
-        if _prof:
-            self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
-
-        result = []
-        for i, (orig_tensor, orig_corners, label) in enumerate(loaded):
-            po                 = patched_orig[i]                         # [1, C, H, W]
-            patched_prep_chw, new_corners = prep_results[i]
-            target_box = self.corners_to_bbox(new_corners)
-            rim_box    = self._rim_bbox(new_corners)
-            ocr_crop   = _bbox_ocr_crop(po, orig_corners, self.ocr.ocr_crop_size)
-            if self.top_extend:
-                top_region_box   = self._top_extend_region_bbox(new_corners)
-                top_corners_orig = self._top_extend_region_corners(orig_corners)
-                top_ocr_crop     = _bbox_ocr_crop(po, top_corners_orig, self.ocr.ocr_crop_size)
-            else:
-                top_region_box = None
-                top_ocr_crop   = None
-            result.append({
-                "patched_prep":   patched_prep_chw,
-                "target_box":     target_box,
-                "rim_box":        rim_box,
-                "new_corners":    new_corners,
-                "ocr_crop":       ocr_crop,
-                "top_region_box": top_region_box,
-                "top_ocr_crop":   top_ocr_crop,
-                "label":          label,
-            })
-
-        if _prof:
-            self._prof.setdefault("prepare/total", []).append(_pt() - _t_batch0)
-        return result
-
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
                      augment: Optional[bool] = None) -> dict:
-        """Single-image wrapper around _prepare_batch."""
-        return self._prepare_batch([batch_item], patch_norm, augment=augment)[0]
+        """Fast per-image ops: patch application + preprocessing. No model calls."""
+        orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
+        orig_corners_np = batch_item["orig_corners"].cpu().numpy()
+        orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
+
+        # Halve images that are too large to keep GPU memory manageable
+        _, H, W = orig_tensor.shape
+        if max(H, W) > 2000:
+            orig_tensor     = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
+                                            mode="bilinear", align_corners=False).squeeze(0)
+            orig_corners_np = orig_corners_np * 0.5
+            orig_corners    = orig_corners * 0.5
+
+        patched_orig, _ = self.apply_patch_to_image(
+            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
+            patch_norm=patch_norm,
+            augment=self.augment if augment is None else augment)
+
+        patched_prep_chw, new_corners_np = self.diff_prep(
+            patched_orig.squeeze(0), orig_corners_np)
+        new_corners = torch.from_numpy(new_corners_np).to(self.device)
+        target_box  = self.corners_to_bbox(new_corners)
+        rim_box     = self._rim_bbox(new_corners)
+        ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
+
+        if self.top_extend:
+            top_region_box = self._top_extend_region_bbox(new_corners)
+            # OCR crop for the top target region, using perspective-correct corners
+            # in original full-res image coords (same column-vector parameterization).
+            top_corners_orig = self._top_extend_region_corners(orig_corners)
+            top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
+                                          self.ocr.ocr_crop_size)
+        else:
+            top_region_box = None
+            top_ocr_crop   = None
+
+        return {
+            "patched_prep":  patched_prep_chw,   # [C, H_p, W_p]
+            "target_box":    target_box,          # [4]
+            "rim_box":       rim_box,             # [4]
+            "ocr_crop":      ocr_crop,            # [1, 3, H_c, W_c]
+            "top_region_box": top_region_box,     # [4] or None
+            "top_ocr_crop":   top_ocr_crop,       # [1, 3, H_c, W_c] or None
+            "label":         batch_item.get("label"),  # str or None
+        }
 
     def compute_loss_batch(self, items: list) -> tuple:
         """Batch the slow model-eval calls; average losses over B items.
@@ -990,15 +837,8 @@ class AdversarialPatchTrainer:
         top_region_boxes = [x["top_region_box"] for x in items]
         tv_l             = self.total_variation_loss(patch_norm)
 
-        _prof = self.profiling
-        if _prof: _t0 = _pt()
-
         two_target_results = self.detector.differentiable_predict_box_batch_two_targets(
             batched_prep, target_boxes, top_region_boxes)
-
-        if _prof:
-            self._prof.setdefault("loss/detector", []).append(_pt() - _t0)
-            _t1 = _pt()
 
         # ── Pass 1: detection losses + crop extraction (no OCR calls) ────
         det_losses, crop_info = [], []
@@ -1041,10 +881,6 @@ class AdversarialPatchTrainer:
 
             crop_info.append((real_crop, top_crop))
 
-        if _prof:
-            self._prof.setdefault("loss/pass1_loop", []).append(_pt() - _t1)
-            _t2 = _pt()
-
         # ── Pass 2: batch OCR — one model call for all crops ──────────────
         image_losses = []
         det_real_l_list, det_top_l_list, ocr_real_l_list, ocr_top_l_list = [], [], [], []
@@ -1057,10 +893,6 @@ class AdversarialPatchTrainer:
                 ti = (len(flat_crops), flat_crops.append(top_crop))[0]  if top_crop  is not None else None
                 crop_idx_per_item.append((ri, ti))
             raw_all = self.ocr.encode_batch(flat_crops) if flat_crops else None
-
-        if _prof:
-            self._prof.setdefault("loss/ocr_encode", []).append(_pt() - _t2)
-            _t3 = _pt()
 
         _zero = torch.tensor(0.0, device=self.device)
         for i, (real_crop, top_crop) in enumerate(crop_info):
@@ -1105,9 +937,6 @@ class AdversarialPatchTrainer:
             ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
             ocr_top_l_list.append(ocr_top_i.detach()  if ocr_top_i  is not None else _zero)
 
-        if _prof:
-            self._prof.setdefault("loss/pass2_loop", []).append(_pt() - _t3)
-
         det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
         total      = (torch.stack(image_losses).mean()
                       + self.tv_weight * tv_l
@@ -1135,15 +964,11 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def save_patch(self, epoch: int, subdir: str = "patches",
-                   stem: Optional[str] = None,
-                   global_update: Optional[int] = None) -> None:
+                   stem: Optional[str] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
         if stem is None:
-            if global_update is not None:
-                stem = f"patch_{self.detector.name}_epoch_{epoch:04d}_batch_{global_update:06d}"
-            else:
-                stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+            stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
@@ -1152,7 +977,6 @@ class AdversarialPatchTrainer:
                 "decoder":       self.decoder.state_dict(),
                 "seed_channels": self.seed_channels,
                 "epoch":         epoch,
-                "global_update": global_update,
                 "backend":       self.detector.name,
                 "ocr":           self.ocr.name,
                 "patch_size":    (self.patch_height, self.patch_width),
@@ -1167,7 +991,7 @@ class AdversarialPatchTrainer:
         """
         Estimate the optimal eval_batch_size by running one real item through
         _prepare_one + compute_loss_batch + backward, measuring peak GPU memory,
-        and scaling to available free memory with a 0.90 safety margin.
+        and scaling to available free memory with a 0.70 safety margin.
 
         Only meaningful on CUDA; returns the current eval_batch_size unchanged
         on other devices.
@@ -1197,7 +1021,7 @@ class AdversarialPatchTrainer:
             torch.cuda.empty_cache()
 
         free_after = torch.cuda.mem_get_info()[0]
-        safety = 0.90
+        safety = 0.70
         bs = max(1, int(free_after * safety / per_sample_mem))
         print(
             f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
@@ -1268,7 +1092,7 @@ class AdversarialPatchTrainer:
                 buffer.append(item)
                 if len(buffer) < B:
                     continue
-                loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(buffer)
+                loss, det_l, ocr_l, tv_l = self.compute_loss_batch(buffer)
                 buffer = []
                 step += 1
                 scaled = loss / update_every
@@ -1345,13 +1169,14 @@ class AdversarialPatchTrainer:
             fn              = (batch["filename"][0]
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
-            orig_tensor  = batch["orig_image"][0].to(self.device)
-            if orig_tensor.dtype == torch.uint8:
-                orig_tensor = orig_tensor.float().div_(255.0)
-            orig_corners = batch["orig_corners"][0].to(self.device)
+            orig_tensor     = batch["orig_image"][0].to(self.device)
+            orig_corners_np = batch["orig_corners"][0].cpu().numpy()
+            orig_corners    = batch["orig_corners"][0].to(self.device)
 
             with torch.no_grad():
-                prep_tensor, new_corners = self.diff_prep(orig_tensor, orig_corners)
+                prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
+            new_corners = torch.from_numpy(new_corners_np).to(self.device)
+            new_c       = new_corners_np
             target_box  = self.corners_to_bbox(new_corners)
 
             with torch.no_grad():
@@ -1397,9 +1222,11 @@ class AdversarialPatchTrainer:
             with torch.no_grad():
                 rand_seed    = torch.randn_like(self.seed)
                 rand_patch   = self.decoder(rand_seed).squeeze(0)   # [3, H, W]
-                raw_item_debug = {k: v[0] for k, v in batch.items()}
-                _dbg_item    = self._prepare_one(raw_item_debug, rand_patch, augment=False)
-                patched_prep = _dbg_item["patched_prep"]
+                patched_orig, _ = self.apply_patch_to_image(
+                    orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
+                    patch_norm=rand_patch,
+                )
+                patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
             patch_vis = (patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
             def _draw_quad(img, corners_t, color):
@@ -1431,7 +1258,7 @@ class AdversarialPatchTrainer:
             # (d) cv2 preprocessing vs differentiable preprocessing comparison
             with torch.no_grad():
                 img_hwc_uint8 = (orig_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners.cpu().numpy())
+                cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners_np)
                 diff_prep_np  = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 cv2_prep_np   = (cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
@@ -1475,11 +1302,8 @@ class AdversarialPatchTrainer:
         window_raw: list,
         B: int,
         update_every: int,
-        sam_m: Optional[int] = None,
     ) -> Tuple[float, float, float, float]:
         """One m-SAM update: ascent on sam_m random items, descent on all items.
-
-        sam_m overrides self.sam_m when provided (used for warmup scheduling).
 
         Returns the sum-of-chunk-averages for (loss, det, ocr, tv) consistent
         with the per-step accounting in train_epoch.
@@ -1492,7 +1316,7 @@ class AdversarialPatchTrainer:
         incoming gradient) propagates correctly to seed/decoder params.
         """
         M = len(window_raw)
-        m = min(sam_m if sam_m is not None else self.sam_m, M)
+        m = min(self.sam_m, M)
 
         def _accumulate(indices, weight):
             """
@@ -1511,9 +1335,11 @@ class AdversarialPatchTrainer:
             total_loss = det_real_sum = det_top_sum = ocr_real_sum = ocr_top_sum = tv_sum = 0.0
             for chunk_start in range(0, len(indices), B):
                 chunk = indices[chunk_start:chunk_start + B]
-                items = self._prepare_batch([window_raw[i] for i in chunk], patch_leaf)
-                for item in items:
+                items = []
+                for i in chunk:
+                    item = self._prepare_one(window_raw[i], patch_leaf)
                     item["_patch_norm"] = patch_leaf
+                    items.append(item)
                 loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(items)
                 # loss is mean over len(chunk); scale back to sum for grad equivalence
                 (loss * weight * len(chunk)).backward()
@@ -1535,12 +1361,6 @@ class AdversarialPatchTrainer:
         _accumulate(ascent_idx, 1.0 / m)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
-        # Scale rho with current LR so the perturbation stays proportional to
-        # the update step size — prevents over-perturbation during LR warmup.
-        _cur_lr = optimizer.base_optimizer.param_groups[0]["lr"]
-        _scaled_rho = self.sam_rho * (_cur_lr / self._peak_lr)
-        for _g in optimizer.param_groups:
-            _g["rho"] = _scaled_rho
         optimizer.first_step(zero_grad=True)
 
         # ── DESCENT: gradients from all M items, perturbed patch ─────────
@@ -1554,12 +1374,7 @@ class AdversarialPatchTrainer:
 
     def train_epoch(self, optimizer, epoch: int, scheduler=None,
                     update_log: Optional[list] = None,
-                    update_offset: int = 0,
-                    tv_warmup_updates: int = 0,
-                    sam_warmup_updates: int = 0,
-                    save_every: int = 0,
-                    last_save_milestone: int = 0) -> Tuple[float, float, float, float]:
-        _saved_tv = self.tv_weight
+                    update_offset: int = 0) -> Tuple[float, float, float, float]:
         if self.ocr.is_trainable:
             self.ocr.train()
 
@@ -1567,14 +1382,6 @@ class AdversarialPatchTrainer:
         update_every = (len(self.train_loader)
                         if self.grad_accumulate is None
                         else self.grad_accumulate)
-
-        use_sam = isinstance(optimizer, SAM)
-        _target_sam_m = self.sam_m if use_sam else 1
-        def _effective_sam_m(global_update: int) -> int:
-            if not use_sam or sam_warmup_updates <= 0:
-                return _target_sam_m
-            t = min(1.0, global_update / sam_warmup_updates)
-            return max(1, round(1 + t * (_target_sam_m - 1)))
         total_loss = accum_loss = 0.0
         total_det_real = total_det_top = total_ocr_real = total_ocr_top = total_tv = 0.0
         # Per-update accumulators (reset after each optimizer step, like accum_loss)
@@ -1584,7 +1391,7 @@ class AdversarialPatchTrainer:
         _loss_accum_t = torch.zeros(6, device=self.device)
         step = num_updates = 0
         buffer: list = []
-        buffer_raw: list = []   # accumulate raw items before batched _prepare_batch
+        use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
 
         # Generate the first patch (with generator graph) for the accumulation window.
@@ -1596,47 +1403,25 @@ class AdversarialPatchTrainer:
         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
         # Progress bar tracks optimizer updates, not individual images.
-        profile_steps = 10 if self.profiling else 0
-        _prof_completed = 0   # optimizer steps finished so far (profiling)
-        _t_iter_end = _pt() if self.profiling else 0.0   # for dataloader fetch timing
-
         updates_per_epoch = max(1, len(self.train_loader) // (B * update_every))
         with tqdm(total=updates_per_epoch,
                   desc=f"Epoch {epoch+1}",
                   leave=False) as pbar:
             for idx, batch in enumerate(self.train_loader):
                 try:
-                    if self.profiling:
-                        self._prof.setdefault("step/dataloader", []).append(_pt() - _t_iter_end)
-
                     raw_item = {k: v[0] for k, v in batch.items()}
 
                     if use_sam:
                         window_raw.append(raw_item)
                         window_full = len(window_raw) == B * update_every
                         if not window_full:
-                            if self.profiling: _t_iter_end = _pt()
                             continue
 
-                        self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
-                        if self.profiling: _tsam0 = _pt()
                         loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
-                            self._msam_step(optimizer, window_raw, B, update_every,
-                                            sam_m=_effective_sam_m(update_offset + num_updates))
-                        if self.profiling:
-                            _tsam_total = _pt() - _tsam0
-                            self._prof.setdefault("step/sam_total", []).append(_tsam_total)
-                            _step_t = self._prof["step/dataloader"][-1] + _tsam_total
-                            self._prof.setdefault("step/total", []).append(_step_t)
-                            _prof_completed += 1
+                            self._msam_step(optimizer, window_raw, B, update_every)
                         window_raw = []
                         step       += update_every
                         num_updates += 1
-                        if save_every > 0:
-                            _ms = (update_offset + num_updates) // save_every
-                            if _ms > last_save_milestone:
-                                last_save_milestone = _ms
-                                self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
                         # _msam_step sums losses over all M=B*update_every items
                         # individually; divide by B so the scale matches the
                         # non-SAM path (which averages over B inside compute_loss_batch).
@@ -1673,40 +1458,24 @@ class AdversarialPatchTrainer:
                         })
                         patch_with_graph = self.generate_patch(training_aug=self.training)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                        if self.profiling:
-                            _t_iter_end = _pt()
-                            if _prof_completed >= profile_steps:
-                                self._print_profile_report(profile_steps, B, update_every)
-                                return
                         continue
 
                     # ── Standard (non-SAM) accumulation path ─────────────────
-                    # Collect raw items until we have a full batch of B, then
-                    # call _prepare_batch once so apply_patch_to_image runs as
-                    # a single batched warp for all B images at once.
-                    buffer_raw.append(raw_item)
-                    if len(buffer_raw) < B:
-                        if self.profiling: _t_iter_end = _pt()
+                    # Use the detached patch_leaf so each backward frees its
+                    # detector/OCR graph immediately (no retain_graph).
+                    item = self._prepare_one(raw_item, patch_leaf)
+                    item["_patch_norm"] = patch_leaf
+                    buffer.append(item)
+
+                    if len(buffer) < B:
                         continue
 
-                    buffer = self._prepare_batch(buffer_raw, patch_leaf)
-                    buffer_raw = []
-                    for item in buffer:
-                        item["_patch_norm"] = patch_leaf
-
-                    self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
-                    if self.profiling: _tlb0 = _pt()
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
-                    if self.profiling:
-                        self._prof.setdefault("step/loss_batch", []).append(_pt() - _tlb0)
                     buffer = []
                     scaled_loss = loss / update_every
                     step += 1
-                    if self.profiling: _tbw0 = _pt()
                     scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
-                    if self.profiling:
-                        self._prof.setdefault("step/backward", []).append(_pt() - _tbw0)
 
                     _loss_accum_t.add_(torch.stack(
                         [loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l]
@@ -1714,7 +1483,6 @@ class AdversarialPatchTrainer:
                     del loss, scaled_loss
 
                     if step % update_every == 0:
-                        if self.profiling: _topt0 = _pt()
                         # Propagate accumulated patch gradient through generator.
                         patch_with_graph.backward(patch_leaf.grad)
                         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
@@ -1734,11 +1502,6 @@ class AdversarialPatchTrainer:
                         total_tv       += _upd_tv
                         total_loss  += accum_loss
                         num_updates += 1
-                        if save_every > 0:
-                            _ms = (update_offset + num_updates) // save_every
-                            if _ms > last_save_milestone:
-                                last_save_milestone = _ms
-                                self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
                         _lr_now = optimizer.param_groups[0]["lr"]
                         if update_log is not None:
                             update_log.append({
@@ -1768,50 +1531,24 @@ class AdversarialPatchTrainer:
                         patch_with_graph = self.generate_patch(training_aug=self.training)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
 
-                        if self.profiling:
-                            self._prof.setdefault("step/optimizer", []).append(_pt() - _topt0)
-                            # Step total = dataloader + B*prepare + loss + backward + opt
-                            _step_t = (
-                                self._prof["step/dataloader"][-1]
-                                + self._prof["prepare/total"][-1]
-                                + self._prof["step/loss_batch"][-1]
-                                + self._prof["step/backward"][-1]
-                                + self._prof["step/optimizer"][-1]
-                            )
-                            self._prof.setdefault("step/total", []).append(_step_t)
-                            _prof_completed += 1
-                            _t_iter_end = _pt()
-                            if _prof_completed >= profile_steps:
-                                self._print_profile_report(profile_steps, B, update_every)
-                                return
-
                 except Exception:
                     print(f"\n[WARNING] Skipping batch {idx} due to error:")
                     traceback.print_exc()
                     # Reset batch state so the next iteration starts clean
                     buffer = []
-                    buffer_raw = []
                     window_raw = []
                     optimizer.zero_grad()
                     patch_with_graph = self.generate_patch(training_aug=self.training)
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                if self.profiling: _t_iter_end = _pt()
 
             # ── Flush remainder at end of epoch ──────────────────────────
             if use_sam and len(window_raw) >= B:
                 # Partial window: trim to a multiple of B, then do m-SAM update
                 n_complete = (len(window_raw) // B) * B
-                self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                 loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
-                    self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B,
-                                    sam_m=_effective_sam_m(update_offset + num_updates))
+                    self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B)
                 step           += n_complete // B
                 num_updates    += 1
-                if save_every > 0:
-                    _ms = (update_offset + num_updates) // save_every
-                    if _ms > last_save_milestone:
-                        last_save_milestone = _ms
-                        self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
                 total_loss     += loss_t      / B
                 total_det_real += det_real_t  / B
                 total_det_top  += det_top_t   / B
@@ -1833,15 +1570,8 @@ class AdversarialPatchTrainer:
                         "lr":       _opt.param_groups[0]["lr"],
                     })
             elif not use_sam:
-                # Flush any raw items not yet prepared
-                if buffer_raw:
-                    buffer = self._prepare_batch(buffer_raw, patch_leaf)
-                    buffer_raw = []
-                    for item in buffer:
-                        item["_patch_norm"] = patch_leaf
                 # Flush remainder buffer (< B images left at end of epoch)
                 if buffer:
-                    self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = \
                         self.compute_loss_batch(buffer)
                     buffer = []
@@ -1871,11 +1601,6 @@ class AdversarialPatchTrainer:
                         scheduler.step()
                     total_loss  += accum_loss
                     num_updates += 1
-                    if save_every > 0:
-                        _ms = (update_offset + num_updates) // save_every
-                        if _ms > last_save_milestone:
-                            last_save_milestone = _ms
-                            self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
                     if update_log is not None:
                         _rem = step % update_every or update_every
                         update_log.append({
@@ -1890,88 +1615,11 @@ class AdversarialPatchTrainer:
                             "lr":       optimizer.param_groups[0]["lr"],
                         })
 
-        self.tv_weight = _saved_tv
         n = max(step, 1)
         return (total_loss / n,
                 total_det_real / n, total_det_top / n,
                 total_ocr_real / n, total_ocr_top / n,
-                total_tv / n, num_updates, last_save_milestone)
-
-    def _print_profile_report(self, n_steps: int, B: int, update_every: int) -> None:
-        """Print a formatted profiling report and clear accumulated data."""
-        p = self._prof
-        sam_mode = "step/sam_total" in p
-
-        step_total = p.get("step/total", [])
-        step_ms    = np.array(step_total) * 1000 if step_total else np.array([1.0])
-        step_mean  = step_ms.mean()
-
-        def _per_step_mean(key):
-            """Return total-per-step mean (ms) by summing all entries / n_steps."""
-            vals = p.get(key, [])
-            if not vals:
-                return None, None
-            a = np.array(vals) * 1000
-            # Each prepare/* key may have multiple entries per step in SAM mode
-            # (one per chunk in each of ascent + descent).  Sum them per step.
-            n = n_steps if n_steps > 0 else 1
-            per_step_sum = a.sum() / n
-            # Rough std: std of individual entries scaled by entries-per-step
-            return per_step_sum, a.std() * (len(a) / n) ** 0.5
-
-        W = 36
-        print("\n" + "═"*76)
-        print(f"  PROFILE REPORT  ({n_steps} steps, eval_batch_size={B}, update_every={update_every})")
-        if sam_mode:
-            print(f"  [SAM mode — prepare/* and loss/* show total per optimizer step]")
-        print("═"*76)
-        print(f"  {'Section':<{W}} {'Mean/step':>10}  {'Std':>8}  {'%step':>7}")
-        print("  " + "─"*72)
-
-        def _row(label, key, ref=None, indent=0):
-            m, s = _per_step_mean(key)
-            if m is None:
-                return
-            ref_ms = ref if ref is not None else step_mean
-            pct = m / ref_ms * 100 if ref_ms > 0 else 0
-            pad = "  " * indent
-            lbl = pad + label
-            print(f"  {lbl:<{W}} {m:>9.1f}ms  {s:>7.1f}ms  {pct:>6.1f}%")
-
-        _row("DataLoader fetch",           "step/dataloader")
-
-        if sam_mode:
-            m_sam, s_sam = _per_step_mean("step/sam_total")
-            if m_sam is not None:
-                pct = m_sam / step_mean * 100 if step_mean > 0 else 0
-                print(f"  {'SAM step (ascent+descent)':<{W}} {m_sam:>9.1f}ms  {s_sam:>7.1f}ms  {pct:>6.1f}%")
-                # Sub-timings as fraction of sam_total
-                _row("_prepare_batch",              "prepare/total",       m_sam, indent=1)
-                _row("  image to GPU",              "prepare/to_gpu",      m_sam, indent=2)
-                _row("  apply_patch (batched)",     "prepare/patch_apply", m_sam, indent=2)
-                _row("  diff_prep (sequential)",    "prepare/diff_prep",   m_sam, indent=2)
-                _row("compute_loss_batch",          "step/loss_batch",     m_sam, indent=1)
-                _row("  detector forward",          "loss/detector",       m_sam, indent=2)
-                _row("  pass1 loop (IoU+crops)",    "loss/pass1_loop",     m_sam, indent=2)
-                _row("  OCR encode",                "loss/ocr_encode",     m_sam, indent=2)
-                _row("  pass2 loop (OCR loss)",     "loss/pass2_loop",     m_sam, indent=2)
-        else:
-            _row("_prepare_batch",              "prepare/total")
-            _row("  image to GPU",              "prepare/to_gpu",      step_mean, indent=1)
-            _row("  apply_patch (batched)",     "prepare/patch_apply", step_mean, indent=1)
-            _row("  diff_prep (sequential)",    "prepare/diff_prep",   step_mean, indent=1)
-            _row("compute_loss_batch",          "step/loss_batch")
-            _row("  detector forward",          "loss/detector",       step_mean, indent=1)
-            _row("  pass1 loop (IoU+crops)",    "loss/pass1_loop",     step_mean, indent=1)
-            _row("  OCR encode",                "loss/ocr_encode",     step_mean, indent=1)
-            _row("  pass2 loop (OCR loss)",     "loss/pass2_loop",     step_mean, indent=1)
-            _row("backward()",                  "step/backward")
-            _row("optimizer step",              "step/optimizer")
-
-        print("  " + "─"*72)
-        print(f"  {'Step total':<{W}} {step_ms.mean():>9.1f}ms  {step_ms.std():>7.1f}ms  {'100.0%':>7}")
-        print("═"*76 + "\n")
-        self._prof.clear()
+                total_tv / n, num_updates)
 
     def validate(self) -> float:
         if self.ocr.is_trainable:
@@ -2002,12 +1650,11 @@ class AdversarialPatchTrainer:
 
     def train(
         self,
-        num_epochs:          int   = 100,
-        learning_rate:       float = 5e-4,
-        lr_min:              float = 1e-5,
-        dry_run:             bool  = False,
-        tv_warmup:           float = 0.1,
-        profile:             bool  = False,
+        num_epochs:    int   = 100,
+        learning_rate: float = 5e-4,
+        lr_min:        float = 1e-5,
+        dry_run:       bool  = False,
+        tv_warmup:     float = 0.1,
     ) -> dict:
         """
         tv_warmup: fraction of total gradient updates during which TV loss is
@@ -2022,17 +1669,10 @@ class AdversarialPatchTrainer:
 
         eta_min       = lr_min
 
-        # Resolve deferred sam_m now that eval_batch_size is known.
-        if self.sam_m == -1:
-            self.sam_m = max(1, self.eval_batch_size // 4)
-            print(f"[m-SAM] auto sam_m={self.sam_m}  (eval_batch_size={self.eval_batch_size}//4)")
-
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
-            self._peak_lr = learning_rate
-            self.sam_rho  = 10 * learning_rate
             optimizer = SAM(
-                self._param_groups(learning_rate),
+                self._trainable_params(),
                 base_optimizer_cls=optim.AdamW,
                 rho=self.sam_rho,
                 lr=learning_rate,
@@ -2042,17 +1682,9 @@ class AdversarialPatchTrainer:
             sched_optimizer = optimizer.base_optimizer
         else:
             optimizer = optim.AdamW(
-                self._param_groups(learning_rate), weight_decay=1e-4
+                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
             )
             sched_optimizer = optimizer
-        # Cap eval_batch_size so total updates >= 10000.
-        _ga_cap = len(self.train_loader) if self.grad_accumulate is None else self.grad_accumulate
-        _max_bs_for_min_updates = max(1, len(self.train_loader) * num_epochs // (10000 * _ga_cap))
-        if self.eval_batch_size > _max_bs_for_min_updates:
-            print(f"  [auto-batch] capping eval_batch_size {self.eval_batch_size} → "
-                  f"{_max_bs_for_min_updates} to ensure ≥10000 total updates")
-            self.eval_batch_size = _max_bs_for_min_updates
-
         # Scheduler counts are in gradient updates, not epochs.
         # _updates_per_epoch is computed below alongside tv_warmup; duplicate
         # the formula here so we can build the scheduler before the print block.
@@ -2091,18 +1723,16 @@ class AdversarialPatchTrainer:
                          else self.grad_accumulate)
         _updates_per_epoch = max(1, len(self.train_loader) //
                                  (self.eval_batch_size * _update_every))
-        total_updates      = num_epochs * _updates_per_epoch
-        tv_warmup_updates  = int(tv_warmup * total_updates)
-        sam_warmup_updates = int(0.1 * total_updates) if self.sam_m is not None else 0
-        save_every         = max(1, total_updates // 10)   # checkpoint every 10% of updates
+        total_updates     = num_epochs * _updates_per_epoch
+        tv_warmup_updates = int(tv_warmup * total_updates)
+        save_every        = max(1, total_updates // 10)   # checkpoint every 10% of updates
 
         n_params = sum(p.numel() for p in self._trainable_params())
         print(f"\n{'='*60}")
         print(f"  Adversarial Patch Training")
         print(f"  Detector  : {self.detector.name}   OCR: {self.ocr.name}")
-        _sh, _sw = self.seed.shape[2], self.seed.shape[3]
         print(f"  Patch gen : ConvTranspose decoder  "
-              f"(seed {self.seed_channels}ch×{_sh}×{_sw} → 3×{self.patch_height}×{self.patch_width})")
+              f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
         print(f"  Trainable : {n_params:,} params  "
               f"(seed {self.seed.numel():,}  +  decoder {n_params-self.seed.numel():,})")
         print(f"  Dataset   : {len(self.train_loader)+len(self.val_loader)} images")
@@ -2115,7 +1745,7 @@ class AdversarialPatchTrainer:
         else:
             print(f"  TV warmup : disabled")
         if self.sam_m is not None:
-            print(f"  Optimizer : m-SAM  (m=1→{self.sam_m} over {sam_warmup_updates} updates, rho={self.sam_rho}, base=AdamW)")
+            print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
         _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
         if self.disable_disruption:
             _mode += '  [detection loss disabled]'
@@ -2132,34 +1762,28 @@ class AdversarialPatchTrainer:
         batch_log_writer = csv.writer(batch_log_file)
         batch_log_writer.writerow(_batch_log_fields)
 
-        if profile:
-            self.profiling = True
-            print(f"\n[profile] Running {10} steps to collect timing data …")
-
         global_updates        = 0
         _last_save_milestone  = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
+            # Suppress TV loss until we've passed the warmup budget of updates.
+            saved_tv = self.tv_weight
+            if global_updates < tv_warmup_updates:
+                self.tv_weight = 0.0
             epoch_update_records: list = []
-            _epoch_result = self.train_epoch(
-                optimizer, epoch, scheduler,
-                update_log=epoch_update_records,
-                update_offset=global_updates,
-                tv_warmup_updates=tv_warmup_updates,
-                sam_warmup_updates=sam_warmup_updates,
-                save_every=save_every,
-                last_save_milestone=_last_save_milestone,
-            )
-            if _epoch_result is None:  # profiling finished early
-                return {}
             (train_loss,
              train_det_real, train_det_top,
              train_ocr_real, train_ocr_top,
-             train_tv, epoch_updates, _last_save_milestone) = _epoch_result  # _print_profile_report already called inside train_epoch
+             train_tv, epoch_updates) = self.train_epoch(
+                optimizer, epoch, scheduler,
+                update_log=epoch_update_records,
+                update_offset=global_updates,
+            )
             for rec in epoch_update_records:
                 batch_log_writer.writerow([rec[f] for f in _batch_log_fields])
             batch_log_file.flush()
+            self.tv_weight  = saved_tv
             global_updates += epoch_updates
             self.training  = False
             val_loss       = self.validate()
@@ -2198,6 +1822,10 @@ class AdversarialPatchTrainer:
             log_file.write(line + "\n")
             log_file.flush()
 
+            milestone = global_updates // save_every
+            if milestone > _last_save_milestone:
+                _last_save_milestone = milestone
+                self.save_patch(epoch, "patches")
 
         log_file.close()
         batch_log_file.close()
@@ -2249,9 +1877,8 @@ def main():
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
                         help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
-    parser.add_argument("--num-workers",     type=int, default=-1,
-                        help="DataLoader workers (-1 = os.cpu_count(), 0 = main process only)")
-    parser.add_argument("--pin-memory",      action="store_true", default=True)
+    parser.add_argument("--num-workers",     type=int, default=0)
+    parser.add_argument("--pin-memory",      action="store_true")
     parser.add_argument("--limit",           type=int, default=0)
     parser.add_argument("--use-all-for-train", action="store_true")
     parser.add_argument("--impersonation-target", default="SHX8459")
@@ -2260,8 +1887,6 @@ def main():
                         help="Allow detector backend weights to update during training.")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--dry-run",    action="store_true")
-    parser.add_argument("--profile",    action="store_true",
-                        help="Run 20 training steps with detailed timing output, then exit.")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
@@ -2309,10 +1934,10 @@ def main():
                              device=args.device, **ocr_kwargs)
     ocr.load()
 
-    # Auto-set sam_m deferred to train() where eval_batch_size is known.
-    # -1 is the sentinel for "auto"; None means disabled.
+    # Auto-set sam_m to grad_accumulate//4 unless the user explicitly passed 0 (disable).
     if args.sam_m is None:
-        args.sam_m = -1   # deferred
+        args.sam_m = max(1, (args.grad_accumulate or 64) // 4)
+        print(f"[m-SAM] auto sam_m={args.sam_m}  (grad_accumulate={args.grad_accumulate or 64}//4)")
     elif args.sam_m == 0:
         args.sam_m = None   # None is the internal sentinel for "disabled"
 
@@ -2346,12 +1971,11 @@ def main():
     )
 
     trainer.train(
-        num_epochs         = args.epochs,
-        learning_rate      = args.lr,
-        lr_min             = args.lr_min,
-        dry_run            = args.dry_run,
-        tv_warmup          = args.tv_warmup,
-        profile            = args.profile,
+        num_epochs    = args.epochs,
+        learning_rate = args.lr,
+        lr_min        = args.lr_min,
+        dry_run       = args.dry_run,
+        tv_warmup     = args.tv_warmup,
     )
 
 
