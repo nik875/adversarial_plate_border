@@ -695,7 +695,7 @@ class AdversarialPatchTrainer:
         ph, pw = self.patch_height, self.patch_width
         src = torch.tensor([[0, 0], [pw, 0], [pw, ph], [0, ph]],
                             dtype=torch.float32, device=self.device
-                            ).unsqueeze(0).repeat(B, 1, 1)             # [B, 4, 2]
+                            ).unsqueeze(0).expand(B, -1, -1)           # [B, 4, 2]
 
         if self.top_extend:
             # Perspective-correct asymmetric border: bottom corners at normal
