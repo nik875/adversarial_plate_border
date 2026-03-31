@@ -2002,6 +2002,11 @@ class AdversarialPatchTrainer:
 
         eta_min       = lr_min
 
+        # Resolve deferred sam_m now that eval_batch_size is known.
+        if self.sam_m == -1:
+            self.sam_m = max(1, self.eval_batch_size // 4)
+            print(f"[m-SAM] auto sam_m={self.sam_m}  (eval_batch_size={self.eval_batch_size}//4)")
+
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
             optimizer = SAM(
@@ -2280,10 +2285,10 @@ def main():
                              device=args.device, **ocr_kwargs)
     ocr.load()
 
-    # Auto-set sam_m to grad_accumulate//4 unless the user explicitly passed 0 (disable).
+    # Auto-set sam_m deferred to train() where eval_batch_size is known.
+    # -1 is the sentinel for "auto"; None means disabled.
     if args.sam_m is None:
-        args.sam_m = max(1, (args.grad_accumulate or 64) // 4)
-        print(f"[m-SAM] auto sam_m={args.sam_m}  (grad_accumulate={args.grad_accumulate or 64}//4)")
+        args.sam_m = -1   # deferred
     elif args.sam_m == 0:
         args.sam_m = None   # None is the internal sentinel for "disabled"
 
