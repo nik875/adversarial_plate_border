@@ -31,7 +31,7 @@ Other design decisions
 * Patch applied to preprocessed image; OCR crop from same space.
 * Detection loss target: corners_to_bbox (not expanded border).
 * Best detection selected by max(IoU × confidence).
-* LR schedule: pre-warmup (1000-image subset, 10 epochs, lr_min→lr linear) then real warmup (10% of total updates, lr_min→lr) + CosineAnnealingLR (→lr_min), no early stopping.
+* LR schedule: warmup (10% of total updates, lr_min→lr) + CosineAnnealingLR (→lr_min), no early stopping.
 * validate_pipeline() sanity-checks before training.
 * save_debug_images() writes 20 annotated images to run_dir/debug/.
 """
@@ -1992,17 +1992,11 @@ class AdversarialPatchTrainer:
         dry_run:             bool  = False,
         tv_warmup:           float = 0.1,
         profile:             bool  = False,
-        pre_warmup_images:   int   = 1000,
-        pre_warmup_epochs:   int   = 10,
     ) -> dict:
         """
         tv_warmup: fraction of total gradient updates during which TV loss is
         suppressed so the patch can move freely early on.  Set to 0.0 to
         disable TV warmup entirely.
-
-        pre_warmup_images: number of images to sample for the pre-warmup phase
-        (0 to disable).  pre_warmup_epochs: number of epochs to train on that
-        subset with a linear LR ramp from lr_min → lr before real training.
         """
         if dry_run:
             print("\nDry run: saving debug images...")
@@ -2040,76 +2034,6 @@ class AdversarialPatchTrainer:
             print(f"  [auto-batch] capping eval_batch_size {self.eval_batch_size} → "
                   f"{_max_bs_for_min_updates} to ensure ≥10000 total updates")
             self.eval_batch_size = _max_bs_for_min_updates
-
-        # ── Pre-warmup phase ─────────────────────────────────────────────────
-        # Sample a small subset and linearly ramp LR from lr_min → lr over
-        # pre_warmup_epochs epochs.  After this phase the optimizer state is
-        # already initialised (Adam moments) and real training begins fresh
-        # with the same warmup → cosine schedule as always.
-        if pre_warmup_images > 0 and pre_warmup_epochs > 0:
-            full_dataset = self.train_loader.dataset
-            n_prewarm    = min(pre_warmup_images, len(full_dataset))
-            pw_indices   = random.sample(range(len(full_dataset)), n_prewarm)
-            pw_subset    = torch.utils.data.Subset(full_dataset, pw_indices)
-            _pw_loader   = torch.utils.data.DataLoader(
-                pw_subset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=self.train_loader.num_workers,
-                pin_memory=self.train_loader.pin_memory,
-                collate_fn=self.train_loader.collate_fn,
-            )
-
-            _ue_pw = (len(_pw_loader) if self.grad_accumulate is None
-                      else self.grad_accumulate)
-            _pw_ups_per_epoch = max(1, len(_pw_loader) //
-                                    (self.eval_batch_size * _ue_pw))
-            _pw_total_updates = pre_warmup_epochs * _pw_ups_per_epoch
-            # Use a plain AdamW for pre-warmup (no m-SAM overhead).
-            pw_optimizer = optim.AdamW(
-                self._param_groups(learning_rate), weight_decay=1e-4
-            )
-            # LambdaLR: ramp lr_min → learning_rate with no factor-range restriction.
-            _pw_n = max(1, _pw_total_updates)
-            prewarm_scheduler = optim.lr_scheduler.LambdaLR(
-                pw_optimizer,
-                lr_lambda=lambda step: (
-                    eta_min + min(step, _pw_n) / _pw_n * (learning_rate - eta_min)
-                ) / learning_rate,
-            )
-
-            _saved_train_loader = self.train_loader
-            self.train_loader   = _pw_loader
-
-            print(f"\n{'='*60}")
-            print(f"  Pre-warmup: {n_prewarm} images × {pre_warmup_epochs} epochs  "
-                  f"({_pw_total_updates} updates)  [AdamW, no m-SAM]")
-            print(f"  LR: {eta_min:.0e} → {learning_rate:.0e} linearly")
-            print(f"{'='*60}\n")
-
-            _pw_global = 0
-            for pw_ep in range(pre_warmup_epochs):
-                self.training = True
-                _pw_result = self.train_epoch(
-                    pw_optimizer, pw_ep, prewarm_scheduler,
-                    update_offset=_pw_global,
-                    tv_warmup_updates=_pw_total_updates + 1,  # suppress TV entirely
-                    save_every=0,
-                    last_save_milestone=0,
-                )
-                if _pw_result is None:
-                    self.train_loader = _saved_train_loader
-                    return {}
-                (_pw_loss, _pw_dr, _pw_dt, _pw_or, _pw_ot,
-                 _pw_tv, _pw_ups, _) = _pw_result
-                _pw_global += _pw_ups
-                _pw_lr = pw_optimizer.param_groups[0]['lr']
-                print(f"  Pre-warmup {pw_ep+1:2d}/{pre_warmup_epochs} | "
-                      f"loss: {_pw_loss:.4f} | lr: {_pw_lr:.2e}")
-
-            self.train_loader = _saved_train_loader
-            del pw_optimizer
-            print()
 
         # Scheduler counts are in gradient updates, not epochs.
         # _updates_per_epoch is computed below alongside tv_warmup; duplicate
@@ -2330,11 +2254,6 @@ def main():
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
                              "Set to 0 to disable TV warmup entirely.")
-    parser.add_argument("--pre-warmup-images", type=int, default=1000,
-                        help="Number of images to sample for the pre-warmup phase "
-                             "(default: 1000).  Set to 0 to disable pre-warmup.")
-    parser.add_argument("--pre-warmup-epochs", type=int, default=10,
-                        help="Number of epochs in the pre-warmup phase (default: 10).")
     parser.add_argument("--no-disruption", action="store_true",
                         help="Disable the detection (disruption) loss component entirely. "
                              "Detection is still computed for pipeline purposes but contributes "
@@ -2415,8 +2334,6 @@ def main():
         dry_run            = args.dry_run,
         tv_warmup          = args.tv_warmup,
         profile            = args.profile,
-        pre_warmup_images  = args.pre_warmup_images,
-        pre_warmup_epochs  = args.pre_warmup_epochs,
     )
 
 
