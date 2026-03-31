@@ -2305,11 +2305,12 @@ def main():
                         help="Run 20 training steps with detailed timing output, then exit.")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check.")
+    parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
+                        help="Multiplicative scale applied to the OCR loss term.")
+    parser.add_argument("--det-loss-scale", type=float, default=1.0,
+                        help="Multiplicative scale applied to the detection loss term.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 10.0).")
-    parser.add_argument("--det-loss-weight", type=float, default=0.0,
-                        help="Weight for the impersonation-zone detection loss added directly "
-                             "to the total loss (default: 0.0, disabled).")
     parser.add_argument("--tv-warmup", type=float, default=0.1,
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
@@ -2380,7 +2381,8 @@ def main():
         train_detector       = args.train_detector,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
-        det_loss_weight      = args.det_loss_weight,
+        ocr_loss_scale       = args.ocr_loss_scale,
+        det_loss_scale       = args.det_loss_scale,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
