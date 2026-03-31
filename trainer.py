@@ -290,16 +290,16 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Residual-stream decoder.  Six stages, each doubling spatial size.
+    Residual-stream decoder.  Three stages, each 4× upsampling spatial size.
 
     Standard (no top-extend):  [1, C, 4, 8] → [1, 3, 256, 512]
-        4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
+        4×8 → 16×32 → 64×128 → 256×512
 
     With top-extend:           [1, C, 8, 8] → [1, 3, 512, 512]
-        8×8 → 16×16 → 32×32 → 64×64 → 128×128 → 256×256 → 512×512
+        8×8 → 32×32 → 128×128 → 512×512
 
     All intermediate feature maps are kept at seed_channels (128) throughout.
-    Each stage: bilinear upsample (non-learned) followed by 10 residual 3×3
+    Each stage: bilinear upsample (non-learned) followed by 3 residual 3×3
     conv blocks, each with GroupNorm(G=8) and leaky_relu.  This is a standard
     ResNet-style decoder — upsample and learned refinement are cleanly separated.
 
@@ -307,7 +307,7 @@ class PatchDecoder(nn.Module):
     Output is passed through tanh and scaled to [0, 1].
     """
 
-    BLOCKS_PER_STAGE = 10
+    BLOCKS_PER_STAGE = 3
 
     def __init__(self, seed_channels: int = 128):
         super().__init__()
@@ -316,11 +316,11 @@ class PatchDecoder(nn.Module):
         N = self.BLOCKS_PER_STAGE
         self.conv_stacks = nn.ModuleList([
             nn.ModuleList([nn.Conv2d(C, C, 3, padding=1) for _ in range(N)])
-            for _ in range(6)
+            for _ in range(3)
         ])
         self.conv_norms = nn.ModuleList([
             nn.ModuleList([nn.GroupNorm(G, C) for _ in range(N)])
-            for _ in range(6)
+            for _ in range(3)
         ])
         self.final = nn.Conv2d(C, 3, 1)
 
@@ -335,7 +335,7 @@ class PatchDecoder(nn.Module):
         """seed: [1, C, H_s, W_s]  →  patch: [1, 3, H_s*64, W_s*64] in [0, 1]"""
         x = seed
         for conv_stack, c_norms in zip(self.conv_stacks, self.conv_norms):
-            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+            x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
             for conv, norm in zip(conv_stack, c_norms):
                 x = x + F.leaky_relu(norm(conv(x)), 0.2)
         return torch.tanh(self.final(x)) * 0.5 + 0.5
@@ -481,7 +481,7 @@ class AdversarialPatchTrainer:
         self.patch_height  = PATCH_HEIGHT * 2 if top_extend else PATCH_HEIGHT
         self.seed_channels = seed_channels
         # Seed spatial size: 4×8 (standard) or 8×8 (top-extend, doubled height)
-        # Six stride-2 stages → output 256×512 or 512×512 respectively.
+        # Three 4× stages → output 256×512 or 512×512 respectively.
         _seed_h = 8 if top_extend else 4
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
         self.seed    = nn.Parameter(
@@ -553,15 +553,10 @@ class AdversarialPatchTrainer:
         return params
 
     def _param_groups(self, lr: float) -> list:
-        """Parameter groups with per-parameter learning rates.
-
-        The seed gets 10× lower LR than the decoder — it controls global
-        patch structure and should move more conservatively than the conv weights.
-        Detector params (if trained) use the full LR.
-        """
+        """Parameter groups. All params use the same LR."""
         groups = [
             {"params": list(self.decoder.parameters()), "lr": lr},
-            {"params": [self.seed],                     "lr": lr / 10},
+            {"params": [self.seed],                     "lr": lr},
         ]
         if self.train_detector:
             groups.append({"params": list(self.detector.parameters()), "lr": lr})
