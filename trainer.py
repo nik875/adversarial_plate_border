@@ -513,10 +513,9 @@ class AdversarialPatchTrainer:
 
     def _make_differentiable_prep(self):
         """
-        Return a callable  (img_chw: Tensor, corners: Tensor [4, 2])
-                        ->  (img_chw_prep: Tensor, new_corners: Tensor [4, 2])
+        Return a callable  (img_chw: Tensor, corners_np: ndarray)
+                        ->  (img_chw_prep: Tensor, new_corners_np: ndarray)
         that applies detector-specific preprocessing differentiably on the GPU.
-        Corners stay on the GPU throughout — no CPU round-trip.
         """
         name = self.detector.name
         if name in ("yolov8", "yolov11"):
@@ -524,28 +523,24 @@ class AdversarialPatchTrainer:
             if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
                 raw = self.detector._yolo.overrides.get("imgsz", 640)
                 imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, imgsz)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         elif name == "rtdetr":
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, sx, sy = _diff_resize(img_chw, 640, 640)
-                c = corners.clone(); c[:, 0] = c[:, 0] * sx; c[:, 1] = c[:, 1] * sy
-                return img, c
+                return img, _corners_resize(corners_np, sx, sy)
         elif name == "fasterrcnn":
-            def fn(img_chw, corners):
-                return img_chw, corners.clone()
+            def fn(img_chw, corners_np):
+                return img_chw, corners_np.astype(np.float32).copy()
         elif name == "yolo-v9-608":
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, 608)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         else:
-            def fn(img_chw, corners):
+            def fn(img_chw, corners_np):
                 img, r, dw, dh = _diff_letterbox(img_chw, 384)
-                c = corners.clone(); c[:, 0] = c[:, 0] * r + dw; c[:, 1] = c[:, 1] * r + dh
-                return img, c
+                return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
 
     def _make_cv2_prep(self):
@@ -763,22 +758,26 @@ class AdversarialPatchTrainer:
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
                      augment: Optional[bool] = None) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
-        orig_tensor  = batch_item["orig_image"].to(self.device)   # [C, H, W]
-        orig_corners = batch_item["orig_corners"].to(self.device)  # [4, 2]
+        orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
+        orig_corners_np = batch_item["orig_corners"].cpu().numpy()
+        orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
 
         # Halve images that are too large to keep GPU memory manageable
         _, H, W = orig_tensor.shape
         if max(H, W) > 2000:
-            orig_tensor  = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
-                                         mode="bilinear", align_corners=False).squeeze(0)
-            orig_corners = orig_corners * 0.5
+            orig_tensor     = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
+                                            mode="bilinear", align_corners=False).squeeze(0)
+            orig_corners_np = orig_corners_np * 0.5
+            orig_corners    = orig_corners * 0.5
 
         patched_orig, _ = self.apply_patch_to_image(
             orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
             patch_norm=patch_norm,
             augment=self.augment if augment is None else augment)
 
-        patched_prep_chw, new_corners = self.diff_prep(patched_orig.squeeze(0), orig_corners)
+        patched_prep_chw, new_corners_np = self.diff_prep(
+            patched_orig.squeeze(0), orig_corners_np)
+        new_corners = torch.from_numpy(new_corners_np).to(self.device)
         target_box  = self.corners_to_bbox(new_corners)
         rim_box     = self._rim_bbox(new_corners)
         ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
@@ -1170,11 +1169,14 @@ class AdversarialPatchTrainer:
             fn              = (batch["filename"][0]
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
-            orig_tensor  = batch["orig_image"][0].to(self.device)
-            orig_corners = batch["orig_corners"][0].to(self.device)
+            orig_tensor     = batch["orig_image"][0].to(self.device)
+            orig_corners_np = batch["orig_corners"][0].cpu().numpy()
+            orig_corners    = batch["orig_corners"][0].to(self.device)
 
             with torch.no_grad():
-                prep_tensor, new_corners = self.diff_prep(orig_tensor, orig_corners)
+                prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
+            new_corners = torch.from_numpy(new_corners_np).to(self.device)
+            new_c       = new_corners_np
             target_box  = self.corners_to_bbox(new_corners)
 
             with torch.no_grad():
@@ -1224,7 +1226,7 @@ class AdversarialPatchTrainer:
                     orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
                     patch_norm=rand_patch,
                 )
-                patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners)
+                patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
             patch_vis = (patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
 
             def _draw_quad(img, corners_t, color):
@@ -1256,7 +1258,7 @@ class AdversarialPatchTrainer:
             # (d) cv2 preprocessing vs differentiable preprocessing comparison
             with torch.no_grad():
                 img_hwc_uint8 = (orig_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners.cpu().numpy())
+                cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners_np)
                 diff_prep_np  = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 cv2_prep_np   = (cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
