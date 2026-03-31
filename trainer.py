@@ -1600,7 +1600,7 @@ class AdversarialPatchTrainer:
                             _ms = (update_offset + num_updates) // save_every
                             if _ms > last_save_milestone:
                                 last_save_milestone = _ms
-                                self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
+                                self.save_patch(epoch, "patches")
                         # _msam_step sums losses over all M=B*update_every items
                         # individually; divide by B so the scale matches the
                         # non-SAM path (which averages over B inside compute_loss_batch).
@@ -1702,7 +1702,7 @@ class AdversarialPatchTrainer:
                             _ms = (update_offset + num_updates) // save_every
                             if _ms > last_save_milestone:
                                 last_save_milestone = _ms
-                                self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
+                                self.save_patch(epoch, "patches")
                         _lr_now = optimizer.param_groups[0]["lr"]
                         if update_log is not None:
                             update_log.append({
@@ -1774,7 +1774,7 @@ class AdversarialPatchTrainer:
                     _ms = (update_offset + num_updates) // save_every
                     if _ms > last_save_milestone:
                         last_save_milestone = _ms
-                        self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
+                        self.save_patch(epoch, "patches")
                 total_loss     += loss_t      / B
                 total_det_real += det_real_t  / B
                 total_det_top  += det_top_t   / B
@@ -1838,7 +1838,7 @@ class AdversarialPatchTrainer:
                         _ms = (update_offset + num_updates) // save_every
                         if _ms > last_save_milestone:
                             last_save_milestone = _ms
-                            self.save_patch(epoch, "patches", global_update=update_offset + num_updates)
+                            self.save_patch(epoch, "patches")
                     if update_log is not None:
                         _rem = step % update_every or update_every
                         update_log.append({
