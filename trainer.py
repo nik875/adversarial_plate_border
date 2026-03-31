@@ -64,8 +64,7 @@ from tqdm import tqdm
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import (create_dataloaders, create_ccpd_dataloaders,
-                     make_letterbox_prep, make_resize_prep, make_passthrough_prep,
-                     _chw_uint8)
+                     make_letterbox_prep, make_resize_prep, make_passthrough_prep)
 
 warnings.filterwarnings("ignore")
 
@@ -480,7 +479,7 @@ class AdversarialPatchTrainer:
         self.decoder = PatchDecoder(seed_channels).to(self.device)
 
         # ── Image transform ────────────────────────────────────────────
-        self.transform = _chw_uint8
+        self.transform = T.Compose([T.ToTensor()])
 
         # ── Sanity check (before any preloading) ───────────────────────
         if not skip_sanity:
@@ -877,17 +876,13 @@ class AdversarialPatchTrainer:
             key = (int(t.shape[-2]), int(t.shape[-1]))
             by_size.setdefault(key, []).append(i)
 
-        # ── Async GPU transfer + float cast ─────────────────────────────
-        # Images are uint8 from the DataLoader (4× smaller over PCIe than
-        # float32). Transfer async on pinned memory, then cast to float32 on
-        # the GPU immediately — all enqueued on the same CUDA stream so the
-        # cast runs only after each DMA transfer completes.
-        loaded = []
-        for t, c, label in loaded_cpu:
-            t_gpu = t.to(self.device, non_blocking=True)
-            if t_gpu.dtype == torch.uint8:
-                t_gpu = t_gpu.float().div_(255.0)
-            loaded.append((t_gpu, c.to(self.device, non_blocking=True), label))
+        # ── Async GPU transfer: non_blocking on pinned DataLoader tensors ──
+        # Issue individual async transfers instead of stacking first —
+        # avoids a CPU-side memcopy into a non-pinned intermediate.
+        loaded = [(t.to(self.device, non_blocking=True),
+                   c.to(self.device, non_blocking=True),
+                   label)
+                  for t, c, label in loaded_cpu]
 
         if _prof:
             self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
@@ -1166,7 +1161,7 @@ class AdversarialPatchTrainer:
         """
         Estimate the optimal eval_batch_size by running one real item through
         _prepare_one + compute_loss_batch + backward, measuring peak GPU memory,
-        and scaling to available free memory with a 0.90 safety margin.
+        and scaling to available free memory with a 0.70 safety margin.
 
         Only meaningful on CUDA; returns the current eval_batch_size unchanged
         on other devices.
@@ -1196,7 +1191,7 @@ class AdversarialPatchTrainer:
             torch.cuda.empty_cache()
 
         free_after = torch.cuda.mem_get_info()[0]
-        safety = 0.90
+        safety = 0.70
         bs = max(1, int(free_after * safety / per_sample_mem))
         print(
             f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
@@ -1345,8 +1340,6 @@ class AdversarialPatchTrainer:
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
             orig_tensor  = batch["orig_image"][0].to(self.device)
-            if orig_tensor.dtype == torch.uint8:
-                orig_tensor = orig_tensor.float().div_(255.0)
             orig_corners = batch["orig_corners"][0].to(self.device)
 
             with torch.no_grad():
