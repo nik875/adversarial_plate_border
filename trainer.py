@@ -1417,7 +1417,9 @@ class AdversarialPatchTrainer:
     def train_epoch(self, optimizer, epoch: int, scheduler=None,
                     update_log: Optional[list] = None,
                     update_offset: int = 0,
-                    tv_warmup_updates: int = 0) -> Tuple[float, float, float, float]:
+                    tv_warmup_updates: int = 0,
+                    save_every: int = 0,
+                    last_save_milestone: int = 0) -> Tuple[float, float, float, float]:
         _saved_tv = self.tv_weight
         if self.ocr.is_trainable:
             self.ocr.train()
@@ -1474,6 +1476,11 @@ class AdversarialPatchTrainer:
                         window_raw = []
                         step       += update_every
                         num_updates += 1
+                        if save_every > 0:
+                            _ms = (update_offset + num_updates) // save_every
+                            if _ms > last_save_milestone:
+                                last_save_milestone = _ms
+                                self.save_patch(epoch, "patches")
                         # _msam_step sums losses over all M=B*update_every items
                         # individually; divide by B so the scale matches the
                         # non-SAM path (which averages over B inside compute_loss_batch).
@@ -1566,6 +1573,11 @@ class AdversarialPatchTrainer:
                         total_tv       += _upd_tv
                         total_loss  += accum_loss
                         num_updates += 1
+                        if save_every > 0:
+                            _ms = (update_offset + num_updates) // save_every
+                            if _ms > last_save_milestone:
+                                last_save_milestone = _ms
+                                self.save_patch(epoch, "patches")
                         _lr_now = optimizer.param_groups[0]["lr"]
                         if update_log is not None:
                             update_log.append({
@@ -1632,6 +1644,11 @@ class AdversarialPatchTrainer:
                     self._msam_step(optimizer, window_raw[:n_complete], B, n_complete // B)
                 step           += n_complete // B
                 num_updates    += 1
+                if save_every > 0:
+                    _ms = (update_offset + num_updates) // save_every
+                    if _ms > last_save_milestone:
+                        last_save_milestone = _ms
+                        self.save_patch(epoch, "patches")
                 total_loss     += loss_t      / B
                 total_det_real += det_real_t  / B
                 total_det_top  += det_top_t   / B
@@ -1685,6 +1702,11 @@ class AdversarialPatchTrainer:
                         scheduler.step()
                     total_loss  += accum_loss
                     num_updates += 1
+                    if save_every > 0:
+                        _ms = (update_offset + num_updates) // save_every
+                        if _ms > last_save_milestone:
+                            last_save_milestone = _ms
+                            self.save_patch(epoch, "patches")
                     if update_log is not None:
                         _rem = step % update_every or update_every
                         update_log.append({
@@ -1704,7 +1726,7 @@ class AdversarialPatchTrainer:
         return (total_loss / n,
                 total_det_real / n, total_det_top / n,
                 total_ocr_real / n, total_ocr_top / n,
-                total_tv / n, num_updates)
+                total_tv / n, num_updates, last_save_milestone)
 
     def _print_profile_report(self, n_steps: int, B: int, update_every: int) -> None:
         """Print a formatted profiling report and clear accumulated data."""
@@ -1937,11 +1959,13 @@ class AdversarialPatchTrainer:
             (train_loss,
              train_det_real, train_det_top,
              train_ocr_real, train_ocr_top,
-             train_tv, epoch_updates) = self.train_epoch(
+             train_tv, epoch_updates, _last_save_milestone) = self.train_epoch(
                 optimizer, epoch, scheduler,
                 update_log=epoch_update_records,
                 update_offset=global_updates,
                 tv_warmup_updates=tv_warmup_updates,
+                save_every=save_every,
+                last_save_milestone=_last_save_milestone,
             )
             if profile:
                 return {}  # _print_profile_report already called inside train_epoch
@@ -1986,10 +2010,6 @@ class AdversarialPatchTrainer:
             log_file.write(line + "\n")
             log_file.flush()
 
-            milestone = global_updates // save_every
-            if milestone > _last_save_milestone:
-                _last_save_milestone = milestone
-                self.save_patch(epoch, "patches")
 
         log_file.close()
         batch_log_file.close()
