@@ -2056,21 +2056,20 @@ class AdversarialPatchTrainer:
                 collate_fn=self.train_loader.collate_fn,
             )
 
-            # Set optimizer LR to eta_min so pre-warmup starts at the floor.
-            for pg in sched_optimizer.param_groups:
-                pg['lr'] = eta_min
-                pg.pop('initial_lr', None)
-
             _ue_pw = (len(_pw_loader) if self.grad_accumulate is None
                       else self.grad_accumulate)
             _pw_ups_per_epoch = max(1, len(_pw_loader) //
                                     (self.eval_batch_size * _ue_pw))
             _pw_total_updates = pre_warmup_epochs * _pw_ups_per_epoch
-            prewarm_scheduler = optim.lr_scheduler.LinearLR(
+            # LambdaLR has no restriction on the multiplier range, so we can
+            # ramp from eta_min up to learning_rate (multiplier > 1 is fine).
+            # base_lr = learning_rate (optimizer was created with that value).
+            _pw_n = max(1, _pw_total_updates)
+            prewarm_scheduler = optim.lr_scheduler.LambdaLR(
                 sched_optimizer,
-                start_factor=1.0,                        # base_lr=eta_min → eta_min
-                end_factor=learning_rate / eta_min,      # → learning_rate
-                total_iters=max(1, _pw_total_updates),
+                lr_lambda=lambda step: (
+                    eta_min + min(step, _pw_n) / _pw_n * (learning_rate - eta_min)
+                ) / learning_rate,
             )
 
             _saved_train_loader = self.train_loader
