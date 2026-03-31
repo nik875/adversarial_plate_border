@@ -1116,7 +1116,7 @@ def train_yolo608(model, train_records: List[dict], val_records: List[dict],
     val_dl   = DataLoader(_DS(val_records),   bs, shuffle=False, **kw)
 
     criterion = v8DetectionLoss(model)
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-4)
+    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs * len(train_dl))
     best  = float("inf"); no_improve = 0
     out_path = Path(args.output_dir) / "yolo608_finetuned.pt"
