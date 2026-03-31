@@ -1131,8 +1131,9 @@ def train_yolo608(model, train_records: List[dict], val_records: List[dict],
                     loss, _ = criterion(preds, batch)
                     opt.zero_grad(); loss.sum().backward()
                     nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-                    opt.step(); sched.step(); tl += loss.sum().item()
-                    window.append(loss.sum().item())
+                    n_samp = batch["img"].shape[0]
+                    opt.step(); sched.step(); tl += loss.sum().item() / n_samp
+                    window.append(loss.sum().item() / n_samp)
                     pbar.set_postfix(loss=f"{sum(window)/len(window):.4f}",
                                      lr=f"{sched.get_last_lr()[0]:.2e}")
                 except Exception:
@@ -1152,7 +1153,7 @@ def train_yolo608(model, train_records: List[dict], val_records: List[dict],
                 batch = {k: v.to(device) for k, v in batch.items()}
                 model.train()
                 loss, _ = criterion(model(batch["img"]), batch)
-                vl += loss.sum().item()
+                vl += loss.sum().item() / batch["img"].shape[0]
                 model.eval()
         vl /= max(1, len(val_dl))
         print(f"  YOLO608 ep{ep}: train={tl/max(1,len(train_dl)):.4f}  val={vl:.4f}")
