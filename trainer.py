@@ -324,6 +324,13 @@ class PatchDecoder(nn.Module):
         ])
         self.final = nn.Conv2d(C, 3, 1)
 
+        for stack in self.conv_stacks:
+            for conv in stack:
+                nn.init.kaiming_normal_(conv.weight, a=0.2, mode='fan_in',
+                                        nonlinearity='leaky_relu')
+                nn.init.zeros_(conv.bias)
+                conv.weight.data *= 0.1
+
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
         """seed: [1, C, H_s, W_s]  →  patch: [1, 3, H_s*64, W_s*64] in [0, 1]"""
         x = seed
