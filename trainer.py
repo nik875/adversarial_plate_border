@@ -290,55 +290,36 @@ def _bbox_ocr_crop(
 
 class PatchDecoder(nn.Module):
     """
-    Residual-stream decoder.  Three stages, each 4× upsampling spatial size.
+    Trainable ConvTranspose2d decoder that maps a compact seed tensor
+    [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Standard (no top-extend):  [1, C, 4, 8] → [1, 3, 256, 512]
-        4×8 → 16×32 → 64×128 → 256×512
+    Six stride-2 layers double the spatial dimensions at each step:
+        4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
-    With top-extend:           [1, C, 8, 8] → [1, 3, 512, 512]
-        8×8 → 32×32 → 128×128 → 512×512
-
-    All intermediate feature maps are kept at seed_channels (128) throughout.
-    Each stage: bilinear upsample (non-learned) followed by 3 residual 3×3
-    conv blocks, each with GroupNorm(G=8) and leaky_relu.  This is a standard
-    ResNet-style decoder — upsample and learned refinement are cleanly separated.
-
-    A final 1×1 conv projects the 128-channel stream to 3 channels (RGB).
+    Channel schedule halves from seed_channels→256→128→64→32→16→3,
+    so the expensive (many-channel) work is done at small spatial grids.
     Output is passed through tanh and scaled to [0, 1].
-    """
 
-    BLOCKS_PER_STAGE = 3
+    Both the seed and the decoder weights are optimised during training —
+    the seed controls global structure while the decoder weights determine
+    how that structure is elaborated into pixel-level detail.
+    """
 
     def __init__(self, seed_channels: int = 128):
         super().__init__()
-        C = seed_channels
-        G = 8  # GroupNorm groups; C must be divisible by G
-        N = self.BLOCKS_PER_STAGE
-        self.conv_stacks = nn.ModuleList([
-            nn.ModuleList([nn.Conv2d(C, C, 3, padding=1) for _ in range(N)])
-            for _ in range(3)
-        ])
-        self.conv_norms = nn.ModuleList([
-            nn.ModuleList([nn.GroupNorm(G, C) for _ in range(N)])
-            for _ in range(3)
-        ])
-        self.final = nn.Conv2d(C, 3, 1)
-
-        for stack in self.conv_stacks:
-            for conv in stack:
-                nn.init.kaiming_normal_(conv.weight, a=0.2, mode='fan_in',
-                                        nonlinearity='leaky_relu')
-                nn.init.zeros_(conv.bias)
-                conv.weight.data *= 0.1
+        c = seed_channels
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(c,   256, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 64,  32, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 32,  16, 4, stride=2, padding=1), nn.LeakyReLU(0.2, inplace=True),
+            nn.ConvTranspose2d( 16,   3, 4, stride=2, padding=1),
+        )
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
-        """seed: [1, C, H_s, W_s]  →  patch: [1, 3, H_s*64, W_s*64] in [0, 1]"""
-        x = seed
-        for conv_stack, c_norms in zip(self.conv_stacks, self.conv_norms):
-            x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=False)
-            for conv, norm in zip(conv_stack, c_norms):
-                x = x + F.leaky_relu(norm(conv(x)), 0.2)
-        return torch.tanh(self.final(x)) * 0.5 + 0.5
+        """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
+        return torch.tanh(self.net(seed)) * 0.5 + 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +462,7 @@ class AdversarialPatchTrainer:
         self.patch_height  = PATCH_HEIGHT * 2 if top_extend else PATCH_HEIGHT
         self.seed_channels = seed_channels
         # Seed spatial size: 4×8 (standard) or 8×8 (top-extend, doubled height)
-        # Three 4× stages → output 256×512 or 512×512 respectively.
+        # Six stride-2 ConvTranspose2d stages → output 256×512 or 512×512 respectively.
         _seed_h = 8 if top_extend else 4
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
         self.seed    = nn.Parameter(
