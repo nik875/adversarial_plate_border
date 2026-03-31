@@ -1976,7 +1976,10 @@ class AdversarialPatchTrainer:
             epoch_start    = time.time()
             self.training  = True
             epoch_update_records: list = []
-            _epoch_result = self.train_epoch(
+            (train_loss,
+             train_det_real, train_det_top,
+             train_ocr_real, train_ocr_top,
+             train_tv, epoch_updates, _last_save_milestone) = self.train_epoch(
                 optimizer, epoch, scheduler,
                 update_log=epoch_update_records,
                 update_offset=global_updates,
@@ -1984,12 +1987,8 @@ class AdversarialPatchTrainer:
                 save_every=save_every,
                 last_save_milestone=_last_save_milestone,
             )
-            if _epoch_result is None:  # profiling finished early
-                return {}
-            (train_loss,
-             train_det_real, train_det_top,
-             train_ocr_real, train_ocr_top,
-             train_tv, epoch_updates, _last_save_milestone) = _epoch_result  # _print_profile_report already called inside train_epoch
+            if profile:
+                return {}  # _print_profile_report already called inside train_epoch
             for rec in epoch_update_records:
                 batch_log_writer.writerow([rec[f] for f in _batch_log_fields])
             batch_log_file.flush()
