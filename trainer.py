@@ -413,8 +413,7 @@ class AdversarialPatchTrainer:
         train_detector:       bool           = False,
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
-        ocr_loss_scale:       float          = 1.0,
-        det_loss_scale:       float          = 1.0,
+        det_loss_weight:      float          = 0.0,
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
@@ -426,8 +425,7 @@ class AdversarialPatchTrainer:
     ):
         self.training             = training
         self.tv_weight            = tv_weight
-        self.ocr_loss_scale       = ocr_loss_scale
-        self.det_loss_scale       = det_loss_scale
+        self.det_loss_weight      = det_loss_weight
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.sam_m                = sam_m
@@ -1099,13 +1097,26 @@ class AdversarialPatchTrainer:
                                   [top_crop], self.impersonation_target,
                                   impersonation=True)[0]                              if top_crop is not None else None)
 
-            det_i = (det_real_i + det_top_i) * self.det_loss_scale
+            # Weights: proportional to each detection term's magnitude.
+            # Not detached: gradients flow through the weights so that reducing
+            # det_top_mag (failing to attract detection) increases w_real and thus
+            # the weighted-average OCR loss, penalising poor top-region detection.
+            det_real_mag = det_real_i.clamp(min=0)
+            det_top_mag  = (-det_top_i).clamp(min=0)
+            total_mag    = det_real_mag + det_top_mag + 1e-6
 
-            ocr_parts = [o for o in [ocr_real_i, ocr_top_i] if o is not None]
-            ocr_i = (sum(ocr_parts) / len(ocr_parts) * self.ocr_loss_scale
-                     if ocr_parts else _zero)
+            if ocr_real_i is not None and ocr_top_i is not None:
+                w_real = det_real_mag / total_mag
+                w_top  = det_top_mag  / total_mag
+                ocr_i  = w_real * ocr_real_i + w_top * ocr_top_i
+            elif ocr_real_i is not None:
+                ocr_i = ocr_real_i
+            elif ocr_top_i is not None:
+                ocr_i = ocr_top_i
+            else:
+                ocr_i = _zero
 
-            image_losses.append((det_i + ocr_i) / 2)
+            image_losses.append(ocr_i)
             det_real_l_list.append(det_real_i.detach())
             det_top_l_list.append(det_top_i.detach())
             ocr_real_l_list.append(ocr_real_i.detach() if ocr_real_i is not None else _zero)
@@ -1114,7 +1125,10 @@ class AdversarialPatchTrainer:
         if _prof:
             self._prof.setdefault("loss/pass2_loop", []).append(_pt() - _t3)
 
-        total      = torch.stack(image_losses).mean() + self.tv_weight * tv_l
+        det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
+        total      = (torch.stack(image_losses).mean()
+                      + self.tv_weight * tv_l
+                      + self.det_loss_weight * det_top_l_for_loss)
         det_real_l = torch.stack(det_real_l_list).mean()
         det_top_l  = torch.stack(det_top_l_list).mean()
         ocr_real_l = torch.stack(ocr_real_l_list).mean()
@@ -2251,12 +2265,11 @@ def main():
                         help="Run 20 training steps with detailed timing output, then exit.")
     parser.add_argument("--skip-sanity", action="store_true",
                         help="Skip pre-training sanity check.")
-    parser.add_argument("--ocr-loss-scale", type=float, default=1.0,
-                        help="Multiplicative scale applied to the OCR loss term.")
-    parser.add_argument("--det-loss-scale", type=float, default=1.0,
-                        help="Multiplicative scale applied to the detection loss term.")
     parser.add_argument("--tv-weight", type=float, default=10.0,
                         help="Weight for total variation loss (default: 10.0).")
+    parser.add_argument("--det-loss-weight", type=float, default=0.0,
+                        help="Weight for the impersonation-zone detection loss added directly "
+                             "to the total loss (default: 0.0, disabled).")
     parser.add_argument("--tv-warmup", type=float, default=0.1,
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
@@ -2322,8 +2335,7 @@ def main():
         train_detector       = args.train_detector,
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
-        ocr_loss_scale       = args.ocr_loss_scale,
-        det_loss_scale       = args.det_loss_scale,
+        det_loss_weight      = args.det_loss_weight,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
