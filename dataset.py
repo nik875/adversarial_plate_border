@@ -385,13 +385,18 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
     train_dataset = AdversarialPatchDataset(train_df, use_original=use_original, gpu_device=gpu_device, **kwargs)
     val_dataset   = AdversarialPatchDataset(val_df,   use_original=use_original, gpu_device=gpu_device, **kwargs)
 
+    _persistent = n_jobs > 0
+    _prefetch   = 4 if n_jobs > 0 else None
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=n_jobs,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
 
     val_loader = DataLoader(
@@ -399,7 +404,9 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         batch_size=batch_size,
         shuffle=False,
         num_workers=n_jobs,
-        pin_memory=pin_memory
+        pin_memory=pin_memory,
+        persistent_workers=_persistent,
+        prefetch_factor=_prefetch,
     )
 
     return train_loader, val_loader
@@ -500,11 +507,15 @@ def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
     Returns (train_loader, val_loader).  The val_loader is an empty stub —
     the split is expected to have been done externally by finetune_all_models.py.
     """
+    _persistent = n_jobs > 0
+    _prefetch   = 4 if n_jobs > 0 else None
+
     ds = CCPDBboxDataset(csv_path, limit=limit)
     print(f"Loaded {len(ds)} samples from {csv_path}")
     train_loader = DataLoader(
         ds, batch_size=batch_size, shuffle=True,
         num_workers=n_jobs, pin_memory=pin_memory,
+        persistent_workers=_persistent, prefetch_factor=_prefetch,
     )
     # Empty val loader (split already done on disk)
     empty_ds = CCPDBboxDataset.__new__(CCPDBboxDataset)
@@ -512,6 +523,7 @@ def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
     val_loader = DataLoader(
         empty_ds, batch_size=batch_size, shuffle=False,
         num_workers=n_jobs, pin_memory=pin_memory,
+        persistent_workers=_persistent, prefetch_factor=_prefetch,
     )
     return train_loader, val_loader
 
