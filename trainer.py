@@ -1163,65 +1163,47 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def _probe_eval_batch_size(self, sample_raw: dict) -> int:
-        """Binary-search for the largest batch size that fits in GPU memory.
-
-        Phase 1 — exponential search: double batch size until OOM to bracket
-        the feasible range.
-        Phase 2 — binary search: narrow to the exact maximum.
-        Returns max_feasible - 1 as a one-step safety buffer.
+        """
+        Estimate the optimal eval_batch_size by running one real item through
+        _prepare_one + compute_loss_batch + backward, measuring peak GPU memory,
+        and scaling to available free memory with a 0.90 safety margin.
 
         Only meaningful on CUDA; returns the current eval_batch_size unchanged
         on other devices.
         """
-        import gc
-
         if not self.device.startswith("cuda"):
             return self.eval_batch_size
 
-        _, total_mem = torch.cuda.mem_get_info()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
 
-        def _try(n: int) -> bool:
-            torch.cuda.empty_cache()
-            gc.collect()
-            try:
-                probe_patch = self.generate_patch(training_aug=False).detach().requires_grad_(True)
-                items = self._prepare_batch([sample_raw] * n, probe_patch)
-                for item in items:
-                    item["_patch_norm"] = probe_patch
-                loss, *_ = self.compute_loss_batch(items)
-                (loss / 4).backward()
-                torch.cuda.synchronize()
-                return True
-            except torch.cuda.OutOfMemoryError:
-                return False
-            finally:
-                torch.cuda.empty_cache()
-                gc.collect()
-
-        if not _try(1):
-            print("  [auto-batch] batch_size=1 OOMs — keeping eval_batch_size=1")
+        try:
+            probe_patch = self.generate_patch(training_aug=False).detach().requires_grad_(True)
+            item = self._prepare_one(sample_raw, probe_patch)
+            item["_patch_norm"] = probe_patch
+            loss, *_ = self.compute_loss_batch([item])
+            (loss / 4).backward()
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated()
+            per_sample_mem = max(1, peak - baseline)
+        except Exception as e:
+            print(f"  [auto-batch] probe failed ({e}) — keeping eval_batch_size=1")
             return 1
+        finally:
+            torch.cuda.empty_cache()
 
-        # Phase 1: exponential search to find upper bound
-        lo, hi = 1, 2
-        while _try(hi):
-            lo, hi = hi, hi * 2
-
-        # Phase 2: binary search in (lo, hi)
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            if _try(mid):
-                lo = mid
-            else:
-                hi = mid
-
-        result = max(1, lo - 1)
         free_after = torch.cuda.mem_get_info()[0]
+        safety = 0.90
+        bs = max(1, int(free_after * safety / per_sample_mem))
         print(
             f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
-            f"  |  max_fits={lo}  →  eval_batch_size={result}"
+            f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
+            f"  →  eval_batch_size={bs}"
         )
-        return result
+        return bs
 
     def validate_pipeline(self, loader=None) -> None:
         """
