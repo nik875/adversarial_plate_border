@@ -576,7 +576,7 @@ class AdversarialPatchTrainer:
         elif name == "fasterrcnn":
             return make_passthrough_prep()
         elif name == "yolo-v9-608":
-            return make_letterbox_prep(384)
+            return make_letterbox_prep(608)
         else:
             return make_letterbox_prep(384)
 
