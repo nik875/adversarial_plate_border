@@ -106,34 +106,6 @@ def _diff_resize(
     return img, target_w / W, target_h / H
 
 
-def _diff_letterbox_batch(
-    imgs_bchw: torch.Tensor, target_size: int
-) -> Tuple[torch.Tensor, float, float, float]:
-    """Batched bilinear resize + grey pad — same logic as _diff_letterbox."""
-    B, C, H, W = imgs_bchw.shape
-    r      = min(target_size / H, target_size / W)
-    new_h  = int(round(H * r))
-    new_w  = int(round(W * r))
-    imgs   = F.interpolate(imgs_bchw, size=(new_h, new_w),
-                           mode="bilinear", align_corners=False)
-    dw     = (target_size - new_w) / 2
-    dh     = (target_size - new_h) / 2
-    top    = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
-    left   = int(round(dw - 0.1)); right  = int(round(dw + 0.1))
-    imgs   = F.pad(imgs, (left, right, top, bottom), value=114.0 / 255.0)
-    return imgs, r, dw, dh
-
-
-def _diff_resize_batch(
-    imgs_bchw: torch.Tensor, target_w: int, target_h: int
-) -> Tuple[torch.Tensor, float, float]:
-    """Batched bilinear hard-resize — same logic as _diff_resize."""
-    B, C, H, W = imgs_bchw.shape
-    imgs = F.interpolate(imgs_bchw, size=(target_h, target_w),
-                         mode="bilinear", align_corners=False)
-    return imgs, target_w / W, target_h / H
-
-
 def _corners_letterbox(corners: np.ndarray, r: float, dw: float, dh: float) -> np.ndarray:
     c = corners.astype(np.float32).copy()
     c[:, 0] = c[:, 0] * r + dw
@@ -592,44 +564,6 @@ class AdversarialPatchTrainer:
                 return img, c
         return fn
 
-    def _diff_prep_batch(
-        self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched differentiable preprocessing.
-
-        imgs_bchw:     [B, C, H, W]
-        corners_batch: [B, 4, 2]
-        Returns:       (imgs_prep [B, C, H', W'], new_corners [B, 4, 2])
-
-        All images in the batch must have the same spatial size (caller's
-        responsibility — guaranteed by the by_size grouping in _prepare_batch).
-        """
-        name = self.detector.name
-        if name in ("yolov8", "yolov11"):
-            imgsz = 640
-            if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
-                raw = self.detector._yolo.overrides.get("imgsz", 640)
-                imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, imgsz)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        elif name == "rtdetr":
-            imgs, sx, sy = _diff_resize_batch(imgs_bchw, 640, 640)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * sx; c[..., 1] = c[..., 1] * sy
-        elif name == "fasterrcnn":
-            imgs = imgs_bchw
-            c = corners_batch.clone()
-        elif name == "yolo-v9-608":
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 608)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        else:
-            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 384)
-            c = corners_batch.clone()
-            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
-        return imgs, c
-
     def _make_cv2_prep(self):
         """Return the equivalent cv2-based prep fn (for debug comparison only)."""
         name = self.detector.name
@@ -866,19 +800,20 @@ class AdversarialPatchTrainer:
             key = (int(t.shape[-2]), int(t.shape[-1]))
             by_size.setdefault(key, []).append(i)
 
-        # ── Async GPU transfer: non_blocking on pinned DataLoader tensors ──
-        # Issue individual async transfers instead of stacking first —
-        # avoids a CPU-side memcopy into a non-pinned intermediate.
-        loaded = [(t.to(self.device, non_blocking=True),
-                   c.to(self.device, non_blocking=True),
-                   label)
-                  for t, c, label in loaded_cpu]
+        # ── Batched GPU transfer: one .to() per size group ───────────────
+        # Stack images of the same spatial size and transfer in one call,
+        # reducing N individual transfers (one per image) to num_size_groups.
+        loaded = [None] * len(loaded_cpu)
+        for size, indices in by_size.items():
+            imgs_gpu    = torch.stack([loaded_cpu[i][0] for i in indices]).to(self.device)
+            corners_gpu = torch.stack([loaded_cpu[i][1] for i in indices]).to(self.device)
+            for j, i in enumerate(indices):
+                loaded[i] = (imgs_gpu[j], corners_gpu[j], loaded_cpu[i][2])
 
         if _prof:
             self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
             _t1 = _pt()
 
-        # ── Batched patch application ────────────────────────────────────
         patched_orig = [None] * len(loaded)
         for indices in by_size.values():
             imgs    = torch.stack([loaded[i][0] for i in indices])       # [G, C, H, W]
@@ -892,24 +827,10 @@ class AdversarialPatchTrainer:
             self._prof.setdefault("prepare/patch_apply", []).append(_pt() - _t1)
             _t2 = _pt()
 
-        # ── Batched diff_prep per size group ─────────────────────────────
-        # All images in a size group share the same H×W → same letterbox
-        # parameters → one F.interpolate call replaces N sequential calls.
-        prep_results = [None] * len(loaded)
-        for indices in by_size.values():
-            batch    = torch.cat([patched_orig[i] for i in indices])     # [G, C, H, W]
-            corners_b = torch.stack([loaded[i][1] for i in indices])     # [G, 4, 2]
-            prep_b, new_corners_b = self._diff_prep_batch(batch, corners_b)
-            for j, i in enumerate(indices):
-                prep_results[i] = (prep_b[j], new_corners_b[j])
-
-        if _prof:
-            self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
-
         result = []
         for i, (orig_tensor, orig_corners, label) in enumerate(loaded):
-            po                 = patched_orig[i]                         # [1, C, H, W]
-            patched_prep_chw, new_corners = prep_results[i]
+            po = patched_orig[i]                                          # [1, C, H, W]
+            patched_prep_chw, new_corners = self.diff_prep(po.squeeze(0), orig_corners)
             target_box = self.corners_to_bbox(new_corners)
             rim_box    = self._rim_bbox(new_corners)
             ocr_crop   = _bbox_ocr_crop(po, orig_corners, self.ocr.ocr_crop_size)
@@ -932,6 +853,7 @@ class AdversarialPatchTrainer:
             })
 
         if _prof:
+            self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
             self._prof.setdefault("prepare/total", []).append(_pt() - _t_batch0)
         return result
 
@@ -1119,15 +1041,11 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def save_patch(self, epoch: int, subdir: str = "patches",
-                   stem: Optional[str] = None,
-                   global_update: Optional[int] = None) -> None:
+                   stem: Optional[str] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
         if stem is None:
-            if global_update is not None:
-                stem = f"patch_{self.detector.name}_epoch_{epoch:04d}_batch_{global_update:06d}"
-            else:
-                stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+            stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
@@ -1136,7 +1054,6 @@ class AdversarialPatchTrainer:
                 "decoder":       self.decoder.state_dict(),
                 "seed_channels": self.seed_channels,
                 "epoch":         epoch,
-                "global_update": global_update,
                 "backend":       self.detector.name,
                 "ocr":           self.ocr.name,
                 "patch_size":    (self.patch_height, self.patch_width),
