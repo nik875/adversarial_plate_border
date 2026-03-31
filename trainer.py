@@ -299,9 +299,15 @@ class PatchDecoder(nn.Module):
         8×8 → 16×16 → 32×32 → 64×64 → 128×128 → 256×256 → 512×512
 
     All intermediate feature maps are kept at seed_channels (128) throughout,
-    forming a flat residual stream. Each stage contributes two additive deltas:
-      1. ConvTranspose2d: nearest-neighbour upsample of stream + deconv delta
-      2. Conv2d 7×7:      stream + conv delta (same spatial size)
+    forming a flat residual stream. Each stage contributes four additive deltas:
+      1. ConvTranspose2d + GroupNorm: nearest-neighbour upsample of stream + deconv delta
+      2-4. Three 3×3 Conv2d + GroupNorm: stream + conv delta (same spatial size, each)
+
+    GroupNorm (G=8) is applied after each activation to keep feature map
+    magnitudes stable across all six stages and across varying spatial sizes.
+    The three 3×3 convs replace the previous single 7×7 conv; stacked through
+    the residual stream they have the same effective receptive field (7×7) while
+    using fewer parameters and being more stable at small spatial sizes.
 
     This gives every layer — including those close to the seed — a short gradient
     path back to the loss, since gradients flow through the addition operations
@@ -314,20 +320,33 @@ class PatchDecoder(nn.Module):
     def __init__(self, seed_channels: int = 128):
         super().__init__()
         C = seed_channels
+        G = 8  # GroupNorm groups; C must be divisible by G
         self.deconvs = nn.ModuleList([
             nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
         ])
-        self.convs = nn.ModuleList([
-            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
+        self.deconv_norms = nn.ModuleList([
+            nn.GroupNorm(G, C) for _ in range(6)
+        ])
+        # Three 3×3 convs per stage, each with its own norm, all in the residual stream
+        self.conv_stacks = nn.ModuleList([
+            nn.ModuleList([nn.Conv2d(C, C, 3, padding=1) for _ in range(3)])
+            for _ in range(6)
+        ])
+        self.conv_norms = nn.ModuleList([
+            nn.ModuleList([nn.GroupNorm(G, C) for _ in range(3)])
+            for _ in range(6)
         ])
         self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
         """seed: [1, C, H_s, W_s]  →  patch: [1, 3, H_s*64, W_s*64] in [0, 1]"""
         x = seed
-        for deconv, conv in zip(self.deconvs, self.convs):
-            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
-            x = x + F.leaky_relu(conv(x), 0.2)
+        for deconv, d_norm, conv_stack, c_norms in zip(
+            self.deconvs, self.deconv_norms, self.conv_stacks, self.conv_norms
+        ):
+            x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(d_norm(deconv(x)), 0.2)
+            for conv, norm in zip(conv_stack, c_norms):
+                x = x + F.leaky_relu(norm(conv(x)), 0.2)
         return torch.tanh(self.final(x)) * 0.5 + 0.5
 
 
