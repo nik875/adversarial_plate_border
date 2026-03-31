@@ -1454,9 +1454,6 @@ class AdversarialPatchTrainer:
         profile_steps = 20 if self.profiling else 0
         _prof_completed = 0   # optimizer steps finished so far (profiling)
         _t_iter_end = _pt() if self.profiling else 0.0   # for dataloader fetch timing
-        # SAM path has no profiling instrumentation — use standard path for profiling.
-        if self.profiling:
-            use_sam = False
 
         updates_per_epoch = max(1, len(self.train_loader) // (B * update_every))
         with tqdm(total=updates_per_epoch,
@@ -1473,19 +1470,11 @@ class AdversarialPatchTrainer:
                         window_raw.append(raw_item)
                         window_full = len(window_raw) == B * update_every
                         if not window_full:
-                            if self.profiling: _t_iter_end = _pt()
                             continue
 
                         self.tv_weight = 0.0 if update_offset + num_updates < tv_warmup_updates else _saved_tv
-                        if self.profiling: _tsam0 = _pt()
                         loss_t, det_real_t, det_top_t, ocr_real_t, ocr_top_t, tv_t = \
                             self._msam_step(optimizer, window_raw, B, update_every)
-                        if self.profiling:
-                            _tsam_total = _pt() - _tsam0
-                            self._prof.setdefault("step/sam_total", []).append(_tsam_total)
-                            _step_t = self._prof["step/dataloader"][-1] + _tsam_total
-                            self._prof.setdefault("step/total", []).append(_step_t)
-                            _prof_completed += 1
                         window_raw = []
                         step       += update_every
                         num_updates += 1
@@ -1530,11 +1519,6 @@ class AdversarialPatchTrainer:
                         })
                         patch_with_graph = self.generate_patch(training_aug=self.training)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                        if self.profiling:
-                            _t_iter_end = _pt()
-                            if _prof_completed >= profile_steps:
-                                self._print_profile_report(profile_steps, B, update_every)
-                                return
                         continue
 
                     # ── Standard (non-SAM) accumulation path ─────────────────
@@ -1750,7 +1734,6 @@ class AdversarialPatchTrainer:
         """Print a formatted profiling report and clear accumulated data."""
         p = self._prof
         # Keys in display order.  prepare/* are per-call (B calls/step); others are per-step.
-        sam_mode = "step/sam_total" in p
         sections = [
             ("DataLoader fetch",          "step/dataloader",     False),
             ("  prepare/to_gpu",          "prepare/to_gpu",      True),
@@ -1764,11 +1747,7 @@ class AdversarialPatchTrainer:
             ("  pass2 loop (OCR loss)",   "loss/pass2_loop",     False),
             ("backward()",                "step/backward",       False),
             ("optimizer step",            "step/optimizer",      False),
-            # SAM path: replaces the above with one aggregate entry
-            ("SAM step (ascent+descent)", "step/sam_total",      False),
         ]
-        if sam_mode:
-            print(f"  [SAM mode: prepare/loss sub-timings cover both ascent+descent passes]")
 
         # Aggregate prepare/* per-call times into per-step totals
         for key in ("prepare/to_gpu", "prepare/patch_apply", "prepare/diff_prep"):
