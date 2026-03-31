@@ -1650,16 +1650,11 @@ def main():
     if not all_records:
         sys.exit("ERROR: no records found — check --data-root")
 
-    # ── Single shared 90/10 split (deterministic) ─────────────────────────────
-    rng = random.Random(42)
-    shuffled = list(all_records)
-    rng.shuffle(shuffled)
-    n_val         = max(1, int(len(shuffled) * 0.1))
-    val_records   = shuffled[:n_val]
-    train_records = shuffled[n_val:]
-
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    val_csv   = out_dir / "val_split.csv"
+    train_csv = out_dir / "train_split.csv"
 
     def _write_split(path: Path, records: list) -> None:
         with open(path, "w", newline="") as f:
@@ -1669,14 +1664,63 @@ def main():
                 x1, y1, x2, y2 = r["bbox"]
                 w.writerow([str(r["image"]), x1, y1, x2, y2, r["label"]])
 
-    val_csv   = out_dir / "val_split.csv"
-    train_csv = out_dir / "train_split.csv"
-    _write_split(val_csv,   val_records)
-    _write_split(train_csv, train_records)
-    print(f"Val split:   {len(val_records):,} records → {val_csv}")
-    print(f"Train split: {len(train_records):,} records → {train_csv}\n")
+    def _read_split(path: Path) -> List[dict]:
+        records = []
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                records.append({
+                    "image": Path(row["image_path"]),
+                    "bbox":  (int(row["x1"]), int(row["y1"]),
+                              int(row["x2"]), int(row["y2"])),
+                    "label": row["label"],
+                })
+        return records
+
+    if train_csv.exists() and val_csv.exists():
+        print(f"Found existing splits — reusing {train_csv} and {val_csv}")
+        train_records = _read_split(train_csv)
+        val_records   = _read_split(val_csv)
+        print(f"  Train: {len(train_records):,} records")
+        print(f"  Val:   {len(val_records):,} records\n")
+    else:
+        # ── Single shared 90/10 split (deterministic) ─────────────────────────
+        rng = random.Random(42)
+        shuffled = list(all_records)
+        rng.shuffle(shuffled)
+        n_val         = max(1, int(len(shuffled) * 0.1))
+        val_records   = shuffled[:n_val]
+        train_records = shuffled[n_val:]
+
+        _write_split(val_csv,   val_records)
+        _write_split(train_csv, train_records)
+        print(f"Val split:   {len(val_records):,} records → {val_csv}")
+        print(f"Train split: {len(train_records):,} records → {train_csv}\n")
 
     todo = set(args.models)
+
+    # ── Skip models whose output already exists ───────────────────────────────
+    _MODEL_OUTPUTS = {
+        "lprnet":     out_dir / "lprnet_finetuned.pt",
+        "trocr":      out_dir / "trocr_small_finetuned.pt",
+        "vitstr":     out_dir / "vitstr_small_finetuned.pt",
+        "rtdetr":     out_dir / "rtdetr_finetuned",
+        "owlvit":     out_dir / "owlvit_finetuned",
+        "fasterrcnn": out_dir / "fasterrcnn_finetuned.pt",
+        "yolo608":    out_dir / "yolo608_finetuned.pt",
+        "cct_s":      out_dir / "cct_s_finetuned.pt",
+    }
+    skipped = []
+    for model_name, artifact in _MODEL_OUTPUTS.items():
+        if model_name in todo and artifact.exists():
+            print(f"[SKIP] {model_name}: output already exists at {artifact}")
+            todo.discard(model_name)
+            skipped.append(model_name)
+    if skipped:
+        print(f"Skipping {len(skipped)} already-finetuned model(s): {skipped}\n")
+
+    if not todo:
+        print("All requested models are already finetuned. Nothing to do.")
+        return
 
     # ── Sanity checks + batch-size probe ──────────────────────────────────────
     checked = run_sanity_checks(args, train_records, weights_dir, todo)
