@@ -1386,9 +1386,6 @@ class AdversarialPatchTrainer:
         total_det_real = total_det_top = total_ocr_real = total_ocr_top = total_tv = 0.0
         # Per-update accumulators (reset after each optimizer step, like accum_loss)
         _upd_det_real = _upd_det_top = _upd_ocr_real = _upd_ocr_top = _upd_tv = 0.0
-        # GPU-side loss accumulator — avoids .item() syncs inside the hot loop.
-        # Flushed with one .tolist() call per optimizer step instead.
-        _loss_accum_t = torch.zeros(6, device=self.device)
         step = num_updates = 0
         buffer: list = []
         use_sam = isinstance(optimizer, SAM)
@@ -1477,9 +1474,17 @@ class AdversarialPatchTrainer:
                     step += 1
                     scaled_loss.backward()  # frees item graph; accumulates into patch_leaf.grad
 
-                    _loss_accum_t.add_(torch.stack(
-                        [loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l]
-                    ).detach())
+                    accum_loss     += loss.item()
+                    total_det_real += det_real_l.item()
+                    total_det_top  += det_top_l.item()
+                    total_ocr_real += ocr_real_l.item()
+                    total_ocr_top  += ocr_top_l.item()
+                    total_tv       += tv_l.item()
+                    _upd_det_real  += det_real_l.item()
+                    _upd_det_top   += det_top_l.item()
+                    _upd_ocr_real  += ocr_real_l.item()
+                    _upd_ocr_top   += ocr_top_l.item()
+                    _upd_tv        += tv_l.item()
                     del loss, scaled_loss
 
                     if step % update_every == 0:
@@ -1490,16 +1495,6 @@ class AdversarialPatchTrainer:
                         optimizer.zero_grad()
                         if scheduler is not None:
                             scheduler.step()
-                        # Single .tolist() here = 1 GPU sync per optimizer step
-                        # instead of 11 syncs per accumulation batch.
-                        accum_loss, _upd_det_real, _upd_det_top, \
-                            _upd_ocr_real, _upd_ocr_top, _upd_tv = _loss_accum_t.tolist()
-                        _loss_accum_t.zero_()
-                        total_det_real += _upd_det_real
-                        total_det_top  += _upd_det_top
-                        total_ocr_real += _upd_ocr_real
-                        total_ocr_top  += _upd_ocr_top
-                        total_tv       += _upd_tv
                         total_loss  += accum_loss
                         num_updates += 1
                         _lr_now = optimizer.param_groups[0]["lr"]
@@ -1577,19 +1572,19 @@ class AdversarialPatchTrainer:
                     buffer = []
                     scaled_loss = loss / update_every
                     scaled_loss.backward()  # accumulates into patch_leaf.grad
-                    _loss_accum_t.add_(torch.stack(
-                        [loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l]
-                    ).detach())
+                    accum_loss     += loss.item()
+                    total_det_real += det_real_l.item()
+                    total_det_top  += det_top_l.item()
+                    total_ocr_real += ocr_real_l.item()
+                    total_ocr_top  += ocr_top_l.item()
+                    total_tv       += tv_l.item()
+                    _upd_det_real  += det_real_l.item()
+                    _upd_det_top   += det_top_l.item()
+                    _upd_ocr_real  += ocr_real_l.item()
+                    _upd_ocr_top   += ocr_top_l.item()
+                    _upd_tv        += tv_l.item()
                     step           += 1
                     del loss, scaled_loss
-                    accum_loss, _upd_det_real, _upd_det_top, \
-                        _upd_ocr_real, _upd_ocr_top, _upd_tv = _loss_accum_t.tolist()
-                    _loss_accum_t.zero_()
-                    total_det_real += _upd_det_real
-                    total_det_top  += _upd_det_top
-                    total_ocr_real += _upd_ocr_real
-                    total_ocr_top  += _upd_ocr_top
-                    total_tv       += _upd_tv
 
                 if step % update_every != 0 and self.grad_accumulate is not None:
                     # Propagate remainder gradients through generator.
