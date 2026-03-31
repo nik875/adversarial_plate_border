@@ -48,6 +48,7 @@ import traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import psutil
 import cv2
 import numpy as np
 import torch
@@ -103,8 +104,28 @@ def find_batch_size(
     Returns:
         Chosen batch size (≥ 1).
     """
+    proc         = psutil.Process()
+    cpu_baseline = proc.memory_info().rss
+
     if not device.startswith("cuda"):
-        return max_bs if max_bs is not None else 32
+        try:
+            probe_fn(1)
+            per_sample_cpu = max(1, proc.memory_info().rss - cpu_baseline)
+        except Exception:
+            print(f"  [auto-batch] probe failed — using batch_size=1")
+            return 1
+
+        vm            = psutil.virtual_memory()
+        cpu_free      = vm.available
+        cpu_uncapped  = max(1, int(cpu_free * safety / per_sample_cpu))
+        bs            = cpu_uncapped if max_bs is None else min(cpu_uncapped, max_bs)
+        cap_str       = "none" if max_bs is None else str(max_bs)
+        print(
+            f"  [auto-batch] RAM {cpu_free/1024**3:.1f}/{vm.total/1024**3:.1f} GB free"
+            f"  |  {per_sample_cpu/1024**2:.0f} MB/sample"
+            f"  →  batch_size={bs}  (cap={cap_str})"
+        )
+        return bs
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -115,22 +136,29 @@ def find_batch_size(
     try:
         probe_fn(1)
         torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated()
+        peak           = torch.cuda.max_memory_allocated()
         per_sample_mem = max(1, peak - baseline)
+        per_sample_cpu = max(1, proc.memory_info().rss - cpu_baseline)
     except Exception:
         print(f"  [auto-batch] probe failed — using batch_size=1")
         return 1
     finally:
         torch.cuda.empty_cache()
 
-    free_after = torch.cuda.mem_get_info()[0]
-    uncapped = max(1, int(free_after * safety / per_sample_mem))
-    bs = uncapped if max_bs is None else min(uncapped, max_bs)
-    cap_str = "none" if max_bs is None else str(max_bs)
+    free_after   = torch.cuda.mem_get_info()[0]
+    vm           = psutil.virtual_memory()
+    cpu_free     = vm.available
+
+    gpu_uncapped = max(1, int(free_after * safety / per_sample_mem))
+    cpu_uncapped = max(1, int(cpu_free   * safety / per_sample_cpu))
+    uncapped     = min(gpu_uncapped, cpu_uncapped)
+    bs           = uncapped if max_bs is None else min(uncapped, max_bs)
+    cap_str      = "none" if max_bs is None else str(max_bs)
     print(
-        f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
-        f"  |  {per_sample_mem/1024**2:.0f} MB/sample"
-        f"  →  batch_size={bs}  (cap={cap_str})"
+        f"  [auto-batch] GPU {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
+        f"  |  RAM {cpu_free/1024**3:.1f}/{vm.total/1024**3:.1f} GB free"
+        f"  |  {per_sample_mem/1024**2:.0f} MB GPU/sample  {per_sample_cpu/1024**2:.0f} MB RAM/sample"
+        f"  →  batch_size={bs}  (gpu_limit={gpu_uncapped}, ram_limit={cpu_uncapped}, cap={cap_str})"
     )
     return bs
 
