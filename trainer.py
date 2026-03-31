@@ -1535,6 +1535,12 @@ class AdversarialPatchTrainer:
         _accumulate(ascent_idx, 1.0 / m)
 
         torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+        # Scale rho with current LR so the perturbation stays proportional to
+        # the update step size — prevents over-perturbation during LR warmup.
+        _cur_lr = optimizer.base_optimizer.param_groups[0]["lr"]
+        _scaled_rho = self.sam_rho * (_cur_lr / self._peak_lr)
+        for _g in optimizer.param_groups:
+            _g["rho"] = _scaled_rho
         optimizer.first_step(zero_grad=True)
 
         # ── DESCENT: gradients from all M items, perturbed patch ─────────
@@ -2013,6 +2019,7 @@ class AdversarialPatchTrainer:
 
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
+            self._peak_lr = learning_rate
             optimizer = SAM(
                 self._param_groups(learning_rate),
                 base_optimizer_cls=optim.AdamW,
