@@ -442,6 +442,9 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                     img = Image.open(record["image"]).convert("RGB")
                     x1, y1, x2, y2 = [int(v) for v in record["box"].tolist()]
                     img_crop = img.crop((x1, y1, x2, y2))
+                    ch, cw = backend.ocr_crop_size
+                    if ch is not None and cw is not None:
+                        img_crop = img_crop.resize((cw, ch), Image.BILINEAR)
                     batch_crops.append(transform(img_crop))
                     batch_gts.append(record["text"])
                     valid_indices.append(i)
@@ -618,6 +621,9 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                 try:
                     x1, y1, x2, y2 = [int(v) for v in best_det_box.tolist()]
                     img_crop = img.crop((x1, y1, x2, y2))
+                    ch, cw = ocr_backend.ocr_crop_size
+                    if ch is not None and cw is not None:
+                        img_crop = img_crop.resize((cw, ch), Image.BILINEAR)
                     ocr_batch_crops.append(transform(img_crop))
                     ocr_batch_gts.append(gt_text)
                     ocr_indices.append(len(lprr_values))  # where to store result
