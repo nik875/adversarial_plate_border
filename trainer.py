@@ -368,6 +368,17 @@ class SAM(torch.optim.Optimizer):
 
 
 # ---------------------------------------------------------------------------
+# Fixed pipeline pairings (mirrors evaluate_finetuned.py)
+# ---------------------------------------------------------------------------
+
+PIPELINE_PAIRINGS: List[Tuple[str, str]] = [
+    ("fasterrcnn",  "lprnet"),
+    ("rtdetr",      "doctr-vitstr"),
+    ("owlvit",      "trocr"),
+    ("yolo-v9-608", "cct"),
+]
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
@@ -403,6 +414,7 @@ class AdversarialPatchTrainer:
         top_extend:           bool           = False,
         ccpd_csv:             Optional[str]  = None,
         continue_run_dir:     Optional[str]  = None,
+        run_dir_override:     Optional[str]  = None,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -419,6 +431,14 @@ class AdversarialPatchTrainer:
         self.impersonation_target = impersonation_target
         self.expected_plate_text  = expected_plate_text
         self.train_detector       = train_detector
+
+        # Stored for _make_pipeline_loader() used by train_ensemble()
+        self._csv_path            = csv_path
+        self._num_workers         = num_workers
+        self._pin_memory          = pin_memory
+        self._limit               = limit
+        self._use_all_for_train   = use_all_for_train
+        self._ccpd_csv            = ccpd_csv
 
         # ── Detector ───────────────────────────────────────────────────
         self.detector = detector
@@ -440,7 +460,9 @@ class AdversarialPatchTrainer:
             self.ocr.eval()
 
         # ── Run output directory ───────────────────────────────────────
-        if continue_run_dir:
+        if run_dir_override:
+            self.run_dir = Path(run_dir_override)
+        elif continue_run_dir:
             self.run_dir = Path(continue_run_dir)
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -637,6 +659,42 @@ class AdversarialPatchTrainer:
             return make_letterbox_prep(384)
         else:
             return make_letterbox_prep(384)
+
+    def _activate_pipeline(self, detector: DetectorBackend, ocr: OCRBackend) -> None:
+        """Hot-swap the active detector/OCR pipeline.
+
+        Updates self.detector, self.ocr, self.diff_prep, and self._cv2_prep so
+        subsequent calls to _prepare_one(), compute_loss_batch(), and validate()
+        use the new pipeline.  Does not modify any model weights or optimiser state.
+        Note: _diff_prep_batch also reads self.detector.name directly and is
+        therefore covered automatically.
+        """
+        self.detector  = detector
+        self.ocr       = ocr
+        self.diff_prep = self._make_differentiable_prep()
+        self._cv2_prep = self._make_cv2_prep()
+
+    def _make_pipeline_loader(self):
+        """Create a fresh non-preloaded train DataLoader.
+
+        Used by train_ensemble() to give each active pipeline its own
+        independent iterator over the full dataset each epoch.
+        """
+        _nj = os.cpu_count() if self._num_workers < 0 else self._num_workers
+        if self._ccpd_csv:
+            loader, _ = create_ccpd_dataloaders(
+                self._ccpd_csv, batch_size=1, n_jobs=_nj,
+                pin_memory=False, limit=self._limit,
+            )
+        else:
+            loader, _ = create_dataloaders(
+                self._csv_path, transform=self.transform,
+                preload=False, gpu_device=None, batch_size=1,
+                n_jobs=_nj, pin_memory=False,
+                limit=self._limit, use_all_for_train=self._use_all_for_train,
+                use_original=True,
+            )
+        return loader
 
     # ====================================================================
     # Geometry helpers
@@ -1838,6 +1896,22 @@ class AdversarialPatchTrainer:
 
         return float(np.mean(losses)) if losses else 0.0
 
+    def _validate_all_pipelines(
+        self,
+        pipelines: List[Tuple[DetectorBackend, OCRBackend]],
+    ) -> Tuple[List[float], float]:
+        """Run validate() against each pipeline; return (per_pipeline_losses, mean).
+
+        Temporarily activates each pipeline in turn, then restores the first.
+        """
+        per: List[float] = []
+        for det, ocr in pipelines:
+            self._activate_pipeline(det, ocr)
+            per.append(self.validate())
+        self._activate_pipeline(*pipelines[0])
+        mean = float(np.mean(per)) if per else 0.0
+        return per, mean
+
     def train(
         self,
         num_epochs:    int   = 100,
@@ -2073,6 +2147,389 @@ class AdversarialPatchTrainer:
         print(f"Training history → {hist_path}")
         return history
 
+    def train_ensemble(
+        self,
+        active_pipelines: List[Tuple[DetectorBackend, OCRBackend]],
+        num_epochs:    int   = 100,
+        learning_rate: float = 5e-4,
+        lr_min:        float = 1e-5,
+        tv_warmup:     float = 0.1,
+        continue_path: Optional[str] = None,
+        continue_lr:   bool  = False,
+    ) -> dict:
+        """Ensemble training: round-robin over active_pipelines, one batch per step.
+
+        active_pipelines : pre-loaded (DetectorBackend, OCRBackend) pairs for the
+                           3 non-holdout pipelines (already eval()+freeze()'d).
+
+        One optimizer step = eval_batch_size images through the current pipeline.
+        For m-SAM, one step = eval_batch_size * grad_accumulate images through
+        the current pipeline (reuses _msam_step() unchanged).
+
+        Batch cycling: A → B → C → A → B → C → …  (round-robin at the step level).
+        Each pipeline has its own independent DataLoader so all 3 see the full
+        dataset each epoch.
+        """
+        # ── Checkpoint load ───────────────────────────────────────────
+        ckpt_global_update = 0
+        if continue_path:
+            ckpt = torch.load(continue_path, map_location="cpu")
+            with torch.no_grad():
+                self.seed.copy_(ckpt["seed"].to(self.device))
+            self.decoder.load_state_dict(ckpt["decoder"])
+            self.decoder.to(self.device)
+            ckpt_global_update = int(ckpt.get("global_update", 0))
+            print(f"  Resumed from  : {continue_path}  (update {ckpt_global_update})")
+
+        n = len(active_pipelines)
+        eta_min = lr_min
+
+        # ── Per-pipeline DataLoaders ──────────────────────────────────
+        loaders = [self._make_pipeline_loader() for _ in active_pipelines]
+
+        # ── Probe batch size per pipeline → take min ──────────────────
+        if self.device.startswith("cuda"):
+            probe_raw = {k: v[0] for k, v in next(iter(loaders[0])).items()}
+            sizes = []
+            for det, ocr in active_pipelines:
+                self._activate_pipeline(det, ocr)
+                sizes.append(self._probe_eval_batch_size(probe_raw))
+            B = min(sizes)
+            print(f"  [ensemble] Per-pipeline batch sizes: {sizes}  →  using min={B}")
+            self.eval_batch_size = B
+            self._activate_pipeline(*active_pipelines[0])
+        else:
+            B = self.eval_batch_size
+
+        # ── Cap eval_batch_size for ≥10 000 total updates ─────────────
+        _update_every_cap = (self.grad_accumulate or 1)
+        _imgs_per_epoch   = sum(len(ld) for ld in loaders)
+        _max_bs = max(1, num_epochs * _imgs_per_epoch // (10_000 * _update_every_cap))
+        if B > _max_bs:
+            print(f"[auto-batch] capping eval_batch_size {B} → {_max_bs} "
+                  f"to ensure ≥10 000 total updates")
+            B = _max_bs
+            self.eval_batch_size = B
+
+        # update_every: for SAM, each optimizer step consumes B*update_every items;
+        # for non-SAM, update_every=1 (each step = exactly B items).
+        update_every = self.grad_accumulate if (isinstance(self.sam_m, int)
+                                                and self.sam_m is not None
+                                                and self.grad_accumulate)  \
+                       else 1
+
+        # ── Optimizer ─────────────────────────────────────────────────
+        if self.sam_m is not None:
+            optimizer = SAM(
+                self._trainable_params(),
+                base_optimizer_cls=optim.AdamW,
+                rho=self.sam_rho,
+                lr=learning_rate,
+                weight_decay=1e-4,
+            )
+            sched_optimizer = optimizer.base_optimizer
+        else:
+            optimizer = optim.AdamW(
+                self._trainable_params(), lr=learning_rate, weight_decay=1e-4
+            )
+            sched_optimizer = optimizer
+
+        # ── LR schedule (same formula as train()) ─────────────────────
+        _ue_sched = update_every
+        _per_epoch_sched = max(1, _imgs_per_epoch // (B * _ue_sched))
+        total_updates_sched = num_epochs * _per_epoch_sched
+        warmup_updates = max(1, int(0.1 * total_updates_sched))
+        cosine_updates = total_updates_sched - warmup_updates
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            sched_optimizer,
+            start_factor=eta_min / learning_rate,
+            end_factor=1.0,
+            total_iters=max(1, warmup_updates),
+        )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            sched_optimizer, T_max=max(1, cosine_updates), eta_min=eta_min,
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            sched_optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[max(1, warmup_updates)],
+        )
+
+        if continue_lr and ckpt_global_update > 0:
+            steps_to_skip = min(ckpt_global_update, total_updates_sched)
+            print(f"  LR schedule  : fast-forwarding {steps_to_skip} steps to match checkpoint")
+            for _ in range(steps_to_skip):
+                scheduler.step()
+
+        # ── TV warmup & checkpoint cadence ────────────────────────────
+        total_updates     = num_epochs * _per_epoch_sched
+        tv_warmup_updates = int(tv_warmup * total_updates)
+        save_every        = max(1, total_updates // 10)
+
+        n_params = sum(p.numel() for p in self._trainable_params())
+        print(f"\n{'='*60}")
+        print(f"  Ensemble Adversarial Patch Training")
+        print(f"  Active pipelines:")
+        for i, (det, ocr) in enumerate(active_pipelines):
+            print(f"    [{i}] {det.name} / {ocr.name}")
+        print(f"  Patch gen : ConvTranspose decoder  "
+              f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
+        print(f"  Trainable : {n_params:,} params")
+        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (across {n} pipelines)")
+        print(f"  Epochs    : {num_epochs}  |  Updates: {total_updates}  |  "
+              f"Save every: {save_every} updates (~10%)")
+        print(f"  Batch/pipeline: {B}  |  update_every: {update_every}")
+        print(f"  LR warmup : {warmup_updates} updates  |  "
+              f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        if tv_warmup_updates > 0:
+            print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
+        else:
+            print(f"  TV warmup : disabled")
+        if self.sam_m is not None:
+            print(f"  Optimizer : m-SAM  (m={self.sam_m}, rho={self.sam_rho}, base=AdamW)")
+        _mode = ('impersonation → ' + self.impersonation_target) if self.impersonation_target else 'disruption'
+        if self.disable_disruption:
+            _mode += '  [detection loss disabled]'
+        print(f"  Mode      : {_mode}")
+        print(f"  Run dir   : {self.run_dir}")
+        print(f"{'='*60}\n")
+
+        # ── Logging ───────────────────────────────────────────────────
+        _resuming = continue_path is not None
+        log_path  = self.run_dir / "training_log.txt"
+        log_file  = open(log_path, "a" if _resuming else "w")
+        batch_log_path = self.run_dir / "batch_log.csv"
+        _batch_log_fields = ["global_update", "pipeline", "epoch", "loss",
+                             "det_real", "det_top", "ocr_real", "ocr_top", "tv", "lr"]
+        _write_header = not (_resuming and batch_log_path.exists())
+        batch_log_file   = open(batch_log_path, "a" if _resuming else "w", newline="")
+        batch_log_writer = csv.writer(batch_log_file)
+        if _write_header:
+            batch_log_writer.writerow(_batch_log_fields)
+
+        history = {
+            "loss": [], "val_score": [], "val_per_pipeline": [],
+            "learning_rate": [],
+            "det_real": [], "det_top": [], "ocr_real": [], "ocr_top": [], "tv": [],
+        }
+        best_loss  = float("inf")
+        best_epoch = -1
+
+        global_updates            = ckpt_global_update
+        self._last_save_milestone = ckpt_global_update // save_every if save_every > 0 else 0
+        _saved_tv_weight          = self.tv_weight
+
+        # ── Epoch loop ────────────────────────────────────────────────
+        for epoch in range(num_epochs):
+            epoch_start  = time.time()
+            self.training = True
+
+            pipe_iters    = [iter(ld) for ld in loaders]
+            exhausted: set = set()
+            buffers       = [[] for _ in range(n)]
+            pipe_loss_sum = [0.0] * n
+            pipe_steps    = [0]   * n
+            # component sums for epoch-level averages
+            pipe_det_real = [0.0] * n
+            pipe_det_top  = [0.0] * n
+            pipe_ocr_real = [0.0] * n
+            pipe_ocr_top  = [0.0] * n
+            pipe_tv       = [0.0] * n
+            global_loss_sum = 0.0
+            global_steps    = 0
+            rr_idx          = 0
+
+            # tqdm total: approximate updates this epoch
+            _approx_upd = max(1, _imgs_per_epoch // (B * update_every))
+            pbar = tqdm(total=_approx_upd, desc=f"Epoch {epoch+1}", unit="upd", leave=False)
+
+            while len(exhausted) < n:
+                pi = rr_idx % n
+                rr_idx += 1
+                if pi in exhausted:
+                    continue
+                try:
+                    raw = {k: v[0] for k, v in next(pipe_iters[pi]).items()}
+                except StopIteration:
+                    exhausted.add(pi)
+                    # Flush remaining buffer for this pipeline
+                    if buffers[pi]:
+                        self._activate_pipeline(*active_pipelines[pi])
+                        patch_with_graph = self.generate_patch(training_aug=True)
+                        patch_leaf = patch_with_graph.detach().requires_grad_(True)
+                        flush_items = [self._prepare_one(r, patch_leaf) for r in buffers[pi]]
+                        for it in flush_items: it["_patch_norm"] = patch_leaf
+                        buffers[pi] = []
+                        loss_f, dr, dt, or_, ot, tv_l = self.compute_loss_batch(flush_items)
+                        loss_f.backward()
+                        patch_with_graph.backward(patch_leaf.grad)
+                        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+                        optimizer.step(); optimizer.zero_grad(); scheduler.step()
+                        lv = loss_f.item()
+                        pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
+                        pipe_det_real[pi] += dr.item(); pipe_det_top[pi] += dt.item()
+                        pipe_ocr_real[pi] += or_.item(); pipe_ocr_top[pi] += ot.item()
+                        pipe_tv[pi]       += tv_l.item()
+                        global_loss_sum   += lv; global_steps   += 1
+                        num_upd = global_updates + global_steps
+                        milestone = num_upd // save_every
+                        if milestone > self._last_save_milestone:
+                            self._last_save_milestone = milestone
+                            self.save_patch(num_upd, "patches")
+                        det_name = active_pipelines[pi][0].name
+                        ocr_name = active_pipelines[pi][1].name
+                        batch_log_writer.writerow([
+                            num_upd, f"{det_name}/{ocr_name}", epoch + 1,
+                            lv, dr.item(), dt.item(), or_.item(), ot.item(), tv_l.item(),
+                            optimizer.param_groups[0]["lr"],
+                        ])
+                        pbar.update(1)
+                    continue
+
+                buffers[pi].append(raw)
+                if len(buffers[pi]) < B * update_every:
+                    continue
+
+                # ── Optimizer step for pipeline pi ────────────────────
+                self._activate_pipeline(*active_pipelines[pi])
+
+                # TV warmup
+                global_upd_for_step = global_updates + global_steps + 1
+                if tv_warmup_updates > 0 and global_upd_for_step <= tv_warmup_updates:
+                    self.tv_weight = _saved_tv_weight * min(
+                        1.0, global_upd_for_step / tv_warmup_updates
+                    )
+                else:
+                    self.tv_weight = _saved_tv_weight
+
+                if isinstance(optimizer, SAM):
+                    # m-SAM: _msam_step reads self.detector/ocr at call time.
+                    loss_t, dr, dt, or_, ot, tv_l = self._msam_step(
+                        optimizer, buffers[pi], B, update_every
+                    )
+                    lv = loss_t / B
+                else:
+                    patch_with_graph = self.generate_patch(training_aug=True)
+                    patch_leaf = patch_with_graph.detach().requires_grad_(True)
+                    items = [self._prepare_one(r, patch_leaf) for r in buffers[pi]]
+                    for it in items: it["_patch_norm"] = patch_leaf
+                    loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
+                    loss.backward()
+                    patch_with_graph.backward(patch_leaf.grad)
+                    torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
+                    optimizer.step(); optimizer.zero_grad()
+                    lv = loss.item()
+
+                buffers[pi] = []
+                scheduler.step()
+
+                # Metrics tracking
+                pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
+                pipe_det_real[pi] += dr.item() if hasattr(dr, 'item') else float(dr)
+                pipe_det_top[pi]  += dt.item() if hasattr(dt, 'item') else float(dt)
+                pipe_ocr_real[pi] += or_.item() if hasattr(or_, 'item') else float(or_)
+                pipe_ocr_top[pi]  += ot.item() if hasattr(ot, 'item') else float(ot)
+                pipe_tv[pi]       += tv_l.item() if hasattr(tv_l, 'item') else float(tv_l)
+                global_loss_sum   += lv; global_steps += 1
+                num_upd = global_updates + global_steps
+
+                # Checkpoint milestone
+                milestone = num_upd // save_every
+                if milestone > self._last_save_milestone:
+                    self._last_save_milestone = milestone
+                    self.save_patch(num_upd, "patches")
+
+                # batch_log row
+                det_name = active_pipelines[pi][0].name
+                ocr_name = active_pipelines[pi][1].name
+                batch_log_writer.writerow([
+                    num_upd, f"{det_name}/{ocr_name}", epoch + 1,
+                    lv,
+                    pipe_det_real[pi] / pipe_steps[pi],
+                    pipe_det_top[pi]  / pipe_steps[pi],
+                    pipe_ocr_real[pi] / pipe_steps[pi],
+                    pipe_ocr_top[pi]  / pipe_steps[pi],
+                    pipe_tv[pi]       / pipe_steps[pi],
+                    optimizer.param_groups[0]["lr"],
+                ])
+
+                # tqdm postfix: overall loss + per-pipeline running avg
+                pbar.update(1)
+                pbar.set_postfix({
+                    "pipe": det_name[:7],
+                    "loss": f"{global_loss_sum / global_steps:.4f}",
+                    **{f"p{i}": f"{pipe_loss_sum[i] / max(pipe_steps[i], 1):.4f}"
+                       for i in range(n)},
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                })
+
+            pbar.close()
+            batch_log_file.flush()
+            global_updates += global_steps
+            self.training   = False
+
+            # ── End-of-epoch validation & logging ─────────────────────
+            val_losses, val_mean = self._validate_all_pipelines(active_pipelines)
+            lr       = optimizer.param_groups[0]["lr"]
+            ep_loss  = global_loss_sum / max(global_steps, 1)
+            ep_dr    = sum(pipe_det_real) / max(sum(pipe_steps), 1)
+            ep_dt    = sum(pipe_det_top)  / max(sum(pipe_steps), 1)
+            ep_or    = sum(pipe_ocr_real) / max(sum(pipe_steps), 1)
+            ep_ot    = sum(pipe_ocr_top)  / max(sum(pipe_steps), 1)
+            ep_tv    = sum(pipe_tv)       / max(sum(pipe_steps), 1)
+            epoch_time = time.time() - epoch_start
+
+            history["loss"].append(ep_loss)
+            history["val_score"].append(val_mean)
+            history["val_per_pipeline"].append(val_losses)
+            history["learning_rate"].append(lr)
+            history["det_real"].append(ep_dr)
+            history["det_top"].append(ep_dt)
+            history["ocr_real"].append(ep_or)
+            history["ocr_top"].append(ep_ot)
+            history["tv"].append(ep_tv)
+
+            init_val    = history["val_score"][0]
+            change      = (val_mean / (init_val + 1e-9) - 1) * 100
+            best_marker = ""
+
+            if val_mean < best_loss:
+                best_loss  = val_mean
+                best_epoch = epoch
+                # Save best patch using the first pipeline's detector name
+                self.save_patch(global_updates, "patches",
+                                stem=f"patch_ensemble_best")
+                best_marker = "  ★ best"
+
+            val_str = "  ".join(
+                f"{active_pipelines[i][0].name}: {v:.4f}"
+                for i, v in enumerate(val_losses)
+            )
+            line = (f"Epoch {epoch+1:3d}/{num_epochs} [ensemble] | "
+                    f"loss: {ep_loss:.4f}  "
+                    f"det_r: {ep_dr:.4f}  det_t: {ep_dt:.4f}  "
+                    f"ocr_r: {ep_or:.4f}  ocr_t: {ep_ot:.4f}  "
+                    f"tv: {ep_tv:.4f} | "
+                    f"val(mean): {val_mean:.4f} Δ{change:+.1f}%  [{val_str}] | "
+                    f"lr: {lr:.2e} | "
+                    f"time: {epoch_time:.1f}s{best_marker}")
+            print(line)
+            log_file.write(line + "\n")
+            log_file.flush()
+
+        log_file.close()
+        batch_log_file.close()
+
+        import pandas as pd
+        hist_path = self.run_dir / "training_history.csv"
+        pd.DataFrame(history).assign(
+            epoch=range(1, len(history["loss"]) + 1)
+        ).to_csv(str(hist_path), index=False)
+
+        print(f"\nDone. Best val loss {best_loss:.4f} at epoch {best_epoch+1}.")
+        print(f"Training history → {hist_path}")
+        return history
+
 
 # ====================================================================
 # CLI
@@ -2171,7 +2628,41 @@ def main():
                              "schedule by the checkpoint's global_update count so training "
                              "continues from the same schedule position.  Without this flag "
                              "(default) the schedule always resets to the new --lr / --lr-min.")
+    parser.add_argument("--holdout", default=None, metavar="DETECTOR",
+                        help="Ensemble training mode: hold out the pipeline whose detector "
+                             "matches DETECTOR (e.g. 'fasterrcnn') and train against the "
+                             "remaining 3 pipelines in round-robin.  Requires --finetuned-models.  "
+                             f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}")
     args = parser.parse_args()
+
+    # ── Holdout / ensemble mode ───────────────────────────────────────────────
+    _holdout_pair: Optional[Tuple[str, str]] = None
+    if args.holdout:
+        _holdout_pair = next(
+            ((d, o) for d, o in PIPELINE_PAIRINGS if d == args.holdout), None
+        )
+        if _holdout_pair is None:
+            parser.error(
+                f"--holdout {args.holdout!r} does not match any pipeline detector.  "
+                f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}"
+            )
+        if not args.finetuned_models:
+            parser.error("--holdout requires --finetuned-models")
+        # Use the first non-holdout pipeline as the primary backend for __init__
+        _primary_det, _primary_ocr = next(
+            (d, o) for d, o in PIPELINE_PAIRINGS if (d, o) != _holdout_pair
+        )
+        args.backend     = _primary_det
+        args.ocr_backend = _primary_ocr
+
+    # ── run_dir override for ensemble mode ───────────────────────────────────
+    _run_dir_override = None
+    if _holdout_pair:
+        holdout_det, holdout_ocr = _holdout_pair
+        _suffix = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        _run_dir_override = str(
+            Path("runs") / f"holdout_{holdout_det}_{holdout_ocr}_{_suffix}"
+        )
 
     # ── Resolve model paths (mirrors evaluate_finetuned.py checkpoint_map) ──
     _FINETUNED_CHECKPOINT_MAP = {
@@ -2217,9 +2708,27 @@ def main():
     if args.sam_m == 0:
         args.sam_m = None   # None is the internal sentinel for "disabled"
 
+    # ── Load all active pipeline backends for ensemble mode ──────────────────
+    active_pipeline_backends: List[Tuple] = []
+    if _holdout_pair and args.finetuned_models:
+        _fdir_ens = Path(args.finetuned_models)
+        for _det_name, _ocr_name in PIPELINE_PAIRINGS:
+            if (_det_name, _ocr_name) == _holdout_pair:
+                continue
+            _dp = str(_fdir_ens / _FINETUNED_CHECKPOINT_MAP[_det_name])
+            _op = str(_fdir_ens / _FINETUNED_CHECKPOINT_MAP[_ocr_name])
+            _det = build_backend(_det_name, _dp, device=args.device)
+            _det.load(); _det.eval(); _det.freeze()
+            _ocr_b = build_ocr_backend(_ocr_name, _op, device=args.device)
+            _ocr_b.load(); _ocr_b.eval()
+            active_pipeline_backends.append((_det, _ocr_b))
+        print(f"  [ensemble] Loaded {len(active_pipeline_backends)} active pipelines "
+              f"(holdout: {_holdout_pair[0]}/{_holdout_pair[1]})")
+
     # If resuming, reuse the original run directory (two levels up from the .pt file).
+    # (Ignored when run_dir_override is set — ensemble mode computes its own path.)
     _continue_run_dir = None
-    if args.continue_path:
+    if args.continue_path and not _run_dir_override:
         _continue_run_dir = str(Path(args.continue_path).parent.parent)
 
     trainer = AdversarialPatchTrainer(
@@ -2251,17 +2760,29 @@ def main():
         top_extend           = args.top_extend,
         ccpd_csv             = args.ccpd_train_csv,
         continue_run_dir     = _continue_run_dir,
+        run_dir_override     = _run_dir_override,
     )
 
-    trainer.train(
-        num_epochs    = args.epochs,
-        learning_rate = args.lr,
-        lr_min        = args.lr_min,
-        dry_run       = args.dry_run,
-        tv_warmup     = args.tv_warmup,
-        continue_path = args.continue_path,
-        continue_lr   = args.continue_lr,
-    )
+    if _holdout_pair:
+        trainer.train_ensemble(
+            active_pipelines = active_pipeline_backends,
+            num_epochs       = args.epochs,
+            learning_rate    = args.lr,
+            lr_min           = args.lr_min,
+            tv_warmup        = args.tv_warmup,
+            continue_path    = args.continue_path,
+            continue_lr      = args.continue_lr,
+        )
+    else:
+        trainer.train(
+            num_epochs    = args.epochs,
+            learning_rate = args.lr,
+            lr_min        = args.lr_min,
+            dry_run       = args.dry_run,
+            tv_warmup     = args.tv_warmup,
+            continue_path = args.continue_path,
+            continue_lr   = args.continue_lr,
+        )
 
 
 if __name__ == "__main__":
