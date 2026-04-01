@@ -721,8 +721,12 @@ class LPRNetBackend(OCRBackend):
     is_trainable  = True
     ocr_crop_size = (48, 96)   # (H, W) — NVIDIA TAO LPRNet input size
 
+    # Original NVIDIA TAO alphabet (no 'O' to avoid 0/O confusion) — 35 chars, blank=35
     ALPHABET  = "0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
     BLANK_IDX = 35   # last index; matches NVIDIA TAO convention
+
+    # Fine-tuned model alphabet: full A-Z including 'O' — 36 chars, blank=0
+    FINETUNED_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     def __init__(self, model_path: str = "none", device: str = "cpu"):
         super().__init__(model_path, device)
@@ -731,7 +735,8 @@ class LPRNetBackend(OCRBackend):
         #   ONNX baseline: 36 outputs, blank=35, char idx = direct
         #   Finetuned .pt: 37 outputs, blank=0,  char idx = idx-1
         self._blank_idx: int = self.BLANK_IDX
-        self._char_offset: int = 0  # subtract from output idx to index into ALPHABET
+        self._char_offset: int = 0  # subtract from output idx to index into _alphabet
+        self._alphabet: str = self.ALPHABET
 
     def load(self) -> None:
         from lprnet_torch import LPRNetTorch, load_weights_from_onnx
@@ -744,17 +749,20 @@ class LPRNetBackend(OCRBackend):
             if self.model_path.suffix == ".pt":
                 # Finetuned model: dense head was replaced with Linear(512, 37)
                 # blank=0, chars at indices 1-36  (finetune BLANK_IDX=0, NUM_CLASSES=37)
+                # Trained with full A-Z alphabet including 'O' (36 chars).
                 old = self._model.dense
                 self._model.dense = nn.Linear(old.in_features, 37)
                 state = torch.load(str(self.model_path), map_location="cpu")
                 self._model.load_state_dict(state)
                 self._blank_idx = 0
-                self._char_offset = 1  # output idx 1 → ALPHABET[0], etc.
+                self._char_offset = 1  # output idx 1 → _alphabet[0], etc.
+                self._alphabet = self.FINETUNED_ALPHABET  # full A-Z including 'O'
                 print(f"[{self.name}] Loaded finetuned weights from {self.model_path}")
             else:
                 load_weights_from_onnx(self._model, str(self.model_path))
                 self._blank_idx = self.BLANK_IDX
                 self._char_offset = 0
+                self._alphabet = self.ALPHABET  # NVIDIA TAO original (no 'O')
                 print(f"[{self.name}] Loaded weights from {self.model_path}")
         else:
             print(f"[{self.name}] No checkpoint — using random weights")
@@ -831,8 +839,8 @@ class LPRNetBackend(OCRBackend):
         for t, idx in enumerate(pred.tolist()):
             if idx != prev and idx != self._blank_idx:
                 char_idx = idx - self._char_offset
-                if 0 <= char_idx < len(self.ALPHABET):
-                    chars.append(self.ALPHABET[char_idx])
+                if 0 <= char_idx < len(self._alphabet):
+                    chars.append(self._alphabet[char_idx])
                     confs.append(probs[t, idx].item())
             prev = idx
         if not chars:
@@ -843,8 +851,10 @@ class LPRNetBackend(OCRBackend):
                  diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """CTC loss on [T, C] log-probabilities."""
         lp = log_probs.unsqueeze(1)   # [T, 1, C]
+        # Use instance alphabet/blank so finetuned and ONNX models both work correctly.
         target_ids = torch.tensor(
-            [self.ALPHABET.index(c) for c in target_text if c in self.ALPHABET],
+            [self._alphabet.index(c) + self._char_offset
+             for c in target_text if c in self._alphabet],
             dtype=torch.long,
         )
         input_len  = torch.tensor([lp.shape[0]], dtype=torch.long)
@@ -852,7 +862,7 @@ class LPRNetBackend(OCRBackend):
         return F.ctc_loss(
             lp, target_ids.unsqueeze(0),
             input_len, target_len,
-            blank=self.BLANK_IDX,
+            blank=self._blank_idx,
             reduction="mean", zero_infinity=True,
         )
 
