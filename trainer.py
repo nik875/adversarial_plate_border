@@ -402,6 +402,7 @@ class AdversarialPatchTrainer:
         augment:              bool           = False,
         top_extend:           bool           = False,
         ccpd_csv:             Optional[str]  = None,
+        continue_run_dir:     Optional[str]  = None,
     ):
         self.training             = training
         self.tv_weight            = tv_weight
@@ -439,9 +440,12 @@ class AdversarialPatchTrainer:
             self.ocr.eval()
 
         # ── Run output directory ───────────────────────────────────────
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        suffix    = run_name or timestamp
-        self.run_dir   = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
+        if continue_run_dir:
+            self.run_dir = Path(continue_run_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix    = run_name or timestamp
+            self.run_dir = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
         self.profiling: bool = False
         self._prof:     dict = {}
         (self.run_dir / "patches").mkdir(parents=True, exist_ok=True)
@@ -1841,17 +1845,39 @@ class AdversarialPatchTrainer:
         lr_min:        float = 1e-5,
         dry_run:       bool  = False,
         tv_warmup:     float = 0.1,
+        continue_path: Optional[str] = None,
+        continue_lr:   bool = False,
     ) -> dict:
         """
         tv_warmup: fraction of total gradient updates during which TV loss is
         suppressed so the patch can move freely early on.  Set to 0.0 to
         disable TV warmup entirely.
+
+        continue_path: path to a .pt checkpoint produced by save_patch().
+                       Loads seed + decoder weights and resumes from
+                       global_update stored in the checkpoint.
+        continue_lr:   if True, fast-forward the new LR schedule to the
+                       checkpoint's global_update so training continues
+                       from the same point in the schedule.  Without this
+                       flag (default) the schedule always resets to the
+                       LR params passed in.
         """
         if dry_run:
             print("\nDry run: saving debug images...")
             self.save_debug_images()
             print("Dry run complete.")
             return {}
+
+        # ── Load checkpoint (--continue) ──────────────────────────────
+        ckpt_global_update = 0
+        if continue_path:
+            ckpt = torch.load(continue_path, map_location="cpu")
+            with torch.no_grad():
+                self.seed.copy_(ckpt["seed"].to(self.device))
+            self.decoder.load_state_dict(ckpt["decoder"])
+            self.decoder.to(self.device)
+            ckpt_global_update = int(ckpt.get("global_update", 0))
+            print(f"  Resumed from  : {continue_path}  (update {ckpt_global_update})")
 
         eta_min       = lr_min
 
@@ -1912,6 +1938,17 @@ class AdversarialPatchTrainer:
             milestones=[max(1, warmup_updates)],
         )
 
+        # Fast-forward scheduler when --continue-lr is requested.
+        # We call scheduler.step() once per past update so that the
+        # scheduler's internal state (last_epoch) reaches the right
+        # position.  This is pure Python math so it completes quickly
+        # even for tens-of-thousands of updates.
+        if continue_lr and ckpt_global_update > 0:
+            steps_to_skip = min(ckpt_global_update, total_updates_sched)
+            print(f"  LR schedule  : fast-forwarding {steps_to_skip} steps to match checkpoint")
+            for _ in range(steps_to_skip):
+                scheduler.step()
+
         history    = {"loss": [], "val_score": [], "learning_rate": [],
                       "det_real": [], "det_top": [], "ocr_real": [], "ocr_top": [], "tv": []}
         best_loss  = float("inf")
@@ -1954,17 +1991,20 @@ class AdversarialPatchTrainer:
         print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
 
+        _resuming     = continue_path is not None
         log_path      = self.run_dir / "training_log.txt"
-        log_file      = open(log_path, "w")
+        log_file      = open(log_path, "a" if _resuming else "w")
         batch_log_path = self.run_dir / "batch_log.csv"
         _batch_log_fields = ["global_update", "epoch", "loss",
                              "det_real", "det_top", "ocr_real", "ocr_top", "tv", "lr"]
-        batch_log_file = open(batch_log_path, "w", newline="")
+        _batch_log_write_header = not (_resuming and batch_log_path.exists())
+        batch_log_file = open(batch_log_path, "a" if _resuming else "w", newline="")
         batch_log_writer = csv.writer(batch_log_file)
-        batch_log_writer.writerow(_batch_log_fields)
+        if _batch_log_write_header:
+            batch_log_writer.writerow(_batch_log_fields)
 
-        global_updates           = 0
-        self._last_save_milestone = 0
+        global_updates            = ckpt_global_update
+        self._last_save_milestone = ckpt_global_update // save_every if save_every > 0 else 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
@@ -2111,6 +2151,16 @@ def main():
                         help="Apply differentiable photometric augmentations (brightness, "
                              "contrast, saturation, color temperature, directional shadow) "
                              "after patch application at each training step.")
+    parser.add_argument("--continue", dest="continue_path", default=None, metavar="CHECKPOINT",
+                        help="Path to a .pt checkpoint produced by a previous run.  "
+                             "Loads seed + decoder weights and resumes from that run's directory.  "
+                             "By default the LR schedule resets to the new --lr / --lr-min values; "
+                             "use --continue-lr to fast-forward it instead.")
+    parser.add_argument("--continue-lr", action="store_true",
+                        help="When resuming from a checkpoint (--continue), advance the new LR "
+                             "schedule by the checkpoint's global_update count so training "
+                             "continues from the same schedule position.  Without this flag "
+                             "(default) the schedule always resets to the new --lr / --lr-min.")
     args = parser.parse_args()
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
@@ -2131,6 +2181,11 @@ def main():
     _sam_m_auto = (args.sam_m is None)
     if args.sam_m == 0:
         args.sam_m = None   # None is the internal sentinel for "disabled"
+
+    # If resuming, reuse the original run directory (two levels up from the .pt file).
+    _continue_run_dir = None
+    if args.continue_path:
+        _continue_run_dir = str(Path(args.continue_path).parent.parent)
 
     trainer = AdversarialPatchTrainer(
         detector             = backend,
@@ -2160,6 +2215,7 @@ def main():
         augment              = args.augment,
         top_extend           = args.top_extend,
         ccpd_csv             = args.ccpd_train_csv,
+        continue_run_dir     = _continue_run_dir,
     )
 
     trainer.train(
@@ -2168,6 +2224,8 @@ def main():
         lr_min        = args.lr_min,
         dry_run       = args.dry_run,
         tv_warmup     = args.tv_warmup,
+        continue_path = args.continue_path,
+        continue_lr   = args.continue_lr,
     )
 
 
