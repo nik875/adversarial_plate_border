@@ -1638,12 +1638,19 @@ class CCTOCRBackend(OCRBackend):
             )
 
         self._model = CCTOCRTorch.from_onnx(str(onnx_path))
+
+        ft_path = self.model_path
+        if ft_path.suffix == ".pt" and ft_path.exists():
+            state = torch.load(str(ft_path), map_location="cpu")
+            self._model.load_state_dict(state)
+            print(f"[{self.name}] Loaded finetuned weights from {ft_path}")
+        else:
+            print(f"[{self.name}] Loaded from {onnx_path}")
+
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
             p.requires_grad_(False)
-
-        print(f"[{self.name}] Loaded from {onnx_path}")
 
     def _preprocess(self, crop: torch.Tensor) -> torch.Tensor:
         """
