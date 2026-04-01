@@ -128,6 +128,25 @@ def apply_adversarial_patch(
     return torch.clamp(result, 0, 1)
 
 
+def _top_extend_region_bbox(corners: torch.Tensor) -> torch.Tensor:
+    """Axis-aligned bbox of the perspective-correct top impersonation target region.
+
+    Mirrors AdversarialPatchTrainer._top_extend_region_bbox exactly.
+    corners: [4, 2] TL, TR, BR, BL in image pixel coords.
+    Returns [4] tensor: [x1, y1, x2, y2].
+    """
+    col_left  = corners[0] - corners[3]   # TL - BL
+    col_right = corners[1] - corners[2]   # TR - BR
+    quad = torch.stack([
+        corners[0] + 1.4 * col_left,   # TL of target
+        corners[1] + 1.4 * col_right,  # TR of target
+        corners[1] + 0.4 * col_right,  # BR of target
+        corners[0] + 0.4 * col_left,   # BL of target
+    ])
+    return torch.stack([quad[:, 0].min(), quad[:, 1].min(),
+                        quad[:, 0].max(), quad[:, 1].max()])
+
+
 def load_patch_tensor(patch_path: str, device: str) -> torch.Tensor:
     """Load a patch PNG and return a [3, H, W] float tensor on device."""
     patch_pil = Image.open(patch_path).convert("RGB")
@@ -355,6 +374,10 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     latencies = []
     mean_iou_values = []
     image_paths = []
+    # Top impersonation zone tracking (only when top_extend + patch are active)
+    track_top_zone = (patch_tensor is not None and top_extend)
+    top_ious_list = []
+    top_confidences_list = []
 
     backend.eval()
     with torch.no_grad():
@@ -402,7 +425,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
                 dets = batch_dets[local_idx]
                 gt_box = gt_boxes[local_idx]
 
-                # Find best detection by IoU
+                # Find best detection by IoU vs GT plate box
                 best_iou = 0.0
                 best_conf = 0.0
                 for det in dets:
@@ -417,10 +440,27 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
                 latencies.append(batch_time * 1000)
                 image_paths.append(str(batch_records[global_idx]["image"]))
 
+                # Find best detection by IoU vs top impersonation zone
+                if track_top_zone:
+                    corners = _box_to_corners(batch_records[global_idx]["box"])
+                    top_box = _top_extend_region_bbox(corners)
+                    top_best_iou = 0.0
+                    top_best_conf = 0.0
+                    for det in dets:
+                        iou = _iou(det.box, top_box)
+                        if iou > top_best_iou:
+                            top_best_iou = iou
+                            top_best_conf = det.confidence
+                    top_ious_list.append(top_best_iou)
+                    top_confidences_list.append(top_best_conf)
+
             # Update progress with running metrics
             current_recall = sum(1 for iou in ious_list if iou >= 0.5) / len(ious_list) if ious_list else 0.0
             current_miou = float(np.mean(mean_iou_values)) if mean_iou_values else 0.0
-            pbar.set_postfix_str(f"recall={current_recall:.3f} mIoU={current_miou:.3f}")
+            suffix = f"recall={current_recall:.3f} mIoU={current_miou:.3f}"
+            if top_ious_list:
+                suffix += f" top_recall={sum(1 for x in top_ious_list if x >= 0.5) / len(top_ious_list):.3f}"
+            pbar.set_postfix_str(suffix)
             pbar.update(len(batch_records))
 
         pbar.close()
@@ -460,7 +500,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     f1_curve = 2 * prec_curve * rec_curve / (prec_curve + rec_curve + 1e-8)
     f1_50 = float(np.max(f1_curve)) if len(f1_curve) > 0 else 0.0
 
-    return {
+    out = {
         "ap_50": ap_50,
         "ap_75": ap_75,
         "map_50_95": map_50_95,
@@ -475,6 +515,16 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
         "confidences_list": confidences_list,
         "image_paths": image_paths,
     }
+    if track_top_zone:
+        top_sorted_idx = np.argsort(-np.array(top_confidences_list))
+        top_confs_sorted = [top_confidences_list[i] for i in top_sorted_idx]
+        top_ious_sorted  = [top_ious_list[i]        for i in top_sorted_idx]
+        out["top_zone_ap_50"]    = compute_ap(top_confs_sorted, top_ious_sorted, iou_threshold=0.50)
+        out["top_zone_recall_50"] = sum(1 for x in top_ious_list if x >= 0.5) / len(top_ious_list)
+        out["top_zone_mean_iou"]  = float(np.mean(top_ious_list))
+        out["top_ious_list"]        = top_ious_list
+        out["top_confidences_list"] = top_confidences_list
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,7 +568,8 @@ def _compute_char_error_rate(pred: str, gt: str) -> float:
 def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                         device: str = "cpu",
                         patch_tensor: Optional[torch.Tensor] = None,
-                        top_extend: bool = True) -> dict:
+                        top_extend: bool = True,
+                        impersonation_target: Optional[str] = None) -> dict:
     """
     Evaluate OCR: compute CRR, LPRR, edit distance.
     Processes records in batches with auto-detected batch size and running metrics.
@@ -535,6 +586,9 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
     image_paths = []
     pred_texts = []
     gt_texts_tracked = []
+    imp_crr_values = []
+    imp_lprr_values = []
+    imp_edit_distances = []
 
     backend.eval()
     with torch.no_grad():
@@ -602,6 +656,14 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                 norm_edit = edit_dist / max_len if max_len > 0 else 0.0
                 edit_distances.append(norm_edit)
 
+                # Impersonation metrics (vs fixed target string)
+                if impersonation_target is not None:
+                    imp_lprr_values.append(1.0 if pred_text == impersonation_target else 0.0)
+                    imp_crr_values.append(_compute_char_error_rate(pred_text, impersonation_target))
+                    imp_ed = _levenshtein_distance(pred_text, impersonation_target)
+                    imp_ml = max(len(pred_text), len(impersonation_target))
+                    imp_edit_distances.append(imp_ed / imp_ml if imp_ml > 0 else 0.0)
+
                 latencies.append(batch_time * 1000)
                 image_paths.append(str(batch_records[global_idx]["image"]))
                 pred_texts.append(pred_text)
@@ -610,12 +672,15 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
             # Update progress with running metrics
             current_lprr = float(np.mean(lprr_values)) if lprr_values else 0.0
             current_crr = float(np.mean(crr_values)) if crr_values else 0.0
-            pbar.set_postfix_str(f"LPRR={current_lprr:.3f} CRR={current_crr:.3f}")
+            suffix = f"LPRR={current_lprr:.3f} CRR={current_crr:.3f}"
+            if imp_lprr_values:
+                suffix += f" imp_LPRR={float(np.mean(imp_lprr_values)):.3f}"
+            pbar.set_postfix_str(suffix)
             pbar.update(len(batch_records))
 
         pbar.close()
 
-    return {
+    out = {
         "crr": float(np.mean(crr_values)) if crr_values else 0.0,
         "lprr": float(np.mean(lprr_values)) if lprr_values else 0.0,
         "mean_edit_distance": float(np.mean(edit_distances)) if edit_distances else 0.0,
@@ -629,6 +694,15 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
         "pred_texts": pred_texts,
         "gt_texts": gt_texts_tracked,
     }
+    if impersonation_target is not None:
+        out["imp_target"] = impersonation_target
+        out["imp_lprr"] = float(np.mean(imp_lprr_values)) if imp_lprr_values else 0.0
+        out["imp_crr"] = float(np.mean(imp_crr_values)) if imp_crr_values else 0.0
+        out["imp_mean_edit_distance"] = float(np.mean(imp_edit_distances)) if imp_edit_distances else 0.0
+        out["imp_lprr_values"] = imp_lprr_values
+        out["imp_crr_values"] = imp_crr_values
+        out["imp_edit_distances"] = imp_edit_distances
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -638,7 +712,8 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
 def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                              records: List[dict], device: str = "cpu",
                              patch_tensor: Optional[torch.Tensor] = None,
-                             top_extend: bool = True) -> dict:
+                             top_extend: bool = True,
+                             impersonation_target: Optional[str] = None) -> dict:
     """
     Evaluate detector + OCR pipeline end-to-end (batched).
 
@@ -653,8 +728,10 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     n_det_failures = 0
     n_ocr_failures = 0  # given good detection
     n_full_successes = 0
+    n_imp_successes = 0
     pipeline_latencies = []
     lprr_values = []
+    imp_lprr_values = []
     raw_image_paths = []
     raw_gt_texts = []
     raw_pred_texts = []
@@ -695,6 +772,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                 except Exception:
                     n_det_failures += 1
                     lprr_values.append(0.0)
+                    imp_lprr_values.append(0.0)
                     pipeline_latencies.append(0.0)
                     raw_image_paths.append(str(record["image"]))
                     raw_gt_texts.append(record.get("text", ""))
@@ -726,19 +804,22 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                 gt_text = batch_gts[global_idx]
                 img = imgs[local_idx]
 
-                # Find best detection by IoU
-                best_iou = 0.0
+                # Pick the highest-confidence detection (no IoU filtering — there is
+                # only one plate per image and the patch may have moved the detector's
+                # attention away from the real plate, so we just trust the top-1 box).
                 best_det_box = None
+                best_conf_det = 0.0
                 for det in dets:
-                    iou = _iou(det.box, gt_box)
-                    if iou > best_iou:
-                        best_iou = iou
+                    if det.confidence > best_conf_det:
+                        best_conf_det = det.confidence
                         best_det_box = det.box
+                best_iou = _iou(best_det_box, gt_box) if best_det_box is not None else 0.0
 
-                # Detection failure
-                if best_iou < 0.5:
+                # Detection failure (no detection at all)
+                if best_det_box is None:
                     n_det_failures += 1
                     lprr_values.append(0.0)
+                    imp_lprr_values.append(0.0)
                     pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
                     raw_image_paths.append(str(batch_records[global_idx]["image"]))
                     raw_gt_texts.append(gt_text)
@@ -757,6 +838,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                     ocr_batch_gts.append(gt_text)
                     ocr_indices.append(len(lprr_values))  # where to store result
                     lprr_values.append(None)  # placeholder
+                    imp_lprr_values.append(None)  # placeholder
                     pipeline_latencies.append(None)
                     raw_image_paths.append(str(batch_records[global_idx]["image"]))
                     raw_gt_texts.append(gt_text)
@@ -765,6 +847,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                 except Exception:
                     n_ocr_failures += 1
                     lprr_values.append(0.0)
+                    imp_lprr_values.append(0.0)
                     pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
                     raw_image_paths.append(str(batch_records[global_idx]["image"]))
                     raw_gt_texts.append(gt_text)
@@ -790,6 +873,15 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                         n_ocr_failures += 1
                         lprr_values[result_idx] = 0.0
 
+                    if impersonation_target is not None:
+                        if pred_text == impersonation_target:
+                            n_imp_successes += 1
+                            imp_lprr_values[result_idx] = 1.0
+                        else:
+                            imp_lprr_values[result_idx] = 0.0
+                    else:
+                        imp_lprr_values[result_idx] = 0.0
+
                     raw_pred_texts[result_idx] = pred_text
                     pipeline_latencies[result_idx] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
 
@@ -799,11 +891,17 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                     pipeline_latencies[i] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
                 if raw_pred_texts[i] is None:
                     raw_pred_texts[i] = ""
+                if i < len(imp_lprr_values) and imp_lprr_values[i] is None:
+                    imp_lprr_values[i] = 0.0
 
             # Update progress
             current_success = n_full_successes / (len(lprr_values)) if lprr_values else 0.0
             current_det_fail = n_det_failures / (len(lprr_values)) if lprr_values else 0.0
-            pbar.set_postfix_str(f"success={current_success:.3f} det_fail={current_det_fail:.3f}")
+            suffix = f"success={current_success:.3f} det_fail={current_det_fail:.3f}"
+            if impersonation_target is not None:
+                current_imp = n_imp_successes / len(lprr_values) if lprr_values else 0.0
+                suffix += f" imp={current_imp:.3f}"
+            pbar.set_postfix_str(suffix)
             pbar.update(len(batch_records))
 
         pbar.close()
@@ -813,7 +911,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     det_failure_rate = n_det_failures / n_images if n_images > 0 else 0.0
     ocr_failure_given_det = n_ocr_failures / (n_images - n_det_failures) if (n_images - n_det_failures) > 0 else 0.0
 
-    return {
+    out = {
         "pipeline_success": pipeline_success_rate,
         "det_failures": n_det_failures,
         "ocr_failures": n_ocr_failures,
@@ -829,6 +927,12 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
         "pred_texts": raw_pred_texts,
         "det_ious": raw_det_ious,
     }
+    if impersonation_target is not None:
+        out["imp_target"] = impersonation_target
+        out["imp_pipeline_success"] = n_imp_successes / n_images if n_images > 0 else 0.0
+        out["imp_successes"] = n_imp_successes
+        out["imp_lprr_values"] = imp_lprr_values
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -845,6 +949,8 @@ class EvalResults:
         _LIST_KEYS = {
             "ious_list", "confidences_list", "crr_values", "lprr_values",
             "edit_distances", "image_paths", "pred_texts", "gt_texts", "det_ious",
+            "imp_lprr_values", "imp_crr_values", "imp_edit_distances",
+            "top_ious_list", "top_confidences_list",
         }
         d = {
             "model": self.model_name,
@@ -896,20 +1002,26 @@ def save_raw_results_csv(results: List[EvalResults], out_dir: str) -> None:
 
         if r.model_type == "detector":
             path = out / f"raw_{safe_name}_detector.csv"
-            rows = [
-                {
+            has_top = "top_ious_list" in m
+            rows = []
+            for i in range(len(m["image_paths"])):
+                row = {
                     "image_path": m["image_paths"][i],
                     "iou": m["ious_list"][i],
                     "confidence": m["confidences_list"][i],
                     "tp_50": int(m["ious_list"][i] >= 0.5),
                 }
-                for i in range(len(m["image_paths"]))
-            ]
+                if has_top:
+                    row["top_zone_iou"] = m["top_ious_list"][i]
+                    row["top_zone_tp_50"] = int(m["top_ious_list"][i] >= 0.5)
+                rows.append(row)
 
         elif r.model_type == "ocr":
             path = out / f"raw_{safe_name}_ocr.csv"
-            rows = [
-                {
+            has_imp = "imp_lprr_values" in m
+            rows = []
+            for i in range(len(m["image_paths"])):
+                row = {
                     "image_path": m["image_paths"][i],
                     "gt_text": m["gt_texts"][i],
                     "pred_text": m["pred_texts"][i],
@@ -917,13 +1029,19 @@ def save_raw_results_csv(results: List[EvalResults], out_dir: str) -> None:
                     "lprr": m["lprr_values"][i],
                     "norm_edit_distance": m["edit_distances"][i],
                 }
-                for i in range(len(m["image_paths"]))
-            ]
+                if has_imp:
+                    row["imp_target"] = m.get("imp_target", "")
+                    row["imp_lprr"] = m["imp_lprr_values"][i]
+                    row["imp_crr"] = m["imp_crr_values"][i]
+                    row["imp_norm_edit_distance"] = m["imp_edit_distances"][i]
+                rows.append(row)
 
         elif r.model_type == "pipeline":
             path = out / f"raw_{safe_name}_pipeline.csv"
-            rows = [
-                {
+            has_imp = "imp_lprr_values" in m
+            rows = []
+            for i in range(len(m["image_paths"])):
+                row = {
                     "image_path": m["image_paths"][i],
                     "gt_text": m["gt_texts"][i],
                     "pred_text": m["pred_texts"][i],
@@ -932,8 +1050,10 @@ def save_raw_results_csv(results: List[EvalResults], out_dir: str) -> None:
                     "ocr_success": int(m["lprr_values"][i] == 1.0) if m["lprr_values"][i] is not None else 0,
                     "pipeline_success": int(m["lprr_values"][i] == 1.0) if m["lprr_values"][i] is not None else 0,
                 }
-                for i in range(len(m["image_paths"]))
-            ]
+                if has_imp:
+                    row["imp_target"] = m.get("imp_target", "")
+                    row["imp_success"] = int(m["imp_lprr_values"][i] == 1.0) if m["imp_lprr_values"][i] is not None else 0
+                rows.append(row)
 
         else:
             continue
@@ -957,18 +1077,21 @@ def _build_summary_table(results: List[EvalResults]) -> str:
 
     if detectors:
         col = 12
+        has_top = any("top_zone_ap_50" in r.metrics for r in detectors)
         hdr = (
             f"{'Model':<20} {'AP@0.5':>{col}} {'AP@0.75':>{col}} "
             f"{'mAP@0.5:0.95':>{col}} {'F1@0.5':>{col}} {'mIoU':>{col}} "
             f"{'Latency(ms)':>{col}} {'P95(ms)':>{col}}"
         )
+        if has_top:
+            hdr += f" {'TopAP@0.5':>{col}} {'TopRec@0.5':>{col}} {'TopmIoU':>{col}}"
         sep = "─" * len(hdr)
         lines.append("\nDETECTORS")
         lines.append(sep)
         lines.append(hdr)
         lines.append(sep)
         for r in detectors:
-            lines.append(
+            row = (
                 f"{r.model_name:<20} "
                 f"{r.metrics['ap_50']:>{col}.4f} "
                 f"{r.metrics['ap_75']:>{col}.4f} "
@@ -978,21 +1101,31 @@ def _build_summary_table(results: List[EvalResults]) -> str:
                 f"{r.metrics['latency_mean_ms']:>{col}.2f} "
                 f"{r.metrics['latency_p95_ms']:>{col}.2f}"
             )
+            if has_top:
+                row += (
+                    f" {r.metrics.get('top_zone_ap_50', 0.0):>{col}.4f}"
+                    f" {r.metrics.get('top_zone_recall_50', 0.0):>{col}.4f}"
+                    f" {r.metrics.get('top_zone_mean_iou', 0.0):>{col}.4f}"
+                )
+            lines.append(row)
         lines.append(sep)
 
     if ocr_models:
         col = 12
+        has_imp = any("imp_lprr" in r.metrics for r in ocr_models)
         hdr = (
             f"{'Model':<20} {'CRR':>{col}} {'LPRR':>{col}} "
             f"{'Edit Dist':>{col}} {'Latency(ms)':>{col}} {'P95(ms)':>{col}}"
         )
+        if has_imp:
+            hdr += f" {'Imp CRR':>{col}} {'Imp LPRR':>{col}} {'Imp Edit':>{col}}"
         sep = "─" * len(hdr)
         lines.append("\nOCR")
         lines.append(sep)
         lines.append(hdr)
         lines.append(sep)
         for r in ocr_models:
-            lines.append(
+            row = (
                 f"{r.model_name:<20} "
                 f"{r.metrics['crr']:>{col}.4f} "
                 f"{r.metrics['lprr']:>{col}.4f} "
@@ -1000,27 +1133,40 @@ def _build_summary_table(results: List[EvalResults]) -> str:
                 f"{r.metrics['latency_mean_ms']:>{col}.2f} "
                 f"{r.metrics['latency_p95_ms']:>{col}.2f}"
             )
+            if has_imp:
+                row += (
+                    f" {r.metrics.get('imp_crr', 0.0):>{col}.4f}"
+                    f" {r.metrics.get('imp_lprr', 0.0):>{col}.4f}"
+                    f" {r.metrics.get('imp_mean_edit_distance', 0.0):>{col}.4f}"
+                )
+            lines.append(row)
         lines.append(sep)
 
     if pipelines:
         col = 12
+        has_imp = any("imp_pipeline_success" in r.metrics for r in pipelines)
         hdr = (
             f"{'Pipeline':<30} {'Success':>{col}} {'Det Fail':>{col}} "
             f"{'OCR Fail|Det':>{col}} {'Latency(ms)':>{col}}"
         )
+        if has_imp:
+            hdr += f" {'Imp Success':>{col}}"
         sep = "─" * len(hdr)
         lines.append("\nEND-TO-END PIPELINE")
         lines.append(sep)
         lines.append(hdr)
         lines.append(sep)
         for r in pipelines:
-            lines.append(
+            row = (
                 f"{r.model_name:<30} "
                 f"{r.metrics['pipeline_success']:>{col}.4f} "
                 f"{r.metrics['det_failure_rate']:>{col}.4f} "
                 f"{r.metrics['ocr_failure_given_det']:>{col}.4f} "
                 f"{r.metrics['latency_mean_ms']:>{col}.2f}"
             )
+            if has_imp:
+                row += f" {r.metrics.get('imp_pipeline_success', 0.0):>{col}.4f}"
+            lines.append(row)
         lines.append(sep)
 
     return "\n".join(lines)
@@ -1203,6 +1349,9 @@ def main():
                         help="Use top-extend geometry when applying the patch (default: on)")
     parser.add_argument("--no-top-extend", dest="top_extend", action="store_false",
                         help="Disable top-extend geometry when applying the patch")
+    parser.add_argument("--impersonation-target", default=None,
+                        help="Fixed target string to evaluate impersonation performance against "
+                             "(e.g. --impersonation-target ABC123). Only meaningful with --patch.")
     args = parser.parse_args()
 
     finetuned_dir = Path(args.finetuned_models)
@@ -1233,6 +1382,11 @@ def main():
     if args.device == "cuda" and not torch.cuda.is_available():
         print("[warn] CUDA not available, falling back to CPU")
         args.device = "cpu"
+
+    # Normalise impersonation target
+    imp_target: Optional[str] = args.impersonation_target.strip().upper() if args.impersonation_target else None
+    if imp_target is not None:
+        print(f"[eval] Impersonation target: '{imp_target}'")
 
     # Load adversarial patch if provided
     patch_tensor: Optional[torch.Tensor] = None
@@ -1304,7 +1458,8 @@ def main():
                 print(f"\n  {name}")
                 try:
                     metrics = compute_ocr_metrics(backend, eval_records, device=args.device,
-                                                  patch_tensor=patch_tensor, top_extend=args.top_extend)
+                                                  patch_tensor=patch_tensor, top_extend=args.top_extend,
+                                                  impersonation_target=imp_target)
                     res.append(EvalResults(name, "ocr", metrics))
                     print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
                 except Exception as e:
@@ -1322,6 +1477,7 @@ def main():
                         detector_backends[det_name], ocr_backends[ocr_name],
                         eval_records, device=args.device,
                         patch_tensor=patch_tensor, top_extend=args.top_extend,
+                        impersonation_target=imp_target,
                     )
                     res.append(EvalResults(f"{det_name}+{ocr_name}", "pipeline", metrics))
                     print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
