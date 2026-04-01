@@ -4,8 +4,10 @@ evaluate_finetuned.py
 Comprehensive evaluation of finetuned detector and OCR models.
 Produces paper-ready metrics: AP/mAP for detectors, CRR/LPRR for OCR.
 
+Auto-discovers models in the finetuned_models/ directory and uses val_split.csv.
+
 Usage:
-    python evaluate_finetuned.py --csv test_set_labels.csv --weights-dir weights/ --device cuda
+    python evaluate_finetuned.py --finetuned-models weights/finetuned/ --device cuda --output results/eval/
 """
 
 from __future__ import annotations
@@ -13,7 +15,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -34,96 +38,109 @@ from ocr_backends import build_ocr_backend, OCRBackend
 # Data Loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_test_records(csv_path: str) -> List[dict]:
+def load_val_split(csv_path: str) -> List[dict]:
     """
-    Load test records from test_set_labels.csv.
+    Load validation records from val_split.csv (created by finetune_all_models.py).
+
+    CSV columns: image_path, x1, y1, x2, y2, label
+
     Returns list of dicts with keys:
-        - filename: path to processed image
-        - text: ground truth plate text
+        - image: Path to image file
         - box: [x1, y1, x2, y2] in pixel coords
+        - text: ground truth plate text (uppercased)
     """
     records = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if not row.get("processed_filename") or not row.get("alpr_text"):
-                continue
             try:
-                x1 = float(row["alpr_x1"])
-                y1 = float(row["alpr_y1"])
-                x2 = float(row["alpr_x2"])
-                y2 = float(row["alpr_y2"])
+                img_path = Path(row["image_path"])
+                if not img_path.exists():
+                    print(f"[warn] image not found: {img_path}")
+                    continue
+                x1, y1, x2, y2 = float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"])
+                label = row["label"].strip().upper()
+
                 records.append({
-                    "filename": row["processed_filename"],
-                    "text": row["alpr_text"].strip().upper(),
+                    "image": img_path,
                     "box": torch.tensor([x1, y1, x2, y2], dtype=torch.float32),
+                    "text": label,
                 })
             except (ValueError, KeyError) as e:
-                print(f"[warn] skipping row with bad bbox: {e}")
+                print(f"[warn] skipping row: {e}")
                 continue
+
     return records
 
 
-def resolve_weights_path(model_name: str, weights_dir: str) -> str:
+def discover_finetuned_models(finetuned_dir: Path) -> Tuple[List[str], List[str]]:
     """
-    Resolve model path: check finetuned first, fall back to base.
-    Maps model name to (finetuned_path, base_path) pairs.
-    """
-    weights_dir = Path(weights_dir)
+    Scan finetuned_dir for checkpoints and determine which models are available.
 
-    detector_paths = {
-        "fasterrcnn": (
-            weights_dir / "finetuned" / "fasterrcnn_finetuned.pt",
-            weights_dir / "model.pt"
-        ),
-        "rtdetr": (
-            weights_dir / "finetuned" / "rtdetr_finetuned",
-            weights_dir / "rtdetr-v2-license-plate"
-        ),
-        "owlvit": (
-            weights_dir / "finetuned" / "owlvit_finetuned",
-            None
-        ),
-        "yolo-v9-608": (
-            weights_dir / "finetuned" / "yolo608_finetuned.pt",
-            None
-        ),
+    Detectors (by checkpoint name):
+        - fasterrcnn_finetuned.pt → "fasterrcnn"
+        - rtdetr_finetuned/ → "rtdetr"
+        - owlvit_finetuned/ → "owlvit"
+        - yolo608_finetuned.pt → "yolo-v9-608"
+
+    OCR (by checkpoint name):
+        - lprnet_finetuned.pt → "lprnet"
+        - trocr_small_finetuned.pt → "trocr"
+        - vitstr_small_finetuned.pt → "doctr-vitstr"
+        - cct_s_finetuned.pt → "cct"
+
+    Returns (detector_names, ocr_names)
+    """
+    detectors = []
+    ocr_models = []
+
+    # Check for detector checkpoints
+    if (finetuned_dir / "fasterrcnn_finetuned.pt").exists():
+        detectors.append("fasterrcnn")
+    if (finetuned_dir / "rtdetr_finetuned").exists():
+        detectors.append("rtdetr")
+    if (finetuned_dir / "owlvit_finetuned").exists():
+        detectors.append("owlvit")
+    if (finetuned_dir / "yolo608_finetuned.pt").exists():
+        detectors.append("yolo-v9-608")
+
+    # Check for OCR checkpoints
+    if (finetuned_dir / "lprnet_finetuned.pt").exists():
+        ocr_models.append("lprnet")
+    if (finetuned_dir / "trocr_small_finetuned.pt").exists():
+        ocr_models.append("trocr")
+    if (finetuned_dir / "vitstr_small_finetuned.pt").exists():
+        ocr_models.append("doctr-vitstr")
+    if (finetuned_dir / "cct_s_finetuned.pt").exists():
+        ocr_models.append("cct")
+
+    return detectors, ocr_models
+
+
+def resolve_checkpoint_path(model_name: str, finetuned_dir: Path) -> str:
+    """
+    Map model name to its checkpoint path in finetuned_dir.
+    Raises FileNotFoundError if checkpoint doesn't exist.
+    """
+    checkpoint_map = {
+        "fasterrcnn": "fasterrcnn_finetuned.pt",
+        "rtdetr": "rtdetr_finetuned",
+        "owlvit": "owlvit_finetuned",
+        "yolo-v9-608": "yolo608_finetuned.pt",
+        "lprnet": "lprnet_finetuned.pt",
+        "trocr": "trocr_small_finetuned.pt",
+        "doctr-vitstr": "vitstr_small_finetuned.pt",
+        "cct": "cct_s_finetuned.pt",
     }
 
-    ocr_paths = {
-        "lprnet": (
-            weights_dir / "finetuned" / "lprnet_finetuned.pt",
-            weights_dir / "lprnet_deployable_onnx_v1.1" / "us_lprnet_baseline18_deployable.onnx"
-        ),
-        "trocr": (
-            weights_dir / "trocr_small_finetuned.pt",
-            "microsoft/trocr-small-printed"
-        ),
-        "doctr-vitstr": (
-            weights_dir / "vitstr_small_finetuned.pt",
-            weights_dir / "vitstr_small_patch16_224.pth"
-        ),
-        "cct": (
-            weights_dir / "finetuned" / "cct_s_finetuned.pt",
-            None
-        ),
-    }
-
-    if model_name in detector_paths:
-        finetuned, base = detector_paths[model_name]
-    elif model_name in ocr_paths:
-        finetuned, base = ocr_paths[model_name]
-    else:
+    if model_name not in checkpoint_map:
         raise ValueError(f"Unknown model: {model_name}")
 
-    # Try finetuned first
-    if finetuned and Path(finetuned).exists():
-        return str(finetuned)
-    if base and Path(base).exists():
-        return str(base)
+    checkpoint_path = finetuned_dir / checkpoint_map[model_name]
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # Fallback: return finetuned path (will fail at load if doesn't exist)
-    return str(finetuned) if finetuned else str(base)
+    return str(checkpoint_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -589,27 +606,39 @@ def plot_ocr_metrics_bar(results: List[EvalResults], path: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate finetuned detector and OCR models"
+        description="Evaluate finetuned detector and OCR models using val_split.csv"
     )
-    parser.add_argument("--csv", default="test_set_labels.csv",
-                        help="Path to test_set_labels.csv")
-    parser.add_argument("--weights-dir", default="weights/",
-                        help="Root directory for model weights")
-    parser.add_argument("--detectors", nargs="*", default=None,
-                        choices=["fasterrcnn", "rtdetr", "owlvit", "yolo-v9-608"],
-                        help="Detectors to evaluate (default: all)")
-    parser.add_argument("--ocr", nargs="*", default=None,
-                        choices=["lprnet", "trocr", "doctr-vitstr", "cct"],
-                        help="OCR models to evaluate (default: all)")
+    parser.add_argument("--finetuned-models", required=True,
+                        help="Path to finetuned_models/ directory (output of finetune_all_models.py)")
     parser.add_argument("--device", default="cuda",
                         help="Device: cuda or cpu")
     parser.add_argument("--output", default="results/eval_finetuned/",
                         help="Output directory")
     args = parser.parse_args()
 
-    # Default to all models if not specified
-    detectors = args.detectors if args.detectors is not None else ["fasterrcnn", "rtdetr", "owlvit", "yolo-v9-608"]
-    ocr_models = args.ocr if args.ocr is not None else ["lprnet", "trocr", "doctr-vitstr", "cct"]
+    finetuned_dir = Path(args.finetuned_models)
+    if not finetuned_dir.exists():
+        print(f"[error] Directory not found: {finetuned_dir}")
+        return 1
+
+    # Look for val_split.csv
+    val_csv = finetuned_dir / "val_split.csv"
+    if not val_csv.exists():
+        print(f"[error] val_split.csv not found in {finetuned_dir}")
+        print(f"       Expected: {val_csv}")
+        return 1
+
+    # Auto-discover available models
+    print(f"[eval] Scanning {finetuned_dir} for finetuned models...")
+    detectors, ocr_models = discover_finetuned_models(finetuned_dir)
+
+    if not detectors and not ocr_models:
+        print("[error] No finetuned models found!")
+        print("        Expected checkpoints: fasterrcnn_finetuned.pt, rtdetr_finetuned/, ...")
+        return 1
+
+    print(f"  Detectors: {detectors}")
+    print(f"  OCR:       {ocr_models}\n")
 
     # Ensure device exists
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -619,60 +648,66 @@ def main():
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load test records
-    print(f"[eval] Loading test data from {args.csv}")
-    records = load_test_records(args.csv)
-    print(f"[eval] Loaded {len(records)} records")
+    # Load validation records
+    print(f"[eval] Loading validation data from {val_csv}")
+    records = load_val_split(str(val_csv))
+    print(f"[eval] Loaded {len(records)} validation records\n")
 
     results = []
 
     # Evaluate detectors
     if detectors:
-        print(f"\n[eval] Evaluating {len(detectors)} detectors...")
+        print(f"[eval] Evaluating {len(detectors)} detectors...")
         for detector_name in detectors:
-            print(f"\n── {detector_name} ──")
+            print(f"\n  {detector_name}")
             try:
-                weight_path = resolve_weights_path(detector_name, args.weights_dir)
-                backend = build_backend(detector_name, weight_path, device=args.device)
+                checkpoint_path = resolve_checkpoint_path(detector_name, finetuned_dir)
+                backend = build_backend(detector_name, checkpoint_path, device=args.device)
                 backend.ensure_loaded()
                 backend.freeze()
 
                 metrics = compute_detector_metrics(backend, records, device=args.device)
                 results.append(EvalResults(detector_name, "detector", metrics))
 
-                print(f"  AP@0.5={metrics['ap_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
+                print(f"    AP@0.5={metrics['ap_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
             except Exception as e:
-                print(f"[error] Failed to evaluate {detector_name}: {e}")
+                print(f"    [error] {e}")
+                traceback.print_exc()
 
     # Evaluate OCR
     if ocr_models:
         print(f"\n[eval] Evaluating {len(ocr_models)} OCR models...")
         for ocr_name in ocr_models:
-            print(f"\n── {ocr_name} ──")
+            print(f"\n  {ocr_name}")
             try:
-                weight_path = resolve_weights_path(ocr_name, args.weights_dir)
-                backend = build_ocr_backend(ocr_name, weight_path, device=args.device)
+                checkpoint_path = resolve_checkpoint_path(ocr_name, finetuned_dir)
+                backend = build_ocr_backend(ocr_name, checkpoint_path, device=args.device)
                 backend.ensure_loaded()
                 backend.freeze()
 
                 metrics = compute_ocr_metrics(backend, records, device=args.device)
                 results.append(EvalResults(ocr_name, "ocr", metrics))
 
-                print(f"  CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
+                print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
             except Exception as e:
-                print(f"[error] Failed to evaluate {ocr_name}: {e}")
+                print(f"    [error] {e}")
+                traceback.print_exc()
 
     # Save results
     print(f"\n[eval] Saving results to {out_dir}")
-    save_results_csv(results, str(out_dir / "results.csv"))
-    save_results_json(results, str(out_dir / "results.json"))
-    save_summary_table(results, str(out_dir / "summary_table.txt"))
-    plot_detector_pr_curves(results, str(out_dir / "detector_pr_curves.png"))
-    plot_detector_metrics_bar(results, str(out_dir / "detector_metrics_bar.png"))
-    plot_ocr_metrics_bar(results, str(out_dir / "ocr_metrics_bar.png"))
-
-    print(f"\n[eval] Done!")
+    if results:
+        save_results_csv(results, str(out_dir / "results.csv"))
+        save_results_json(results, str(out_dir / "results.json"))
+        save_summary_table(results, str(out_dir / "summary_table.txt"))
+        plot_detector_pr_curves(results, str(out_dir / "detector_pr_curves.png"))
+        plot_detector_metrics_bar(results, str(out_dir / "detector_metrics_bar.png"))
+        plot_ocr_metrics_bar(results, str(out_dir / "ocr_metrics_bar.png"))
+        print(f"\n[eval] Done!")
+        return 0
+    else:
+        print("[error] No results to save (all evaluations failed)")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
