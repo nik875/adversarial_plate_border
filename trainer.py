@@ -2193,6 +2193,9 @@ class AdversarialPatchTrainer:
             sizes = []
             for det, ocr in active_pipelines:
                 self._activate_pipeline(det, ocr)
+                # cuDNN RNN backward requires training mode
+                self.detector.train_mode()
+                self.ocr.train()
                 sizes.append(self._probe_eval_batch_size(probe_raw))
             B = min(sizes)
             print(f"  [ensemble] Per-pipeline batch sizes: {sizes}  →  using min={B}")
@@ -2355,6 +2358,9 @@ class AdversarialPatchTrainer:
                     # Flush remaining buffer for this pipeline
                     if buffers[pi]:
                         self._activate_pipeline(*active_pipelines[pi])
+                        # cuDNN RNN backward requires training mode
+                        self.detector.train_mode()
+                        self.ocr.train()
                         patch_with_graph = self.generate_patch(training_aug=True)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
                         flush_items = [self._prepare_one(r, patch_leaf) for r in buffers[pi]]
@@ -2392,6 +2398,9 @@ class AdversarialPatchTrainer:
 
                 # ── Optimizer step for pipeline pi ────────────────────
                 self._activate_pipeline(*active_pipelines[pi])
+                # cuDNN RNN backward requires training mode
+                self.detector.train_mode()
+                self.ocr.train()
 
                 # TV warmup
                 global_upd_for_step = global_updates + global_steps + 1
