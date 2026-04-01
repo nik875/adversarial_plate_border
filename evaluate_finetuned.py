@@ -26,13 +26,113 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as T
+import kornia.geometry as KG
 from difflib import SequenceMatcher
 from PIL import Image
 from tqdm import tqdm
 
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import build_ocr_backend, OCRBackend
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Adversarial Patch Application
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _box_to_corners(box: torch.Tensor) -> torch.Tensor:
+    """Convert [x1, y1, x2, y2] box to [4, 2] corners: TL, TR, BR, BL."""
+    x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
+    return torch.tensor(
+        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+        dtype=torch.float32,
+    )
+
+
+def apply_adversarial_patch(
+    image: torch.Tensor,        # [B, C, H, W] float [0, 1] on device
+    corners: torch.Tensor,      # [4, 2]: TL, TR, BR, BL on same device
+    patch_norm: torch.Tensor,   # [3, ph, pw] float [0, 1] on same device
+    top_extend: bool = True,
+    border_scale: float = 1.4,
+) -> torch.Tensor:
+    """Warp patch onto image exactly as AdversarialPatchTrainer.apply_patch_to_image does.
+
+    Creates a ring-shaped mask (border quad minus plate quad) and composites the
+    patch over the image.  With top_extend=True the border is asymmetric:
+    bottom corners scale normally from center; top corners additionally extend
+    by 1.4 × the plate's column vectors (TL-BL, TR-BR).
+    """
+    B = image.shape[0]
+    H, W = image.shape[2], image.shape[3]
+    device = image.device
+
+    plate = corners  # [4, 2]: TL, TR, BR, BL
+    cx, cy = plate[:, 0].mean(), plate[:, 1].mean()
+    center = torch.tensor([cx, cy], device=device)
+
+    ph, pw = patch_norm.shape[-2], patch_norm.shape[-1]
+    src = torch.tensor(
+        [[0, 0], [pw, 0], [pw, ph], [0, ph]],
+        dtype=torch.float32, device=device,
+    ).unsqueeze(0)  # [1, 4, 2]
+
+    if top_extend:
+        p1_b = center + (plate[0] - center) * border_scale
+        p2_b = center + (plate[1] - center) * border_scale
+        p3_b = center + (plate[2] - center) * border_scale
+        p4_b = center + (plate[3] - center) * border_scale
+        col_left  = plate[0] - plate[3]   # TL - BL
+        col_right = plate[1] - plate[2]   # TR - BR
+        border = torch.stack([
+            p1_b + 1.4 * col_left,
+            p2_b + 1.4 * col_right,
+            p3_b, p4_b,
+        ]).unsqueeze(0)  # [1, 4, 2]
+    else:
+        border = (
+            center.unsqueeze(0) + (plate - center.unsqueeze(0)) * border_scale
+        ).unsqueeze(0)  # [1, 4, 2]
+
+    M_border = KG.get_perspective_transform(src, border)
+    M_plate  = KG.get_perspective_transform(src, plate.unsqueeze(0))
+
+    patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
+
+    # Brightness correction: scale patch to match the plate region's mean brightness.
+    px1 = int(plate[:, 0].min().clamp(0, W - 1).item())
+    px2 = int(plate[:, 0].max().clamp(0, W).item())
+    py1 = int(plate[:, 1].min().clamp(0, H - 1).item())
+    py2 = int(plate[:, 1].max().clamp(0, H).item())
+    if px2 > px1 and py2 > py1:
+        plate_brightness = image[0, :, py1:py2, px1:px2].mean().clamp(min=1e-6)
+        patch_brightness = patch_batch.mean().clamp(min=1e-6)
+        brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
+        patch_batch = patch_batch * brightness_scale
+
+    ones = torch.ones(B, 1, ph, pw, device=device)
+
+    warped_patch       = KG.warp_perspective(patch_batch, M_border, (H, W),
+                                              mode="bilinear", padding_mode="zeros",
+                                              align_corners=True)
+    warped_border_mask = KG.warp_perspective(ones, M_border, (H, W),
+                                              mode="bilinear", padding_mode="zeros",
+                                              align_corners=True)
+    warped_plate_mask  = KG.warp_perspective(ones, M_plate,  (H, W),
+                                              mode="bilinear", padding_mode="zeros",
+                                              align_corners=True)
+
+    final_mask = torch.clamp(warped_border_mask - warped_plate_mask, 0, 1).expand(-1, 3, -1, -1)
+    result = image * (1 - final_mask) + warped_patch * final_mask
+    return torch.clamp(result, 0, 1)
+
+
+def load_patch_tensor(patch_path: str, device: str) -> torch.Tensor:
+    """Load a patch PNG and return a [3, H, W] float tensor on device."""
+    patch_pil = Image.open(patch_path).convert("RGB")
+    patch_t = T.ToTensor()(patch_pil).to(device)  # [3, H, W] in [0, 1]
+    return patch_t
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +338,9 @@ def compute_ap(confidences: List[float], ious: List[float],
 
 
 def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
-                             device: str = "cpu") -> dict:
+                             device: str = "cpu",
+                             patch_tensor: Optional[torch.Tensor] = None,
+                             top_extend: bool = True) -> dict:
     """
     Evaluate detector: compute AP@0.5, AP@0.75, mAP@0.5:0.95, etc.
     Processes records in batches with auto-detected batch size and running metrics.
@@ -269,7 +371,14 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
             for i, record in enumerate(batch_records):
                 try:
                     img = Image.open(record["image"]).convert("RGB")
-                    batch_images.append(transform(img))
+                    img_t = transform(img)
+                    if patch_tensor is not None:
+                        corners = _box_to_corners(record["box"]).to(device)
+                        img_t = apply_adversarial_patch(
+                            img_t.unsqueeze(0).to(device), corners,
+                            patch_tensor, top_extend,
+                        ).squeeze(0).cpu()
+                    batch_images.append(img_t)
                     batch_boxes.append(record["box"])
                     valid_indices.append(i)
                 except Exception:
@@ -407,7 +516,9 @@ def _compute_char_error_rate(pred: str, gt: str) -> float:
 
 
 def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
-                        device: str = "cpu") -> dict:
+                        device: str = "cpu",
+                        patch_tensor: Optional[torch.Tensor] = None,
+                        top_extend: bool = True) -> dict:
     """
     Evaluate OCR: compute CRR, LPRR, edit distance.
     Processes records in batches with auto-detected batch size and running metrics.
@@ -440,6 +551,13 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
             for i, record in enumerate(batch_records):
                 try:
                     img = Image.open(record["image"]).convert("RGB")
+                    if patch_tensor is not None:
+                        corners = _box_to_corners(record["box"]).to(device)
+                        img_t = apply_adversarial_patch(
+                            transform(img).unsqueeze(0).to(device), corners,
+                            patch_tensor, top_extend,
+                        ).squeeze(0)
+                        img = T.ToPILImage()(img_t.cpu())
                     x1, y1, x2, y2 = [int(v) for v in record["box"].tolist()]
                     img_crop = img.crop((x1, y1, x2, y2))
                     ch, cw = backend.ocr_crop_size
@@ -518,7 +636,9 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
-                             records: List[dict], device: str = "cpu") -> dict:
+                             records: List[dict], device: str = "cpu",
+                             patch_tensor: Optional[torch.Tensor] = None,
+                             top_extend: bool = True) -> dict:
     """
     Evaluate detector + OCR pipeline end-to-end (batched).
 
@@ -559,7 +679,16 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
             for i, record in enumerate(batch_records):
                 try:
                     img = Image.open(record["image"]).convert("RGB")
-                    batch_images.append((img, transform(img)))
+                    img_t = transform(img)
+                    if patch_tensor is not None:
+                        corners = _box_to_corners(record["box"]).to(device)
+                        img_t = apply_adversarial_patch(
+                            img_t.unsqueeze(0).to(device), corners,
+                            patch_tensor, top_extend,
+                        ).squeeze(0)
+                        img = T.ToPILImage()(img_t.cpu())
+                        img_t = img_t.cpu()
+                    batch_images.append((img, img_t))
                     batch_boxes.append(record["box"])
                     batch_gts.append(record["text"])
                     valid_indices.append(i)
@@ -1068,6 +1197,12 @@ def main():
                         help="Output directory")
     parser.add_argument("--skip-preview", action="store_true",
                         help="Skip the 256-image preview and go straight to full evaluation")
+    parser.add_argument("--patch", default=None,
+                        help="Path to adversarial patch PNG to apply before evaluation")
+    parser.add_argument("--top-extend", dest="top_extend", action="store_true", default=True,
+                        help="Use top-extend geometry when applying the patch (default: on)")
+    parser.add_argument("--no-top-extend", dest="top_extend", action="store_false",
+                        help="Disable top-extend geometry when applying the patch")
     args = parser.parse_args()
 
     finetuned_dir = Path(args.finetuned_models)
@@ -1098,6 +1233,16 @@ def main():
     if args.device == "cuda" and not torch.cuda.is_available():
         print("[warn] CUDA not available, falling back to CPU")
         args.device = "cpu"
+
+    # Load adversarial patch if provided
+    patch_tensor: Optional[torch.Tensor] = None
+    if args.patch is not None:
+        patch_path = Path(args.patch)
+        if not patch_path.exists():
+            print(f"[error] Patch file not found: {patch_path}")
+            return 1
+        patch_tensor = load_patch_tensor(str(patch_path), args.device)
+        print(f"[eval] Loaded patch: {patch_path}  shape={tuple(patch_tensor.shape)}  top_extend={args.top_extend}")
 
     # Load validation records
     print(f"[eval] Loading validation data from {val_csv}")
@@ -1145,7 +1290,8 @@ def main():
             for name, backend in detector_backends.items():
                 print(f"\n  {name}")
                 try:
-                    metrics = compute_detector_metrics(backend, eval_records, device=args.device)
+                    metrics = compute_detector_metrics(backend, eval_records, device=args.device,
+                                                       patch_tensor=patch_tensor, top_extend=args.top_extend)
                     res.append(EvalResults(name, "detector", metrics))
                     print(f"    AP@0.5={metrics['ap_50']:.4f}, F1@0.5={metrics['f1_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
                 except Exception as e:
@@ -1157,7 +1303,8 @@ def main():
             for name, backend in ocr_backends.items():
                 print(f"\n  {name}")
                 try:
-                    metrics = compute_ocr_metrics(backend, eval_records, device=args.device)
+                    metrics = compute_ocr_metrics(backend, eval_records, device=args.device,
+                                                  patch_tensor=patch_tensor, top_extend=args.top_extend)
                     res.append(EvalResults(name, "ocr", metrics))
                     print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
                 except Exception as e:
@@ -1174,6 +1321,7 @@ def main():
                     metrics = compute_pipeline_metrics(
                         detector_backends[det_name], ocr_backends[ocr_name],
                         eval_records, device=args.device,
+                        patch_tensor=patch_tensor, top_extend=args.top_extend,
                     )
                     res.append(EvalResults(f"{det_name}+{ocr_name}", "pipeline", metrics))
                     print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
