@@ -1447,7 +1447,10 @@ def main():
                     metrics = compute_detector_metrics(backend, eval_records, device=args.device,
                                                        patch_tensor=patch_tensor, top_extend=args.top_extend)
                     res.append(EvalResults(name, "detector", metrics))
-                    print(f"    AP@0.5={metrics['ap_50']:.4f}, F1@0.5={metrics['f1_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
+                    det_line = f"    AP@0.5={metrics['ap_50']:.4f}, F1@0.5={metrics['f1_50']:.4f}, mAP={metrics['map_50_95']:.4f}"
+                    if "top_zone_ap_50" in metrics:
+                        det_line += f"  |  TopZone AP@0.5={metrics['top_zone_ap_50']:.4f}, Rec@0.5={metrics['top_zone_recall_50']:.4f}, mIoU={metrics['top_zone_mean_iou']:.4f}"
+                    print(det_line)
                 except Exception as e:
                     print(f"    [error] {e}")
                     traceback.print_exc()
@@ -1461,7 +1464,10 @@ def main():
                                                   patch_tensor=patch_tensor, top_extend=args.top_extend,
                                                   impersonation_target=imp_target)
                     res.append(EvalResults(name, "ocr", metrics))
-                    print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
+                    ocr_line = f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}"
+                    if "imp_lprr" in metrics:
+                        ocr_line += f"  |  Imp CRR={metrics['imp_crr']:.4f}, Imp LPRR={metrics['imp_lprr']:.4f}"
+                    print(ocr_line)
                 except Exception as e:
                     print(f"    [error] {e}")
                     traceback.print_exc()
@@ -1480,7 +1486,10 @@ def main():
                         impersonation_target=imp_target,
                     )
                     res.append(EvalResults(f"{det_name}+{ocr_name}", "pipeline", metrics))
-                    print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
+                    pipe_line = f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}"
+                    if "imp_pipeline_success" in metrics:
+                        pipe_line += f"  |  Imp Success={metrics['imp_pipeline_success']:.4f}"
+                    print(pipe_line)
                 except Exception as e:
                     print(f"    [error] {e}")
                     traceback.print_exc()
