@@ -1441,7 +1441,7 @@ class FasterRCNNBackend(DetectorBackend):
 
     def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
         """
-        True batch inference for Faster R-CNN on same-sized images.
+        Batch inference for Faster R-CNN (via List[Tensor] for proper handling).
 
         Parameters
         ----------
@@ -1455,44 +1455,44 @@ class FasterRCNNBackend(DetectorBackend):
         """
         self.ensure_loaded()
         batch_size = images.shape[0]
-        images = images.to(self.device)
 
-        # Call backbone
-        features = self._model.backbone(images)
-        if isinstance(features, torch.Tensor):
-            features = {"0": features}
+        # Convert to list of tensors (FasterRCNN model handles this properly)
+        images_list = [images[i].to(self.device) for i in range(batch_size)]
 
-        # Call RPN
-        proposals, proposal_losses = self._model.rpn(images, features)
+        with torch.no_grad():
+            outputs = self._model(images_list)
 
-        # Call ROI head
-        detections, detector_losses = self._model.roi_heads(features, proposals, images.shape[-2:])
+        if isinstance(outputs, dict):
+            outputs = [outputs]
 
         # Parse detections for each image
         results_list = []
-        for i in range(batch_size):
-            detections_i: List[Detection] = []
+        for out in outputs:
+            boxes = out.get("boxes")
+            scores = out.get("scores")
+            labels = out.get("labels")
 
-            boxes = detections[i].get("boxes") if isinstance(detections[i], dict) else detections[i]["boxes"]
-            scores = detections[i].get("scores") if isinstance(detections[i], dict) else detections[i]["scores"]
-            labels = detections[i].get("labels") if isinstance(detections[i], dict) else detections[i]["labels"]
+            if boxes is None or scores is None or labels is None:
+                results_list.append([])
+                continue
 
-            for j in range(len(scores)):
-                conf = float(scores[j].item())
+            detections: List[Detection] = []
+            for i in range(len(scores)):
+                conf = float(scores[i].item())
                 if conf < self.conf_threshold:
                     continue
 
-                x1, y1, x2, y2 = [float(v) for v in boxes[j].tolist()]
-                class_id = int(labels[j].item())
+                x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
+                class_id = int(labels[i].item())
                 synthetic = torch.tensor([0.0, x1, y1, x2, y2, float(class_id), conf],
                                          dtype=torch.float32)
-                detections_i.append(Detection(
+                detections.append(Detection(
                     x1=x1, y1=y1, x2=x2, y2=y2,
                     confidence=conf, class_id=class_id, raw=synthetic,
                 ))
 
-            detections_i.sort(key=lambda d: d.confidence, reverse=True)
-            results_list.append(detections_i)
+            detections.sort(key=lambda d: d.confidence, reverse=True)
+            results_list.append(detections)
 
         return results_list
 
