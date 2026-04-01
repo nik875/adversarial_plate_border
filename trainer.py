@@ -2048,7 +2048,7 @@ def main():
                              "When set, overrides --csv and uses CCPD data with per-image "
                              "ground-truth labels.")
 
-    TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "yolo-v9-608"]
+    TRAINABLE_DET = ["sam", "yolov8", "fasterrcnn", "yolov11", "rtdetr", "owlvit", "yolo-v9-608"]
     TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)

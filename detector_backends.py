@@ -1242,6 +1242,92 @@ class OWLViTBackend(DetectorBackend):
             for i in range(B)
         ]
 
+    def _diff_preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        """Differentiable image preprocessing matching OwlViTImageProcessor."""
+        ip = getattr(self._processor, "image_processor", self._processor)
+        size = ip.size  # {"height": H, "width": W} or {"shortest_edge": N}
+        if "height" in size:
+            th, tw = size["height"], size["width"]
+        else:
+            th = tw = size.get("shortest_edge", 768)
+        x = F.interpolate(image.unsqueeze(0), size=(th, tw),
+                          mode="bilinear", align_corners=False)
+        mean = torch.tensor(ip.image_mean, dtype=torch.float32,
+                            device=self.device).view(1, 3, 1, 1)
+        std  = torch.tensor(ip.image_std,  dtype=torch.float32,
+                            device=self.device).view(1, 3, 1, 1)
+        return (x - mean) / std  # [1, 3, th, tw]
+
+    def differentiable_predict_box_batch(self, images: torch.Tensor,
+                                          target_boxes: list) -> list:
+        """Batch differentiable forward; gradients flow from scores/boxes to image."""
+        self.ensure_loaded()
+        B = images.shape[0]
+        preprocessed = torch.cat(
+            [self._diff_preprocess(images[i].to(self.device)) for i in range(B)], dim=0
+        )
+        text = {k: v.expand(B, -1) for k, v in self._text_inputs.items()}
+        out = self._model(pixel_values=preprocessed, **text)
+
+        results = []
+        for i in range(B):
+            scores_i = out.logits[i].squeeze(-1).sigmoid()  # [N]
+            boxes_i  = out.pred_boxes[i]                     # [N, 4] cxcywh normalised
+            orig_h, orig_w = images.shape[2], images.shape[3]
+            cx, cy, bw, bh = boxes_i.unbind(-1)
+            boxes_xyxy = torch.stack([
+                (cx - bw / 2) * orig_w, (cy - bh / 2) * orig_h,
+                (cx + bw / 2) * orig_w, (cy + bh / 2) * orig_h,
+            ], dim=-1)
+            if len(scores_i) == 0:
+                results.append((torch.tensor(0.0, device=self.device,
+                                             requires_grad=True), None))
+                continue
+            box_t = target_boxes[i].to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                weights = torch.stack([
+                    _box_iou_scalar(boxes_xyxy[j].detach().unsqueeze(0), box_t)
+                    * scores_i[j].detach()
+                    for j in range(len(scores_i))
+                ])
+            if weights.max().item() < 1e-6:
+                results.append((torch.tensor(0.0, device=self.device), None))
+                continue
+            best_idx = int(weights.argmax().item())
+            if scores_i[best_idx].detach().item() < self.conf_threshold:
+                results.append((scores_i[best_idx], None))
+            else:
+                results.append((scores_i[best_idx], boxes_xyxy[best_idx]))
+        return results
+
+    def differentiable_predict_box_batch_two_targets(self, images, target_boxes1, target_boxes2):
+        self.ensure_loaded()
+        B = images.shape[0]
+        preprocessed = torch.cat(
+            [self._diff_preprocess(images[i].to(self.device)) for i in range(B)], dim=0
+        )
+        text = {k: v.expand(B, -1) for k, v in self._text_inputs.items()}
+        out = self._model(pixel_values=preprocessed, **text)
+        results = []
+        for i in range(B):
+            scores_i = out.logits[i].squeeze(-1).sigmoid()
+            boxes_i  = out.pred_boxes[i]
+            orig_h, orig_w = images.shape[2], images.shape[3]
+            cx, cy, bw, bh = boxes_i.unbind(-1)
+            boxes_xyxy_i = torch.stack([
+                (cx - bw / 2) * orig_w, (cy - bh / 2) * orig_h,
+                (cx + bw / 2) * orig_w, (cy + bh / 2) * orig_h,
+            ], dim=-1)
+            if len(scores_i) == 0:
+                zero = torch.tensor(0.0, device=self.device, requires_grad=True)
+                results.append(((zero, None), (zero, None)))
+                continue
+            r1, r2 = _select_two_targets(scores_i, boxes_xyxy_i,
+                                         target_boxes1[i], target_boxes2[i],
+                                         self.conf_threshold, self.device)
+            results.append((r1, r2))
+        return results
+
     def freeze(self) -> None:
         if self._model is not None:
             for p in self._model.parameters():
