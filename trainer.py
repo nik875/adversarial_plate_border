@@ -367,6 +367,7 @@ class AdversarialPatchTrainer:
         disable_disruption:   bool           = False,
         eval_batch_size:      int            = 1,
         sam_m:                Optional[int]  = None,
+        sam_m_auto:           bool           = False,
         sam_rho:              float          = 0.025,
         skip_sanity:          bool           = False,
         augment:              bool           = False,
@@ -379,6 +380,7 @@ class AdversarialPatchTrainer:
         self.disable_disruption   = disable_disruption
         self.eval_batch_size      = eval_batch_size
         self.sam_m                = sam_m
+        self._sam_m_auto          = sam_m_auto and (sam_m is None)
         self.sam_rho              = sam_rho
         self.print_blur           = print_blur
         self.augment              = augment
@@ -1717,6 +1719,13 @@ class AdversarialPatchTrainer:
 
         eta_min       = lr_min
 
+        # Resolve auto sam_m now that eval_batch_size is known (probed in sanity check).
+        if self._sam_m_auto:
+            self.sam_m = max(1, (self.grad_accumulate or 64) * self.eval_batch_size // 4)
+            self._sam_m_auto = False
+            print(f"[m-SAM] auto sam_m={self.sam_m}  "
+                  f"(grad_accumulate={self.grad_accumulate or 64} × eval_batch_size={self.eval_batch_size} // 4)")
+
         # Optimizer starts at learning_rate; warmup scales from eta_min up to it
         if self.sam_m is not None:
             optimizer = SAM(
@@ -1973,11 +1982,9 @@ def main():
                              device=args.device, **ocr_kwargs)
     ocr.load()
 
-    # Auto-set sam_m to grad_accumulate//4 unless the user explicitly passed 0 (disable).
-    if args.sam_m is None:
-        args.sam_m = max(1, (args.grad_accumulate or 64) // 4)
-        print(f"[m-SAM] auto sam_m={args.sam_m}  (grad_accumulate={args.grad_accumulate or 64}//4)")
-    elif args.sam_m == 0:
+    # sam_m auto-detection is deferred to train() where eval_batch_size is already known.
+    _sam_m_auto = (args.sam_m is None)
+    if args.sam_m == 0:
         args.sam_m = None   # None is the internal sentinel for "disabled"
 
     trainer = AdversarialPatchTrainer(
@@ -2002,6 +2009,7 @@ def main():
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
+        sam_m_auto           = _sam_m_auto,
         sam_rho              = args.sam_rho,
         skip_sanity          = args.skip_sanity,
         augment              = args.augment,
