@@ -734,10 +734,15 @@ class LPRNetBackend(OCRBackend):
         if str(self.model_path) != "none":
             if not self.model_path.exists():
                 raise FileNotFoundError(
-                    f"LPRNet ONNX file not found: {self.model_path}"
+                    f"LPRNet checkpoint not found: {self.model_path}"
                 )
-            load_weights_from_onnx(self._model, str(self.model_path))
-            print(f"[{self.name}] Loaded weights from {self.model_path}")
+            if self.model_path.suffix == ".pt":
+                state = torch.load(str(self.model_path), map_location="cpu")
+                self._model.load_state_dict(state)
+                print(f"[{self.name}] Loaded finetuned weights from {self.model_path}")
+            else:
+                load_weights_from_onnx(self._model, str(self.model_path))
+                print(f"[{self.name}] Loaded weights from {self.model_path}")
         else:
             print(f"[{self.name}] No checkpoint — using random weights")
         self._model.to(self.device)
