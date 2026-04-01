@@ -262,6 +262,25 @@ class DetectorBackend(abc.ABC):
             One entry per detected bounding box, sorted by confidence (desc).
         """
 
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        """
+        Run detection on a batch of images.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape ``[B, C, H, W]``, dtype float32, values in ``[0, 1]``.
+
+        Returns
+        -------
+        List[List[Detection]]
+            One list of detections per image in the batch.
+
+        Default implementation loops over single-image predict().
+        Override for true batch inference.
+        """
+        return [self.predict(images[i]) for i in range(images.shape[0])]
+
     @abc.abstractmethod
     def parameters(self) -> Iterator[nn.Parameter]:
         """Yield all learnable parameters (so the trainer can freeze them)."""
@@ -501,6 +520,38 @@ class YOLOv8Backend(DetectorBackend):
         results = self._yolo.predict(img_np, conf=self.conf_threshold,
                                      iou=self.iou_threshold, verbose=False)
         return _results_to_detections(results, self.conf_threshold, image)
+
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        """
+        True batch inference: process B images in one GPU call.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape ``[B, C, H, W]``, dtype float32, values in ``[0, 1]``.
+
+        Returns
+        -------
+        List[List[Detection]]
+            Per-image detection lists.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+        results_list = []
+
+        # Convert batch to numpy [B, H, W, C] uint8
+        images_np = (images.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype("uint8")
+
+        # Pad each image and run through ultralytics API
+        for i in range(batch_size):
+            img_np = images_np[i]
+            img_np = _pad_to_stride(img_np)
+            results = self._yolo.predict(img_np, conf=self.conf_threshold,
+                                         iou=self.iou_threshold, verbose=False)
+            detections = _results_to_detections(results, self.conf_threshold, images[i])
+            results_list.append(detections)
+
+        return results_list
 
     def raw_forward(self, batch: torch.Tensor):
         """

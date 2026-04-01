@@ -133,6 +133,25 @@ class OCRBackend(abc.ABC):
             logits carries the gradient graph for trainable backends.
         """
 
+    def batch_predict(self, images: torch.Tensor) -> List[OCRResult]:
+        """
+        Run OCR on a batch of cropped plate images.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], float32, values in [0, 1].
+
+        Returns
+        -------
+        List[OCRResult]
+            Per-image OCR results.
+
+        Default implementation loops over single-image predict().
+        Override for true batch inference.
+        """
+        return [self.predict(images[i]) for i in range(images.shape[0])]
+
     @abc.abstractmethod
     def parameters(self) -> Iterator[nn.Parameter]:
         """Yield all learnable parameters (for freezing in the trainer)."""
@@ -746,6 +765,47 @@ class LPRNetBackend(OCRBackend):
             confidence=confidence,
         )
 
+    def batch_predict(self, images: torch.Tensor) -> List[OCRResult]:
+        """
+        Batch OCR inference: preprocess all, one forward pass, decode all.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], float32, values in [0, 1].
+
+        Returns
+        -------
+        List[OCRResult]
+            Per-image OCR results.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        # Preprocess all at once: each image → [1, 3, 48, 96], then cat
+        preprocessed = []
+        for i in range(batch_size):
+            inp = self._preprocess(images[i])  # [1, 3, 48, 96]
+            preprocessed.append(inp)
+        inp_batch = torch.cat(preprocessed, dim=0)  # [B, 3, 48, 96]
+
+        # Single forward pass
+        probs_batch = self._model(inp_batch)  # [B, 24, 36]
+
+        # Decode each
+        results = []
+        for i in range(batch_size):
+            probs = probs_batch[i]
+            text, confidence = self._greedy_decode(probs.detach().cpu())
+            log_probs = torch.log(probs.clamp(min=1e-8))
+            results.append(OCRResult(
+                logits=log_probs,
+                text=text,
+                confidence=confidence,
+            ))
+
+        return results
+
     def _greedy_decode(self, probs: torch.Tensor) -> tuple:
         """Greedy CTC decode on [T, C] softmax probabilities."""
         pred = probs.argmax(dim=-1)   # [T]
@@ -981,6 +1041,58 @@ class TrOCROCRBackend(OCRBackend):
             confidence = float(sum(step_conf) / max(len(step_conf), 1))
 
         return OCRResult(logits=None, text=(text if text else None), confidence=confidence)
+
+    def batch_predict(self, images: torch.Tensor) -> List[OCRResult]:
+        """
+        Batch OCR inference via TrOCR.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], float32, values in [0, 1].
+
+        Returns
+        -------
+        List[OCRResult]
+            Per-image OCR results.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        # Convert to PIL images
+        pil_images = [self._to_pil(images[i]) for i in range(batch_size)]
+
+        # Process batch
+        pixel_values = self._processor(images=pil_images, return_tensors="pt").pixel_values.to(self.device)
+
+        with torch.no_grad():
+            generated = self._model.generate(
+                pixel_values,
+                max_new_tokens=self.max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+
+        # Decode all
+        texts = self._processor.batch_decode(generated.sequences, skip_special_tokens=True)
+
+        results = []
+        for i, text in enumerate(texts):
+            confidence = 0.0
+            if generated.scores:
+                step_conf = [
+                    torch.softmax(scores[i:i+1], dim=-1).max(dim=-1).values.mean().item()
+                    for scores in generated.scores
+                ]
+                confidence = float(sum(step_conf) / max(len(step_conf), 1))
+
+            results.append(OCRResult(
+                logits=None,
+                text=(text.strip() if text else None),
+                confidence=confidence,
+            ))
+
+        return results
 
     def compute_target_loss(self, image: torch.Tensor, target_text: str) -> torch.Tensor:
         """
@@ -1537,6 +1649,44 @@ class CCTOCRBackend(OCRBackend):
 
         return OCRResult(logits=logits.detach(), text=text, confidence=confidence)
 
+    def batch_predict(self, images: torch.Tensor) -> List[OCRResult]:
+        """
+        Batch OCR inference for CCT.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], float32, values in [0, 1].
+
+        Returns
+        -------
+        List[OCRResult]
+            Per-image OCR results.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        with torch.no_grad():
+            # Preprocess all: [B, 3, H, W] → [B, 64, 128, 3] in [0, 255]
+            x = self._preprocess(images.to(self.device))  # [B, 64, 128, 3]
+            output = self._model(x)  # [B, 9, 37]
+
+        results = []
+        for i in range(batch_size):
+            logits = output[i]  # [9, 37]
+            pred_ids = logits.argmax(dim=1).tolist()  # [9]
+            chars = [self.ALPHABET[j] for j in pred_ids if j < len(self.ALPHABET)]
+            text = "".join(c for c in chars if c != "_").strip() or None
+            confidence = float(logits.max(dim=1).values.mean().item())
+
+            results.append(OCRResult(
+                logits=logits.detach(),
+                text=text,
+                confidence=confidence,
+            ))
+
+        return results
+
     def ce_loss(self, probs: torch.Tensor, target_text: str,
                 diff_positions: Optional[List[int]] = None) -> torch.Tensor:
         """
@@ -1713,6 +1863,36 @@ class DoctrViTSTRBackend(OCRBackend):
         text, conf = out["preds"][0]
         text = text.upper().replace("-", "") or None
         return OCRResult(logits=None, text=text, confidence=conf)
+
+    def batch_predict(self, images: torch.Tensor) -> List[OCRResult]:
+        """
+        Batch OCR inference for doctr ViTSTR.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], float32, values in [0, 1].
+
+        Returns
+        -------
+        List[OCRResult]
+            Per-image OCR results.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        with torch.no_grad():
+            # Preprocess all: [B, C, H, W] → [B, C, 32, 128]
+            inp = torch.cat([self._preprocess(images[i]) for i in range(batch_size)], dim=0)
+            out = self._model(inp, return_preds=True)
+
+        results = []
+        for i in range(batch_size):
+            text, conf = out["preds"][i]
+            text = text.upper().replace("-", "") or None
+            results.append(OCRResult(logits=None, text=text, confidence=conf))
+
+        return results
 
     def differentiable_loss(self, crop: torch.Tensor, target_text: str,
                              impersonation: bool = False,

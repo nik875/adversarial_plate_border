@@ -281,12 +281,9 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
             batch_tensor = torch.stack(batch_images).to(device)
             gt_boxes = torch.stack(batch_boxes).to(device)
 
-            # Forward pass
+            # Forward pass (batched)
             t0 = time.perf_counter()
-            batch_dets = []
-            for img_tensor in batch_tensor:
-                dets = backend.predict(img_tensor)
-                batch_dets.append(dets)
+            batch_dets = backend.batch_predict(batch_tensor)
             batch_time = (time.perf_counter() - t0) / len(batch_tensor)
 
             # Process detections
@@ -440,12 +437,9 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
             # Stack and move to device
             batch_tensor = torch.stack(batch_crops).to(device)
 
-            # Forward pass
+            # Forward pass (batched)
             t0 = time.perf_counter()
-            batch_ocr = []
-            for crop_tensor in batch_tensor:
-                ocr_result = backend.predict(crop_tensor)
-                batch_ocr.append(ocr_result)
+            batch_ocr = backend.batch_predict(batch_tensor)
             batch_time = (time.perf_counter() - t0) / len(batch_tensor)
 
             # Process OCR results
@@ -554,10 +548,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
 
             # Batch detect
             t0 = time.perf_counter()
-            batch_dets = []
-            for img_tensor in batch_tensor:
-                dets = detector.predict(img_tensor)
-                batch_dets.append(dets)
+            batch_dets = detector.batch_predict(batch_tensor)
 
             # Process detections and filter for OCR
             ocr_batch_crops = []
@@ -604,10 +595,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
             if ocr_batch_crops:
                 batch_crops = torch.stack(ocr_batch_crops).to(device)
                 ocr_start = time.perf_counter()
-                batch_ocr = []
-                for crop_tensor in batch_crops:
-                    ocr_result = ocr_backend.predict(crop_tensor)
-                    batch_ocr.append(ocr_result)
+                batch_ocr = ocr_backend.batch_predict(batch_crops)
                 ocr_time = (time.perf_counter() - ocr_start) / len(batch_ocr)
 
                 # Process OCR results
