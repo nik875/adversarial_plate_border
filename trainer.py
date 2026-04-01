@@ -450,11 +450,12 @@ class AdversarialPatchTrainer:
 
         # ── Patch decoder (seed + decoder jointly optimised) ───────────
         self.patch_width   = PATCH_WIDTH
-        self.patch_height  = PATCH_HEIGHT
+        self.patch_height  = PATCH_HEIGHT if not top_extend else PATCH_HEIGHT * 2
         self.seed_channels = seed_channels
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
+        seed_h = 8 if top_extend else 4
         self.seed    = nn.Parameter(
-            torch.randn(1, seed_channels, 4, 8, device=self.device) * 0.1
+            torch.randn(1, seed_channels, seed_h, 8, device=self.device) * 0.1
         )
         self.decoder = PatchDecoder(seed_channels).to(self.device)
 
