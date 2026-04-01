@@ -2332,12 +2332,20 @@ class Yolov9TorchBackend(DetectorBackend):
             )
 
         self._model = load_yolov9s_from_onnx(str(onnx_path), nc=1)
+
+        # If a finetuned .pt checkpoint was provided, load it on top
+        ft_path = Path(str(self.model_path))
+        if ft_path.suffix == ".pt" and ft_path.exists():
+            state = torch.load(str(ft_path), map_location="cpu")
+            self._model.load_state_dict(state)
+            print(f"[{self.name}] Loaded finetuned weights from {ft_path}")
+        else:
+            print(f"[{self.name}] Loaded from {onnx_path}")
+
         self._model.to(self.device)
         self._model.eval()
         for p in self._model.parameters():
             p.requires_grad_(False)
-
-        print(f"[{self.name}] Loaded from {onnx_path}")
 
     # Fixed input size this model was trained on.
     INPUT_SIZE: int = 608
