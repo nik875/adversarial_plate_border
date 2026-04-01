@@ -965,12 +965,12 @@ class AdversarialPatchTrainer:
     # Patch persistence
     # ====================================================================
 
-    def save_patch(self, epoch: int, subdir: str = "patches",
+    def save_patch(self, global_update: int, subdir: str = "patches",
                    stem: Optional[str] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
         if stem is None:
-            stem = f"patch_{self.detector.name}_epoch_{epoch:04d}"
+            stem = f"patch_{self.detector.name}_update_{global_update:06d}"
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
@@ -978,7 +978,7 @@ class AdversarialPatchTrainer:
                 "seed":          self.seed.detach().cpu(),
                 "decoder":       self.decoder.state_dict(),
                 "seed_channels": self.seed_channels,
-                "epoch":         epoch,
+                "global_update": global_update,
                 "backend":       self.detector.name,
                 "ocr":           self.ocr.name,
                 "patch_size":    (self.patch_height, self.patch_width),
@@ -1397,7 +1397,7 @@ class AdversarialPatchTrainer:
         buffer: list = []
         use_sam = isinstance(optimizer, SAM)
         window_raw: list = []   # SAM: raw batch items for the current update window
-        _last_save_milestone = 0  # Track saved 10% milestones
+        # _last_save_milestone is owned by train() and persists across epochs.
         _saved_tv_weight = self.tv_weight  # Save original TV weight for warmup scaling
 
         # Generate the first patch (with generator graph) for the accumulation window.
@@ -1464,10 +1464,9 @@ class AdversarialPatchTrainer:
                         if save_every > 0:
                             global_update = update_offset + num_updates
                             milestone = global_update // save_every
-                            if milestone > _last_save_milestone:
-                                _last_save_milestone = milestone
-                                self.save_patch(epoch, "patches",
-                                               stem=f"patch_{self.detector.name}_update_{global_update:06d}")
+                            if milestone > self._last_save_milestone:
+                                self._last_save_milestone = milestone
+                                self.save_patch(global_update, "patches")
                         pbar.update(1)
                         pbar.set_postfix({
                             "loss":   f"{total_loss/step:.4f}",
@@ -1550,10 +1549,9 @@ class AdversarialPatchTrainer:
                         if save_every > 0:
                             global_update = update_offset + num_updates
                             milestone = global_update // save_every
-                            if milestone > _last_save_milestone:
-                                _last_save_milestone = milestone
-                                self.save_patch(epoch, "patches",
-                                               stem=f"patch_{self.detector.name}_update_{global_update:06d}")
+                            if milestone > self._last_save_milestone:
+                                self._last_save_milestone = milestone
+                                self.save_patch(global_update, "patches")
                         accum_loss = _upd_det_real = _upd_det_top = \
                             _upd_ocr_real = _upd_ocr_top = _upd_tv = 0.0
                         pbar.update(1)
@@ -1719,6 +1717,14 @@ class AdversarialPatchTrainer:
 
         eta_min       = lr_min
 
+        # Cap eval_batch_size so total gradient updates >= 10 000.
+        _update_every_cap = self.grad_accumulate or len(self.train_loader)
+        _max_bs = max(1, num_epochs * len(self.train_loader) // (10_000 * _update_every_cap))
+        if self.eval_batch_size > _max_bs:
+            print(f"[auto-batch] capping eval_batch_size {self.eval_batch_size} → {_max_bs} "
+                  f"to ensure ≥10 000 total updates")
+            self.eval_batch_size = _max_bs
+
         # Resolve auto sam_m now that eval_batch_size is known (probed in sanity check).
         if self._sam_m_auto:
             self.sam_m = max(1, (self.grad_accumulate or 64) * self.eval_batch_size // 4)
@@ -1819,7 +1825,8 @@ class AdversarialPatchTrainer:
         batch_log_writer = csv.writer(batch_log_file)
         batch_log_writer.writerow(_batch_log_fields)
 
-        global_updates        = 0
+        global_updates           = 0
+        self._last_save_milestone = 0
         for epoch in range(num_epochs):
             epoch_start    = time.time()
             self.training  = True
@@ -1859,7 +1866,7 @@ class AdversarialPatchTrainer:
             if val_loss < best_loss:
                 best_loss  = val_loss
                 best_epoch = epoch
-                self.save_patch(epoch, "patches", stem=f"patch_{self.detector.name}_best")
+                self.save_patch(global_updates, "patches", stem=f"patch_{self.detector.name}_best")
                 best_marker = "  ★ best"
 
             line = (f"Epoch {epoch+1:3d}/{num_epochs} "
