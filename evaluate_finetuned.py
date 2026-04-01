@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import sys
 import time
 import traceback
@@ -811,8 +812,8 @@ def save_raw_results_csv(results: List[EvalResults], out_dir: str) -> None:
         print(f"[eval] Raw results → {path}")
 
 
-def save_summary_table(results: List[EvalResults], path: str) -> None:
-    """Print and save summary table in three sections: detectors, OCR, and pipeline."""
+def _build_summary_table(results: List[EvalResults]) -> str:
+    """Build summary table string in three sections: detectors, OCR, and pipeline."""
     detectors = [r for r in results if r.model_type == "detector"]
     ocr_models = [r for r in results if r.model_type == "ocr"]
     pipelines = [r for r in results if r.model_type == "pipeline"]
@@ -878,9 +879,8 @@ def save_summary_table(results: List[EvalResults], path: str) -> None:
         lines.append(hdr)
         lines.append(sep)
         for r in pipelines:
-            pipeline_name = f"{r.model_name}"
             lines.append(
-                f"{pipeline_name:<30} "
+                f"{r.model_name:<30} "
                 f"{r.metrics['pipeline_success']:>{col}.4f} "
                 f"{r.metrics['det_failure_rate']:>{col}.4f} "
                 f"{r.metrics['ocr_failure_given_det']:>{col}.4f} "
@@ -888,7 +888,12 @@ def save_summary_table(results: List[EvalResults], path: str) -> None:
             )
         lines.append(sep)
 
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def save_summary_table(results: List[EvalResults], path: str) -> None:
+    """Print and save summary table to file."""
+    text = _build_summary_table(results)
     print(text)
     with open(path, "w") as f:
         f.write(text + "\n")
@@ -1055,6 +1060,8 @@ def main():
                         help="Device: cuda or cpu")
     parser.add_argument("--output", default="results/eval_finetuned/",
                         help="Output directory")
+    parser.add_argument("--skip-preview", action="store_true",
+                        help="Skip the 256-image preview and go straight to full evaluation")
     args = parser.parse_args()
 
     finetuned_dir = Path(args.finetuned_models)
@@ -1086,55 +1093,11 @@ def main():
         print("[warn] CUDA not available, falling back to CPU")
         args.device = "cpu"
 
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     # Load validation records
     print(f"[eval] Loading validation data from {val_csv}")
     records = load_val_split(str(val_csv))
     print(f"[eval] Loaded {len(records)} validation records\n")
 
-    results = []
-
-    # Evaluate detectors
-    if detectors:
-        print(f"[eval] Evaluating {len(detectors)} detectors...")
-        for detector_name in detectors:
-            print(f"\n  {detector_name}")
-            try:
-                checkpoint_path = resolve_checkpoint_path(detector_name, finetuned_dir)
-                backend = build_backend(detector_name, checkpoint_path, device=args.device)
-                backend.ensure_loaded()
-                backend.freeze()
-
-                metrics = compute_detector_metrics(backend, records, device=args.device)
-                results.append(EvalResults(detector_name, "detector", metrics))
-
-                print(f"    AP@0.5={metrics['ap_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
-            except Exception as e:
-                print(f"    [error] {e}")
-                traceback.print_exc()
-
-    # Evaluate OCR
-    if ocr_models:
-        print(f"\n[eval] Evaluating {len(ocr_models)} OCR models...")
-        for ocr_name in ocr_models:
-            print(f"\n  {ocr_name}")
-            try:
-                checkpoint_path = resolve_checkpoint_path(ocr_name, finetuned_dir)
-                backend = build_ocr_backend(ocr_name, checkpoint_path, device=args.device)
-                backend.ensure_loaded()
-                backend.freeze()
-
-                metrics = compute_ocr_metrics(backend, records, device=args.device)
-                results.append(EvalResults(ocr_name, "ocr", metrics))
-
-                print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
-            except Exception as e:
-                print(f"    [error] {e}")
-                traceback.print_exc()
-
-    # Evaluate pipelines (detector + OCR pairings)
     pipeline_pairings = [
         ("fasterrcnn", "lprnet"),
         ("rtdetr", "doctr-vitstr"),
@@ -1142,46 +1105,96 @@ def main():
         ("yolo-v9-608", "cct"),
     ]
 
-    print(f"\n[eval] Evaluating {len(pipeline_pairings)} pipelines...")
-    detector_cache = {}
-    ocr_cache = {}
-
-    for det_name, ocr_name in pipeline_pairings:
-        if det_name not in detectors or ocr_name not in ocr_models:
-            print(f"\n  {det_name}+{ocr_name}: skipped (missing model)")
-            continue
-
-        print(f"\n  {det_name} + {ocr_name}")
+    # Load all backends once (reused for preview and full eval)
+    print("[eval] Loading models...")
+    detector_backends: dict = {}
+    for name in detectors:
         try:
-            # Load detector (cache to avoid reloading)
-            if det_name not in detector_cache:
-                det_path = resolve_checkpoint_path(det_name, finetuned_dir)
-                det_backend = build_backend(det_name, det_path, device=args.device)
-                det_backend.ensure_loaded()
-                det_backend.freeze()
-                detector_cache[det_name] = det_backend
-            else:
-                det_backend = detector_cache[det_name]
-
-            # Load OCR (cache to avoid reloading)
-            if ocr_name not in ocr_cache:
-                ocr_path = resolve_checkpoint_path(ocr_name, finetuned_dir)
-                ocr_backend = build_ocr_backend(ocr_name, ocr_path, device=args.device)
-                ocr_backend.ensure_loaded()
-                ocr_backend.freeze()
-                ocr_cache[ocr_name] = ocr_backend
-            else:
-                ocr_backend = ocr_cache[ocr_name]
-
-            # Evaluate pipeline
-            metrics = compute_pipeline_metrics(det_backend, ocr_backend, records, device=args.device)
-            pipeline_name = f"{det_name}+{ocr_name}"
-            results.append(EvalResults(pipeline_name, "pipeline", metrics))
-
-            print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
+            path = resolve_checkpoint_path(name, finetuned_dir)
+            b = build_backend(name, path, device=args.device)
+            b.ensure_loaded()
+            b.freeze()
+            detector_backends[name] = b
         except Exception as e:
-            print(f"    [error] {e}")
+            print(f"  [error] loading {name}: {e}")
             traceback.print_exc()
+
+    ocr_backends: dict = {}
+    for name in ocr_models:
+        try:
+            path = resolve_checkpoint_path(name, finetuned_dir)
+            b = build_ocr_backend(name, path, device=args.device)
+            b.ensure_loaded()
+            b.freeze()
+            ocr_backends[name] = b
+        except Exception as e:
+            print(f"  [error] loading {name}: {e}")
+            traceback.print_exc()
+
+    def _run_evals(eval_records: List[dict]) -> List[EvalResults]:
+        res = []
+
+        if detector_backends:
+            print(f"\n[eval] Evaluating {len(detector_backends)} detectors on {len(eval_records)} images...")
+            for name, backend in detector_backends.items():
+                print(f"\n  {name}")
+                try:
+                    metrics = compute_detector_metrics(backend, eval_records, device=args.device)
+                    res.append(EvalResults(name, "detector", metrics))
+                    print(f"    AP@0.5={metrics['ap_50']:.4f}, F1@0.5={metrics['f1_50']:.4f}, mAP={metrics['map_50_95']:.4f}")
+                except Exception as e:
+                    print(f"    [error] {e}")
+                    traceback.print_exc()
+
+        if ocr_backends:
+            print(f"\n[eval] Evaluating {len(ocr_backends)} OCR models on {len(eval_records)} images...")
+            for name, backend in ocr_backends.items():
+                print(f"\n  {name}")
+                try:
+                    metrics = compute_ocr_metrics(backend, eval_records, device=args.device)
+                    res.append(EvalResults(name, "ocr", metrics))
+                    print(f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}")
+                except Exception as e:
+                    print(f"    [error] {e}")
+                    traceback.print_exc()
+
+        active_pairs = [(d, o) for d, o in pipeline_pairings
+                        if d in detector_backends and o in ocr_backends]
+        if active_pairs:
+            print(f"\n[eval] Evaluating {len(active_pairs)} pipelines on {len(eval_records)} images...")
+            for det_name, ocr_name in active_pairs:
+                print(f"\n  {det_name} + {ocr_name}")
+                try:
+                    metrics = compute_pipeline_metrics(
+                        detector_backends[det_name], ocr_backends[ocr_name],
+                        eval_records, device=args.device,
+                    )
+                    res.append(EvalResults(f"{det_name}+{ocr_name}", "pipeline", metrics))
+                    print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
+                except Exception as e:
+                    print(f"    [error] {e}")
+                    traceback.print_exc()
+
+        return res
+
+    # 256-image preview
+    if not args.skip_preview:
+        n_preview = min(256, len(records))
+        preview_records = random.sample(records, n_preview)
+        print(f"[preview] Running full pipeline on {n_preview} randomly sampled images...")
+        preview_results = _run_evals(preview_records)
+        if preview_results:
+            print(f"\n[preview] Results on {n_preview} images (no files saved):")
+            print(_build_summary_table(preview_results))
+        print(f"\n{'─' * 60}")
+        print(f"[eval] Starting full evaluation on {len(records)} images...")
+        print(f"{'─' * 60}\n")
+
+    # Full evaluation
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results = _run_evals(records)
 
     # Save results
     print(f"\n[eval] Saving results to {out_dir}")
