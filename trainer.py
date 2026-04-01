@@ -59,7 +59,8 @@ from tqdm import tqdm
 from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import (create_dataloaders, create_ccpd_dataloaders,
-                     make_letterbox_prep, make_resize_prep, make_passthrough_prep)
+                     make_letterbox_prep, make_resize_prep, make_passthrough_prep,
+                     _chw_uint8)
 
 warnings.filterwarnings("ignore")
 
@@ -351,8 +352,8 @@ class AdversarialPatchTrainer:
         seed_channels:        int            = 128,
         preload_images:       bool           = False,
         gpu_preload:          bool           = False,
-        num_workers:          int            = 0,
-        pin_memory:           bool           = False,
+        num_workers:          int            = -1,
+        pin_memory:           bool           = True,
         limit:                int            = 0,
         use_all_for_train:    bool           = False,
         grad_accumulate:      Optional[int]  = None,
@@ -428,7 +429,7 @@ class AdversarialPatchTrainer:
         self.decoder = PatchDecoder(seed_channels).to(self.device)
 
         # ── Image transform ────────────────────────────────────────────
-        self.transform = T.Compose([T.ToTensor()])
+        self.transform = _chw_uint8
 
         # ── Sanity check (before any preloading) ───────────────────────
         if not skip_sanity:
@@ -456,10 +457,11 @@ class AdversarialPatchTrainer:
             del _sanity_loader
 
         # ── DataLoaders ────────────────────────────────────────────────
+        _n_jobs = os.cpu_count() if num_workers < 0 else num_workers
         if ccpd_csv:
             self.train_loader, self.val_loader = create_ccpd_dataloaders(
                 ccpd_csv, batch_size=1,
-                n_jobs=num_workers, pin_memory=pin_memory,
+                n_jobs=_n_jobs, pin_memory=pin_memory,
                 limit=limit,
             )
         else:
@@ -469,7 +471,7 @@ class AdversarialPatchTrainer:
                 preload=preload_images,
                 gpu_device=self.device if gpu_preload else None,
                 batch_size=1,
-                n_jobs=0 if (gpu_preload or preload_images) else num_workers,
+                n_jobs=0 if (gpu_preload or preload_images) else _n_jobs,
                 pin_memory=False if (gpu_preload or preload_images) else pin_memory,
                 limit=limit,
                 use_all_for_train=use_all_for_train,
@@ -760,9 +762,11 @@ class AdversarialPatchTrainer:
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
                      augment: Optional[bool] = None) -> dict:
         """Fast per-image ops: patch application + preprocessing. No model calls."""
-        orig_tensor     = batch_item["orig_image"].to(self.device)      # [C, H, W]
+        orig_tensor = batch_item["orig_image"].to(self.device, non_blocking=True)  # [C, H, W]
+        if orig_tensor.dtype == torch.uint8:
+            orig_tensor = orig_tensor.float().div_(255.0)
         orig_corners_np = batch_item["orig_corners"].cpu().numpy()
-        orig_corners    = batch_item["orig_corners"].to(self.device)    # [4, 2]
+        orig_corners    = batch_item["orig_corners"].to(self.device, non_blocking=True)  # [4, 2]
 
         # Halve images that are too large to keep GPU memory manageable
         _, H, W = orig_tensor.shape
@@ -1023,7 +1027,7 @@ class AdversarialPatchTrainer:
             torch.cuda.empty_cache()
 
         free_after = torch.cuda.mem_get_info()[0]
-        safety = 0.70
+        safety = 0.90
         bs = max(1, int(free_after * safety / per_sample_mem))
         print(
             f"  [auto-batch] {free_after/1024**3:.1f}/{total_mem/1024**3:.1f} GB free"
@@ -1171,9 +1175,11 @@ class AdversarialPatchTrainer:
             fn              = (batch["filename"][0]
                                if isinstance(batch["filename"], (list, tuple))
                                else batch["filename"])
-            orig_tensor     = batch["orig_image"][0].to(self.device)
+            orig_tensor = batch["orig_image"][0].to(self.device, non_blocking=True)
+            if orig_tensor.dtype == torch.uint8:
+                orig_tensor = orig_tensor.float().div_(255.0)
             orig_corners_np = batch["orig_corners"][0].cpu().numpy()
-            orig_corners    = batch["orig_corners"][0].to(self.device)
+            orig_corners    = batch["orig_corners"][0].to(self.device, non_blocking=True)
 
             with torch.no_grad():
                 prep_tensor, new_corners_np = self.diff_prep(orig_tensor, orig_corners_np)
