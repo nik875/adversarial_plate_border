@@ -96,6 +96,34 @@ def _diff_resize(
     return img, target_w / W, target_h / H
 
 
+def _diff_letterbox_batch(
+    imgs_bchw: torch.Tensor, target_size: int
+) -> Tuple[torch.Tensor, float, float, float]:
+    """Batched bilinear resize + grey pad — same logic as _diff_letterbox."""
+    B, C, H, W = imgs_bchw.shape
+    r      = min(target_size / H, target_size / W)
+    new_h  = int(round(H * r))
+    new_w  = int(round(W * r))
+    imgs   = F.interpolate(imgs_bchw, size=(new_h, new_w),
+                           mode="bilinear", align_corners=False)
+    dw     = (target_size - new_w) / 2
+    dh     = (target_size - new_h) / 2
+    top    = int(round(dh - 0.1)); bottom = int(round(dh + 0.1))
+    left   = int(round(dw - 0.1)); right  = int(round(dw + 0.1))
+    imgs   = F.pad(imgs, (left, right, top, bottom), value=114.0 / 255.0)
+    return imgs, r, dw, dh
+
+
+def _diff_resize_batch(
+    imgs_bchw: torch.Tensor, target_w: int, target_h: int
+) -> Tuple[torch.Tensor, float, float]:
+    """Batched bilinear hard-resize — same logic as _diff_resize."""
+    B, C, H, W = imgs_bchw.shape
+    imgs = F.interpolate(imgs_bchw, size=(target_h, target_w),
+                         mode="bilinear", align_corners=False)
+    return imgs, target_w / W, target_h / H
+
+
 def _corners_letterbox(corners: np.ndarray, r: float, dw: float, dh: float) -> np.ndarray:
     c = corners.astype(np.float32).copy()
     c[:, 0] = c[:, 0] * r + dw
@@ -547,6 +575,44 @@ class AdversarialPatchTrainer:
                 return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
 
+    def _diff_prep_batch(
+        self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched differentiable preprocessing.
+
+        imgs_bchw:     [B, C, H, W]
+        corners_batch: [B, 4, 2]
+        Returns:       (imgs_prep [B, C, H', W'], new_corners [B, 4, 2])
+
+        All images in the batch must have the same spatial size (caller's
+        responsibility — guaranteed by the by_size grouping in _prepare_batch).
+        """
+        name = self.detector.name
+        if name in ("yolov8", "yolov11"):
+            imgsz = 640
+            if hasattr(self.detector, "_yolo") and self.detector._yolo is not None:
+                raw = self.detector._yolo.overrides.get("imgsz", 640)
+                imgsz = int(raw[0] if hasattr(raw, "__len__") else raw)
+            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, imgsz)
+            c = corners_batch.clone()
+            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
+        elif name == "rtdetr":
+            imgs, sx, sy = _diff_resize_batch(imgs_bchw, 640, 640)
+            c = corners_batch.clone()
+            c[..., 0] = c[..., 0] * sx; c[..., 1] = c[..., 1] * sy
+        elif name == "fasterrcnn":
+            imgs = imgs_bchw
+            c = corners_batch.clone()
+        elif name == "yolo-v9-608":
+            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 608)
+            c = corners_batch.clone()
+            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
+        else:
+            imgs, r, dw, dh = _diff_letterbox_batch(imgs_bchw, 384)
+            c = corners_batch.clone()
+            c[..., 0] = c[..., 0] * r + dw; c[..., 1] = c[..., 1] * r + dh
+        return imgs, c
+
     def _make_cv2_prep(self):
         """Return the equivalent cv2-based prep fn (for debug comparison only)."""
         name = self.detector.name
@@ -759,55 +825,118 @@ class AdversarialPatchTrainer:
     def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
         return augment_plate(image, self.device)
 
+    def _prepare_batch(self, raw_items: list, patch_norm: torch.Tensor,
+                       augment: Optional[bool] = None) -> list:
+        """Batch patch application + preprocessing for a list of raw items.
+
+        Groups images by spatial size so apply_patch_to_image can run as a
+        single batched warp call per size group (kornia requires uniform HxW).
+        diff_prep runs as a single batched F.interpolate call per size group.
+        """
+        _prof = self.profiling
+        if _prof: _t_batch0 = _t0 = _pt()
+
+        # ── CPU-side downscale + size grouping ──────────────────────────
+        # Downscale on CPU before transfer so we only move the smaller tensor.
+        loaded_cpu = []
+        for raw in raw_items:
+            t = raw["orig_image"]       # [C, H, W] — stays on CPU
+            c = raw["orig_corners"]     # [4, 2]
+            _, H, W = t.shape
+            if max(H, W) > 2000:
+                # F.interpolate requires float; if uint8 normalize now so the
+                # GPU transfer path doesn't see a float image in [0,255].
+                t_f = t.float().div_(255.0) if t.dtype == torch.uint8 else t
+                t = F.interpolate(t_f.unsqueeze(0), scale_factor=0.5,
+                                  mode="bilinear", align_corners=False).squeeze(0)
+                c = c * 0.5
+            loaded_cpu.append((t, c, raw.get("label")))
+
+        aug = self.augment if augment is None else augment
+
+        # Group indices by image spatial size for batched warp.
+        by_size: Dict[Tuple[int, int], List[int]] = {}
+        for i, (t, _, _) in enumerate(loaded_cpu):
+            key = (int(t.shape[-2]), int(t.shape[-1]))
+            by_size.setdefault(key, []).append(i)
+
+        # ── Async GPU transfer + float cast ─────────────────────────────
+        # Images are uint8 from the DataLoader (4× smaller over PCIe than
+        # float32). Transfer async on pinned memory, then cast to float32 on
+        # the GPU immediately — all enqueued on the same CUDA stream so the
+        # cast runs only after each DMA transfer completes.
+        loaded = []
+        for t, c, label in loaded_cpu:
+            t_gpu = t.to(self.device, non_blocking=True)
+            if t_gpu.dtype == torch.uint8:
+                t_gpu = t_gpu.float().div_(255.0)
+            loaded.append((t_gpu, c.to(self.device, non_blocking=True), label))
+
+        if _prof:
+            self._prof.setdefault("prepare/to_gpu", []).append(_pt() - _t0)
+            _t1 = _pt()
+
+        # ── Batched patch application ────────────────────────────────────
+        patched_orig = [None] * len(loaded)
+        for indices in by_size.values():
+            imgs    = torch.stack([loaded[i][0] for i in indices])       # [G, C, H, W]
+            corners = torch.stack([loaded[i][1] for i in indices])       # [G, 4, 2]
+            patched, _ = self.apply_patch_to_image(
+                imgs, corners, patch_norm=patch_norm, augment=aug)
+            for j, i in enumerate(indices):
+                patched_orig[i] = patched[j:j + 1]                       # [1, C, H, W]
+
+        if _prof:
+            self._prof.setdefault("prepare/patch_apply", []).append(_pt() - _t1)
+            _t2 = _pt()
+
+        # ── Batched diff_prep per size group ─────────────────────────────
+        # All images in a size group share the same H×W → same letterbox
+        # parameters → one F.interpolate call replaces N sequential calls.
+        prep_results = [None] * len(loaded)
+        for indices in by_size.values():
+            batch     = torch.cat([patched_orig[i] for i in indices])    # [G, C, H, W]
+            corners_b = torch.stack([loaded[i][1] for i in indices])     # [G, 4, 2]
+            prep_b, new_corners_b = self._diff_prep_batch(batch, corners_b)
+            for j, i in enumerate(indices):
+                prep_results[i] = (prep_b[j], new_corners_b[j])
+
+        if _prof:
+            self._prof.setdefault("prepare/diff_prep", []).append(_pt() - _t2)
+
+        result = []
+        for i, (orig_tensor, orig_corners, label) in enumerate(loaded):
+            po                        = patched_orig[i]                  # [1, C, H, W]
+            patched_prep_chw, new_corners = prep_results[i]
+            target_box = self.corners_to_bbox(new_corners)
+            rim_box    = self._rim_bbox(new_corners)
+            ocr_crop   = _bbox_ocr_crop(po, orig_corners, self.ocr.ocr_crop_size)
+            if self.top_extend:
+                top_region_box   = self._top_extend_region_bbox(new_corners)
+                top_corners_orig = self._top_extend_region_corners(orig_corners)
+                top_ocr_crop     = _bbox_ocr_crop(po, top_corners_orig, self.ocr.ocr_crop_size)
+            else:
+                top_region_box = None
+                top_ocr_crop   = None
+            result.append({
+                "patched_prep":   patched_prep_chw,  # [C, H_p, W_p]
+                "target_box":     target_box,         # [4]
+                "rim_box":        rim_box,             # [4]
+                "new_corners":    new_corners,         # [4, 2]
+                "ocr_crop":       ocr_crop,            # [1, 3, H_c, W_c]
+                "top_region_box": top_region_box,      # [4] or None
+                "top_ocr_crop":   top_ocr_crop,        # [1, 3, H_c, W_c] or None
+                "label":          label,
+            })
+
+        if _prof:
+            self._prof.setdefault("prepare/total", []).append(_pt() - _t_batch0)
+        return result
+
     def _prepare_one(self, batch_item: dict, patch_norm: torch.Tensor,
                      augment: Optional[bool] = None) -> dict:
-        """Fast per-image ops: patch application + preprocessing. No model calls."""
-        orig_tensor = batch_item["orig_image"].to(self.device, non_blocking=True)  # [C, H, W]
-        if orig_tensor.dtype == torch.uint8:
-            orig_tensor = orig_tensor.float().div_(255.0)
-        orig_corners_np = batch_item["orig_corners"].cpu().numpy()
-        orig_corners    = batch_item["orig_corners"].to(self.device, non_blocking=True)  # [4, 2]
-
-        # Halve images that are too large to keep GPU memory manageable
-        _, H, W = orig_tensor.shape
-        if max(H, W) > 2000:
-            orig_tensor     = F.interpolate(orig_tensor.unsqueeze(0), scale_factor=0.5,
-                                            mode="bilinear", align_corners=False).squeeze(0)
-            orig_corners_np = orig_corners_np * 0.5
-            orig_corners    = orig_corners * 0.5
-
-        patched_orig, _ = self.apply_patch_to_image(
-            orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
-            patch_norm=patch_norm,
-            augment=self.augment if augment is None else augment)
-
-        patched_prep_chw, new_corners_np = self.diff_prep(
-            patched_orig.squeeze(0), orig_corners_np)
-        new_corners = torch.from_numpy(new_corners_np).to(self.device)
-        target_box  = self.corners_to_bbox(new_corners)
-        rim_box     = self._rim_bbox(new_corners)
-        ocr_crop    = _bbox_ocr_crop(patched_orig, orig_corners, self.ocr.ocr_crop_size)
-
-        if self.top_extend:
-            top_region_box = self._top_extend_region_bbox(new_corners)
-            # OCR crop for the top target region, using perspective-correct corners
-            # in original full-res image coords (same column-vector parameterization).
-            top_corners_orig = self._top_extend_region_corners(orig_corners)
-            top_ocr_crop = _bbox_ocr_crop(patched_orig, top_corners_orig,
-                                          self.ocr.ocr_crop_size)
-        else:
-            top_region_box = None
-            top_ocr_crop   = None
-
-        return {
-            "patched_prep":  patched_prep_chw,   # [C, H_p, W_p]
-            "target_box":    target_box,          # [4]
-            "rim_box":       rim_box,             # [4]
-            "ocr_crop":      ocr_crop,            # [1, 3, H_c, W_c]
-            "top_region_box": top_region_box,     # [4] or None
-            "top_ocr_crop":   top_ocr_crop,       # [1, 3, H_c, W_c] or None
-            "label":         batch_item.get("label"),  # str or None
-        }
+        """Single-image wrapper around _prepare_batch."""
+        return self._prepare_batch([batch_item], patch_norm, augment=augment)[0]
 
     def compute_loss_batch(self, items: list) -> tuple:
         """Batch the slow model-eval calls; average losses over B items.
