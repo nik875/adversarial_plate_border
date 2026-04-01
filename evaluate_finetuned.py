@@ -52,10 +52,10 @@ def find_optimal_batch_size(backend: DetectorBackend, device: str, max_bs: int =
     torch.cuda.reset_peak_memory_stats()
 
     try:
-        # Probe with batch size 1
+        # Probe with batch size 1 via batch_predict (same path as eval loop)
         dummy = torch.randn(1, 3, 640, 640).to(device)
         with torch.no_grad():
-            backend.predict(dummy)
+            backend.batch_predict(dummy)
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated()
         per_sample_mem = max(1, peak - baseline)
