@@ -523,7 +523,7 @@ class YOLOv8Backend(DetectorBackend):
 
     def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
         """
-        True batch inference: process B images in one GPU call.
+        True batch inference: one raw forward pass for B images.
 
         Parameters
         ----------
@@ -537,18 +537,49 @@ class YOLOv8Backend(DetectorBackend):
         """
         self.ensure_loaded()
         batch_size = images.shape[0]
-        results_list = []
+        imgs_to_device = images.to(self.device)
 
-        # Convert batch to numpy [B, H, W, C] uint8
-        images_np = (images.permute(0, 2, 3, 1).detach().cpu().numpy() * 255).astype("uint8")
-
-        # Pad each image and run through ultralytics API
+        # Pad and prepare batch: [B, C, H, W]
+        batch_padded = []
         for i in range(batch_size):
-            img_np = images_np[i]
+            img_np = (imgs_to_device[i].permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
             img_np = _pad_to_stride(img_np)
-            results = self._yolo.predict(img_np, conf=self.conf_threshold,
-                                         iou=self.iou_threshold, verbose=False)
-            detections = _results_to_detections(results, self.conf_threshold, images[i])
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            batch_padded.append(img_tensor)
+
+        batch_tensor = torch.cat(batch_padded, dim=0).to(self.device)  # [B, C, H, W]
+
+        # One raw forward pass
+        with torch.no_grad():
+            raw_output = self._model(batch_tensor)  # [B, 4+C, A]
+
+        # Decode all at once
+        preds = raw_output[0].permute(0, 2, 1)  # [B, A, 4+C]
+        boxes_cxcywh = preds[..., :4]
+        boxes_xyxy = torch.cat([
+            boxes_cxcywh[..., :2] - boxes_cxcywh[..., 2:] / 2,
+            boxes_cxcywh[..., :2] + boxes_cxcywh[..., 2:] / 2,
+        ], dim=-1)  # [B, A, 4]
+        scores = preds[..., 4:].max(-1).values  # [B, A]
+
+        results_list = []
+        for b in range(batch_size):
+            detections: List[Detection] = []
+            box_scores = scores[b]
+            sorted_idx = torch.argsort(box_scores, descending=True)
+
+            for idx in sorted_idx:
+                conf = float(box_scores[idx].item())
+                if conf < self.conf_threshold:
+                    break
+
+                x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[b, idx].tolist()]
+                detections.append(Detection(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    confidence=conf,
+                    class_id=0,
+                ))
+
             results_list.append(detections)
 
         return results_list
@@ -669,6 +700,48 @@ class YOLOv5Backend(DetectorBackend):
             ))
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
+
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        """Batch prediction via YOLOv5 hub model."""
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+        results_list = []
+
+        # Convert batch to numpy
+        images_np = (images.permute(0, 2, 3, 1).cpu().numpy() * 255).astype("uint8")
+
+        # Run through model (YOLOv5 can handle batches)
+        results = self._model(images_np)
+
+        # Parse results (results is a Results object or list of Results)
+        if not isinstance(results, list):
+            results = [results]
+
+        for i, result in enumerate(results):
+            if hasattr(result, 'xyxy'):
+                raw_boxes = result.xyxy if isinstance(result.xyxy, list) else [result.xyxy]
+                raw_boxes = raw_boxes[0] if raw_boxes else torch.empty(0, 6)
+            else:
+                raw_boxes = torch.empty(0, 6)
+
+            detections: List[Detection] = []
+            for row in raw_boxes:
+                conf = row[4].item()
+                synthetic = torch.zeros(7, device=row.device)
+                synthetic[1:5] = row[:4]
+                synthetic[5] = row[5]
+                synthetic[6] = conf
+                detections.append(Detection(
+                    x1=row[0].item(), y1=row[1].item(),
+                    x2=row[2].item(), y2=row[3].item(),
+                    confidence=conf,
+                    class_id=int(row[5].item()),
+                    raw=synthetic,
+                ))
+            detections.sort(key=lambda d: d.confidence, reverse=True)
+            results_list.append(detections)
+
+        return results_list
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -794,6 +867,83 @@ class RTDETRBackend(DetectorBackend):
         # Sort by confidence descending
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
+
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        """
+        Batch RT-DETR inference: one forward pass for all images.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], dtype float32, values in [0, 1].
+
+        Returns
+        -------
+        List[List[Detection]]
+            Per-image detection lists.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        # Convert to PIL images
+        from PIL import Image
+        pil_images = []
+        orig_sizes = []
+        for i in range(batch_size):
+            img_np = (images[i].permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+            pil_images.append(Image.fromarray(img_np))
+            orig_sizes.append([images[i].shape[1], images[i].shape[2]])
+
+        # Batch process
+        inputs = self._processor(images=pil_images, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        target_sizes = torch.tensor(orig_sizes, device=self.device)
+
+        # Batch inference
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+
+        # Post-process all at once
+        results = self._processor.post_process_object_detection(
+            outputs,
+            threshold=self.conf_threshold,
+            target_sizes=target_sizes
+        )
+
+        # Parse each image's results
+        results_list = []
+        for result in results:
+            detections: List[Detection] = []
+
+            scores = result["scores"].cpu()
+            labels = result["labels"].cpu()
+            boxes = result["boxes"].cpu()
+
+            for i in range(len(scores)):
+                score = scores[i].item()
+                if score < self.conf_threshold:
+                    continue
+
+                x1, y1, x2, y2 = boxes[i].tolist()
+                class_id = labels[i].item()
+
+                synthetic = torch.tensor(
+                    [0.0, x1, y1, x2, y2, class_id, score],
+                    dtype=torch.float32,
+                )
+
+                detections.append(Detection(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    confidence=score,
+                    class_id=int(class_id),
+                    raw=synthetic,
+                ))
+
+            detections.sort(key=lambda d: d.confidence, reverse=True)
+            results_list.append(detections)
+
+        return results_list
 
     def parameters(self) -> Iterator[nn.Parameter]:
         if self._model is not None:
@@ -1296,6 +1446,62 @@ class FasterRCNNBackend(DetectorBackend):
 
         detections.sort(key=lambda d: d.confidence, reverse=True)
         return detections
+
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        """
+        True batch inference for Faster R-CNN.
+
+        Parameters
+        ----------
+        images : torch.Tensor
+            Shape [B, C, H, W], dtype float32, values in [0, 1].
+
+        Returns
+        -------
+        List[List[Detection]]
+            Per-image detection lists.
+        """
+        self.ensure_loaded()
+        batch_size = images.shape[0]
+
+        # FasterRCNN expects List[Tensor]
+        images_list = [images[i].to(self.device) for i in range(batch_size)]
+
+        with torch.no_grad():
+            outputs = self._model(images_list)
+
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+
+        results_list = []
+        for out in outputs:
+            boxes = out.get("boxes")
+            scores = out.get("scores")
+            labels = out.get("labels")
+
+            if boxes is None or scores is None or labels is None:
+                results_list.append([])
+                continue
+
+            detections: List[Detection] = []
+            for i in range(len(scores)):
+                conf = float(scores[i].item())
+                if conf < self.conf_threshold:
+                    continue
+
+                x1, y1, x2, y2 = [float(v) for v in boxes[i].tolist()]
+                class_id = int(labels[i].item())
+                synthetic = torch.tensor([0.0, x1, y1, x2, y2, float(class_id), conf],
+                                         dtype=torch.float32)
+                detections.append(Detection(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    confidence=conf, class_id=class_id, raw=synthetic,
+                ))
+
+            detections.sort(key=lambda d: d.confidence, reverse=True)
+            results_list.append(detections)
+
+        return results_list
 
     def differentiable_det_loss(self, image: torch.Tensor,
                                  target_box: torch.Tensor) -> torch.Tensor:
