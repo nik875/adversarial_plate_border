@@ -2092,9 +2092,19 @@ def main():
     TRAINABLE_OCR = ["crnn", "trocr", "dtrb", "lprnet", "cct", "fastanpr-ocr", "doctr-vitstr"]
 
     parser.add_argument("--backend",      default="yolov8",  choices=TRAINABLE_DET)
-    parser.add_argument("--model-path",   default="license_plate_detector.pt")
+    parser.add_argument("--model-path",   default=None,
+                        help="Path to detector checkpoint.  Defaults to the finetuned path "
+                             "derived from --finetuned-models when that flag is set and the "
+                             "backend is a recognised finetuned model.")
     parser.add_argument("--ocr-backend",  default="crnn",    choices=TRAINABLE_OCR)
-    parser.add_argument("--ocr-model-path", default="none")
+    parser.add_argument("--ocr-model-path", default=None,
+                        help="Path to OCR checkpoint.  Same default logic as --model-path.")
+    parser.add_argument("--finetuned-models", default=None, metavar="DIR",
+                        help="Directory containing finetuned checkpoints (same convention as "
+                             "evaluate_finetuned.py).  When set, --model-path and "
+                             "--ocr-model-path are auto-derived from this directory for "
+                             "recognised backends (fasterrcnn, rtdetr, owlvit, yolo-v9-608, "
+                             "lprnet, trocr, doctr-vitstr, cct) unless explicitly overridden.")
     parser.add_argument("--ocr-repo-root",  default=None)
     parser.add_argument("--dtrb-feature-extraction", default="vitstr_small_patch16_224")
     parser.add_argument("--dtrb-sequence-modeling",  default="None")
@@ -2162,6 +2172,31 @@ def main():
                              "continues from the same schedule position.  Without this flag "
                              "(default) the schedule always resets to the new --lr / --lr-min.")
     args = parser.parse_args()
+
+    # ── Resolve model paths (mirrors evaluate_finetuned.py checkpoint_map) ──
+    _FINETUNED_CHECKPOINT_MAP = {
+        "fasterrcnn":  "fasterrcnn_finetuned.pt",
+        "rtdetr":      "rtdetr_finetuned",
+        "owlvit":      "owlvit_finetuned",
+        "yolo-v9-608": "yolo608_finetuned.pt",
+        "lprnet":      "lprnet_finetuned.pt",
+        "trocr":       "trocr_small_finetuned.pt",
+        "doctr-vitstr":"vitstr_small_finetuned.pt",
+        "cct":         "cct_s_finetuned.pt",
+    }
+    if args.finetuned_models:
+        _fdir = Path(args.finetuned_models)
+        if args.model_path is None and args.backend in _FINETUNED_CHECKPOINT_MAP:
+            args.model_path = str(_fdir / _FINETUNED_CHECKPOINT_MAP[args.backend])
+            print(f"  [auto] detector path : {args.model_path}")
+        if args.ocr_model_path is None and args.ocr_backend in _FINETUNED_CHECKPOINT_MAP:
+            args.ocr_model_path = str(_fdir / _FINETUNED_CHECKPOINT_MAP[args.ocr_backend])
+            print(f"  [auto] OCR path      : {args.ocr_model_path}")
+    # Fall back to sentinel "none" so backends that don't require a path still work.
+    if args.model_path is None:
+        args.model_path = "none"
+    if args.ocr_model_path is None:
+        args.ocr_model_path = "none"
 
     backend = build_backend(args.backend, args.model_path, device=args.device)
     backend.load()
