@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import subprocess
 import json
 import sys
@@ -44,18 +45,23 @@ def get_file_size():
     return matches[0]["size"]
 
 
-def download(url, file_size, output_path):
+def download(url, file_size, output_path=None):
+    """Download to output_path, or to stdout if output_path is None."""
+    stdout_mode = output_path is None
+    log = sys.stderr if stdout_mode else sys.stdout
+
     cursor = 0
 
-    if os.path.exists(output_path):
-        cursor = os.path.getsize(output_path)
-        if cursor == file_size:
-            print("File already fully downloaded.")
-            return
-        print(f"Resuming from byte {cursor:,} ({cursor / 1024**3:.2f} GB)")
-    else:
-        with open(output_path, "wb") as f:
-            f.truncate(file_size)
+    if not stdout_mode:
+        if os.path.exists(output_path):
+            cursor = os.path.getsize(output_path)
+            if cursor == file_size:
+                print("File already fully downloaded.")
+                return
+            print(f"Resuming from byte {cursor:,} ({cursor / 1024**3:.2f} GB)")
+        else:
+            with open(output_path, "wb") as f:
+                f.truncate(file_size)
 
     attempt = 0
 
@@ -67,18 +73,21 @@ def download(url, file_size, output_path):
         unit_divisor=1024,
         desc=FILE,
         dynamic_ncols=True,
+        file=log,
     ) as pbar:
-        with open(output_path, "r+b") as f:
+        out = sys.stdout.buffer if stdout_mode else open(output_path, "r+b")
+        try:
             while cursor < file_size:
                 attempt += 1
                 headers = {"Range": f"bytes={cursor}-{file_size - 1}"}
 
-                print(f"\n[attempt {attempt}] Connecting from byte {cursor:,}...")
+                print(f"\n[attempt {attempt}] Connecting from byte {cursor:,}...", file=log)
 
                 try:
                     with requests.get(url, headers=headers, stream=True, timeout=TIMEOUT) as resp:
                         resp.raise_for_status()
-                        f.seek(cursor)
+                        if not stdout_mode:
+                            out.seek(cursor)
 
                         slow_since = None
                         window = collections.deque()  # (timestamp, bytes)
@@ -87,7 +96,9 @@ def download(url, file_size, output_path):
                             if not chunk:
                                 continue
 
-                            f.write(chunk)
+                            out.write(chunk)
+                            if stdout_mode:
+                                out.flush()
                             cursor += len(chunk)
                             pbar.update(len(chunk))
 
@@ -113,7 +124,8 @@ def download(url, file_size, output_path):
                                     print(
                                         f"\n[throttle] Speed {rate / 1024**2:.1f} MB/s "
                                         f"below threshold for {GRACE_PERIOD}s — "
-                                        f"dropping connection, backing off {BACKOFF}s..."
+                                        f"dropping connection, backing off {BACKOFF}s...",
+                                        file=log,
                                     )
                                     break
                             else:
@@ -125,25 +137,39 @@ def download(url, file_size, output_path):
                 except (requests.exceptions.RequestException, OSError) as e:
                     print(f"\n[error] {e}", file=sys.stderr)
 
-                print(f"Backing off {BACKOFF}s...")
+                print(f"Backing off {BACKOFF}s...", file=log)
                 time.sleep(BACKOFF)
+        finally:
+            if not stdout_mode:
+                out.close()
 
-    actual_size = os.path.getsize(output_path)
-    if actual_size != file_size:
-        raise RuntimeError(f"Size mismatch: expected {file_size}, got {actual_size}")
-
-    print(f"\nDone: {output_path} ({actual_size:,} bytes)")
+    if not stdout_mode:
+        actual_size = os.path.getsize(output_path)
+        if actual_size != file_size:
+            raise RuntimeError(f"Size mismatch: expected {file_size}, got {actual_size}")
+        print(f"\nDone: {output_path} ({actual_size:,} bytes)")
+    else:
+        print(f"\nDone: streamed {cursor:,} bytes to stdout", file=log)
 
 
 def main():
-    print("Getting download URL...")
+    parser = argparse.ArgumentParser(description="Download CCPD dataset from Backblaze B2")
+    parser.add_argument(
+        "--stdout", action="store_true",
+        help="Stream downloaded bytes to stdout instead of writing to a file"
+    )
+    args = parser.parse_args()
+
+    log = sys.stderr if args.stdout else sys.stdout
+
+    print("Getting download URL...", file=log)
     url = get_download_url()
 
-    print("Getting file size...")
+    print("Getting file size...", file=log)
     file_size = get_file_size()
-    print(f"File size: {file_size:,} bytes ({file_size / 1024**3:.2f} GB)")
+    print(f"File size: {file_size:,} bytes ({file_size / 1024**3:.2f} GB)", file=log)
 
-    download(url, file_size, OUTPUT)
+    download(url, file_size, output_path=None if args.stdout else OUTPUT)
 
 
 if __name__ == "__main__":
