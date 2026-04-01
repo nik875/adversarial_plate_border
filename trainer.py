@@ -2184,12 +2184,16 @@ class AdversarialPatchTrainer:
         n = len(active_pipelines)
         eta_min = lr_min
 
-        # ── Per-pipeline DataLoaders ──────────────────────────────────
-        loaders = [self._make_pipeline_loader() for _ in active_pipelines]
+        # ── Single shared DataLoader (each image processed by one pipeline) ──
+        # Using one loader and distributing items round-robin means each image
+        # is processed exactly once per epoch — same total GPU work as single-
+        # pipeline training.  Three separate full-dataset loaders would give 3×
+        # the compute with no benefit.
+        shared_loader = self._make_pipeline_loader()
 
         # ── Probe batch size per pipeline → take min ──────────────────
         if self.device.startswith("cuda"):
-            probe_raw = {k: v[0] for k, v in next(iter(loaders[0])).items()}
+            probe_raw = {k: v[0] for k, v in next(iter(shared_loader)).items()}
             sizes = []
             for det, ocr in active_pipelines:
                 self._activate_pipeline(det, ocr)
@@ -2206,7 +2210,7 @@ class AdversarialPatchTrainer:
 
         # ── Cap eval_batch_size for ≥10 000 total updates ─────────────
         _update_every_cap = (self.grad_accumulate or 1)
-        _imgs_per_epoch   = sum(len(ld) for ld in loaders)
+        _imgs_per_epoch   = len(shared_loader)
         _max_bs = max(1, num_epochs * _imgs_per_epoch // (10_000 * _update_every_cap))
         if B > _max_bs:
             print(f"[auto-batch] capping eval_batch_size {B} → {_max_bs} "
@@ -2278,7 +2282,7 @@ class AdversarialPatchTrainer:
         print(f"  Patch gen : ConvTranspose decoder  "
               f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
         print(f"  Trainable : {n_params:,} params")
-        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (across {n} pipelines)")
+        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (round-robin across {n} pipelines)")
         print(f"  Epochs    : {num_epochs}  |  Updates: {total_updates}  |  "
               f"Save every: {save_every} updates (~10%)")
         print(f"  Batch/pipeline: {B}  |  update_every: {update_every}")
@@ -2327,8 +2331,7 @@ class AdversarialPatchTrainer:
             epoch_start  = time.time()
             self.training = True
 
-            pipe_iters    = [iter(ld) for ld in loaders]
-            exhausted: set = set()
+            shared_iter   = iter(shared_loader)
             buffers       = [[] for _ in range(n)]
             pipe_loss_sum = [0.0] * n
             pipe_steps    = [0]   * n
@@ -2346,19 +2349,24 @@ class AdversarialPatchTrainer:
             _approx_upd = max(1, _imgs_per_epoch // (B * update_every))
             pbar = tqdm(total=_approx_upd, desc=f"Epoch {epoch+1}", unit="upd", leave=False)
 
-            while len(exhausted) < n:
+            # Feed items from the single shared loader to pipelines round-robin.
+            # When the loader is exhausted, flush all remaining partial buffers.
+            _shared_done = False
+            while not _shared_done:
                 pi = rr_idx % n
                 rr_idx += 1
-                if pi in exhausted:
-                    continue
+
                 try:
-                    raw = {k: v[0] for k, v in next(pipe_iters[pi]).items()}
+                    raw = {k: v[0] for k, v in next(shared_iter).items()}
+                    buffers[pi].append(raw)
                 except StopIteration:
-                    exhausted.add(pi)
-                    # Flush remaining buffer for this pipeline
-                    if buffers[pi]:
+                    _shared_done = True
+                    # Flush every non-empty buffer in round-robin order
+                    for _flush_pi in [_pi % n for _pi in range(rr_idx, rr_idx + n)]:
+                        if not buffers[_flush_pi]:
+                            continue
+                        pi = _flush_pi
                         self._activate_pipeline(*active_pipelines[pi])
-                        # cuDNN RNN backward requires train() on OCR (e.g. LPRNet LSTM)
                         self.ocr.train()
                         patch_with_graph = self.generate_patch(training_aug=True)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
@@ -2389,9 +2397,8 @@ class AdversarialPatchTrainer:
                             optimizer.param_groups[0]["lr"],
                         ])
                         pbar.update(1)
-                    continue
+                    break
 
-                buffers[pi].append(raw)
                 if len(buffers[pi]) < B * update_every:
                     continue
 
