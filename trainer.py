@@ -277,8 +277,8 @@ class PatchDecoder(nn.Module):
     """
     Residual-stream decoder that maps [1, seed_channels, 4, 8] → [1, 3, 256, 512].
 
-    Six stages (or seven with top_extend), each doubling spatial size:
-        4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512 [→ 512×1024 with top_extend]
+    Six stages, each doubling spatial size:
+        4×8 → 8×16 → 16×32 → 32×64 → 64×128 → 128×256 → 256×512
 
     All intermediate feature maps are kept at seed_channels (128) throughout,
     forming a flat residual stream. Each stage contributes two additive deltas:
@@ -293,20 +293,19 @@ class PatchDecoder(nn.Module):
     Output is passed through tanh and scaled to [0, 1].
     """
 
-    def __init__(self, seed_channels: int = 128, top_extend: bool = False):
+    def __init__(self, seed_channels: int = 128):
         super().__init__()
         C = seed_channels
-        num_stages = 7 if top_extend else 6
         self.deconvs = nn.ModuleList([
-            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(num_stages)
+            nn.ConvTranspose2d(C, C, 4, stride=2, padding=1) for _ in range(6)
         ])
         self.convs = nn.ModuleList([
-            nn.Conv2d(C, C, 7, padding=3) for _ in range(num_stages)
+            nn.Conv2d(C, C, 7, padding=3) for _ in range(6)
         ])
         self.final = nn.Conv2d(C, 3, 1)
 
     def forward(self, seed: torch.Tensor) -> torch.Tensor:
-        """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] or [1, 3, 512, 1024] with top_extend"""
+        """seed: [1, C, 4, 8]  →  patch: [1, 3, 256, 512] in [0, 1]"""
         x = seed
         for deconv, conv in zip(self.deconvs, self.convs):
             x = F.interpolate(x, scale_factor=2, mode='nearest') + F.leaky_relu(deconv(x), 0.2)
@@ -450,14 +449,14 @@ class AdversarialPatchTrainer:
         print(f"  Run directory : {self.run_dir}")
 
         # ── Patch decoder (seed + decoder jointly optimised) ───────────
-        self.patch_width   = PATCH_WIDTH if not top_extend else PATCH_WIDTH * 2
-        self.patch_height  = PATCH_HEIGHT if not top_extend else PATCH_HEIGHT * 2
+        self.patch_width   = PATCH_WIDTH
+        self.patch_height  = PATCH_HEIGHT
         self.seed_channels = seed_channels
         # Small initialisation → decoder output ≈ 0.5 (neutral grey patch)
         self.seed    = nn.Parameter(
             torch.randn(1, seed_channels, 4, 8, device=self.device) * 0.1
         )
-        self.decoder = PatchDecoder(seed_channels, top_extend=top_extend).to(self.device)
+        self.decoder = PatchDecoder(seed_channels).to(self.device)
 
         # ── Image transform ────────────────────────────────────────────
         self.transform = _chw_uint8
