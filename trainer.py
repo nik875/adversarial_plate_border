@@ -2193,8 +2193,8 @@ class AdversarialPatchTrainer:
             sizes = []
             for det, ocr in active_pipelines:
                 self._activate_pipeline(det, ocr)
-                # cuDNN RNN backward requires training mode
-                self.detector.train_mode()
+                # cuDNN RNN backward requires train() on the OCR model (e.g. LPRNet LSTM);
+                # detectors must stay in eval() — e.g. FasterRCNN requires targets in train mode
                 self.ocr.train()
                 sizes.append(self._probe_eval_batch_size(probe_raw))
             B = min(sizes)
@@ -2358,8 +2358,7 @@ class AdversarialPatchTrainer:
                     # Flush remaining buffer for this pipeline
                     if buffers[pi]:
                         self._activate_pipeline(*active_pipelines[pi])
-                        # cuDNN RNN backward requires training mode
-                        self.detector.train_mode()
+                        # cuDNN RNN backward requires train() on OCR (e.g. LPRNet LSTM)
                         self.ocr.train()
                         patch_with_graph = self.generate_patch(training_aug=True)
                         patch_leaf = patch_with_graph.detach().requires_grad_(True)
@@ -2398,8 +2397,7 @@ class AdversarialPatchTrainer:
 
                 # ── Optimizer step for pipeline pi ────────────────────
                 self._activate_pipeline(*active_pipelines[pi])
-                # cuDNN RNN backward requires training mode
-                self.detector.train_mode()
+                # cuDNN RNN backward requires train() on OCR (e.g. LPRNet LSTM)
                 self.ocr.train()
 
                 # TV warmup
