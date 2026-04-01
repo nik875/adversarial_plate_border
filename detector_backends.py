@@ -122,8 +122,12 @@ def _select_best_from_scores_boxes(
             dists         = ((box_centers - target_center) ** 2).sum(-1).sqrt()
             target_size   = max((tb[2] - tb[0]).item(), (tb[3] - tb[1]).item(), 1.0)
             if exclude_mask is not None and exclude_mask.any():
-                dists = dists.clone()
-                dists[exclude_mask.to(device)] = float('inf')
+                mask = exclude_mask.to(device)
+                # Only apply exclusion if it doesn't exclude ALL boxes — otherwise
+                # softmax([-inf, -inf, ...]) would produce all-NaN weights.
+                if not mask.all():
+                    dists = dists.clone()
+                    dists[mask] = float('inf')
             proximity_weights = torch.softmax(-dists / target_size, dim=0)
         else:
             best_idx = int((ious * scores.detach()).argmax().item())
