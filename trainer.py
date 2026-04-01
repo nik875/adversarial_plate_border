@@ -441,7 +441,9 @@ class AdversarialPatchTrainer:
         # ── Run output directory ───────────────────────────────────────
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         suffix    = run_name or timestamp
-        self.run_dir = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
+        self.run_dir   = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
+        self.profiling: bool = False
+        self._prof:     dict = {}
         (self.run_dir / "patches").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "debug").mkdir(parents=True, exist_ok=True)
         print(f"  Run directory : {self.run_dir}")
