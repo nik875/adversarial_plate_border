@@ -214,7 +214,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     with torch.no_grad():
         for record in tqdm(records, desc=f"  {backend.name}", leave=False):
             try:
-                img = Image.open(record["filename"]).convert("RGB")
+                img = Image.open(record["image"]).convert("RGB")
             except Exception as e:
                 print(f"[warn] could not load {record['filename']}: {e}")
                 continue
@@ -333,7 +333,7 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
     with torch.no_grad():
         for record in tqdm(records, desc=f"  {backend.name}", leave=False):
             try:
-                img = Image.open(record["filename"]).convert("RGB")
+                img = Image.open(record["image"]).convert("RGB")
             except Exception as e:
                 print(f"[warn] could not load {record['filename']}: {e}")
                 continue
@@ -376,6 +376,101 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
         "latency_p95_ms": float(np.percentile(latencies, 95)) if latencies else 0.0,
         "n_plates": len(records),
         "crr_values": crr_values,
+        "lprr_values": lprr_values,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End-to-End Pipeline Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
+                             records: List[dict], device: str = "cpu") -> dict:
+    """
+    Evaluate detector + OCR pipeline end-to-end.
+
+    For each image:
+    1. Run detector to find plate
+    2. If detection succeeds (IoU ≥ 0.5), crop and run OCR
+    3. Track: detection failures, OCR failures (given good detection), full successes
+    """
+    transform = T.ToTensor()
+    n_det_failures = 0
+    n_ocr_failures = 0  # given good detection
+    n_full_successes = 0
+    pipeline_latencies = []
+    lprr_values = []
+
+    detector.eval()
+    ocr_backend.eval()
+
+    with torch.no_grad():
+        for record in tqdm(records, desc=f"  {detector.name} + {ocr_backend.name}", leave=False):
+            try:
+                img = Image.open(record["image"]).convert("RGB")
+            except Exception:
+                n_det_failures += 1
+                continue
+
+            img_tensor = transform(img).to(device)
+            gt_box = record["box"].to(device)
+            gt_text = record["text"]
+
+            t0 = time.perf_counter()
+
+            # Step 1: Detect
+            dets = detector.predict(img_tensor)
+            best_iou = 0.0
+            best_det_box = None
+            for det in dets:
+                iou = _iou(det.box, gt_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_box = det.box
+
+            # Detection failure
+            if best_iou < 0.5:
+                n_det_failures += 1
+                pipeline_latencies.append((time.perf_counter() - t0) * 1000)
+                lprr_values.append(0.0)
+                continue
+
+            # Step 2: OCR on detected box
+            try:
+                x1, y1, x2, y2 = [int(v) for v in best_det_box.tolist()]
+                img_crop = img.crop((x1, y1, x2, y2))
+                crop_tensor = transform(img_crop).to(device)
+                ocr_result = ocr_backend.predict(crop_tensor)
+                pred_text = ocr_result.text.strip().upper()
+
+                # Full pipeline success
+                if pred_text == gt_text:
+                    n_full_successes += 1
+                    lprr_values.append(1.0)
+                else:
+                    n_ocr_failures += 1
+                    lprr_values.append(0.0)
+            except Exception:
+                n_ocr_failures += 1
+                lprr_values.append(0.0)
+
+            pipeline_latencies.append((time.perf_counter() - t0) * 1000)
+
+    n_images = len(records)
+    pipeline_success_rate = n_full_successes / n_images if n_images > 0 else 0.0
+    det_failure_rate = n_det_failures / n_images if n_images > 0 else 0.0
+    ocr_failure_given_det = n_ocr_failures / (n_images - n_det_failures) if (n_images - n_det_failures) > 0 else 0.0
+
+    return {
+        "pipeline_success": pipeline_success_rate,
+        "det_failures": n_det_failures,
+        "ocr_failures": n_ocr_failures,
+        "full_successes": n_full_successes,
+        "n_images": n_images,
+        "det_failure_rate": det_failure_rate,
+        "ocr_failure_given_det": ocr_failure_given_det,
+        "latency_mean_ms": float(np.mean(pipeline_latencies)) if pipeline_latencies else 0.0,
+        "latency_p95_ms": float(np.percentile(pipeline_latencies, 95)) if pipeline_latencies else 0.0,
         "lprr_values": lprr_values,
     }
 
@@ -429,9 +524,10 @@ def save_results_json(results: List[EvalResults], path: str) -> None:
 
 
 def save_summary_table(results: List[EvalResults], path: str) -> None:
-    """Print and save summary table in two sections: detectors and OCR."""
+    """Print and save summary table in three sections: detectors, OCR, and pipeline."""
     detectors = [r for r in results if r.model_type == "detector"]
     ocr_models = [r for r in results if r.model_type == "ocr"]
+    pipelines = [r for r in results if r.model_type == "pipeline"]
 
     lines = []
 
@@ -478,6 +574,28 @@ def save_summary_table(results: List[EvalResults], path: str) -> None:
                 f"{r.metrics['mean_edit_distance']:>{col}.4f} "
                 f"{r.metrics['latency_mean_ms']:>{col}.2f} "
                 f"{r.metrics['latency_p95_ms']:>{col}.2f}"
+            )
+        lines.append(sep)
+
+    if pipelines:
+        col = 12
+        hdr = (
+            f"{'Pipeline':<30} {'Success':>{col}} {'Det Fail':>{col}} "
+            f"{'OCR Fail|Det':>{col}} {'Latency(ms)':>{col}}"
+        )
+        sep = "─" * len(hdr)
+        lines.append("\nEND-TO-END PIPELINE")
+        lines.append(sep)
+        lines.append(hdr)
+        lines.append(sep)
+        for r in pipelines:
+            pipeline_name = f"{r.model_name}"
+            lines.append(
+                f"{pipeline_name:<30} "
+                f"{r.metrics['pipeline_success']:>{col}.4f} "
+                f"{r.metrics['det_failure_rate']:>{col}.4f} "
+                f"{r.metrics['ocr_failure_given_det']:>{col}.4f} "
+                f"{r.metrics['latency_mean_ms']:>{col}.2f}"
             )
         lines.append(sep)
 
@@ -600,6 +718,40 @@ def plot_ocr_metrics_bar(results: List[EvalResults], path: str) -> None:
     print(f"[eval] OCR bar chart → {path}")
 
 
+def plot_pipeline_metrics_bar(results: List[EvalResults], path: str) -> None:
+    """Bar chart: end-to-end pipeline success, detection failure, OCR failure rates."""
+    pipelines = [r for r in results if r.model_type == "pipeline"]
+    if not pipelines:
+        return
+
+    names = [r.model_name for r in pipelines]
+    success = [r.metrics["pipeline_success"] for r in pipelines]
+    det_fail = [r.metrics["det_failure_rate"] for r in pipelines]
+    ocr_fail = [r.metrics["ocr_failure_given_det"] for r in pipelines]
+
+    x = np.arange(len(names))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width, success, width, label="Full Success", alpha=0.8, color="green")
+    ax.bar(x, det_fail, width, label="Detection Failure", alpha=0.8, color="red")
+    ax.bar(x + width, ocr_fail, width, label="OCR Failure (given det)", alpha=0.8, color="orange")
+
+    ax.set_xlabel("Pipeline")
+    ax.set_ylabel("Rate")
+    ax.set_title("End-to-End Pipeline Performance")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=30, ha="right")
+    ax.legend()
+    ax.set_ylim([0, 1])
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval] Pipeline bar chart → {path}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -693,6 +845,55 @@ def main():
                 print(f"    [error] {e}")
                 traceback.print_exc()
 
+    # Evaluate pipelines (detector + OCR pairings)
+    pipeline_pairings = [
+        ("fasterrcnn", "lprnet"),
+        ("rtdetr", "doctr-vitstr"),
+        ("owlvit", "trocr"),
+        ("yolo-v9-608", "cct"),
+    ]
+
+    print(f"\n[eval] Evaluating {len(pipeline_pairings)} pipelines...")
+    detector_cache = {}
+    ocr_cache = {}
+
+    for det_name, ocr_name in pipeline_pairings:
+        if det_name not in detectors or ocr_name not in ocr_models:
+            print(f"\n  {det_name}+{ocr_name}: skipped (missing model)")
+            continue
+
+        print(f"\n  {det_name} + {ocr_name}")
+        try:
+            # Load detector (cache to avoid reloading)
+            if det_name not in detector_cache:
+                det_path = resolve_checkpoint_path(det_name, finetuned_dir)
+                det_backend = build_backend(det_name, det_path, device=args.device)
+                det_backend.ensure_loaded()
+                det_backend.freeze()
+                detector_cache[det_name] = det_backend
+            else:
+                det_backend = detector_cache[det_name]
+
+            # Load OCR (cache to avoid reloading)
+            if ocr_name not in ocr_cache:
+                ocr_path = resolve_checkpoint_path(ocr_name, finetuned_dir)
+                ocr_backend = build_ocr_backend(ocr_name, ocr_path, device=args.device)
+                ocr_backend.ensure_loaded()
+                ocr_backend.freeze()
+                ocr_cache[ocr_name] = ocr_backend
+            else:
+                ocr_backend = ocr_cache[ocr_name]
+
+            # Evaluate pipeline
+            metrics = compute_pipeline_metrics(det_backend, ocr_backend, records, device=args.device)
+            pipeline_name = f"{det_name}+{ocr_name}"
+            results.append(EvalResults(pipeline_name, "pipeline", metrics))
+
+            print(f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}")
+        except Exception as e:
+            print(f"    [error] {e}")
+            traceback.print_exc()
+
     # Save results
     print(f"\n[eval] Saving results to {out_dir}")
     if results:
@@ -702,6 +903,7 @@ def main():
         plot_detector_pr_curves(results, str(out_dir / "detector_pr_curves.png"))
         plot_detector_metrics_bar(results, str(out_dir / "detector_metrics_bar.png"))
         plot_ocr_metrics_bar(results, str(out_dir / "ocr_metrics_bar.png"))
+        plot_pipeline_metrics_bar(results, str(out_dir / "pipeline_metrics_bar.png"))
         print(f"\n[eval] Done!")
         return 0
     else:
