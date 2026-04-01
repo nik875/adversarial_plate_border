@@ -1130,6 +1130,142 @@ class RTDETRBackend(DetectorBackend):
 
 
 # ---------------------------------------------------------------------------
+# OWL-ViT backend  (google/owlvit-base-patch32, fine-tuned for LP detection)
+# ---------------------------------------------------------------------------
+
+_OWLVIT_QUERY = ["a license plate"]
+
+
+class OWLViTBackend(DetectorBackend):
+    """
+    Wraps a fine-tuned OWL-ViT (google/owlvit-base-patch32) detector.
+
+    Loads from a local directory saved via model.save_pretrained() /
+    processor.save_pretrained() during finetune_all_models.py.
+
+    Uses the fixed text query "a license plate" for detection.
+    """
+
+    name = "owlvit"
+
+    def __init__(self, model_path: str, device: str = "cpu",
+                 conf_threshold: float = 0.1):
+        super().__init__(model_path, device)
+        self.conf_threshold = conf_threshold
+        self._model: Optional[nn.Module] = None
+        self._processor = None
+        self._text_inputs: Optional[dict] = None  # pre-tokenized, on device
+
+    def load(self) -> None:
+        from transformers import OwlViTProcessor, OwlViTForObjectDetection
+        model_dir = str(self.model_path)
+        self._processor = OwlViTProcessor.from_pretrained(model_dir)
+        self._model = OwlViTForObjectDetection.from_pretrained(model_dir)
+        self._model.to(self.device)
+        self._model.eval()
+        # Pre-tokenize text query once; shape [1, seq_len]
+        raw = self._processor(text=_OWLVIT_QUERY, return_tensors="pt", padding=True)
+        self._text_inputs = {k: v.to(self.device) for k, v in raw.items()}
+        print(f"[{self.name}] Loaded from {model_dir}")
+
+    def _postprocess(self, pred_boxes: torch.Tensor, logits: torch.Tensor,
+                     orig_h: int, orig_w: int) -> List[Detection]:
+        """Convert single-image model output to Detection list."""
+        # logits: [N, 1] → sigmoid → [N]
+        scores = logits.squeeze(-1).sigmoid()
+        mask = scores >= self.conf_threshold
+        scores = scores[mask]
+        boxes = pred_boxes[mask]  # [K, 4] cxcywh normalized
+
+        detections: List[Detection] = []
+        if boxes.shape[0] > 0:
+            cx, cy, bw, bh = boxes.unbind(-1)
+            x1s = ((cx - bw / 2) * orig_w).clamp(0, orig_w)
+            y1s = ((cy - bh / 2) * orig_h).clamp(0, orig_h)
+            x2s = ((cx + bw / 2) * orig_w).clamp(0, orig_w)
+            y2s = ((cy + bh / 2) * orig_h).clamp(0, orig_h)
+
+            for i in range(len(scores)):
+                score = scores[i].item()
+                x1, y1 = x1s[i].item(), y1s[i].item()
+                x2, y2 = x2s[i].item(), y2s[i].item()
+                synthetic = torch.tensor(
+                    [0.0, x1, y1, x2, y2, 0.0, score], dtype=torch.float32
+                )
+                detections.append(Detection(
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                    confidence=score, class_id=0, raw=synthetic,
+                ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections
+
+    def predict(self, image: torch.Tensor) -> List[Detection]:
+        self.ensure_loaded()
+        from PIL import Image as PILImage
+        img_np = (image.permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+        pil_img = PILImage.fromarray(img_np)
+        orig_h, orig_w = image.shape[1], image.shape[2]
+
+        pixel_values = self._processor(
+            images=pil_img, return_tensors="pt"
+        )["pixel_values"].to(self.device)
+        text = {k: v.expand(1, -1) for k, v in self._text_inputs.items()}
+
+        with torch.no_grad():
+            out = self._model(pixel_values=pixel_values, **text)
+
+        return self._postprocess(out.pred_boxes[0], out.logits[0], orig_h, orig_w)
+
+    def batch_predict(self, images: torch.Tensor) -> List[List[Detection]]:
+        self.ensure_loaded()
+        from PIL import Image as PILImage
+        B = images.shape[0]
+
+        pil_images = []
+        orig_sizes = []
+        for i in range(B):
+            img_np = (images[i].permute(1, 2, 0).detach().cpu().numpy() * 255).astype("uint8")
+            pil_images.append(PILImage.fromarray(img_np))
+            orig_sizes.append((images[i].shape[1], images[i].shape[2]))
+
+        pixel_values = self._processor(
+            images=pil_images, return_tensors="pt"
+        )["pixel_values"].to(self.device)
+        text = {k: v.expand(B, -1) for k, v in self._text_inputs.items()}
+
+        with torch.no_grad():
+            out = self._model(pixel_values=pixel_values, **text)
+
+        return [
+            self._postprocess(out.pred_boxes[i], out.logits[i], *orig_sizes[i])
+            for i in range(B)
+        ]
+
+    def freeze(self) -> None:
+        if self._model is not None:
+            for p in self._model.parameters():
+                p.requires_grad_(False)
+
+    def parameters(self) -> Iterator[nn.Parameter]:
+        if self._model is not None:
+            yield from self._model.parameters()
+
+    def eval(self) -> "OWLViTBackend":
+        if self._model is not None:
+            self._model.eval()
+        return self
+
+    def to(self, device: str) -> "OWLViTBackend":
+        self.device = device
+        if self._model is not None:
+            self._model.to(device)
+        if self._text_inputs is not None:
+            self._text_inputs = {k: v.to(device) for k, v in self._text_inputs.items()}
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Mock / stub backend  (useful for unit-testing without GPU/weights)
 # ---------------------------------------------------------------------------
 
@@ -2392,6 +2528,7 @@ TRAINABLE_REGISTRY: dict[str, type[DetectorBackend]] = {
     "fasterrcnn":  FasterRCNNBackend,        # pip install torchvision  |  weights: weights/model.pt
     "yolov11":     YOLOv11Backend,           # pip install ultralytics  |  weights: morsetechlab/yolov11-license-plate-detection (HF)
     "rtdetr":      RTDETRBackend,            # pip install transformers  |  weights: justjuu/rtdetr-v2-license-plate-detection (HF)
+    "owlvit":      OWLViTBackend,            # pip install transformers  |  weights: owlvit_finetuned/ (save_pretrained dir)
     "yolo-v9-608": Yolov9TorchBackend,       # pip install onnx open-image-models  |  auto-downloaded
 }
 
