@@ -208,7 +208,7 @@ def compute_ap(confidences: List[float], ious: List[float],
         iou_threshold: IoU threshold for positive
 
     Returns:
-        AP (area under PR curve, 11-point interpolation)
+        AP (area under PR curve, 101-point interpolation, COCO-style)
     """
     if not confidences:
         return 0.0
@@ -224,14 +224,14 @@ def compute_ap(confidences: List[float], ious: List[float],
     recall = tp_cumsum / n_images
     precision = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-8)
 
-    # 11-point interpolation
+    # 101-point interpolation (COCO-style)
     ap = 0.0
-    for t in np.linspace(0, 1, 11):
+    for t in np.linspace(0, 1, 101):
         if np.sum(recall >= t) == 0:
             p = 0
         else:
             p = np.max(precision[recall >= t])
-        ap += p / 11.0
+        ap += p / 101.0
 
     return float(ap)
 
