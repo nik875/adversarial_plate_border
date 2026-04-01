@@ -251,6 +251,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     ious_list = []
     latencies = []
     mean_iou_values = []
+    image_paths = []
 
     backend.eval()
     with torch.no_grad():
@@ -304,12 +305,13 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
                 ious_list.append(best_iou)
                 mean_iou_values.append(best_iou)
                 latencies.append(batch_time * 1000)
+                image_paths.append(str(batch_records[global_idx]["image"]))
 
             # Update progress with running metrics
             current_recall = sum(1 for iou in ious_list if iou >= 0.5) / len(ious_list) if ious_list else 0.0
             current_miou = float(np.mean(mean_iou_values)) if mean_iou_values else 0.0
-            pbar.update(len(batch_records))
             pbar.set_postfix_str(f"recall={current_recall:.3f} mIoU={current_miou:.3f}")
+            pbar.update(len(batch_records))
 
         pbar.close()
 
@@ -330,18 +332,29 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     map_50_95 = float(np.mean(ap_values))
 
     # Recall at IoU=0.5
+    n_gt = len(ious_list)
     n_detected = sum(1 for iou in ious_list if iou >= 0.5)
-    recall_50 = n_detected / len(ious_list) if ious_list else 0.0
+    recall_50 = n_detected / n_gt if n_gt else 0.0
 
     # Precision at confidence=0.5
     confident_dets = [i for i, conf in enumerate(confidences_list) if conf >= 0.5]
     correct_confident = sum(1 for i in confident_dets if ious_list[i] >= 0.5)
     precision_50 = correct_confident / len(confident_dets) if confident_dets else 0.0
 
+    # F1@0.5: best F1 from the PR curve at IoU=0.5
+    tp_arr = np.array([1 if iou >= 0.5 else 0 for iou in ious_sorted], dtype=np.float32)
+    tp_cs = np.cumsum(tp_arr)
+    fp_cs = np.cumsum(1 - tp_arr)
+    rec_curve = tp_cs / n_gt if n_gt else tp_cs
+    prec_curve = tp_cs / (tp_cs + fp_cs + 1e-8)
+    f1_curve = 2 * prec_curve * rec_curve / (prec_curve + rec_curve + 1e-8)
+    f1_50 = float(np.max(f1_curve)) if len(f1_curve) > 0 else 0.0
+
     return {
         "ap_50": ap_50,
         "ap_75": ap_75,
         "map_50_95": map_50_95,
+        "f1_50": f1_50,
         "recall_50": recall_50,
         "precision_50": precision_50,
         "mean_iou": float(np.mean(mean_iou_values)) if mean_iou_values else 0.0,
@@ -350,6 +363,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
         "n_images": len(records),
         "ious_list": ious_list,
         "confidences_list": confidences_list,
+        "image_paths": image_paths,
     }
 
 
@@ -406,6 +420,9 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
     crr_values = []
     lprr_values = []
     edit_distances = []
+    image_paths = []
+    pred_texts = []
+    gt_texts_tracked = []
 
     backend.eval()
     with torch.no_grad():
@@ -464,12 +481,15 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                 edit_distances.append(norm_edit)
 
                 latencies.append(batch_time * 1000)
+                image_paths.append(str(batch_records[global_idx]["image"]))
+                pred_texts.append(pred_text)
+                gt_texts_tracked.append(gt_text)
 
             # Update progress with running metrics
             current_lprr = float(np.mean(lprr_values)) if lprr_values else 0.0
             current_crr = float(np.mean(crr_values)) if crr_values else 0.0
-            pbar.update(len(batch_records))
             pbar.set_postfix_str(f"LPRR={current_lprr:.3f} CRR={current_crr:.3f}")
+            pbar.update(len(batch_records))
 
         pbar.close()
 
@@ -482,6 +502,10 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
         "n_plates": len(records),
         "crr_values": crr_values,
         "lprr_values": lprr_values,
+        "edit_distances": edit_distances,
+        "image_paths": image_paths,
+        "pred_texts": pred_texts,
+        "gt_texts": gt_texts_tracked,
     }
 
 
@@ -507,6 +531,10 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     n_full_successes = 0
     pipeline_latencies = []
     lprr_values = []
+    raw_image_paths = []
+    raw_gt_texts = []
+    raw_pred_texts = []
+    raw_det_ious = []
 
     detector.eval()
     ocr_backend.eval()
@@ -535,6 +563,10 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                     n_det_failures += 1
                     lprr_values.append(0.0)
                     pipeline_latencies.append(0.0)
+                    raw_image_paths.append(str(record["image"]))
+                    raw_gt_texts.append(record.get("text", ""))
+                    raw_pred_texts.append("")
+                    raw_det_ious.append(0.0)
 
             if not batch_images:
                 pbar.update(len(batch_records))
@@ -575,6 +607,10 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                     n_det_failures += 1
                     lprr_values.append(0.0)
                     pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
+                    raw_image_paths.append(str(batch_records[global_idx]["image"]))
+                    raw_gt_texts.append(gt_text)
+                    raw_pred_texts.append("")
+                    raw_det_ious.append(best_iou)
                     continue
 
                 # Successful detection: prepare for OCR
@@ -586,10 +622,18 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                     ocr_indices.append(len(lprr_values))  # where to store result
                     lprr_values.append(None)  # placeholder
                     pipeline_latencies.append(None)
+                    raw_image_paths.append(str(batch_records[global_idx]["image"]))
+                    raw_gt_texts.append(gt_text)
+                    raw_pred_texts.append(None)  # filled in after OCR
+                    raw_det_ious.append(best_iou)
                 except Exception:
                     n_ocr_failures += 1
                     lprr_values.append(0.0)
                     pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
+                    raw_image_paths.append(str(batch_records[global_idx]["image"]))
+                    raw_gt_texts.append(gt_text)
+                    raw_pred_texts.append("")
+                    raw_det_ious.append(best_iou)
 
             # Batch OCR on successful detections
             if ocr_batch_crops:
@@ -610,18 +654,21 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                         n_ocr_failures += 1
                         lprr_values[result_idx] = 0.0
 
+                    raw_pred_texts[result_idx] = pred_text
                     pipeline_latencies[result_idx] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
 
-            # Fill in None placeholders with latency
+            # Fill in None placeholders with latency and empty pred_text
             for i in range(len(lprr_values)):
                 if pipeline_latencies[i] is None:
                     pipeline_latencies[i] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
+                if raw_pred_texts[i] is None:
+                    raw_pred_texts[i] = ""
 
             # Update progress
             current_success = n_full_successes / (len(lprr_values)) if lprr_values else 0.0
             current_det_fail = n_det_failures / (len(lprr_values)) if lprr_values else 0.0
-            pbar.update(len(batch_records))
             pbar.set_postfix_str(f"success={current_success:.3f} det_fail={current_det_fail:.3f}")
+            pbar.update(len(batch_records))
 
         pbar.close()
 
@@ -641,6 +688,10 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
         "latency_mean_ms": float(np.mean(pipeline_latencies)) if pipeline_latencies else 0.0,
         "latency_p95_ms": float(np.percentile(pipeline_latencies, 95)) if pipeline_latencies else 0.0,
         "lprr_values": lprr_values,
+        "image_paths": raw_image_paths,
+        "gt_texts": raw_gt_texts,
+        "pred_texts": raw_pred_texts,
+        "det_ious": raw_det_ious,
     }
 
 
@@ -655,11 +706,15 @@ class EvalResults:
     metrics: dict
 
     def to_flat_dict(self) -> dict:
+        _LIST_KEYS = {
+            "ious_list", "confidences_list", "crr_values", "lprr_values",
+            "edit_distances", "image_paths", "pred_texts", "gt_texts", "det_ious",
+        }
         d = {
             "model": self.model_name,
             "type": self.model_type,
         }
-        d.update(self.metrics)
+        d.update({k: v for k, v in self.metrics.items() if k not in _LIST_KEYS})
         return d
 
 
@@ -692,6 +747,70 @@ def save_results_json(results: List[EvalResults], path: str) -> None:
     print(f"[eval] Full results → {path}")
 
 
+def save_raw_results_csv(results: List[EvalResults], out_dir: str) -> None:
+    """Write per-image/per-plate raw CSV files for all models."""
+    out = Path(out_dir)
+
+    for r in results:
+        m = r.metrics
+        if "image_paths" not in m:
+            continue
+
+        safe_name = r.model_name.replace("/", "_").replace("+", "_plus_")
+
+        if r.model_type == "detector":
+            path = out / f"raw_{safe_name}_detector.csv"
+            rows = [
+                {
+                    "image_path": m["image_paths"][i],
+                    "iou": m["ious_list"][i],
+                    "confidence": m["confidences_list"][i],
+                    "tp_50": int(m["ious_list"][i] >= 0.5),
+                }
+                for i in range(len(m["image_paths"]))
+            ]
+
+        elif r.model_type == "ocr":
+            path = out / f"raw_{safe_name}_ocr.csv"
+            rows = [
+                {
+                    "image_path": m["image_paths"][i],
+                    "gt_text": m["gt_texts"][i],
+                    "pred_text": m["pred_texts"][i],
+                    "crr": m["crr_values"][i],
+                    "lprr": m["lprr_values"][i],
+                    "norm_edit_distance": m["edit_distances"][i],
+                }
+                for i in range(len(m["image_paths"]))
+            ]
+
+        elif r.model_type == "pipeline":
+            path = out / f"raw_{safe_name}_pipeline.csv"
+            rows = [
+                {
+                    "image_path": m["image_paths"][i],
+                    "gt_text": m["gt_texts"][i],
+                    "pred_text": m["pred_texts"][i],
+                    "det_iou": m["det_ious"][i],
+                    "det_success": int(m["det_ious"][i] >= 0.5),
+                    "ocr_success": int(m["lprr_values"][i] == 1.0) if m["lprr_values"][i] is not None else 0,
+                    "pipeline_success": int(m["lprr_values"][i] == 1.0) if m["lprr_values"][i] is not None else 0,
+                }
+                for i in range(len(m["image_paths"]))
+            ]
+
+        else:
+            continue
+
+        if not rows:
+            continue
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"[eval] Raw results → {path}")
+
+
 def save_summary_table(results: List[EvalResults], path: str) -> None:
     """Print and save summary table in three sections: detectors, OCR, and pipeline."""
     detectors = [r for r in results if r.model_type == "detector"]
@@ -704,7 +823,7 @@ def save_summary_table(results: List[EvalResults], path: str) -> None:
         col = 12
         hdr = (
             f"{'Model':<20} {'AP@0.5':>{col}} {'AP@0.75':>{col}} "
-            f"{'mAP@0.5:0.95':>{col}} {'mIoU':>{col}} "
+            f"{'mAP@0.5:0.95':>{col}} {'F1@0.5':>{col}} {'mIoU':>{col}} "
             f"{'Latency(ms)':>{col}} {'P95(ms)':>{col}}"
         )
         sep = "─" * len(hdr)
@@ -718,6 +837,7 @@ def save_summary_table(results: List[EvalResults], path: str) -> None:
                 f"{r.metrics['ap_50']:>{col}.4f} "
                 f"{r.metrics['ap_75']:>{col}.4f} "
                 f"{r.metrics['map_50_95']:>{col}.4f} "
+                f"{r.metrics.get('f1_50', 0.0):>{col}.4f} "
                 f"{r.metrics['mean_iou']:>{col}.4f} "
                 f"{r.metrics['latency_mean_ms']:>{col}.2f} "
                 f"{r.metrics['latency_p95_ms']:>{col}.2f}"
@@ -1068,6 +1188,7 @@ def main():
     if results:
         save_results_csv(results, str(out_dir / "results.csv"))
         save_results_json(results, str(out_dir / "results.json"))
+        save_raw_results_csv(results, str(out_dir))
         save_summary_table(results, str(out_dir / "summary_table.txt"))
         plot_detector_pr_curves(results, str(out_dir / "detector_pr_curves.png"))
         plot_detector_metrics_bar(results, str(out_dir / "detector_metrics_bar.png"))
