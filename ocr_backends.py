@@ -727,6 +727,11 @@ class LPRNetBackend(OCRBackend):
     def __init__(self, model_path: str = "none", device: str = "cpu"):
         super().__init__(model_path, device)
         self._model: Optional[nn.Module] = None
+        # Set during load() based on model type:
+        #   ONNX baseline: 36 outputs, blank=35, char idx = direct
+        #   Finetuned .pt: 37 outputs, blank=0,  char idx = idx-1
+        self._blank_idx: int = self.BLANK_IDX
+        self._char_offset: int = 0  # subtract from output idx to index into ALPHABET
 
     def load(self) -> None:
         from lprnet_torch import LPRNetTorch, load_weights_from_onnx
@@ -737,11 +742,19 @@ class LPRNetBackend(OCRBackend):
                     f"LPRNet checkpoint not found: {self.model_path}"
                 )
             if self.model_path.suffix == ".pt":
+                # Finetuned model: dense head was replaced with Linear(512, 37)
+                # blank=0, chars at indices 1-36  (finetune BLANK_IDX=0, NUM_CLASSES=37)
+                old = self._model.dense
+                self._model.dense = nn.Linear(old.in_features, 37)
                 state = torch.load(str(self.model_path), map_location="cpu")
                 self._model.load_state_dict(state)
+                self._blank_idx = 0
+                self._char_offset = 1  # output idx 1 → ALPHABET[0], etc.
                 print(f"[{self.name}] Loaded finetuned weights from {self.model_path}")
             else:
                 load_weights_from_onnx(self._model, str(self.model_path))
+                self._blank_idx = self.BLANK_IDX
+                self._char_offset = 0
                 print(f"[{self.name}] Loaded weights from {self.model_path}")
         else:
             print(f"[{self.name}] No checkpoint — using random weights")
@@ -814,11 +827,13 @@ class LPRNetBackend(OCRBackend):
     def _greedy_decode(self, probs: torch.Tensor) -> tuple:
         """Greedy CTC decode on [T, C] softmax probabilities."""
         pred = probs.argmax(dim=-1)   # [T]
-        chars, confs, prev = [], [], self.BLANK_IDX
+        chars, confs, prev = [], [], self._blank_idx
         for t, idx in enumerate(pred.tolist()):
-            if idx != prev and idx != self.BLANK_IDX:
-                chars.append(self.ALPHABET[idx])
-                confs.append(probs[t, idx].item())
+            if idx != prev and idx != self._blank_idx:
+                char_idx = idx - self._char_offset
+                if 0 <= char_idx < len(self.ALPHABET):
+                    chars.append(self.ALPHABET[char_idx])
+                    confs.append(probs[t, idx].item())
             prev = idx
         if not chars:
             return None, 0.0
