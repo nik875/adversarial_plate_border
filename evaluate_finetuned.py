@@ -35,6 +35,43 @@ from ocr_backends import build_ocr_backend, OCRBackend
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Batch Size Auto-Detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_optimal_batch_size(backend: DetectorBackend, device: str, max_bs: int = 64) -> int:
+    """
+    Auto-detect optimal batch size by probing with batch=1 and scaling to free memory.
+    """
+    if not device.startswith("cuda"):
+        return min(32, max_bs)
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    try:
+        # Probe with batch size 1
+        dummy = torch.randn(1, 3, 640, 640).to(device)
+        with torch.no_grad():
+            backend.predict(dummy)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated()
+        per_sample_mem = max(1, peak - baseline)
+    except Exception:
+        return 1
+    finally:
+        torch.cuda.empty_cache()
+
+    free_after = torch.cuda.mem_get_info()[0]
+    safety = 0.70
+    uncapped = max(1, int(free_after * safety / per_sample_mem))
+    bs = min(uncapped, max_bs)
+    return max(1, bs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data Loading
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -203,8 +240,13 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
                              device: str = "cpu") -> dict:
     """
     Evaluate detector: compute AP@0.5, AP@0.75, mAP@0.5:0.95, etc.
+    Processes records in batches with auto-detected batch size and running metrics.
     """
     transform = T.ToTensor()
+
+    # Auto-detect batch size
+    batch_size = find_optimal_batch_size(backend, device, max_bs=64)
+
     confidences_list = []
     ious_list = []
     latencies = []
@@ -212,33 +254,67 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
 
     backend.eval()
     with torch.no_grad():
-        for record in tqdm(records, desc=f"  {backend.name}", leave=False):
-            try:
-                img = Image.open(record["image"]).convert("RGB")
-            except Exception as e:
-                print(f"[warn] could not load {record['filename']}: {e}")
+        pbar = tqdm(total=len(records), desc=f"  {backend.name}", leave=False)
+
+        for batch_idx in range(0, len(records), batch_size):
+            batch_records = records[batch_idx:batch_idx + batch_size]
+
+            # Load batch
+            batch_images = []
+            batch_boxes = []
+            valid_indices = []
+
+            for i, record in enumerate(batch_records):
+                try:
+                    img = Image.open(record["image"]).convert("RGB")
+                    batch_images.append(transform(img))
+                    batch_boxes.append(record["box"])
+                    valid_indices.append(i)
+                except Exception:
+                    pass
+
+            if not batch_images:
+                pbar.update(len(batch_records))
                 continue
 
-            img_tensor = transform(img).to(device)
-            gt_box = record["box"].to(device)
+            # Stack and move to device
+            batch_tensor = torch.stack(batch_images).to(device)
+            gt_boxes = torch.stack(batch_boxes).to(device)
 
+            # Forward pass
             t0 = time.perf_counter()
-            dets = backend.predict(img_tensor)
-            latency_ms = (time.perf_counter() - t0) * 1000
-            latencies.append(latency_ms)
+            batch_dets = []
+            for img_tensor in batch_tensor:
+                dets = backend.predict(img_tensor)
+                batch_dets.append(dets)
+            batch_time = (time.perf_counter() - t0) / len(batch_tensor)
 
-            # Find best detection by IoU
-            best_iou = 0.0
-            best_conf = 0.0
-            for det in dets:
-                iou = _iou(det.box, gt_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_conf = det.confidence
+            # Process detections
+            for local_idx, global_idx in enumerate(valid_indices):
+                dets = batch_dets[local_idx]
+                gt_box = gt_boxes[local_idx]
 
-            confidences_list.append(best_conf)
-            ious_list.append(best_iou)
-            mean_iou_values.append(best_iou)
+                # Find best detection by IoU
+                best_iou = 0.0
+                best_conf = 0.0
+                for det in dets:
+                    iou = _iou(det.box, gt_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_conf = det.confidence
+
+                confidences_list.append(best_conf)
+                ious_list.append(best_iou)
+                mean_iou_values.append(best_iou)
+                latencies.append(batch_time * 1000)
+
+            # Update progress with running metrics
+            current_recall = sum(1 for iou in ious_list if iou >= 0.5) / len(ious_list) if ious_list else 0.0
+            current_miou = float(np.mean(mean_iou_values)) if mean_iou_values else 0.0
+            pbar.update(len(batch_records))
+            pbar.set_postfix_str(f"recall={current_recall:.3f} mIoU={current_miou:.3f}")
+
+        pbar.close()
 
     # Sort by confidence
     sorted_idx = np.argsort(-np.array(confidences_list))
@@ -322,8 +398,13 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                         device: str = "cpu") -> dict:
     """
     Evaluate OCR: compute CRR, LPRR, edit distance.
+    Processes records in batches with auto-detected batch size and running metrics.
     """
     transform = T.ToTensor()
+
+    # Auto-detect batch size (for OCR, smaller batches usually needed)
+    batch_size = max(1, min(32, find_optimal_batch_size(backend, device, max_bs=64)))
+
     latencies = []
     crr_values = []
     lprr_values = []
@@ -331,42 +412,72 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
 
     backend.eval()
     with torch.no_grad():
-        for record in tqdm(records, desc=f"  {backend.name}", leave=False):
-            try:
-                img = Image.open(record["image"]).convert("RGB")
-            except Exception as e:
-                print(f"[warn] could not load {record['filename']}: {e}")
+        pbar = tqdm(total=len(records), desc=f"  {backend.name}", leave=False)
+
+        for batch_idx in range(0, len(records), batch_size):
+            batch_records = records[batch_idx:batch_idx + batch_size]
+
+            # Load and crop batch
+            batch_crops = []
+            batch_gts = []
+            valid_indices = []
+
+            for i, record in enumerate(batch_records):
+                try:
+                    img = Image.open(record["image"]).convert("RGB")
+                    x1, y1, x2, y2 = [int(v) for v in record["box"].tolist()]
+                    img_crop = img.crop((x1, y1, x2, y2))
+                    batch_crops.append(transform(img_crop))
+                    batch_gts.append(record["text"])
+                    valid_indices.append(i)
+                except Exception:
+                    pass
+
+            if not batch_crops:
+                pbar.update(len(batch_records))
                 continue
 
-            # Crop to GT box
-            x1, y1, x2, y2 = [int(v) for v in record["box"].tolist()]
-            img_crop = img.crop((x1, y1, x2, y2))
+            # Stack and move to device
+            batch_tensor = torch.stack(batch_crops).to(device)
 
-            # Convert to tensor (model will handle resize)
-            crop_tensor = transform(img_crop).to(device)
-
-            gt_text = record["text"]
-
+            # Forward pass
             t0 = time.perf_counter()
-            ocr_result = backend.predict(crop_tensor)
-            latency_ms = (time.perf_counter() - t0) * 1000
-            latencies.append(latency_ms)
+            batch_ocr = []
+            for crop_tensor in batch_tensor:
+                ocr_result = backend.predict(crop_tensor)
+                batch_ocr.append(ocr_result)
+            batch_time = (time.perf_counter() - t0) / len(batch_tensor)
 
-            pred_text = ocr_result.text.strip().upper()
+            # Process OCR results
+            for local_idx, global_idx in enumerate(valid_indices):
+                ocr_result = batch_ocr[local_idx]
+                gt_text = batch_gts[global_idx]
 
-            # LPRR: exact match
-            lprr = 1.0 if pred_text == gt_text else 0.0
-            lprr_values.append(lprr)
+                pred_text = ocr_result.text.strip().upper()
 
-            # CRR: character-level accuracy
-            crr = _compute_char_error_rate(pred_text, gt_text)
-            crr_values.append(crr)
+                # LPRR: exact match
+                lprr = 1.0 if pred_text == gt_text else 0.0
+                lprr_values.append(lprr)
 
-            # Edit distance (normalized)
-            edit_dist = _levenshtein_distance(pred_text, gt_text)
-            max_len = max(len(pred_text), len(gt_text))
-            norm_edit = edit_dist / max_len if max_len > 0 else 0.0
-            edit_distances.append(norm_edit)
+                # CRR: character-level accuracy
+                crr = _compute_char_error_rate(pred_text, gt_text)
+                crr_values.append(crr)
+
+                # Edit distance (normalized)
+                edit_dist = _levenshtein_distance(pred_text, gt_text)
+                max_len = max(len(pred_text), len(gt_text))
+                norm_edit = edit_dist / max_len if max_len > 0 else 0.0
+                edit_distances.append(norm_edit)
+
+                latencies.append(batch_time * 1000)
+
+            # Update progress with running metrics
+            current_lprr = float(np.mean(lprr_values)) if lprr_values else 0.0
+            current_crr = float(np.mean(crr_values)) if crr_values else 0.0
+            pbar.update(len(batch_records))
+            pbar.set_postfix_str(f"LPRR={current_lprr:.3f} CRR={current_crr:.3f}")
+
+        pbar.close()
 
     return {
         "crr": float(np.mean(crr_values)) if crr_values else 0.0,
@@ -387,7 +498,7 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
 def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                              records: List[dict], device: str = "cpu") -> dict:
     """
-    Evaluate detector + OCR pipeline end-to-end.
+    Evaluate detector + OCR pipeline end-to-end (batched).
 
     For each image:
     1. Run detector to find plate
@@ -395,6 +506,8 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     3. Track: detection failures, OCR failures (given good detection), full successes
     """
     transform = T.ToTensor()
+    batch_size = find_optimal_batch_size(detector, device, max_bs=64)
+
     n_det_failures = 0
     n_ocr_failures = 0  # given good detection
     n_full_successes = 0
@@ -405,56 +518,124 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     ocr_backend.eval()
 
     with torch.no_grad():
-        for record in tqdm(records, desc=f"  {detector.name} + {ocr_backend.name}", leave=False):
-            try:
-                img = Image.open(record["image"]).convert("RGB")
-            except Exception:
-                n_det_failures += 1
+        pbar = tqdm(total=len(records), desc=f"  {detector.name} + {ocr_backend.name}", leave=False)
+
+        for batch_idx in range(0, len(records), batch_size):
+            batch_records = records[batch_idx:batch_idx + batch_size]
+            batch_start = time.perf_counter()
+
+            # Load images
+            batch_images = []
+            batch_boxes = []
+            batch_gts = []
+            valid_indices = []
+
+            for i, record in enumerate(batch_records):
+                try:
+                    img = Image.open(record["image"]).convert("RGB")
+                    batch_images.append((img, transform(img)))
+                    batch_boxes.append(record["box"])
+                    batch_gts.append(record["text"])
+                    valid_indices.append(i)
+                except Exception:
+                    n_det_failures += 1
+                    lprr_values.append(0.0)
+                    pipeline_latencies.append(0.0)
+
+            if not batch_images:
+                pbar.update(len(batch_records))
                 continue
 
-            img_tensor = transform(img).to(device)
-            gt_box = record["box"].to(device)
-            gt_text = record["text"]
+            # Stack tensors for detection
+            img_tensors = [t for _, t in batch_images]
+            batch_tensor = torch.stack(img_tensors).to(device)
+            gt_boxes = torch.stack(batch_boxes).to(device)
+            imgs = [img for img, _ in batch_images]
 
+            # Batch detect
             t0 = time.perf_counter()
+            batch_dets = []
+            for img_tensor in batch_tensor:
+                dets = detector.predict(img_tensor)
+                batch_dets.append(dets)
 
-            # Step 1: Detect
-            dets = detector.predict(img_tensor)
-            best_iou = 0.0
-            best_det_box = None
-            for det in dets:
-                iou = _iou(det.box, gt_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_det_box = det.box
+            # Process detections and filter for OCR
+            ocr_batch_crops = []
+            ocr_batch_gts = []
+            ocr_indices = []  # maps back to original batch
 
-            # Detection failure
-            if best_iou < 0.5:
-                n_det_failures += 1
-                pipeline_latencies.append((time.perf_counter() - t0) * 1000)
-                lprr_values.append(0.0)
-                continue
+            for local_idx, global_idx in enumerate(valid_indices):
+                dets = batch_dets[local_idx]
+                gt_box = gt_boxes[local_idx]
+                gt_text = batch_gts[global_idx]
+                img = imgs[local_idx]
 
-            # Step 2: OCR on detected box
-            try:
-                x1, y1, x2, y2 = [int(v) for v in best_det_box.tolist()]
-                img_crop = img.crop((x1, y1, x2, y2))
-                crop_tensor = transform(img_crop).to(device)
-                ocr_result = ocr_backend.predict(crop_tensor)
-                pred_text = ocr_result.text.strip().upper()
+                # Find best detection by IoU
+                best_iou = 0.0
+                best_det_box = None
+                for det in dets:
+                    iou = _iou(det.box, gt_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_det_box = det.box
 
-                # Full pipeline success
-                if pred_text == gt_text:
-                    n_full_successes += 1
-                    lprr_values.append(1.0)
-                else:
+                # Detection failure
+                if best_iou < 0.5:
+                    n_det_failures += 1
+                    lprr_values.append(0.0)
+                    pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
+                    continue
+
+                # Successful detection: prepare for OCR
+                try:
+                    x1, y1, x2, y2 = [int(v) for v in best_det_box.tolist()]
+                    img_crop = img.crop((x1, y1, x2, y2))
+                    ocr_batch_crops.append(transform(img_crop))
+                    ocr_batch_gts.append(gt_text)
+                    ocr_indices.append(len(lprr_values))  # where to store result
+                    lprr_values.append(None)  # placeholder
+                    pipeline_latencies.append(None)
+                except Exception:
                     n_ocr_failures += 1
                     lprr_values.append(0.0)
-            except Exception:
-                n_ocr_failures += 1
-                lprr_values.append(0.0)
+                    pipeline_latencies.append((time.perf_counter() - t0) / len(valid_indices) * 1000)
 
-            pipeline_latencies.append((time.perf_counter() - t0) * 1000)
+            # Batch OCR on successful detections
+            if ocr_batch_crops:
+                batch_crops = torch.stack(ocr_batch_crops).to(device)
+                ocr_start = time.perf_counter()
+                batch_ocr = []
+                for crop_tensor in batch_crops:
+                    ocr_result = ocr_backend.predict(crop_tensor)
+                    batch_ocr.append(ocr_result)
+                ocr_time = (time.perf_counter() - ocr_start) / len(batch_ocr)
+
+                # Process OCR results
+                for ocr_idx, (ocr_result, gt_text) in enumerate(zip(batch_ocr, ocr_batch_gts)):
+                    pred_text = ocr_result.text.strip().upper()
+                    result_idx = ocr_indices[ocr_idx]
+
+                    if pred_text == gt_text:
+                        n_full_successes += 1
+                        lprr_values[result_idx] = 1.0
+                    else:
+                        n_ocr_failures += 1
+                        lprr_values[result_idx] = 0.0
+
+                    pipeline_latencies[result_idx] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
+
+            # Fill in None placeholders with latency
+            for i in range(len(lprr_values)):
+                if pipeline_latencies[i] is None:
+                    pipeline_latencies[i] = (time.perf_counter() - batch_start) / len(batch_records) * 1000
+
+            # Update progress
+            current_success = n_full_successes / (len(lprr_values)) if lprr_values else 0.0
+            current_det_fail = n_det_failures / (len(lprr_values)) if lprr_values else 0.0
+            pbar.update(len(batch_records))
+            pbar.set_postfix_str(f"success={current_success:.3f} det_fail={current_det_fail:.3f}")
+
+        pbar.close()
 
     n_images = len(records)
     pipeline_success_rate = n_full_successes / n_images if n_images > 0 else 0.0
