@@ -2283,9 +2283,9 @@ class AdversarialPatchTrainer:
 
         # ── Cap eval_batch_size for ≥10 000 total updates ─────────────
         # Skipped when --eval-batch-size was explicitly set by the user.
+        _imgs_per_epoch = len(shared_loader)
         if not self._eval_batch_size_fixed:
             _update_every_cap = (self.grad_accumulate or 1)
-            _imgs_per_epoch   = len(shared_loader)
             _max_bs = max(1, num_epochs * _imgs_per_epoch // (10_000 * _update_every_cap))
             if B > _max_bs:
                 print(f"[auto-batch] capping eval_batch_size {B} → {_max_bs} "
