@@ -141,70 +141,6 @@ def _corners_resize(corners: np.ndarray, sx: float, sy: float) -> np.ndarray:
 PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
 
-# Probability that each augmentation transform is applied on a given call.
-AUG_PROB = 1 / 3
-
-
-def augment_plate(image: torch.Tensor, device: str) -> torch.Tensor:
-    """
-    Differentiable photometric augmentation for the canonical plate+border region.
-
-    Each transform is applied independently with probability AUG_PROB so that
-    the number and type of transforms varies per sample.  All ops are pure
-    tensor arithmetic — the autograd graph from loss to patch decoder is fully
-    preserved.
-
-    Transforms (each applied with probability AUG_PROB):
-      1. Brightness       — U(0.5, 1.5) multiplicative scale
-      2. Contrast         — U(0.7, 1.3) scale around channel mean
-      3. Saturation       — U(0.5, 1.5) via kornia
-      4. Color temperature — U(-0.2, 0.2) shift; warm (+) boosts R/reduces B,
-                             cool (-) does the opposite
-      5. Directional shadow — angle U(0°, 360°), intensity U(0.1, 0.4),
-                              linear gradient mask
-
-    Parameters
-    ----------
-    image  : [1, C, H, W] float32 in [0, 1]
-    device : torch device string (must match image.device)
-    """
-    if random.random() < AUG_PROB:
-        factor = random.uniform(0.5, 1.5)
-        image  = image * factor
-
-    if random.random() < AUG_PROB:
-        factor = random.uniform(0.7, 1.3)
-        mean   = image.mean()
-        image  = (image - mean) * factor + mean
-
-    if random.random() < AUG_PROB:
-        factor = random.uniform(0.5, 1.5)
-        image  = kornia.enhance.adjust_saturation(image, factor)
-
-    if random.random() < AUG_PROB:
-        shift      = random.uniform(-0.2, 0.2)
-        temp_scale = torch.tensor(
-            [1.0 + shift * 0.3, 1.0, 1.0 - shift * 0.3],
-            dtype=image.dtype, device=device,
-        ).view(1, 3, 1, 1)
-        image = image * temp_scale
-
-    if random.random() < AUG_PROB:
-        angle_deg = random.uniform(0.0, 360.0)
-        intensity = random.uniform(0.1, 0.4)
-        H, W      = image.shape[-2], image.shape[-1]
-        xs        = torch.linspace(0.0, 1.0, W, device=device)
-        ys        = torch.linspace(0.0, 1.0, H, device=device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        cos_a     = float(np.cos(np.radians(angle_deg)))
-        sin_a     = float(np.sin(np.radians(angle_deg)))
-        gradient  = grid_x * cos_a + grid_y * sin_a
-        gradient  = (gradient - gradient.min()) / (gradient.max() - gradient.min() + 1e-6)
-        shadow    = 1.0 - gradient * intensity
-        image     = image * shadow.unsqueeze(0).unsqueeze(0)
-
-    return torch.clamp(image, 0.0, 1.0)
-
 
 def _bbox_ocr_crop_diff(
     img: torch.Tensor,                      # [1, C, H, W]
@@ -837,8 +773,6 @@ class AdversarialPatchTrainer:
         M_plate  = K.get_perspective_transform(src, plate.unsqueeze(0))
 
         patch_batch = patch_norm.unsqueeze(0).repeat(B, 1, 1, 1)
-        if augment:
-            patch_batch = self._augment_image(patch_batch)
 
         # Brightness correction: scale patch to match the plate region's mean
         # brightness, so it doesn't stand out against different lighting conditions.
@@ -855,6 +789,48 @@ class AdversarialPatchTrainer:
                     patch_brightness = patch_batch.mean().clamp(min=1e-6)
                     brightness_scale = (plate_brightness / patch_brightness).clamp(0.2, 5.0)
                     patch_batch = patch_batch * brightness_scale
+
+        # ── Impersonation-region occlusion in patch space ────────────────
+        # Randomly zero out square regions of patch_batch inside the IZ
+        # footprint *before* warping. Prevents the patch from trivially
+        # winning by painting a realistic-looking fake plate in the IZ.
+        # Applied per-sample so each item in the batch gets a different
+        # random occlusion pattern.
+        if augment and self.top_extend:
+            M_inv  = torch.linalg.inv(M_border[0])                            # [3, 3]
+            iz_img = self._top_extend_region_corners(plate)                    # [4, 2] image-space
+            iz_h   = torch.cat([iz_img,
+                                 torch.ones(4, 1, device=self.device)], 1)     # [4, 3]
+            iz_p_h = M_inv @ iz_h.T                                            # [3, 4]
+            iz_p   = (iz_p_h[:2] / iz_p_h[2]).T                               # [4, 2] patch-space
+
+            # Axis-aligned bbox of the (possibly skewed) IZ quad in patch space
+            px1 = float(iz_p[:, 0].min().clamp(0, pw))
+            py1 = float(iz_p[:, 1].min().clamp(0, ph))
+            px2 = float(iz_p[:, 0].max().clamp(0, pw))
+            py2 = float(iz_p[:, 1].max().clamp(0, ph))
+            sq  = (py2 - py1) / 3.0                  # square side = 1/3 IZ height
+
+            # Center range: keep the entire square strictly inside the bbox
+            cx_lo, cx_hi = px1 + sq / 2.0, px2 - sq / 2.0
+            cy_lo, cy_hi = py1 + sq / 2.0, py2 - sq / 2.0
+
+            if cx_hi > cx_lo and cy_hi > cy_lo:
+                occ_mask = torch.ones_like(patch_batch)   # constant, no grad
+                for b in range(B):
+                    # n ~ 1 + Geometric(p=0.5): always at least 1, P(n=1)=0.5, P(n=2)=0.25, …
+                    n = 1
+                    while random.random() < 0.5:
+                        n += 1
+                    for _ in range(n):
+                        cx = random.uniform(cx_lo, cx_hi)
+                        cy = random.uniform(cy_lo, cy_hi)
+                        lx = max(0,  int(round(cx - sq / 2.0)))
+                        rx = min(pw, int(round(cx + sq / 2.0)))
+                        ly = max(0,  int(round(cy - sq / 2.0)))
+                        ry = min(ph, int(round(cy + sq / 2.0)))
+                        occ_mask[b, :, ly:ry, lx:rx] = 0.0
+                patch_batch = patch_batch * occ_mask      # differentiable; grad=0 in masked pixels
 
         ones = torch.ones(B, 1, ph, pw, device=self.device)
 
@@ -886,9 +862,6 @@ class AdversarialPatchTrainer:
         tv_v = (patch[:, 1:, :] - patch[:, :-1, :]).pow(2).sum()
         num_comparisons = C * (H * (W - 1) + (H - 1) * W)
         return (tv_h + tv_v) / num_comparisons
-
-    def _augment_image(self, image: torch.Tensor) -> torch.Tensor:
-        return augment_plate(image, self.device)
 
     def _prepare_batch(self, raw_items: list, patch_norm: torch.Tensor,
                        augment: Optional[bool] = None) -> list:
@@ -1392,7 +1365,7 @@ class AdversarialPatchTrainer:
             img_plate_text = (batch.get("label", [None])[0]) or self.expected_plate_text
             is_correct = self._plate_text_matches(text, img_plate_text)
 
-            vis = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
+            vis = cv2.cvtColor((prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
             # (a) preprocessed image + detected bbox (red) + OCR label
             if detections:
@@ -1412,7 +1385,7 @@ class AdversarialPatchTrainer:
                         self._shrink_for_save(vis))
 
             # (b) raw OCR crop
-            crop_np = (crop.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            crop_np = cv2.cvtColor((crop.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_b_ocr_crop.png"), crop_np)
 
             # (c) random patch applied with geometry annotations:
@@ -1429,7 +1402,7 @@ class AdversarialPatchTrainer:
                     patch_norm=rand_patch,
                 )
                 patched_prep, _ = self.diff_prep(patched_orig.squeeze(0), orig_corners_np)
-            patch_vis = (patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8).copy()
+            patch_vis = cv2.cvtColor((patched_prep.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
             def _draw_quad(img, corners_t, color):
                 pts = corners_t.detach().cpu().numpy().astype(np.int32).reshape(-1, 1, 2)
@@ -1457,12 +1430,108 @@ class AdversarialPatchTrainer:
             cv2.imwrite(str(debug_dir / f"{img_idx:02d}_c_random_patch.png"),
                         self._shrink_for_save(patch_vis))
 
+            # (e) IZ occlusion debug — only meaningful when top_extend is on
+            # Left panel:  random patch in patch-pixel space, IZ bbox in yellow (before masking)
+            # Right panel: same patch with black squares applied in patch space
+            # _f image:    the masked patch warped onto the preprocessed image
+            if self.top_extend:
+                with torch.no_grad():
+                    _ph, _pw = self.patch_height, self.patch_width
+
+                    # Fresh random patch for this visualisation
+                    _rand_seed_e  = torch.randn_like(self.seed)
+                    _rand_patch_e = self.decoder(_rand_seed_e).squeeze(0)      # [3, ph, pw]
+
+                    # Replicate M_border computation using orig_corners (as apply_patch_to_image does)
+                    _plate_e  = orig_corners                                    # [4, 2]
+                    _cx_e     = _plate_e[:, 0].mean()
+                    _cy_e     = _plate_e[:, 1].mean()
+                    _ctr_e    = torch.tensor([_cx_e, _cy_e], device=self.device)
+                    _cl_e     = _plate_e[0] - _plate_e[3]
+                    _cr_e     = _plate_e[1] - _plate_e[2]
+                    _p1b_e    = _ctr_e + (_plate_e[0] - _ctr_e) * 1.4
+                    _p2b_e    = _ctr_e + (_plate_e[1] - _ctr_e) * 1.4
+                    _p3b_e    = _ctr_e + (_plate_e[2] - _ctr_e) * 1.4
+                    _p4b_e    = _ctr_e + (_plate_e[3] - _ctr_e) * 1.4
+                    _border_e = torch.stack([
+                        _p1b_e + 1.4 * _cl_e, _p2b_e + 1.4 * _cr_e,
+                        _p3b_e, _p4b_e,
+                    ]).unsqueeze(0)                                             # [1, 4, 2]
+                    _src_e = torch.tensor(
+                        [[0, 0], [_pw, 0], [_pw, _ph], [0, _ph]],
+                        dtype=torch.float32, device=self.device,
+                    ).unsqueeze(0)
+                    _M_border_e = K.get_perspective_transform(_src_e, _border_e)  # [1, 3, 3]
+                    _M_inv_e    = torch.linalg.inv(_M_border_e[0])                # [3, 3]
+
+                    # IZ corners → patch space
+                    _iz_img_e = self._top_extend_region_corners(_plate_e)          # [4, 2]
+                    _iz_h_e   = torch.cat(
+                        [_iz_img_e, torch.ones(4, 1, device=self.device)], 1)     # [4, 3]
+                    _iz_p_h_e = _M_inv_e @ _iz_h_e.T                              # [3, 4]
+                    _iz_p_e   = (_iz_p_h_e[:2] / _iz_p_h_e[2]).T                 # [4, 2]
+
+                    _ipx1 = float(_iz_p_e[:, 0].min().clamp(0, _pw))
+                    _ipy1 = float(_iz_p_e[:, 1].min().clamp(0, _ph))
+                    _ipx2 = float(_iz_p_e[:, 0].max().clamp(0, _pw))
+                    _ipy2 = float(_iz_p_e[:, 1].max().clamp(0, _ph))
+                    _sq_e = (_ipy2 - _ipy1) / 3.0
+
+                    _cx_lo_e = _ipx1 + _sq_e / 2.0
+                    _cx_hi_e = _ipx2 - _sq_e / 2.0
+                    _cy_lo_e = _ipy1 + _sq_e / 2.0
+                    _cy_hi_e = _ipy2 - _sq_e / 2.0
+
+                    # Build one sample's random mask (for the debug visualisation)
+                    _mask_e = torch.ones(3, _ph, _pw, device=self.device)
+                    if _cx_hi_e > _cx_lo_e and _cy_hi_e > _cy_lo_e:
+                        _n_e = 1
+                        while random.random() < 0.5:
+                            _n_e += 1
+                        for _ in range(_n_e):
+                            _cxr = random.uniform(_cx_lo_e, _cx_hi_e)
+                            _cyr = random.uniform(_cy_lo_e, _cy_hi_e)
+                            _lx_e = max(0,   int(round(_cxr - _sq_e / 2.0)))
+                            _rx_e = min(_pw, int(round(_cxr + _sq_e / 2.0)))
+                            _ly_e = max(0,   int(round(_cyr - _sq_e / 2.0)))
+                            _ry_e = min(_ph, int(round(_cyr + _sq_e / 2.0)))
+                            _mask_e[:, _ly_e:_ry_e, _lx_e:_rx_e] = 0.0
+                    _masked_patch_e = _rand_patch_e * _mask_e
+
+                    # Patch-space side-by-side: left=unmasked, right=masked
+                    # IZ axis-aligned bbox drawn in yellow on both panels
+                    _p_np_e  = cv2.cvtColor((_rand_patch_e.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    _pm_np_e = cv2.cvtColor((_masked_patch_e.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    _iz_box  = np.array([
+                        [int(_ipx1), int(_ipy1)], [int(_ipx2), int(_ipy1)],
+                        [int(_ipx2), int(_ipy2)], [int(_ipx1), int(_ipy2)],
+                    ], np.int32)
+                    cv2.polylines(_p_np_e,  [_iz_box.reshape(-1, 1, 2)], True, (0, 255, 255), 2)
+                    cv2.polylines(_pm_np_e, [_iz_box.reshape(-1, 1, 2)], True, (0, 255, 255), 2)
+                    cv2.imwrite(
+                        str(debug_dir / f"{img_idx:02d}_e_patch_patchspace.png"),
+                        np.concatenate([_p_np_e, _pm_np_e], axis=1),
+                    )
+
+                    # Warp the pre-masked patch onto the image and annotate quads
+                    _patched_m, _ = self.apply_patch_to_image(
+                        orig_tensor.unsqueeze(0), orig_corners.unsqueeze(0),
+                        patch_norm=_masked_patch_e, augment=False,
+                    )
+                    _prep_m, _ = self.diff_prep(_patched_m.squeeze(0), orig_corners_np)
+                    _vis_m = cv2.cvtColor((_prep_m.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    _draw_quad(_vis_m, new_corners, (0, 255, 0))
+                    _draw_quad(_vis_m, _border_corners, (0, 255, 255))
+                    _draw_quad(_vis_m, self._top_extend_region_corners(new_corners), (0, 0, 255))
+                    cv2.imwrite(str(debug_dir / f"{img_idx:02d}_f_masked_on_image.png"),
+                                self._shrink_for_save(_vis_m))
+
             # (d) cv2 preprocessing vs differentiable preprocessing comparison
             with torch.no_grad():
                 img_hwc_uint8 = (orig_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                 cv2_prep_t, _ = self._cv2_prep(img_hwc_uint8, orig_corners_np)
-                diff_prep_np  = (prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                cv2_prep_np   = (cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                diff_prep_np  = cv2.cvtColor((prep_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                cv2_prep_np   = cv2.cvtColor((cv2_prep_t.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
                 comparison = np.concatenate([cv2_prep_np, diff_prep_np], axis=1)
                 cv2.imwrite(str(debug_dir / f"{img_idx:02d}_d_prep_comparison.png"),
                             self._shrink_for_save(comparison))
@@ -2703,19 +2772,46 @@ def main():
     if args.ocr_model_path is None:
         args.ocr_model_path = "none"
 
-    backend = build_backend(args.backend, args.model_path, device=args.device)
-    backend.load()
+    if args.dry_run:
+        # Lightweight stubs — no weights loaded, no GPU required.
+        # save_debug_images() only needs predict() / ocr_crop_size; stubs
+        # return empty/null results so the patch/geometry images still render.
+        class _StubDetector(DetectorBackend):
+            name = "stub"
+            def load(self): pass
+            def predict(self, image): return []
+            def parameters(self): return iter([])
+            def eval(self): return self
+            def train(self, mode=True): return self
+            def freeze(self): pass
 
-    ocr_kwargs = {}
-    if args.ocr_backend == "dtrb":
-        if args.ocr_repo_root:
-            ocr_kwargs["dtrb_root"] = args.ocr_repo_root
-        ocr_kwargs["feature_extraction"] = args.dtrb_feature_extraction
-        ocr_kwargs["sequence_modeling"]  = args.dtrb_sequence_modeling
-        ocr_kwargs["transformation"]     = args.dtrb_transformation
-    ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path,
-                             device=args.device, **ocr_kwargs)
-    ocr.load()
+        class _StubOCR(OCRBackend):
+            name        = "stub"
+            is_trainable = False
+            ocr_crop_size = (32, 128)
+            def load(self): pass
+            def predict(self, image): return OCRResult(logits=None, text=None, confidence=0.0)
+            def parameters(self): return iter([])
+            def differentiable_loss_batch(self, *a, **kw): return []
+
+        backend = _StubDetector("none", device=args.device)
+        ocr     = _StubOCR("none",     device=args.device)
+        args.skip_sanity = True
+        print("Dry run: using stub detector/OCR (no model weights loaded).")
+    else:
+        backend = build_backend(args.backend, args.model_path, device=args.device)
+        backend.load()
+
+        ocr_kwargs = {}
+        if args.ocr_backend == "dtrb":
+            if args.ocr_repo_root:
+                ocr_kwargs["dtrb_root"] = args.ocr_repo_root
+            ocr_kwargs["feature_extraction"] = args.dtrb_feature_extraction
+            ocr_kwargs["sequence_modeling"]  = args.dtrb_sequence_modeling
+            ocr_kwargs["transformation"]     = args.dtrb_transformation
+        ocr = build_ocr_backend(args.ocr_backend, args.ocr_model_path,
+                                 device=args.device, **ocr_kwargs)
+        ocr.load()
 
     # sam_m auto-detection is deferred to train() where eval_batch_size is already known.
     _sam_m_auto = (args.sam_m is None)
