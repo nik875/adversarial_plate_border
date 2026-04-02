@@ -341,7 +341,7 @@ class AdversarialPatchTrainer:
         tv_weight:            float          = 10.0,
         det_loss_weight:      float          = 0.0,
         disable_disruption:   bool           = False,
-        eval_batch_size:      int            = 1,
+        eval_batch_size:      Optional[int]  = None,
         sam_m:                Optional[int]  = None,
         sam_m_auto:           bool           = False,
         sam_rho:              float          = 0.025,
@@ -356,7 +356,8 @@ class AdversarialPatchTrainer:
         self.tv_weight            = tv_weight
         self.det_loss_weight      = det_loss_weight
         self.disable_disruption   = disable_disruption
-        self.eval_batch_size      = eval_batch_size
+        self._eval_batch_size_fixed = eval_batch_size is not None
+        self.eval_batch_size        = eval_batch_size if eval_batch_size is not None else 1
         self.sam_m                = sam_m
         self._sam_m_auto          = sam_m_auto and (sam_m is None)
         self.sam_rho              = sam_rho
@@ -1229,8 +1230,8 @@ class AdversarialPatchTrainer:
             raise RuntimeError("No training data found for sanity check.")
         items_raw = [{k: v[0] for k, v in first_batch.items()}]
 
-        # Auto-detect batch size when using the default of 1.
-        if B == 1:
+        # Auto-detect batch size when not explicitly set by the user.
+        if B == 1 and not self._eval_batch_size_fixed:
             self.detector.train_mode()
             self.ocr.train()
             try:
@@ -2024,13 +2025,15 @@ class AdversarialPatchTrainer:
 
         eta_min       = lr_min
 
-        # Cap eval_batch_size so total gradient updates >= 10 000.
-        _update_every_cap = self.grad_accumulate or len(self.train_loader)
-        _max_bs = max(1, num_epochs * len(self.train_loader) // (10_000 * _update_every_cap))
-        if self.eval_batch_size > _max_bs:
-            print(f"[auto-batch] capping eval_batch_size {self.eval_batch_size} → {_max_bs} "
-                  f"to ensure ≥10 000 total updates")
-            self.eval_batch_size = _max_bs
+        # Cap eval_batch_size so total gradient updates >= 10 000 (skipped when
+        # --eval-batch-size was explicitly specified by the user).
+        if not self._eval_batch_size_fixed:
+            _update_every_cap = self.grad_accumulate or len(self.train_loader)
+            _max_bs = max(1, num_epochs * len(self.train_loader) // (10_000 * _update_every_cap))
+            if self.eval_batch_size > _max_bs:
+                print(f"[auto-batch] capping eval_batch_size {self.eval_batch_size} → {_max_bs} "
+                      f"to ensure ≥10 000 total updates")
+                self.eval_batch_size = _max_bs
 
         # Resolve auto sam_m now that eval_batch_size is known (probed in sanity check).
         if self._sam_m_auto:
@@ -2261,7 +2264,8 @@ class AdversarialPatchTrainer:
         shared_loader = self._make_pipeline_loader()
 
         # ── Probe batch size per pipeline → take min ──────────────────
-        if self.device.startswith("cuda"):
+        # Skipped when --eval-batch-size was explicitly set by the user.
+        if not self._eval_batch_size_fixed and self.device.startswith("cuda"):
             probe_raw = {k: v[0] for k, v in next(iter(shared_loader)).items()}
             sizes = []
             for det, ocr in active_pipelines:
@@ -2278,14 +2282,16 @@ class AdversarialPatchTrainer:
             B = self.eval_batch_size
 
         # ── Cap eval_batch_size for ≥10 000 total updates ─────────────
-        _update_every_cap = (self.grad_accumulate or 1)
-        _imgs_per_epoch   = len(shared_loader)
-        _max_bs = max(1, num_epochs * _imgs_per_epoch // (10_000 * _update_every_cap))
-        if B > _max_bs:
-            print(f"[auto-batch] capping eval_batch_size {B} → {_max_bs} "
-                  f"to ensure ≥10 000 total updates")
-            B = _max_bs
-            self.eval_batch_size = B
+        # Skipped when --eval-batch-size was explicitly set by the user.
+        if not self._eval_batch_size_fixed:
+            _update_every_cap = (self.grad_accumulate or 1)
+            _imgs_per_epoch   = len(shared_loader)
+            _max_bs = max(1, num_epochs * _imgs_per_epoch // (10_000 * _update_every_cap))
+            if B > _max_bs:
+                print(f"[auto-batch] capping eval_batch_size {B} → {_max_bs} "
+                      f"to ensure ≥10 000 total updates")
+                B = _max_bs
+                self.eval_batch_size = B
 
         # update_every: for SAM, each optimizer step consumes B*update_every items;
         # for non-SAM, update_every=1 (each step = exactly B items).
@@ -2685,8 +2691,11 @@ def main():
                         help="Disable the detection (disruption) loss component entirely. "
                              "Detection is still computed for pipeline purposes but contributes "
                              "zero gradient to the total loss.")
-    parser.add_argument("--eval-batch-size", type=int, default=1,
-                        help="Number of images to batch for detector/OCR evaluation (default 1).")
+    parser.add_argument("--eval-batch-size", type=int, default=None,
+                        help="Number of images to batch for detector/OCR evaluation. "
+                             "When omitted, auto-detected from GPU memory and capped to ensure "
+                             "≥10 000 gradient updates. When specified, used as-is with no "
+                             "probing or capping.")
     parser.add_argument("--sam-m", type=int, default=None,
                         help="m-SAM ascent step size.  Defaults to grad-accumulate//4 "
                              "(auto).  Set to 0 to disable m-SAM entirely.")
