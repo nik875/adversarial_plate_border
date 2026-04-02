@@ -818,9 +818,9 @@ class AdversarialPatchTrainer:
             if cx_hi > cx_lo and cy_hi > cy_lo:
                 occ_mask = torch.ones_like(patch_batch)   # constant, no grad
                 for b in range(B):
-                    # n ~ 1 + Geometric(p=0.5): always at least 1, P(n=1)=0.5, P(n=2)=0.25, …
-                    n = 1
-                    while random.random() < 0.5:
+                    # n ~ Geometric(p=0.25) on {0,1,2,…}: P(n=0)=0.25, P(n≥1)=0.75, …
+                    n = 0
+                    while random.random() < 0.75:
                         n += 1
                     for _ in range(n):
                         cx = random.uniform(cx_lo, cx_hi)
@@ -1485,8 +1485,8 @@ class AdversarialPatchTrainer:
                     # Build one sample's random mask (for the debug visualisation)
                     _mask_e = torch.ones(3, _ph, _pw, device=self.device)
                     if _cx_hi_e > _cx_lo_e and _cy_hi_e > _cy_lo_e:
-                        _n_e = 1
-                        while random.random() < 0.5:
+                        _n_e = 0
+                        while random.random() < 0.75:
                             _n_e += 1
                         for _ in range(_n_e):
                             _cxr = random.uniform(_cx_lo_e, _cx_hi_e)
