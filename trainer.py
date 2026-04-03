@@ -2296,6 +2296,15 @@ class AdversarialPatchTrainer:
                 B = _max_bs
                 self.eval_batch_size = B
 
+        # Resolve auto sam_m now that eval_batch_size is final.
+        # Mirrors the same block in train() — was missing from train_ensemble,
+        # causing SAM to be silently disabled whenever --eval-batch-size was passed.
+        if self._sam_m_auto:
+            self.sam_m = max(1, (self.grad_accumulate or 64) * B // 4)
+            self._sam_m_auto = False
+            print(f"[m-SAM] auto sam_m={self.sam_m}  "
+                  f"(grad_accumulate={self.grad_accumulate or 64} × eval_batch_size={B} // 4)")
+
         # update_every: for SAM, each optimizer step consumes B*update_every items;
         # for non-SAM, update_every=1 (each step = exactly B items).
         update_every = self.grad_accumulate if (isinstance(self.sam_m, int)
