@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import os
 import random
 import re
 import resource
