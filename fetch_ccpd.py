@@ -13,7 +13,7 @@ BUCKET = "licenseplate-dataset"
 FILE = "CCPD_AUGMENTED.tar"
 OUTPUT = FILE
 
-SPEED_THRESHOLD = 100 * 1024 * 1024  # 100 MB/s in bytes
+SPEED_THRESHOLD = 80 * 1024 * 1024  # 100 MB/s in bytes
 WINDOW_SIZE = 5.0                     # seconds for sliding window rate
 GRACE_PERIOD = 3.0                    # seconds below threshold before killing
 BACKOFF = 5.0                         # seconds to wait before reconnecting
