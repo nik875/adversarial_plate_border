@@ -2985,7 +2985,7 @@ def main():
     parser.add_argument("--preload-images",  action="store_true")
     parser.add_argument("--gpu-preload",     action="store_true",
                         help="Preload entire dataset as GPU tensors (implies --preload-images, forces num-workers=0)")
-    parser.add_argument("--num-workers",     type=int, default=0)
+    parser.add_argument("--num-workers",     type=int, default=os.cpu_count())
     parser.add_argument("--pin-memory",      action="store_true")
     parser.add_argument("--limit",           type=int, default=0)
     parser.add_argument("--use-all-for-train", action="store_true")
