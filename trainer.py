@@ -2484,10 +2484,9 @@ class AdversarialPatchTrainer:
                     _mem_prof = (self.profiling == "mem")
                     if _mem_prof:
                         _mp_steps = getattr(self, '_mem_prof_steps', 10)
+                        # Helpers — defined once on step 0, then reused via closure
                         def _rss_mb():
-                            # Read current (not peak) RSS from /proc — ru_maxrss is a
-                            # monotonically-increasing high-water mark and never decreases,
-                            # so it cannot detect per-step growth after the first big alloc.
+                            # VmRSS: current process RSS (not peak). /proc is Linux-only.
                             try:
                                 with open("/proc/self/status") as _f:
                                     for _l in _f:
@@ -2498,27 +2497,35 @@ class AdversarialPatchTrainer:
                             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
                         def _sys_free_mb():
                             try:
-                                _mi = {}
                                 with open("/proc/meminfo") as _f:
                                     for _l in _f:
-                                        k, v = _l.split(":")
-                                        _mi[k.strip()] = int(v.split()[0])
-                                # MemAvailable is the most reliable "usable free" metric
-                                return _mi.get("MemAvailable", _mi.get("MemFree", 0)) / 1024
+                                        if _l.startswith("MemAvailable:"):
+                                            return int(_l.split()[1]) / 1024
                             except OSError:
-                                return float("nan")
+                                pass
+                            return float("nan")
                         if global_steps == 0:
                             tracemalloc.start(25)
-                            _mem_snap_before = tracemalloc.take_snapshot()
-                            _mem_rss_start   = _rss_mb()
+                            _mem_snap_before    = tracemalloc.take_snapshot()
+                            _mem_rss_start      = _rss_mb()
                             _mem_sys_free_start = _sys_free_mb()
-                            _mem_step_rows   = []   # list of per-step dicts
+                            _mem_step_rows      = []  # list of per-step dicts
+                            # Open CSV for streaming writes — one row per step
+                            _csv_path = self.run_dir / "mem_profile.csv"
+                            _csv_file = open(_csv_path, "w", newline="")
+                            _csv_cols = [
+                                "step", "pipeline",
+                                "rss_mb", "sys_free_mb", "step_delta_mb",
+                                "start", "generate_patch", "prepare_items",
+                                "compute_loss", "loss_backward", "gen_backward", "opt_step",
+                            ]
+                            _csv_writer = csv.writer(_csv_file)
+                            _csv_writer.writerow(_csv_cols)
                             print(f"\n[mem-prof] Profiling {_mp_steps} steps. "
-                                  f"Baseline process RSS: {_mem_rss_start:.1f} MB  "
-                                  f"System free: {_mem_sys_free_start:.0f} MB\n")
-                        # Between-step RSS: captured NOW, before any work for this step
-                        _rss_between = _rss_mb()
-                        _rss_0 = _rss_between
+                                  f"Baseline RSS: {_mem_rss_start:.1f} MB  "
+                                  f"SysFree: {_mem_sys_free_start:.0f} MB  "
+                                  f"CSV: {_csv_path}")
+                        _rss_0 = _rss_mb()
                         _mem_checkpoints = [("start", _rss_0)]
 
                     patch_with_graph = self.generate_patch(training_aug=True)
@@ -2554,114 +2561,92 @@ class AdversarialPatchTrainer:
 
                     if _mem_prof:
                         _mem_checkpoints.append(("opt_step", _rss_mb()))
-                        _rss_end  = _mem_checkpoints[-1][1]
-                        _stage_deltas = {
-                            b: _mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]
-                            for i, (b, _) in enumerate(_mem_checkpoints[:-1])
-                        }
+                        _rss_end      = _mem_checkpoints[-1][1]
                         _sys_free_now = _sys_free_mb()
+                        _stage        = {b: _mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]
+                                         for i, (b, _) in enumerate(_mem_checkpoints[:-1])}
                         _row = {
-                            "step": global_steps,
-                            "pipeline": f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
-                            "rss_mb": _rss_end,
-                            "sys_free_mb": _sys_free_now,
-                            "step_delta_mb": _rss_end - _rss_0,
-                            **_stage_deltas,
+                            "step":           global_steps,
+                            "pipeline":       f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
+                            "rss_mb":         _rss_end,
+                            "sys_free_mb":    _sys_free_now,
+                            "step_delta_mb":  _rss_end - _rss_0,
+                            **_stage,
                         }
                         _mem_step_rows.append(_row)
-                        stages_str = " | ".join(
-                            f"{b}: {v:+.2f}"
-                            for b, v in _stage_deltas.items()
-                        )
-                        print(f"[mem-prof] step {global_steps:5d}  "
-                              f"RSS {_rss_end:.1f} MB  "
-                              f"(step Δ {_rss_end - _rss_0:+.2f} MB)  "
-                              f"SysFree {_sys_free_now:.0f} MB  "
-                              f"pipe={_row['pipeline']:<25}  "
-                              f"{stages_str}")
+                        # Stream one CSV row per step so data is safe even if we crash
+                        _csv_writer.writerow([_row.get(c, 0) for c in _csv_cols])
+                        _csv_file.flush()
+                        # Terse per-step console line: step, RSS, Δ, SysFree
+                        print(f"[mem-prof] {global_steps:5d}  "
+                              f"RSS {_rss_end:7.1f} MB  "
+                              f"Δ {_rss_end - _rss_0:+7.2f} MB  "
+                              f"SysFree {_sys_free_now:7.0f} MB  "
+                              f"{_row['pipeline']}")
 
                         if global_steps == _mp_steps - 1:
                             gc.collect()
                             _mem_snap_after = tracemalloc.take_snapshot()
                             tracemalloc.stop()
+                            _csv_file.close()
 
-                            _rss_final        = _rss_mb()
-                            _rss_total        = _rss_final - _mem_rss_start
-                            _sys_free_final   = _sys_free_mb()
-                            _sys_consumed     = _mem_sys_free_start - _sys_free_final
-                            # Exclude step 0 warm-up (model loading) from per-step rate
-                            _steady_rows = [r for r in _mem_step_rows if r["step"] >= 3]
-                            if _steady_rows:
-                                _steady_delta = (_steady_rows[-1]["rss_mb"]
-                                                 - _steady_rows[0]["rss_mb"])
-                                _steady_n     = len(_steady_rows)
-                                _rate         = _steady_delta / max(_steady_n - 1, 1)
+                            _rss_final      = _rss_mb()
+                            _sys_free_final = _sys_free_mb()
+                            _steady_rows    = [r for r in _mem_step_rows if r["step"] >= 3]
+                            if len(_steady_rows) >= 2:
+                                _rate = ((_steady_rows[-1]["rss_mb"] - _steady_rows[0]["rss_mb"])
+                                         / (len(_steady_rows) - 1))
                             else:
-                                _steady_delta = _rss_total
-                                _steady_n     = _mp_steps
-                                _rate         = _rss_total / max(_mp_steps - 1, 1)
+                                _rate = (_rss_final - _mem_rss_start) / max(_mp_steps - 1, 1)
 
-                            _top = _mem_snap_after.compare_to(
-                                _mem_snap_before, "lineno")
+                            _top = _mem_snap_after.compare_to(_mem_snap_before, "lineno")
                             _top.sort(key=lambda s: -s.size_diff)
-                            _top_positive = [s for s in _top if s.size_diff > 0]
+                            _top_pos = [s for s in _top if s.size_diff > 0]
 
-                            # ── Build report string ──────────────────────
-                            _sep = "=" * 80
-                            _lines = [
+                            # ── Console summary (brief) ───────────────────
+                            _sep = "=" * 60
+                            _summary_lines = [
                                 _sep,
-                                "  MEM-PROF REPORT",
+                                "  MEM-PROF SUMMARY",
                                 _sep,
-                                f"  Steps profiled        : {_mp_steps}",
-                                f"  Baseline process RSS  : {_mem_rss_start:.1f} MB",
-                                f"  Final process RSS     : {_rss_final:.1f} MB",
-                                f"  Process RSS growth    : {_rss_total:+.1f} MB",
-                                f"  System free (start)   : {_mem_sys_free_start:.0f} MB",
-                                f"  System free (end)     : {_sys_free_final:.0f} MB",
-                                f"  System memory consumed: {_sys_consumed:+.0f} MB  "
-                                f"(process + GPU + OS buffers)",
-                                f"  Steady-state process RSS growth (step 3+): "
-                                f"{_steady_delta:+.1f} MB over {_steady_n} steps "
-                                f"≈ {_rate:+.3f} MB/step",
-                                "",
-                                "  Per-step RSS table (VmRSS = current process RSS from /proc):",
-                                f"  {'step':>6}  {'VmRSS':>8}  {'SysFree':>8}  {'Δ RSS':>7}  "
-                                f"{'pipeline':<25}  "
-                                f"start  gen_patch  prep  compute  bwd_loss  bwd_gen  opt",
+                                f"  Steps              : {_mp_steps}",
+                                f"  Process RSS start  : {_mem_rss_start:.1f} MB",
+                                f"  Process RSS end    : {_rss_final:.1f} MB",
+                                f"  Process RSS growth : {_rss_final - _mem_rss_start:+.1f} MB",
+                                f"  SysFree start      : {_mem_sys_free_start:.0f} MB",
+                                f"  SysFree end        : {_sys_free_final:.0f} MB",
+                                f"  SysFree consumed   : {_mem_sys_free_start - _sys_free_final:+.0f} MB",
+                                f"  Steady rate (s3+)  : {_rate:+.3f} MB/step",
+                                f"  Per-step data      : {_csv_path}",
+                                f"  Top tracemalloc allocation sites (step 0 → {_mp_steps-1}):",
                             ]
-                            for r in _mem_step_rows:
-                                _lines.append(
-                                    f"  {r['step']:>6}  {r['rss_mb']:>7.1f}M  "
-                                    f"{r['sys_free_mb']:>7.0f}M  "
-                                    f"{r['step_delta_mb']:>+7.2f}  "
-                                    f"{r['pipeline']:<25}  "
-                                    f"{r.get('start',0):+6.2f}  "
-                                    f"{r.get('generate_patch',0):+9.2f}  "
-                                    f"{r.get('prepare_items',0):+4.2f}  "
-                                    f"{r.get('compute_loss',0):+7.2f}  "
-                                    f"{r.get('loss_backward',0):+8.2f}  "
-                                    f"{r.get('gen_backward',0):+7.2f}  "
-                                    f"{r.get('opt_step',0):+3.2f}"
+                            for _s in _top_pos[:15]:
+                                _summary_lines.append(
+                                    f"    {_s.size_diff/1024:+8.1f} KB  "
+                                    f"count {_s.count_diff:+6d}  {_s}"
                                 )
-                            _lines += [
-                                "",
-                                f"  Top {len(_top_positive)} Python allocation sites "
-                                f"(tracemalloc diff, step 0 → step {_mp_steps-1}):",
-                            ]
-                            for stat in _top_positive[:50]:
-                                _lines.append(
-                                    f"    +{stat.size_diff/1024:8.1f} KB  "
-                                    f"count Δ {stat.count_diff:+6d}  {stat}"
-                                )
-                            _lines.append(_sep)
-                            _report = "\n".join(_lines)
+                            _summary_lines.append(_sep)
+                            _summary = "\n".join(_summary_lines)
+                            print("\n" + _summary)
 
-                            print("\n" + _report)
-                            # Save to file
-                            _rpt_path = self.run_dir / "mem_profile.txt"
-                            with open(_rpt_path, "w") as _rf:
-                                _rf.write(_report + "\n")
-                            print(f"\n[mem-prof] Report saved to {_rpt_path}")
+                            # ── Full tracemalloc data → JSON lines file ───
+                            import json as _json
+                            _tm_path = self.run_dir / "mem_profile_tracemalloc.jsonl"
+                            with open(_tm_path, "w") as _tf:
+                                for _s in _top:
+                                    if _s.size_diff == 0 and _s.count_diff == 0:
+                                        continue
+                                    _tf.write(_json.dumps({
+                                        "size_diff_b":  _s.size_diff,
+                                        "count_diff":   _s.count_diff,
+                                        "size_b":       _s.new.size,
+                                        "count":        _s.new.count,
+                                        "traceback":    str(_s),
+                                    }) + "\n")
+
+                            print(f"[mem-prof] Files written:\n"
+                                  f"  {_csv_path}\n"
+                                  f"  {_tm_path}")
                             print("[mem-prof] Done — exiting.")
                             raise SystemExit(0)
 
