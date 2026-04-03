@@ -2435,7 +2435,10 @@ class AdversarialPatchTrainer:
 
             while True:
                 # ── Choose pipeline via EMA-weighted softmax ──────────
-                _weights = [np.exp(l / _ema_tau) for l in ema_loss]
+                # Centre before exp so only relative differences drive
+                # sampling — prevents one high-loss pipeline from monopolising.
+                _mean_ema = sum(ema_loss) / n
+                _weights  = [np.exp((l - _mean_ema) / _ema_tau) for l in ema_loss]
                 pi = random.choices(range(n), weights=_weights)[0]
 
                 # ── Grab items_needed items from the shared loader ────
