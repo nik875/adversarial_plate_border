@@ -2511,10 +2511,11 @@ class AdversarialPatchTrainer:
             global_steps    = 0
 
             # tqdm total: approximate updates this epoch
-            _approx_upd = max(1, _imgs_per_epoch // (B * update_every))
-            pbar = tqdm(total=_approx_upd, desc=f"Epoch {epoch+1}", unit="upd", leave=False)
-
             items_needed = B * update_every
+            _approx_upd  = max(1, _imgs_per_epoch // items_needed)
+            _steps_done  = _items_consumed_epoch // items_needed  # >0 on resume epoch
+            pbar = tqdm(total=_approx_upd, initial=_steps_done,
+                        desc=f"Epoch {epoch+1}", unit="upd", leave=False)
 
             while True:
                 # ── Choose pipeline via EMA-weighted softmax ──────────
@@ -2862,6 +2863,15 @@ class AdversarialPatchTrainer:
 
             if _max_steps_hit:
                 break  # skip end-of-epoch validation; wrapper will resume
+
+            if global_steps == 0:
+                # Loader was exhausted during the skip (resume_items exceeded
+                # dataset size — e.g. --segments set too high).  Nothing was
+                # trained; skip validation to avoid GPU OOM on wasted segment.
+                print(f"[ensemble] Epoch {epoch+1}: 0 steps (loader exhausted "
+                      f"during skip — resume_items={ckpt_resume_items} "
+                      f"> dataset size).  Skipping validation.")
+                break
 
             # ── End-of-epoch validation & logging ─────────────────────
             val_losses, val_mean = self._validate_all_pipelines(active_pipelines)
