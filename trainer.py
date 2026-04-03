@@ -2577,12 +2577,13 @@ class AdversarialPatchTrainer:
                         # Stream one CSV row per step so data is safe even if we crash
                         _csv_writer.writerow([_row.get(c, 0) for c in _csv_cols])
                         _csv_file.flush()
-                        # Terse per-step console line: step, RSS, Δ, SysFree
-                        print(f"[mem-prof] {global_steps:5d}  "
-                              f"RSS {_rss_end:7.1f} MB  "
-                              f"Δ {_rss_end - _rss_0:+7.2f} MB  "
-                              f"SysFree {_sys_free_now:7.0f} MB  "
-                              f"{_row['pipeline']}")
+                        # Print every 50 steps — data is in the CSV for full resolution
+                        if global_steps % 50 == 0:
+                            print(f"[mem-prof] {global_steps:5d}  "
+                                  f"RSS {_rss_end:7.1f} MB  "
+                                  f"Δ {_rss_end - _rss_0:+7.2f} MB  "
+                                  f"SysFree {_sys_free_now:7.0f} MB  "
+                                  f"{_row['pipeline']}")
 
                         if global_steps == _mp_steps - 1:
                             gc.collect()
