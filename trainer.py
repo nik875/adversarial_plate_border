@@ -2229,18 +2229,19 @@ class AdversarialPatchTrainer:
         continue_path: Optional[str] = None,
         continue_lr:   bool  = False,
     ) -> dict:
-        """Ensemble training: round-robin over active_pipelines, one batch per step.
+        """Ensemble training: EMA-weighted sampling over active_pipelines, one batch per step.
 
         active_pipelines : pre-loaded (DetectorBackend, OCRBackend) pairs for the
                            3 non-holdout pipelines (already eval()+freeze()'d).
 
-        One optimizer step = eval_batch_size images through the current pipeline.
+        One optimizer step = eval_batch_size images through the chosen pipeline.
         For m-SAM, one step = eval_batch_size * grad_accumulate images through
-        the current pipeline (reuses _msam_step() unchanged).
+        the chosen pipeline (reuses _msam_step() unchanged).
 
-        Batch cycling: A → B → C → A → B → C → …  (round-robin at the step level).
-        Each pipeline has its own independent DataLoader so all 3 see the full
-        dataset each epoch.
+        Pipeline selection: at each step the next pipeline is sampled with
+        probability ∝ softmax(ema_loss / τ).  Pipelines where the attack is
+        still struggling (high EMA loss) are visited more often; well-attacked
+        pipelines naturally receive fewer steps as their loss drops.
         """
         # ── Checkpoint load ───────────────────────────────────────────
         ckpt_global_update = 0
@@ -2257,10 +2258,9 @@ class AdversarialPatchTrainer:
         eta_min = lr_min
 
         # ── Single shared DataLoader (each image processed by one pipeline) ──
-        # Using one loader and distributing items round-robin means each image
-        # is processed exactly once per epoch — same total GPU work as single-
-        # pipeline training.  Three separate full-dataset loaders would give 3×
-        # the compute with no benefit.
+        # One loader feeds all pipelines.  At each step, the target pipeline is
+        # chosen by EMA-weighted sampling, then eval_batch_size items are drawn
+        # from the loader and routed directly to that pipeline.
         shared_loader = self._make_pipeline_loader()
 
         # ── Probe batch size per pipeline → take min ──────────────────
@@ -2357,7 +2357,7 @@ class AdversarialPatchTrainer:
         print(f"  Patch gen : ConvTranspose decoder  "
               f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
         print(f"  Trainable : {n_params:,} params")
-        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (round-robin across {n} pipelines)")
+        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (EMA-weighted sampling across {n} pipelines)")
         print(f"  Epochs    : {num_epochs}  |  Updates: {total_updates}  |  "
               f"Save every: {save_every} updates (~10%)")
         print(f"  Batch/pipeline: {B}  |  update_every: {update_every}")
@@ -2401,13 +2401,21 @@ class AdversarialPatchTrainer:
         self._last_save_milestone = ckpt_global_update // save_every if save_every > 0 else 0
         _saved_tv_weight          = self.tv_weight
 
+        # ── EMA loss per pipeline (persists across epochs) ────────────
+        # Initialized uniform so the first epoch is approximately round-robin.
+        # After each step, ema_loss[pi] is updated with the observed batch loss.
+        # Pipeline selection probability ∝ softmax(ema_loss / τ): pipelines
+        # where the attack is still struggling get more optimizer steps.
+        _ema_alpha = 0.1   # smoothing factor
+        _ema_tau   = 1.0   # softmax temperature (higher → more uniform)
+        ema_loss   = [1.0] * n
+
         # ── Epoch loop ────────────────────────────────────────────────
         for epoch in range(num_epochs):
             epoch_start  = time.time()
             self.training = True
 
             shared_iter   = iter(shared_loader)
-            buffers       = [[] for _ in range(n)]
             pipe_loss_sum = [0.0] * n
             pipe_steps    = [0]   * n
             # component sums for epoch-level averages
@@ -2418,66 +2426,30 @@ class AdversarialPatchTrainer:
             pipe_tv       = [0.0] * n
             global_loss_sum = 0.0
             global_steps    = 0
-            rr_idx          = 0
 
             # tqdm total: approximate updates this epoch
             _approx_upd = max(1, _imgs_per_epoch // (B * update_every))
             pbar = tqdm(total=_approx_upd, desc=f"Epoch {epoch+1}", unit="upd", leave=False)
 
-            # Feed items from the single shared loader to pipelines round-robin.
-            # When the loader is exhausted, flush all remaining partial buffers.
-            _shared_done = False
-            while not _shared_done:
-                pi = rr_idx % n
-                rr_idx += 1
+            items_needed = B * update_every
 
-                try:
-                    raw = {k: v[0] for k, v in next(shared_iter).items()}
-                    buffers[pi].append(raw)
-                except StopIteration:
-                    _shared_done = True
-                    # Flush every non-empty buffer in round-robin order
-                    for _flush_pi in [_pi % n for _pi in range(rr_idx, rr_idx + n)]:
-                        if not buffers[_flush_pi]:
-                            continue
-                        pi = _flush_pi
-                        self._activate_pipeline(*active_pipelines[pi])
-                        self.ocr.train()
-                        patch_with_graph = self.generate_patch(training_aug=True)
-                        patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                        flush_items = [self._prepare_one(r, patch_leaf) for r in buffers[pi]]
-                        for it in flush_items: it["_patch_norm"] = patch_leaf
-                        buffers[pi] = []
-                        loss_f, dr, dt, or_, ot, tv_l = self.compute_loss_batch(flush_items)
-                        loss_f.backward()
-                        patch_with_graph.backward(patch_leaf.grad)
-                        torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
-                        optimizer.step(); optimizer.zero_grad(); scheduler.step()
-                        lv = loss_f.item()
-                        pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
-                        pipe_det_real[pi] += dr.item(); pipe_det_top[pi] += dt.item()
-                        pipe_ocr_real[pi] += or_.item(); pipe_ocr_top[pi] += ot.item()
-                        pipe_tv[pi]       += tv_l.item()
-                        global_loss_sum   += lv; global_steps   += 1
-                        num_upd = global_updates + global_steps
-                        milestone = num_upd // save_every
-                        if milestone > self._last_save_milestone:
-                            self._last_save_milestone = milestone
-                            self.save_patch(num_upd, "patches")
-                        det_name = active_pipelines[pi][0].name
-                        ocr_name = active_pipelines[pi][1].name
-                        batch_log_writer.writerow([
-                            num_upd, f"{det_name}/{ocr_name}", epoch + 1,
-                            lv, dr.item(), dt.item(), or_.item(), ot.item(), tv_l.item(),
-                            optimizer.param_groups[0]["lr"],
-                        ])
-                        pbar.update(1)
+            while True:
+                # ── Choose pipeline via EMA-weighted softmax ──────────
+                _weights = [np.exp(l / _ema_tau) for l in ema_loss]
+                pi = random.choices(range(n), weights=_weights)[0]
+
+                # ── Grab items_needed items from the shared loader ────
+                items_raw = []
+                for _ in range(items_needed):
+                    try:
+                        items_raw.append({k: v[0] for k, v in next(shared_iter).items()})
+                    except StopIteration:
+                        break
+
+                if not items_raw:
                     break
 
-                if len(buffers[pi]) < B * update_every:
-                    continue
-
-                # ── Optimizer step for pipeline pi ────────────────────
+                # ── Activate pipeline ─────────────────────────────────
                 self._activate_pipeline(*active_pipelines[pi])
                 # cuDNN RNN backward requires train() on OCR (e.g. LPRNet LSTM)
                 self.ocr.train()
@@ -2494,13 +2466,13 @@ class AdversarialPatchTrainer:
                 if isinstance(optimizer, SAM):
                     # m-SAM: _msam_step reads self.detector/ocr at call time.
                     loss_t, dr, dt, or_, ot, tv_l = self._msam_step(
-                        optimizer, buffers[pi], B, update_every
+                        optimizer, items_raw, B, update_every
                     )
                     lv = loss_t / B
                 else:
                     patch_with_graph = self.generate_patch(training_aug=True)
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
-                    items = [self._prepare_one(r, patch_leaf) for r in buffers[pi]]
+                    items = [self._prepare_one(r, patch_leaf) for r in items_raw]
                     for it in items: it["_patch_norm"] = patch_leaf
                     loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
                     loss.backward()
@@ -2509,8 +2481,10 @@ class AdversarialPatchTrainer:
                     optimizer.step(); optimizer.zero_grad()
                     lv = loss.item()
 
-                buffers[pi] = []
                 scheduler.step()
+
+                # ── Update EMA ────────────────────────────────────────
+                ema_loss[pi] = (1 - _ema_alpha) * ema_loss[pi] + _ema_alpha * lv
 
                 # Metrics tracking
                 pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
@@ -2551,6 +2525,9 @@ class AdversarialPatchTrainer:
                        for i in range(n)},
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 })
+
+                if len(items_raw) < items_needed:
+                    break  # partial batch → loader exhausted, end of epoch
 
             pbar.close()
             batch_log_file.flush()
