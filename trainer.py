@@ -2505,80 +2505,53 @@ class AdversarialPatchTrainer:
                                 pass
                             return float("nan")
                         if global_steps == 0:
+                            # tracemalloc: only take two snapshots (start + end),
+                            # not per-step — minimises allocation instrumentation cost.
                             tracemalloc.start(25)
                             _mem_snap_before    = tracemalloc.take_snapshot()
                             _mem_rss_start      = _rss_mb()
                             _mem_sys_free_start = _sys_free_mb()
                             _mem_step_rows      = []  # list of per-step dicts
-                            # Open CSV for streaming writes — one row per step
+                            # Open CSV — buffered, flush only every 50 steps
                             _csv_path = self.run_dir / "mem_profile.csv"
-                            _csv_file = open(_csv_path, "w", newline="")
-                            _csv_cols = [
-                                "step", "pipeline",
-                                "rss_mb", "sys_free_mb", "step_delta_mb",
-                                "start", "generate_patch", "prepare_items",
-                                "compute_loss", "loss_backward", "gen_backward", "opt_step",
-                            ]
+                            _csv_file = open(_csv_path, "w", newline="", buffering=1 << 16)
+                            _csv_cols = ["step", "pipeline", "rss_mb", "sys_free_mb", "step_delta_mb"]
                             _csv_writer = csv.writer(_csv_file)
                             _csv_writer.writerow(_csv_cols)
                             print(f"\n[mem-prof] Profiling {_mp_steps} steps. "
                                   f"Baseline RSS: {_mem_rss_start:.1f} MB  "
                                   f"SysFree: {_mem_sys_free_start:.0f} MB  "
                                   f"CSV: {_csv_path}")
+                        # Two /proc reads per step (start + end) instead of 7.
+                        # Stage-level breakdown dropped to minimise overhead.
                         _rss_0 = _rss_mb()
-                        _mem_checkpoints = [("start", _rss_0)]
 
                     patch_with_graph = self.generate_patch(training_aug=True)
-
-                    if _mem_prof:
-                        _mem_checkpoints.append(("generate_patch", _rss_mb()))
-
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
                     items = [self._prepare_one(r, patch_leaf) for r in items_raw]
                     for it in items: it["_patch_norm"] = patch_leaf
-
-                    if _mem_prof:
-                        _mem_checkpoints.append(("prepare_items", _rss_mb()))
-
                     loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
-
-                    if _mem_prof:
-                        _mem_checkpoints.append(("compute_loss", _rss_mb()))
-
                     loss.backward()
-
-                    if _mem_prof:
-                        _mem_checkpoints.append(("loss_backward", _rss_mb()))
-
                     patch_with_graph.backward(patch_leaf.grad)
-
-                    if _mem_prof:
-                        _mem_checkpoints.append(("gen_backward", _rss_mb()))
-
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step(); optimizer.zero_grad()
                     lv = loss.item()
 
                     if _mem_prof:
-                        _mem_checkpoints.append(("opt_step", _rss_mb()))
-                        _rss_end      = _mem_checkpoints[-1][1]
+                        _rss_end      = _rss_mb()
                         _sys_free_now = _sys_free_mb()
-                        _stage        = {b: _mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]
-                                         for i, (b, _) in enumerate(_mem_checkpoints[:-1])}
                         _row = {
-                            "step":           global_steps,
-                            "pipeline":       f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
-                            "rss_mb":         _rss_end,
-                            "sys_free_mb":    _sys_free_now,
-                            "step_delta_mb":  _rss_end - _rss_0,
-                            **_stage,
+                            "step":          global_steps,
+                            "pipeline":      f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
+                            "rss_mb":        _rss_end,
+                            "sys_free_mb":   _sys_free_now,
+                            "step_delta_mb": _rss_end - _rss_0,
                         }
                         _mem_step_rows.append(_row)
-                        # Stream one CSV row per step so data is safe even if we crash
-                        _csv_writer.writerow([_row.get(c, 0) for c in _csv_cols])
-                        _csv_file.flush()
-                        # Print every 50 steps — data is in the CSV for full resolution
+                        _csv_writer.writerow([_row[c] for c in _csv_cols])
+                        # Flush + console print every 50 steps
                         if global_steps % 50 == 0:
+                            _csv_file.flush()
                             print(f"[mem-prof] {global_steps:5d}  "
                                   f"RSS {_rss_end:7.1f} MB  "
                                   f"Δ {_rss_end - _rss_0:+7.2f} MB  "
