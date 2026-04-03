@@ -614,17 +614,25 @@ class AdversarialPatchTrainer:
         self.diff_prep = self._make_differentiable_prep()
         self._cv2_prep = self._make_cv2_prep()
 
-    def _make_pipeline_loader(self):
+    def _make_pipeline_loader(self, seed: Optional[int] = None):
         """Create a fresh non-preloaded train DataLoader.
 
         Used by train_ensemble() to give each active pipeline its own
         independent iterator over the full dataset each epoch.
+
+        seed: if given, the DataLoader shuffle is fully deterministic for that
+              seed (via torch.Generator).  Pass seed=base_seed+epoch so each
+              epoch has a different but reproducible order.
         """
         _nj = os.cpu_count() if self._num_workers < 0 else self._num_workers
+        _gen = None
+        if seed is not None:
+            _gen = torch.Generator()
+            _gen.manual_seed(seed)
         if self._ccpd_csv:
             loader, _ = create_ccpd_dataloaders(
                 self._ccpd_csv, batch_size=1, n_jobs=_nj,
-                pin_memory=False, limit=self._limit,
+                pin_memory=False, limit=self._limit, generator=_gen,
             )
         else:
             loader, _ = create_dataloaders(
@@ -632,7 +640,7 @@ class AdversarialPatchTrainer:
                 preload=False, gpu_device=None, batch_size=1,
                 n_jobs=_nj, pin_memory=False,
                 limit=self._limit, use_all_for_train=self._use_all_for_train,
-                use_original=True,
+                use_original=True, generator=_gen,
             )
         return loader
 
@@ -1141,7 +1149,7 @@ class AdversarialPatchTrainer:
     # ====================================================================
 
     def save_patch(self, global_update: int, subdir: str = "patches",
-                   stem: Optional[str] = None) -> None:
+                   stem: Optional[str] = None, extra: Optional[dict] = None) -> None:
         save_dir = self.run_dir / subdir
         save_dir.mkdir(parents=True, exist_ok=True)
         if stem is None:
@@ -1149,7 +1157,7 @@ class AdversarialPatchTrainer:
         with torch.no_grad():
             patch_img = self.generate_patch()   # [3, H, W] in [0,1]
             T.ToPILImage()(patch_img.cpu()).save(str(save_dir / f"{stem}.png"))
-            torch.save({
+            ckpt = {
                 "seed":          self.seed.detach().cpu(),
                 "decoder":       self.decoder.state_dict(),
                 "seed_channels": self.seed_channels,
@@ -1158,7 +1166,10 @@ class AdversarialPatchTrainer:
                 "ocr":           self.ocr.name,
                 "patch_size":    (self.patch_height, self.patch_width),
                 "patch":         patch_img.cpu(),   # rendered tensor (incl. print_blur)
-            }, str(save_dir / f"{stem}.pt"))
+            }
+            if extra:
+                ckpt.update(extra)
+            torch.save(ckpt, str(save_dir / f"{stem}.pt"))
 
     # ====================================================================
     # Pre-training sanity check
@@ -2258,7 +2269,10 @@ class AdversarialPatchTrainer:
         pipelines naturally receive fewer steps as their loss drops.
         """
         # ── Checkpoint load ───────────────────────────────────────────
-        ckpt_global_update = 0
+        ckpt_global_update  = 0
+        ckpt_resume_epoch   = 0   # which epoch to start on (0-indexed)
+        ckpt_resume_items   = 0   # items already consumed in that epoch
+        ckpt_loader_seed    = None  # base seed used by original run (None = not set yet)
         if continue_path:
             ckpt = torch.load(continue_path, map_location="cpu")
             with torch.no_grad():
@@ -2266,7 +2280,13 @@ class AdversarialPatchTrainer:
             self.decoder.load_state_dict(ckpt["decoder"])
             self.decoder.to(self.device)
             ckpt_global_update = int(ckpt.get("global_update", 0))
+            ckpt_resume_epoch  = int(ckpt.get("resume_epoch",  0))
+            ckpt_resume_items  = int(ckpt.get("resume_items",  0))
+            ckpt_loader_seed   = ckpt.get("loader_base_seed",  None)
             print(f"  Resumed from  : {continue_path}  (update {ckpt_global_update})")
+            if ckpt_loader_seed is not None:
+                print(f"  Loader state  : epoch {ckpt_resume_epoch}, "
+                      f"skip {ckpt_resume_items} items  (seed {ckpt_loader_seed})")
 
         n = len(active_pipelines)
         eta_min = lr_min
@@ -2306,6 +2326,14 @@ class AdversarialPatchTrainer:
                       f"to ensure ≥10 000 total updates")
                 B = _max_bs
                 self.eval_batch_size = B
+
+        # ── Loader base seed: fixed for the lifetime of this run ─────────
+        # Each epoch uses seed = _loader_base_seed + epoch_index, giving a
+        # deterministic but different shuffle per epoch.  Saved in every
+        # checkpoint so a resumed run can replay the exact same order.
+        import random as _rand
+        _loader_base_seed = (ckpt_loader_seed if ckpt_loader_seed is not None
+                             else _rand.randint(0, 2**31 - 1))
 
         # Resolve auto sam_m now that eval_batch_size is final.
         # Mirrors the same block in train() — was missing from train_ensemble,
@@ -2449,11 +2477,28 @@ class AdversarialPatchTrainer:
         ema_loss: list = [None] * n   # None = not yet observed
 
         # ── Epoch loop ────────────────────────────────────────────────
-        for epoch in range(num_epochs):
+        for epoch in range(ckpt_resume_epoch, num_epochs):
             epoch_start  = time.time()
             self.training = True
 
-            shared_iter   = iter(shared_loader)
+            # Create a seeded loader for this epoch so the shuffle order is
+            # deterministic and can be replayed exactly on resume.
+            _epoch_loader = self._make_pipeline_loader(seed=_loader_base_seed + epoch)
+            shared_iter   = iter(_epoch_loader)
+
+            # On the resume epoch, skip items already consumed in the previous
+            # session.  The seeded loader replays the identical shuffle order,
+            # so advancing the iterator puts us at the exact same position.
+            _items_consumed_epoch = 0
+            if epoch == ckpt_resume_epoch and ckpt_resume_items > 0:
+                for _ in range(ckpt_resume_items):
+                    try:
+                        next(shared_iter)
+                    except StopIteration:
+                        break
+                _items_consumed_epoch = ckpt_resume_items
+                print(f"  [loader] Epoch {epoch}: skipped {ckpt_resume_items} "
+                      f"already-seen items to restore position.")
             pipe_loss_sum = [0.0] * n
             pipe_steps    = [0]   * n
             # component sums for epoch-level averages
@@ -2489,6 +2534,7 @@ class AdversarialPatchTrainer:
                 for _ in range(items_needed):
                     try:
                         items_raw.append({k: v[0] for k, v in next(shared_iter).items()})
+                        _items_consumed_epoch += 1
                     except StopIteration:
                         break
 
@@ -2762,16 +2808,22 @@ class AdversarialPatchTrainer:
                 num_upd = global_updates + global_steps
 
                 # Checkpoint milestone
+                _loader_extra = {
+                    "loader_base_seed": _loader_base_seed,
+                    "resume_epoch":     epoch,
+                    "resume_items":     _items_consumed_epoch,
+                }
                 milestone = num_upd // save_every
                 if milestone > self._last_save_milestone:
                     self._last_save_milestone = milestone
-                    self.save_patch(num_upd, "patches")
+                    self.save_patch(num_upd, "patches", extra=_loader_extra)
 
                 # --max-steps: stop after N optimizer steps in this session.
                 # Force-save so the wrapper can find a checkpoint to resume from.
                 if max_steps is not None and _session_steps >= max_steps:
                     self.save_patch(num_upd, "patches",
-                                    stem=f"patch_{self.detector.name}_update_{num_upd:06d}")
+                                    stem=f"patch_{self.detector.name}_update_{num_upd:06d}",
+                                    extra=_loader_extra)
                     print(f"[max-steps] Reached {max_steps} steps (update {num_upd}) — stopping.")
                     _max_steps_hit = True
                     break
@@ -2841,7 +2893,10 @@ class AdversarialPatchTrainer:
                 best_epoch = epoch
                 # Save best patch using the first pipeline's detector name
                 self.save_patch(global_updates, "patches",
-                                stem=f"patch_ensemble_best")
+                                stem=f"patch_ensemble_best",
+                                extra={"loader_base_seed": _loader_base_seed,
+                                       "resume_epoch":     epoch + 1,
+                                       "resume_items":     0})
                 best_marker = "  ★ best"
 
             val_str = "  ".join(

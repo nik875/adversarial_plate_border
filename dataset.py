@@ -346,7 +346,8 @@ class AdversarialPatchDataset(Dataset):
 def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=0.8,
                        n_jobs=1, limit=0, use_all_for_train=False,
                        use_original: bool = False,
-                       pin_memory=True, gpu_device=None, **kwargs):
+                       pin_memory=True, gpu_device=None,
+                       generator=None, **kwargs):
     """Create train and validation DataLoaders
 
     Args:
@@ -408,6 +409,7 @@ def create_dataloaders(csv_path="preproc_labels.csv", batch_size=8, train_split=
         pin_memory=pin_memory,
         persistent_workers=_persistent,
         prefetch_factor=_prefetch,
+        generator=generator,
     )
 
     val_loader = DataLoader(
@@ -471,7 +473,7 @@ class CCPDBboxDataset(Dataset):
 
 def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
                             n_jobs: int = 0, pin_memory: bool = False,
-                            limit: int = 0):
+                            limit: int = 0, generator=None):
     """DataLoaders for a CCPD-format split CSV (train_split.csv / val_split.csv).
 
     Returns (train_loader, val_loader).  The val_loader is an empty stub —
@@ -486,6 +488,7 @@ def create_ccpd_dataloaders(csv_path: str, batch_size: int = 1,
         ds, batch_size=batch_size, shuffle=True,
         num_workers=n_jobs, pin_memory=pin_memory,
         persistent_workers=_persistent, prefetch_factor=_prefetch,
+        generator=generator,
     )
     # Empty val loader (split already done on disk)
     empty_ds = CCPDBboxDataset.__new__(CCPDBboxDataset)
