@@ -2405,11 +2405,9 @@ class AdversarialPatchTrainer:
         # ema_loss[i] = None until pipeline i has been seen at least once.
         # Unseen pipelines are visited first (round-robin warm-up) to get a
         # realistic loss estimate before weighted sampling begins.
-        # After the warm-up, pipeline selection probability ∝
-        # softmax((ema_loss - mean) / τ): pipelines where the attack is still
-        # struggling get more optimizer steps.
+        # After the warm-up, pipeline selection probability ∝ ema_loss[i]:
+        # pipelines where the attack is still struggling get more steps.
         _ema_alpha = 0.1   # smoothing factor
-        _ema_tau   = 1.0   # softmax temperature (higher → more uniform)
         ema_loss: list = [None] * n   # None = not yet observed
 
         # ── Epoch loop ────────────────────────────────────────────────
@@ -2444,9 +2442,7 @@ class AdversarialPatchTrainer:
                 if _unseen:
                     pi = _unseen[0]
                 else:
-                    _mean_ema = sum(ema_loss) / n
-                    _weights  = [np.exp((l - _mean_ema) / _ema_tau) for l in ema_loss]
-                    pi = random.choices(range(n), weights=_weights)[0]
+                    pi = random.choices(range(n), weights=ema_loss)[0]
 
                 # ── Grab items_needed items from the shared loader ────
                 items_raw = []
