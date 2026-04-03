@@ -2423,6 +2423,19 @@ class AdversarialPatchTrainer:
         self._last_save_milestone = ckpt_global_update // save_every if save_every > 0 else 0
         _saved_tv_weight          = self.tv_weight
 
+        # ── malloc_trim: reclaim glibc heap fragmentation each step ──────
+        # Profiling shows ~15-20 MB of glibc heap fragmentation per rtdetr step
+        # that accumulates to 23 GB+ over 17k steps.  malloc_trim(0) reclaims it
+        # all (net RSS after trim is actually negative per step), keeping RSS flat.
+        import ctypes as _ctypes
+        try:
+            _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+            _libc.malloc_trim.restype  = _ctypes.c_int
+            _libc.malloc_trim.argtypes = [_ctypes.c_size_t]
+            _trim_each_step = True
+        except Exception:
+            _trim_each_step = False
+
         # ── EMA loss per pipeline (persists across epochs) ────────────
         # ema_loss[i] = None until pipeline i has been seen at least once.
         # Unseen pipelines are visited first (round-robin warm-up) to get a
@@ -2717,6 +2730,14 @@ class AdversarialPatchTrainer:
                               f"  {_tm_path}")
                         print("[mem-prof] Done — exiting.")
                         raise SystemExit(0)
+
+                # Return fragmented glibc heap pages to the OS every step.
+                # Profiling confirmed ~15-20 MB of fragmentation per rtdetr step
+                # that is otherwise never returned, accumulating to GB+ over 17k steps.
+                # malloc_trim(0) reclaims it immediately; net RSS after trim is negative.
+                # Skipped in profiling mode since the profiling block already calls it.
+                if _trim_each_step and not _mem_prof:
+                    _libc.malloc_trim(0)
 
                 scheduler.step()
 
