@@ -2863,6 +2863,17 @@ class AdversarialPatchTrainer:
             self.training   = False
 
             if _max_steps_hit:
+                # Explicitly shut down the DataLoader iterator and loader so
+                # worker processes exit before we return.  Without this,
+                # persistent workers outlive the process and hold the CUDA
+                # context open, preventing GPU memory from being freed.
+                try:
+                    del shared_iter
+                    del _epoch_loader
+                    del shared_loader
+                    gc.collect()
+                except Exception:
+                    pass
                 break  # skip end-of-epoch validation; wrapper will resume
 
             if global_steps == 0:
@@ -3257,8 +3268,20 @@ if __name__ == "__main__":
             pass
         gc.collect()
         # Exit with the standard Ctrl+C code so the parent shell/script sees it.
-        import os as _os
-        _os.kill(_os.getpid(), _signal.SIGTERM)
+        os.kill(os.getpid(), _signal.SIGTERM)
 
     _signal.signal(_signal.SIGINT, _sigint_handler)
-    main()
+
+    try:
+        main()
+    finally:
+        # Runs on any exit path (normal, SystemExit from --max-steps, exception).
+        # Ensures DataLoader workers are reaped and the CUDA context is released
+        # before the process exits, so nvidia-smi shows freed memory immediately.
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
