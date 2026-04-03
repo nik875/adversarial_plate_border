@@ -2485,14 +2485,37 @@ class AdversarialPatchTrainer:
                     if _mem_prof:
                         _mp_steps = getattr(self, '_mem_prof_steps', 10)
                         def _rss_mb():
+                            # Read current (not peak) RSS from /proc — ru_maxrss is a
+                            # monotonically-increasing high-water mark and never decreases,
+                            # so it cannot detect per-step growth after the first big alloc.
+                            try:
+                                with open("/proc/self/status") as _f:
+                                    for _l in _f:
+                                        if _l.startswith("VmRSS:"):
+                                            return int(_l.split()[1]) / 1024  # kB → MB
+                            except OSError:
+                                pass
                             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                        def _sys_free_mb():
+                            try:
+                                _mi = {}
+                                with open("/proc/meminfo") as _f:
+                                    for _l in _f:
+                                        k, v = _l.split(":")
+                                        _mi[k.strip()] = int(v.split()[0])
+                                # MemAvailable is the most reliable "usable free" metric
+                                return _mi.get("MemAvailable", _mi.get("MemFree", 0)) / 1024
+                            except OSError:
+                                return float("nan")
                         if global_steps == 0:
                             tracemalloc.start(25)
                             _mem_snap_before = tracemalloc.take_snapshot()
                             _mem_rss_start   = _rss_mb()
+                            _mem_sys_free_start = _sys_free_mb()
                             _mem_step_rows   = []   # list of per-step dicts
                             print(f"\n[mem-prof] Profiling {_mp_steps} steps. "
-                                  f"Baseline RSS: {_mem_rss_start:.1f} MB\n")
+                                  f"Baseline process RSS: {_mem_rss_start:.1f} MB  "
+                                  f"System free: {_mem_sys_free_start:.0f} MB\n")
                         # Between-step RSS: captured NOW, before any work for this step
                         _rss_between = _rss_mb()
                         _rss_0 = _rss_between
@@ -2536,10 +2559,12 @@ class AdversarialPatchTrainer:
                             b: _mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]
                             for i, (b, _) in enumerate(_mem_checkpoints[:-1])
                         }
+                        _sys_free_now = _sys_free_mb()
                         _row = {
                             "step": global_steps,
                             "pipeline": f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
                             "rss_mb": _rss_end,
+                            "sys_free_mb": _sys_free_now,
                             "step_delta_mb": _rss_end - _rss_0,
                             **_stage_deltas,
                         }
@@ -2551,6 +2576,7 @@ class AdversarialPatchTrainer:
                         print(f"[mem-prof] step {global_steps:5d}  "
                               f"RSS {_rss_end:.1f} MB  "
                               f"(step Δ {_rss_end - _rss_0:+.2f} MB)  "
+                              f"SysFree {_sys_free_now:.0f} MB  "
                               f"pipe={_row['pipeline']:<25}  "
                               f"{stages_str}")
 
@@ -2559,8 +2585,10 @@ class AdversarialPatchTrainer:
                             _mem_snap_after = tracemalloc.take_snapshot()
                             tracemalloc.stop()
 
-                            _rss_final   = _rss_mb()
-                            _rss_total   = _rss_final - _mem_rss_start
+                            _rss_final        = _rss_mb()
+                            _rss_total        = _rss_final - _mem_rss_start
+                            _sys_free_final   = _sys_free_mb()
+                            _sys_consumed     = _mem_sys_free_start - _sys_free_final
                             # Exclude step 0 warm-up (model loading) from per-step rate
                             _steady_rows = [r for r in _mem_step_rows if r["step"] >= 3]
                             if _steady_rows:
@@ -2579,28 +2607,33 @@ class AdversarialPatchTrainer:
                             _top_positive = [s for s in _top if s.size_diff > 0]
 
                             # ── Build report string ──────────────────────
-                            _sep = "=" * 70
+                            _sep = "=" * 80
                             _lines = [
                                 _sep,
                                 "  MEM-PROF REPORT",
                                 _sep,
-                                f"  Steps profiled   : {_mp_steps}",
-                                f"  Baseline RSS     : {_mem_rss_start:.1f} MB",
-                                f"  Final RSS        : {_rss_final:.1f} MB",
-                                f"  Total RSS growth : {_rss_total:.1f} MB",
-                                f"  Steady-state growth (step 3+): "
-                                f"{_steady_delta:.1f} MB over {_steady_n} steps "
-                                f"≈ {_rate:.3f} MB/step",
+                                f"  Steps profiled        : {_mp_steps}",
+                                f"  Baseline process RSS  : {_mem_rss_start:.1f} MB",
+                                f"  Final process RSS     : {_rss_final:.1f} MB",
+                                f"  Process RSS growth    : {_rss_total:+.1f} MB",
+                                f"  System free (start)   : {_mem_sys_free_start:.0f} MB",
+                                f"  System free (end)     : {_sys_free_final:.0f} MB",
+                                f"  System memory consumed: {_sys_consumed:+.0f} MB  "
+                                f"(process + GPU + OS buffers)",
+                                f"  Steady-state process RSS growth (step 3+): "
+                                f"{_steady_delta:+.1f} MB over {_steady_n} steps "
+                                f"≈ {_rate:+.3f} MB/step",
                                 "",
-                                "  Per-step RSS table:",
-                                f"  {'step':>6}  {'RSS MB':>9}  {'Δ MB':>8}  "
+                                "  Per-step RSS table (VmRSS = current process RSS from /proc):",
+                                f"  {'step':>6}  {'VmRSS':>8}  {'SysFree':>8}  {'Δ RSS':>7}  "
                                 f"{'pipeline':<25}  "
                                 f"start  gen_patch  prep  compute  bwd_loss  bwd_gen  opt",
                             ]
                             for r in _mem_step_rows:
                                 _lines.append(
-                                    f"  {r['step']:>6}  {r['rss_mb']:>9.1f}  "
-                                    f"{r['step_delta_mb']:>+8.2f}  "
+                                    f"  {r['step']:>6}  {r['rss_mb']:>7.1f}M  "
+                                    f"{r['sys_free_mb']:>7.0f}M  "
+                                    f"{r['step_delta_mb']:>+7.2f}  "
                                     f"{r['pipeline']:<25}  "
                                     f"{r.get('start',0):+6.2f}  "
                                     f"{r.get('generate_patch',0):+9.2f}  "
