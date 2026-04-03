@@ -1439,7 +1439,7 @@ def main():
     def _run_evals(eval_records: List[dict]) -> List[EvalResults]:
         res = []
 
-        if detector_backends:
+        if detector_backends and patch_tensor is None:
             print(f"\n[eval] Evaluating {len(detector_backends)} detectors on {len(eval_records)} images...")
             for name, backend in detector_backends.items():
                 print(f"\n  {name}")
@@ -1455,7 +1455,7 @@ def main():
                     print(f"    [error] {e}")
                     traceback.print_exc()
 
-        if ocr_backends:
+        if ocr_backends and patch_tensor is None:
             print(f"\n[eval] Evaluating {len(ocr_backends)} OCR models on {len(eval_records)} images...")
             for name, backend in ocr_backends.items():
                 print(f"\n  {name}")
@@ -1500,7 +1500,10 @@ def main():
     if not args.skip_preview:
         n_preview = min(256, len(records))
         preview_records = random.sample(records, n_preview)
-        print(f"[preview] Running full pipeline on {n_preview} randomly sampled images...")
+        if patch_tensor is not None:
+            print(f"[preview] Running pipelines only (--patch given) on {n_preview} randomly sampled images...")
+        else:
+            print(f"[preview] Running full pipeline on {n_preview} randomly sampled images...")
         preview_results = _run_evals(preview_records)
         if preview_results:
             print(f"\n[preview] Results on {n_preview} images (no files saved):")
