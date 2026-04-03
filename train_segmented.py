@@ -74,16 +74,16 @@ def main():
 
     n_images        = count_csv_data_rows(args.ccpd_train_csv)
     steps_per_epoch = n_images // args.eval_batch_size
-    total_steps     = args.epochs * steps_per_epoch
-    segment_steps   = math.ceil(total_steps / args.segments)
+    segment_steps   = math.ceil(steps_per_epoch / args.segments)
+    total_segments  = args.epochs * args.segments
 
-    print(f"[segmented] holdout      : {holdout} / {holdout_ocr}")
-    print(f"[segmented] run_dir      : {run_dir}")
-    print(f"[segmented] n_images     : {n_images}")
-    print(f"[segmented] steps/epoch  : {steps_per_epoch}")
-    print(f"[segmented] total_steps  : {total_steps}")
-    print(f"[segmented] segments     : {args.segments}")
-    print(f"[segmented] segment_steps: {segment_steps}")
+    print(f"[segmented] holdout        : {holdout} / {holdout_ocr}")
+    print(f"[segmented] run_dir        : {run_dir}")
+    print(f"[segmented] n_images       : {n_images}")
+    print(f"[segmented] steps/epoch    : {steps_per_epoch}")
+    print(f"[segmented] segments/epoch : {args.segments}  ({100//args.segments}% each)")
+    print(f"[segmented] segment_steps  : {segment_steps}")
+    print(f"[segmented] total_segments : {total_segments}  ({args.epochs} epochs × {args.segments})")
     print()
 
     # Base command — passed to every segment unchanged.
@@ -109,7 +109,7 @@ def main():
 
     continue_ckpt = None
 
-    for seg in range(1, args.segments + 1):
+    for seg in range(1, total_segments + 1):
         cmd = list(base_cmd)
         if continue_ckpt is not None:
             cmd += ["--continue", str(continue_ckpt), "--continue-lr"]
@@ -117,7 +117,7 @@ def main():
         lo = (seg - 1) * segment_steps + 1
         hi = seg * segment_steps
         print(f"{'='*60}")
-        print(f"[segmented] Segment {seg}/{args.segments}  (steps {lo}–{hi})")
+        print(f"[segmented] Segment {seg}/{total_segments}  (steps {lo}–{hi})")
         if continue_ckpt:
             print(f"[segmented] Resuming from: {continue_ckpt}")
         print(f"[segmented] Command: {' '.join(cmd)}")
@@ -138,7 +138,7 @@ def main():
         print(f"\n[segmented] Segment {seg} complete. Checkpoint: {continue_ckpt}\n")
 
     print(f"{'='*60}")
-    print(f"[segmented] All {args.segments} segments complete.")
+    print(f"[segmented] All {total_segments} segments complete.")
     print(f"[segmented] Run dir: {run_dir}")
     print(f"[segmented] Final checkpoint: {continue_ckpt}")
 
