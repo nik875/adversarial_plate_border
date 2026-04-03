@@ -35,10 +35,13 @@ Other design decisions
 from __future__ import annotations
 
 import csv
+import gc
 import random
 import re
+import resource
 import time
 import traceback
+import tracemalloc
 import warnings
 import argparse
 from datetime import datetime
@@ -405,7 +408,7 @@ class AdversarialPatchTrainer:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             suffix    = run_name or timestamp
             self.run_dir = Path("runs") / f"{detector.name}_{ocr.name}_{suffix}"
-        self.profiling: bool = False
+        self.profiling = False   # False | True (timing) | "mem" (memory tracing)
         self._prof:     dict = {}
         (self.run_dir / "patches").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "debug").mkdir(parents=True, exist_ok=True)
@@ -2478,16 +2481,81 @@ class AdversarialPatchTrainer:
                     )
                     lv = loss_t / B
                 else:
+                    _mem_prof = (self.profiling == "mem")
+                    if _mem_prof:
+                        def _rss_mb():
+                            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                        if global_steps == 0:
+                            tracemalloc.start(25)
+                            _mem_snap_before = tracemalloc.take_snapshot()
+                            _mem_rss_start   = _rss_mb()
+                            print(f"\n[mem-prof] step 0 baseline RSS: {_mem_rss_start:.1f} MB")
+                        _rss_0 = _rss_mb()
+                        _mem_checkpoints = [("start", _rss_0)]
+
                     patch_with_graph = self.generate_patch(training_aug=True)
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("generate_patch", _rss_mb()))
+
                     patch_leaf = patch_with_graph.detach().requires_grad_(True)
                     items = [self._prepare_one(r, patch_leaf) for r in items_raw]
                     for it in items: it["_patch_norm"] = patch_leaf
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("prepare_items", _rss_mb()))
+
                     loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("compute_loss", _rss_mb()))
+
                     loss.backward()
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("loss_backward", _rss_mb()))
+
                     patch_with_graph.backward(patch_leaf.grad)
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("gen_backward", _rss_mb()))
+
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step(); optimizer.zero_grad()
                     lv = loss.item()
+
+                    if _mem_prof:
+                        _mem_checkpoints.append(("opt_step", _rss_mb()))
+                        _rss_end  = _rss_mb()
+                        _rss_diff = _rss_end - _rss_0
+                        # Print per-stage RSS deltas
+                        stages = " | ".join(
+                            f"{b}: {_mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]:+.2f}"
+                            for i, (b, _) in enumerate(_mem_checkpoints[:-1])
+                        )
+                        print(f"[mem-prof] step {global_steps:4d}  RSS {_rss_end:.1f} MB "
+                              f"(+{_rss_diff:.2f} MB this step) | {stages}")
+
+                        # After 10 steps, print tracemalloc diff and exit
+                        if global_steps == 9:
+                            gc.collect()
+                            _mem_snap_after = tracemalloc.take_snapshot()
+                            tracemalloc.stop()
+                            _rss_total = _rss_mb() - _mem_rss_start
+                            print(f"\n[mem-prof] Total RSS growth over 10 steps: "
+                                  f"{_rss_total:.1f} MB  "
+                                  f"({_rss_total/10:.2f} MB/step)\n")
+                            print("[mem-prof] Top 30 Python allocation sites by growth "
+                                  "(tracemalloc diff):")
+                            _top = _mem_snap_after.compare_to(
+                                _mem_snap_before, "lineno")
+                            _top.sort(key=lambda s: -s.size_diff)
+                            for stat in _top[:30]:
+                                if stat.size_diff <= 0:
+                                    break
+                                print(f"  +{stat.size_diff/1024:8.1f} KB  {stat}")
+                            print("\n[mem-prof] Done — exiting after 10 steps.")
+                            raise SystemExit(0)
 
                 scheduler.step()
 
@@ -2713,6 +2781,13 @@ def main():
                              "matches DETECTOR (e.g. 'fasterrcnn') and train against the "
                              "remaining 3 pipelines in round-robin.  Requires --finetuned-models.  "
                              f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}")
+    parser.add_argument("--profile", default=None,
+                        choices=["timing", "mem"],
+                        help="Enable profiling.  'timing' reports per-stage wall-clock time "
+                             "in _prepare_batch (existing behaviour).  'mem' traces CPU RSS "
+                             "and Python heap allocations in train_ensemble, prints a "
+                             "tracemalloc diff of the top allocation sites after 10 steps, "
+                             "and exits — use this to diagnose the CPU memory leak.")
     args = parser.parse_args()
 
     # ── Holdout / ensemble mode ───────────────────────────────────────────────
@@ -2869,6 +2944,11 @@ def main():
         continue_run_dir     = _continue_run_dir,
         run_dir_override     = _run_dir_override,
     )
+
+    if args.profile == "timing":
+        trainer.profiling = True
+    elif args.profile == "mem":
+        trainer.profiling = "mem"
 
     if _holdout_pair:
         trainer.train_ensemble(
