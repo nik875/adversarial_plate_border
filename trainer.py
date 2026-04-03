@@ -2442,7 +2442,9 @@ class AdversarialPatchTrainer:
                 if _unseen:
                     pi = _unseen[0]
                 else:
-                    pi = random.choices(range(n), weights=ema_loss)[0]
+                    pi = random.choices(range(n), weights=[
+                        l + self.det_loss_weight + 1e-6 for l in ema_loss
+                    ])[0]
 
                 # ── Grab items_needed items from the shared loader ────
                 items_raw = []
