@@ -2549,14 +2549,14 @@ class AdversarialPatchTrainer:
                         }
                         _mem_step_rows.append(_row)
                         _csv_writer.writerow([_row[c] for c in _csv_cols])
-                        # Flush + console print every 50 steps
+                        # Flush CSV every 50 steps; print every step
                         if global_steps % 50 == 0:
                             _csv_file.flush()
-                            print(f"[mem-prof] {global_steps:5d}  "
-                                  f"RSS {_rss_end:7.1f} MB  "
-                                  f"Δ {_rss_end - _rss_0:+7.2f} MB  "
-                                  f"SysFree {_sys_free_now:7.0f} MB  "
-                                  f"{_row['pipeline']}")
+                        print(f"[mem-prof] {global_steps:5d}  "
+                              f"RSS {_rss_end:7.1f} MB  "
+                              f"Δ {_rss_end - _rss_0:+7.2f} MB  "
+                              f"SysFree {_sys_free_now:7.0f} MB  "
+                              f"{_row['pipeline']}")
 
                         if global_steps == _mp_steps - 1:
                             gc.collect()
