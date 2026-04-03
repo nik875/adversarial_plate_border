@@ -2241,6 +2241,7 @@ class AdversarialPatchTrainer:
         tv_warmup:     float = 0.1,
         continue_path: Optional[str] = None,
         continue_lr:   bool  = False,
+        max_steps:     Optional[int] = None,
     ) -> dict:
         """Ensemble training: EMA-weighted sampling over active_pipelines, one batch per step.
 
@@ -2422,6 +2423,8 @@ class AdversarialPatchTrainer:
         global_updates            = ckpt_global_update
         self._last_save_milestone = ckpt_global_update // save_every if save_every > 0 else 0
         _saved_tv_weight          = self.tv_weight
+        _session_steps            = 0   # optimizer steps taken in this process invocation
+        _max_steps_hit            = False
 
         # ── malloc_trim: reclaim glibc heap fragmentation each step ──────
         # Profiling shows ~15-20 MB of glibc heap fragmentation per rtdetr step
@@ -2755,6 +2758,7 @@ class AdversarialPatchTrainer:
                 pipe_ocr_top[pi]  += ot.item() if hasattr(ot, 'item') else float(ot)
                 pipe_tv[pi]       += tv_l.item() if hasattr(tv_l, 'item') else float(tv_l)
                 global_loss_sum   += lv; global_steps += 1
+                _session_steps    += 1
                 num_upd = global_updates + global_steps
 
                 # Checkpoint milestone
@@ -2762,6 +2766,15 @@ class AdversarialPatchTrainer:
                 if milestone > self._last_save_milestone:
                     self._last_save_milestone = milestone
                     self.save_patch(num_upd, "patches")
+
+                # --max-steps: stop after N optimizer steps in this session.
+                # Force-save so the wrapper can find a checkpoint to resume from.
+                if max_steps is not None and _session_steps >= max_steps:
+                    self.save_patch(num_upd, "patches",
+                                    stem=f"patch_{self.detector.name}_update_{num_upd:06d}")
+                    print(f"[max-steps] Reached {max_steps} steps (update {num_upd}) — stopping.")
+                    _max_steps_hit = True
+                    break
 
                 # batch_log row
                 det_name = active_pipelines[pi][0].name
@@ -2794,6 +2807,9 @@ class AdversarialPatchTrainer:
             batch_log_file.flush()
             global_updates += global_steps
             self.training   = False
+
+            if _max_steps_hit:
+                break  # skip end-of-epoch validation; wrapper will resume
 
             # ── End-of-epoch validation & logging ─────────────────────
             val_losses, val_mean = self._validate_all_pipelines(active_pipelines)
@@ -2969,6 +2985,9 @@ def main():
                              "in _prepare_batch (existing behaviour).  'mem' traces CPU RSS "
                              "and Python heap allocations in train_ensemble, prints and saves "
                              "a full report to mem_profile.txt, then exits.")
+    parser.add_argument("--max-steps", type=int, default=None, metavar="N",
+                        help="Stop after N optimizer steps in this session (used by "
+                             "train_segmented.py to split a long run into restartable chunks).")
     parser.add_argument("--profile-steps", type=int, default=10, metavar="N",
                         help="Number of training steps to profile when --profile mem is used "
                              "(default: 10).  Use a larger value (e.g. 200) to detect slow "
@@ -3145,6 +3164,7 @@ def main():
             tv_warmup        = args.tv_warmup,
             continue_path    = args.continue_path,
             continue_lr      = args.continue_lr,
+            max_steps        = args.max_steps,
         )
     else:
         trainer.train(
