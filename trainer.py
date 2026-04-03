@@ -875,7 +875,7 @@ class AdversarialPatchTrainer:
         single batched warp call per size group (kornia requires uniform HxW).
         diff_prep runs as a single batched F.interpolate call per size group.
         """
-        _prof = self.profiling
+        _prof = (self.profiling is True)  # only True (timing), not "mem"
         if _prof: _t_batch0 = _t0 = _pt()
 
         # ── CPU-side downscale + size grouping ──────────────────────────
