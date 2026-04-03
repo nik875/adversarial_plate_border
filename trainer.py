@@ -2483,14 +2483,19 @@ class AdversarialPatchTrainer:
                 else:
                     _mem_prof = (self.profiling == "mem")
                     if _mem_prof:
+                        _mp_steps = getattr(self, '_mem_prof_steps', 10)
                         def _rss_mb():
                             return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
                         if global_steps == 0:
                             tracemalloc.start(25)
                             _mem_snap_before = tracemalloc.take_snapshot()
                             _mem_rss_start   = _rss_mb()
-                            print(f"\n[mem-prof] step 0 baseline RSS: {_mem_rss_start:.1f} MB")
-                        _rss_0 = _rss_mb()
+                            _mem_step_rows   = []   # list of per-step dicts
+                            print(f"\n[mem-prof] Profiling {_mp_steps} steps. "
+                                  f"Baseline RSS: {_mem_rss_start:.1f} MB\n")
+                        # Between-step RSS: captured NOW, before any work for this step
+                        _rss_between = _rss_mb()
+                        _rss_0 = _rss_between
                         _mem_checkpoints = [("start", _rss_0)]
 
                     patch_with_graph = self.generate_patch(training_aug=True)
@@ -2526,35 +2531,105 @@ class AdversarialPatchTrainer:
 
                     if _mem_prof:
                         _mem_checkpoints.append(("opt_step", _rss_mb()))
-                        _rss_end  = _rss_mb()
-                        _rss_diff = _rss_end - _rss_0
-                        # Print per-stage RSS deltas
-                        stages = " | ".join(
-                            f"{b}: {_mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]:+.2f}"
+                        _rss_end  = _mem_checkpoints[-1][1]
+                        _stage_deltas = {
+                            b: _mem_checkpoints[i+1][1] - _mem_checkpoints[i][1]
                             for i, (b, _) in enumerate(_mem_checkpoints[:-1])
+                        }
+                        _row = {
+                            "step": global_steps,
+                            "pipeline": f"{active_pipelines[pi][0].name}/{active_pipelines[pi][1].name}",
+                            "rss_mb": _rss_end,
+                            "step_delta_mb": _rss_end - _rss_0,
+                            **_stage_deltas,
+                        }
+                        _mem_step_rows.append(_row)
+                        stages_str = " | ".join(
+                            f"{b}: {v:+.2f}"
+                            for b, v in _stage_deltas.items()
                         )
-                        print(f"[mem-prof] step {global_steps:4d}  RSS {_rss_end:.1f} MB "
-                              f"(+{_rss_diff:.2f} MB this step) | {stages}")
+                        print(f"[mem-prof] step {global_steps:5d}  "
+                              f"RSS {_rss_end:.1f} MB  "
+                              f"(step Δ {_rss_end - _rss_0:+.2f} MB)  "
+                              f"pipe={_row['pipeline']:<25}  "
+                              f"{stages_str}")
 
-                        # After 10 steps, print tracemalloc diff and exit
-                        if global_steps == 9:
+                        if global_steps == _mp_steps - 1:
                             gc.collect()
                             _mem_snap_after = tracemalloc.take_snapshot()
                             tracemalloc.stop()
-                            _rss_total = _rss_mb() - _mem_rss_start
-                            print(f"\n[mem-prof] Total RSS growth over 10 steps: "
-                                  f"{_rss_total:.1f} MB  "
-                                  f"({_rss_total/10:.2f} MB/step)\n")
-                            print("[mem-prof] Top 30 Python allocation sites by growth "
-                                  "(tracemalloc diff):")
+
+                            _rss_final   = _rss_mb()
+                            _rss_total   = _rss_final - _mem_rss_start
+                            # Exclude step 0 warm-up (model loading) from per-step rate
+                            _steady_rows = [r for r in _mem_step_rows if r["step"] >= 3]
+                            if _steady_rows:
+                                _steady_delta = (_steady_rows[-1]["rss_mb"]
+                                                 - _steady_rows[0]["rss_mb"])
+                                _steady_n     = len(_steady_rows)
+                                _rate         = _steady_delta / max(_steady_n - 1, 1)
+                            else:
+                                _steady_delta = _rss_total
+                                _steady_n     = _mp_steps
+                                _rate         = _rss_total / max(_mp_steps - 1, 1)
+
                             _top = _mem_snap_after.compare_to(
                                 _mem_snap_before, "lineno")
                             _top.sort(key=lambda s: -s.size_diff)
-                            for stat in _top[:30]:
-                                if stat.size_diff <= 0:
-                                    break
-                                print(f"  +{stat.size_diff/1024:8.1f} KB  {stat}")
-                            print("\n[mem-prof] Done — exiting after 10 steps.")
+                            _top_positive = [s for s in _top if s.size_diff > 0]
+
+                            # ── Build report string ──────────────────────
+                            _sep = "=" * 70
+                            _lines = [
+                                _sep,
+                                "  MEM-PROF REPORT",
+                                _sep,
+                                f"  Steps profiled   : {_mp_steps}",
+                                f"  Baseline RSS     : {_mem_rss_start:.1f} MB",
+                                f"  Final RSS        : {_rss_final:.1f} MB",
+                                f"  Total RSS growth : {_rss_total:.1f} MB",
+                                f"  Steady-state growth (step 3+): "
+                                f"{_steady_delta:.1f} MB over {_steady_n} steps "
+                                f"≈ {_rate:.3f} MB/step",
+                                "",
+                                "  Per-step RSS table:",
+                                f"  {'step':>6}  {'RSS MB':>9}  {'Δ MB':>8}  "
+                                f"{'pipeline':<25}  "
+                                f"start  gen_patch  prep  compute  bwd_loss  bwd_gen  opt",
+                            ]
+                            for r in _mem_step_rows:
+                                _lines.append(
+                                    f"  {r['step']:>6}  {r['rss_mb']:>9.1f}  "
+                                    f"{r['step_delta_mb']:>+8.2f}  "
+                                    f"{r['pipeline']:<25}  "
+                                    f"{r.get('start',0):+6.2f}  "
+                                    f"{r.get('generate_patch',0):+9.2f}  "
+                                    f"{r.get('prepare_items',0):+4.2f}  "
+                                    f"{r.get('compute_loss',0):+7.2f}  "
+                                    f"{r.get('loss_backward',0):+8.2f}  "
+                                    f"{r.get('gen_backward',0):+7.2f}  "
+                                    f"{r.get('opt_step',0):+3.2f}"
+                                )
+                            _lines += [
+                                "",
+                                f"  Top {len(_top_positive)} Python allocation sites "
+                                f"(tracemalloc diff, step 0 → step {_mp_steps-1}):",
+                            ]
+                            for stat in _top_positive[:50]:
+                                _lines.append(
+                                    f"    +{stat.size_diff/1024:8.1f} KB  "
+                                    f"count Δ {stat.count_diff:+6d}  {stat}"
+                                )
+                            _lines.append(_sep)
+                            _report = "\n".join(_lines)
+
+                            print("\n" + _report)
+                            # Save to file
+                            _rpt_path = self.run_dir / "mem_profile.txt"
+                            with open(_rpt_path, "w") as _rf:
+                                _rf.write(_report + "\n")
+                            print(f"\n[mem-prof] Report saved to {_rpt_path}")
+                            print("[mem-prof] Done — exiting.")
                             raise SystemExit(0)
 
                 scheduler.step()
@@ -2785,9 +2860,12 @@ def main():
                         choices=["timing", "mem"],
                         help="Enable profiling.  'timing' reports per-stage wall-clock time "
                              "in _prepare_batch (existing behaviour).  'mem' traces CPU RSS "
-                             "and Python heap allocations in train_ensemble, prints a "
-                             "tracemalloc diff of the top allocation sites after 10 steps, "
-                             "and exits — use this to diagnose the CPU memory leak.")
+                             "and Python heap allocations in train_ensemble, prints and saves "
+                             "a full report to mem_profile.txt, then exits.")
+    parser.add_argument("--profile-steps", type=int, default=10, metavar="N",
+                        help="Number of training steps to profile when --profile mem is used "
+                             "(default: 10).  Use a larger value (e.g. 200) to detect slow "
+                             "leaks that only manifest over many steps.")
     args = parser.parse_args()
 
     # ── Holdout / ensemble mode ───────────────────────────────────────────────
@@ -2949,6 +3027,7 @@ def main():
         trainer.profiling = True
     elif args.profile == "mem":
         trainer.profiling = "mem"
+        trainer._mem_prof_steps = args.profile_steps
 
     if _holdout_pair:
         trainer.train_ensemble(
