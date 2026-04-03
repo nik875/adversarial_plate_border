@@ -3244,4 +3244,20 @@ def main():
 
 
 if __name__ == "__main__":
+    import signal as _signal
+
+    def _sigint_handler(signum, frame):
+        print("\n[interrupted] Freeing GPU memory before exit...")
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        # Exit with the standard Ctrl+C code so the parent shell/script sees it.
+        import os as _os
+        _os.kill(_os.getpid(), _signal.SIGTERM)
+
+    _signal.signal(_signal.SIGINT, _sigint_handler)
     main()
