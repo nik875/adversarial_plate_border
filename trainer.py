@@ -2402,13 +2402,15 @@ class AdversarialPatchTrainer:
         _saved_tv_weight          = self.tv_weight
 
         # ── EMA loss per pipeline (persists across epochs) ────────────
-        # Initialized uniform so the first epoch is approximately round-robin.
-        # After each step, ema_loss[pi] is updated with the observed batch loss.
-        # Pipeline selection probability ∝ softmax(ema_loss / τ): pipelines
-        # where the attack is still struggling get more optimizer steps.
+        # ema_loss[i] = None until pipeline i has been seen at least once.
+        # Unseen pipelines are visited first (round-robin warm-up) to get a
+        # realistic loss estimate before weighted sampling begins.
+        # After the warm-up, pipeline selection probability ∝
+        # softmax((ema_loss - mean) / τ): pipelines where the attack is still
+        # struggling get more optimizer steps.
         _ema_alpha = 0.1   # smoothing factor
         _ema_tau   = 1.0   # softmax temperature (higher → more uniform)
-        ema_loss   = [1.0] * n
+        ema_loss: list = [None] * n   # None = not yet observed
 
         # ── Epoch loop ────────────────────────────────────────────────
         for epoch in range(num_epochs):
@@ -2435,11 +2437,16 @@ class AdversarialPatchTrainer:
 
             while True:
                 # ── Choose pipeline via EMA-weighted softmax ──────────
-                # Centre before exp so only relative differences drive
-                # sampling — prevents one high-loss pipeline from monopolising.
-                _mean_ema = sum(ema_loss) / n
-                _weights  = [np.exp((l - _mean_ema) / _ema_tau) for l in ema_loss]
-                pi = random.choices(range(n), weights=_weights)[0]
+                # Warm-up: visit any pipeline not yet observed, in order.
+                # This ensures every pipeline gets a real loss estimate before
+                # weighted sampling begins (avoids init-value collapse).
+                _unseen = [i for i in range(n) if ema_loss[i] is None]
+                if _unseen:
+                    pi = _unseen[0]
+                else:
+                    _mean_ema = sum(ema_loss) / n
+                    _weights  = [np.exp((l - _mean_ema) / _ema_tau) for l in ema_loss]
+                    pi = random.choices(range(n), weights=_weights)[0]
 
                 # ── Grab items_needed items from the shared loader ────
                 items_raw = []
@@ -2487,7 +2494,10 @@ class AdversarialPatchTrainer:
                 scheduler.step()
 
                 # ── Update EMA ────────────────────────────────────────
-                ema_loss[pi] = (1 - _ema_alpha) * ema_loss[pi] + _ema_alpha * lv
+                if ema_loss[pi] is None:
+                    ema_loss[pi] = lv          # cold start: set directly
+                else:
+                    ema_loss[pi] = (1 - _ema_alpha) * ema_loss[pi] + _ema_alpha * lv
 
                 # Metrics tracking
                 pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
