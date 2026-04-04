@@ -9,12 +9,13 @@ from the last checkpoint.  All segments share a single run dir.
 Usage:
     python train_segmented.py --holdout owlvit
     python train_segmented.py --holdout owlvit --epochs 5 --segments 10
-    python train_segmented.py --holdout owlvit --lr 5e-5 --no-augment
+    python train_segmented.py --holdout owlvit --continue   # resume latest run
 """
 
 import argparse
 import csv
 import math
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -41,14 +42,33 @@ def latest_checkpoint(patches_dir: Path):
     return pts[-1] if pts else None
 
 
+def global_update_from_ckpt(ckpt: Path) -> int:
+    """Parse global_update from checkpoint filename (avoids importing torch)."""
+    m = re.search(r"update_(\d+)\.pt$", ckpt.name)
+    return int(m.group(1)) if m else 0
+
+
+def find_latest_run(holdout: str, holdout_ocr: str) -> Path | None:
+    runs_dir = Path("runs")
+    prefix = f"holdout_{holdout}_{holdout_ocr}_"
+    matches = sorted(
+        (p for p in runs_dir.glob(f"{prefix}*") if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    return matches[-1] if matches else None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--holdout", required=True,
                         choices=[d for d, _ in PIPELINE_PAIRINGS],
                         help="Detector name to hold out")
+    parser.add_argument("--continue", dest="resume", action="store_true",
+                        help="Resume the most recent matching run from its "
+                             "last checkpoint, preserving LR and dataloader state")
     parser.add_argument("--segments", type=int, default=5,
-                        help="Number of segments to split training into")
+                        help="Number of segments per epoch")
     # trainer.py args — all optional, override the defaults below
     parser.add_argument("--finetuned-models", default="finetuned_models", metavar="DIR")
     parser.add_argument("--ccpd-train-csv",   default="finetuned_models/train_split.csv")
@@ -68,14 +88,54 @@ def main():
     holdout     = args.holdout
     holdout_ocr = next(o for d, o in PIPELINE_PAIRINGS if d == holdout)
 
-    # Fixed run_name so all segments land in the same run dir.
-    run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir  = Path("runs") / f"holdout_{holdout}_{holdout_ocr}_{run_name}"
-
     n_images        = count_csv_data_rows(args.ccpd_train_csv)
     steps_per_epoch = n_images // args.eval_batch_size
     segment_steps   = math.ceil(steps_per_epoch / args.segments)
+    total_steps     = args.epochs * steps_per_epoch
     total_segments  = args.epochs * args.segments
+
+    MIN_SEGMENT_STEPS = 50
+    if segment_steps < MIN_SEGMENT_STEPS:
+        print(f"[segmented] ERROR: --segments {args.segments} gives only "
+              f"{segment_steps} steps/segment (minimum is {MIN_SEGMENT_STEPS}).  "
+              f"Max useful --segments for this dataset: "
+              f"{steps_per_epoch // MIN_SEGMENT_STEPS}.")
+        sys.exit(1)
+
+    # ── Resume detection ──────────────────────────────────────────────────
+    continue_ckpt = None
+    start_seg     = 1
+
+    if args.resume:
+        existing_run = find_latest_run(holdout, holdout_ocr)
+        if existing_run is None:
+            print(f"[segmented] --continue: no existing run found for "
+                  f"holdout={holdout}/{holdout_ocr} in runs/")
+            sys.exit(1)
+
+        patches_dir = existing_run / "patches"
+        ckpt = latest_checkpoint(patches_dir)
+        if ckpt is None:
+            print(f"[segmented] --continue: no checkpoint found in {patches_dir}")
+            sys.exit(1)
+
+        prefix   = f"holdout_{holdout}_{holdout_ocr}_"
+        run_name = existing_run.name[len(prefix):]
+        run_dir  = existing_run
+        global_update = global_update_from_ckpt(ckpt)
+        remaining_steps = max(0, total_steps - global_update)
+        remaining_segs  = math.ceil(remaining_steps / segment_steps)
+        start_seg       = total_segments - remaining_segs + 1
+        continue_ckpt   = ckpt
+
+        print(f"[segmented] Resuming run   : {existing_run}")
+        print(f"[segmented] Checkpoint     : {ckpt.name}  (global_update={global_update})")
+        print(f"[segmented] Steps done     : {global_update}/{total_steps}")
+        print(f"[segmented] Segments left  : {remaining_segs}/{total_segments} "
+              f"(starting at segment {start_seg})")
+    else:
+        run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir  = Path("runs") / f"holdout_{holdout}_{holdout_ocr}_{run_name}"
 
     print(f"[segmented] holdout        : {holdout} / {holdout_ocr}")
     print(f"[segmented] run_dir        : {run_dir}")
@@ -107,9 +167,7 @@ def main():
     if args.augment:
         base_cmd.append("--augment")
 
-    continue_ckpt = None
-
-    for seg in range(1, total_segments + 1):
+    for seg in range(start_seg, total_segments + 1):
         cmd = list(base_cmd)
         if continue_ckpt is not None:
             cmd += ["--continue", str(continue_ckpt), "--continue-lr"]
@@ -138,7 +196,7 @@ def main():
         print(f"\n[segmented] Segment {seg} complete. Checkpoint: {continue_ckpt}\n")
 
     print(f"{'='*60}")
-    print(f"[segmented] All {total_segments} segments complete.")
+    print(f"[segmented] All segments complete.")
     print(f"[segmented] Run dir: {run_dir}")
     print(f"[segmented] Final checkpoint: {continue_ckpt}")
 
