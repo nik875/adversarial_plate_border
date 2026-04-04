@@ -64,7 +64,7 @@ from detector_backends import DetectorBackend, Detection, build_backend
 from ocr_backends import OCRBackend, OCRResult, build_ocr_backend
 from dataset import (create_dataloaders, create_ccpd_dataloaders,
                      make_letterbox_prep, make_resize_prep, make_passthrough_prep,
-                     _chw_uint8)
+                     _chw_uint8, CCPDBboxDataset, AdversarialPatchDataset)
 
 warnings.filterwarnings("ignore")
 
@@ -615,35 +615,48 @@ class AdversarialPatchTrainer:
         self.diff_prep = self._make_differentiable_prep()
         self._cv2_prep = self._make_cv2_prep()
 
-    def _make_pipeline_loader(self, seed: Optional[int] = None):
+    def _make_pipeline_loader(self, seed: Optional[int] = None, skip: int = 0):
         """Create a fresh non-preloaded train DataLoader.
 
-        Used by train_ensemble() to give each active pipeline its own
-        independent iterator over the full dataset each epoch.
-
-        seed: if given, the DataLoader shuffle is fully deterministic for that
-              seed (via torch.Generator).  Pass seed=base_seed+epoch so each
-              epoch has a different but reproducible order.
+        seed: if given, shuffle is deterministic (pass base_seed+epoch so each
+              epoch has a different but reproducible order).
+        skip: number of items already consumed this epoch.  Instead of loading
+              and discarding skip items at iteration time, we generate the same
+              randperm mathematically and slice the dataset — O(1) regardless of
+              how many items are skipped.
         """
         _nj = os.cpu_count() if self._num_workers < 0 else self._num_workers
-        _gen = None
+        _persistent = _nj > 0
+        _prefetch   = 4 if _nj > 0 else None
+
+        if self._ccpd_csv:
+            ds = CCPDBboxDataset(self._ccpd_csv, limit=self._limit)
+        else:
+            import pandas as _pd
+            _df = _pd.read_csv(self._csv_path)
+            if self._limit:
+                _df = _df.iloc[-self._limit:]
+            _df = _df.sample(frac=1, random_state=42).reset_index(drop=True)
+            if not self._use_all_for_train:
+                _df = _df.iloc[:int(0.8 * len(_df))]
+            ds = AdversarialPatchDataset(_df, use_original=True)
+
         if seed is not None:
             _gen = torch.Generator()
             _gen.manual_seed(seed)
-        if self._ccpd_csv:
-            loader, _ = create_ccpd_dataloaders(
-                self._ccpd_csv, batch_size=1, n_jobs=_nj,
-                pin_memory=False, limit=self._limit, generator=_gen,
-            )
+            perm = torch.randperm(len(ds), generator=_gen).tolist()
+            if skip > 0:
+                perm = perm[skip:]
+            from torch.utils.data import Subset, DataLoader as _DL, SequentialSampler
+            ds = Subset(ds, perm)
+            return _DL(ds, batch_size=1, sampler=SequentialSampler(ds),
+                       num_workers=_nj, pin_memory=False,
+                       persistent_workers=_persistent, prefetch_factor=_prefetch)
         else:
-            loader, _ = create_dataloaders(
-                self._csv_path, transform=self.transform,
-                preload=False, gpu_device=None, batch_size=1,
-                n_jobs=_nj, pin_memory=False,
-                limit=self._limit, use_all_for_train=self._use_all_for_train,
-                use_original=True, generator=_gen,
-            )
-        return loader
+            from torch.utils.data import DataLoader as _DL
+            return _DL(ds, batch_size=1, shuffle=True,
+                       num_workers=_nj, pin_memory=False,
+                       persistent_workers=_persistent, prefetch_factor=_prefetch)
 
     # ====================================================================
     # Geometry helpers
@@ -2482,24 +2495,17 @@ class AdversarialPatchTrainer:
             epoch_start  = time.time()
             self.training = True
 
-            # Create a seeded loader for this epoch so the shuffle order is
-            # deterministic and can be replayed exactly on resume.
-            _epoch_loader = self._make_pipeline_loader(seed=_loader_base_seed + epoch)
+            # Create a seeded loader for this epoch.  On the resume epoch,
+            # pass skip= so the randperm is sliced mathematically — no images
+            # are loaded just to be discarded.
+            _skip = ckpt_resume_items if epoch == ckpt_resume_epoch else 0
+            _epoch_loader = self._make_pipeline_loader(
+                seed=_loader_base_seed + epoch, skip=_skip)
             shared_iter   = iter(_epoch_loader)
-
-            # On the resume epoch, skip items already consumed in the previous
-            # session.  The seeded loader replays the identical shuffle order,
-            # so advancing the iterator puts us at the exact same position.
-            _items_consumed_epoch = 0
-            if epoch == ckpt_resume_epoch and ckpt_resume_items > 0:
-                for _ in range(ckpt_resume_items):
-                    try:
-                        next(shared_iter)
-                    except StopIteration:
-                        break
-                _items_consumed_epoch = ckpt_resume_items
-                print(f"  [loader] Epoch {epoch}: skipped {ckpt_resume_items} "
-                      f"already-seen items to restore position.")
+            _items_consumed_epoch = _skip
+            if _skip > 0:
+                print(f"  [loader] Epoch {epoch}: fast-skipped {_skip} "
+                      f"already-seen items (O(1) index slice).")
             pipe_loss_sum = [0.0] * n
             pipe_steps    = [0]   * n
             # component sums for epoch-level averages
