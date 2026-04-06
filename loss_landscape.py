@@ -528,6 +528,14 @@ def _qs_compute_one(
     det_b, ocr_b = pipeline_backends[pi]
     trainer._activate_pipeline(det_b, ocr_b)
 
+    # CuDNN LSTM (e.g. LPRNet) requires training mode for the entire
+    # forward+backward cycle.  Only switch models that actually have RNN layers
+    # to avoid unnecessary BatchNorm behaviour change in other models.
+    has_rnn = any(isinstance(m, (torch.nn.LSTM, torch.nn.GRU, torch.nn.RNN))
+                  for m in nn_model.modules())
+    if has_rnn:
+        nn_model.train()
+
     # Zero decoder + seed gradients
     trainer.decoder.zero_grad()
     if trainer.seed.grad is not None:
@@ -580,6 +588,8 @@ def _qs_compute_one(
         return float('nan'), torch.zeros(n_params, dtype=torch.float32)
 
     (total_ql / n_valid).backward()
+    if has_rnn:
+        nn_model.eval()
     return (total_ql / n_valid).item(), _collect_grad(trainer)
 
 
