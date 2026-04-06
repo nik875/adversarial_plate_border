@@ -270,11 +270,30 @@ class _EncoderOnlyWrapper(torch.nn.Module):
         super().__init__()
         self.enc = encoder
 
-    def named_modules(self):          # expose encoder leaf modules to hooks
+    def named_modules(self):
         return self.enc.named_modules()
 
     def forward(self, x):
         return self.enc(pixel_values=x).last_hidden_state
+
+
+class _VisionOnlyWrapper(torch.nn.Module):
+    """
+    Wraps an OWLViT (or any model with a .owlvit.vision_model sub-module)
+    so only the visual backbone runs.  OWLViT's full forward requires text
+    input tokens; the vision model accepts only pixel_values.
+    """
+    def __init__(self, vision_model):
+        super().__init__()
+        self.vm = vision_model
+
+    def named_modules(self):
+        return self.vm.named_modules()
+
+    def forward(self, x):
+        out = self.vm(pixel_values=x)
+        # Return last_hidden_state if present, else the raw output
+        return getattr(out, 'last_hidden_state', out)
 
 
 def _qs_discover_leaf_shapes(model, sample_input, device):
@@ -465,7 +484,14 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
             loss, *_ = trainer.compute_loss_batch(chunk)
             pipe_loss = pipe_loss + loss / len(pipeline_backends)
 
+        # CuDNN LSTM (e.g. LPRNet) requires training mode for backward even
+        # when weights are frozen.  Switch, backprop, then restore eval.
+        ocr_nn = getattr(ocr, '_model', None)
+        if ocr_nn is not None:
+            ocr_nn.train()
         pipe_loss.backward()   # accumulates into .grad; graph freed immediately
+        if ocr_nn is not None:
+            ocr_nn.eval()
         total_loss += pipe_loss.item()
 
     return total_loss, _collect_grad(trainer)
@@ -511,17 +537,18 @@ def _qs_compute_one(
                 ctrl_crop = ctrl_item.get("ocr_crop")
                 if ctrl_crop is None:
                     continue
-                ctrl_crop = ctrl_crop.to(device)           # [3, H, W] float [0,1]
+                # ocr_crop is [1, 3, H, W] (already batched by _prepare_batch)
+                ctrl_crop = ctrl_crop.to(device)           # [1, 3, H, W]
                 oh, ow    = backend.ocr_crop_size
-                # Resize patch to OCR crop size; gradient flows through this op
-                p_small   = F.interpolate(
+                # Keep batch dim: [1, 3, oh, ow]; gradient flows through interpolate
+                p_batch   = F.interpolate(
                     patch_norm.unsqueeze(0), size=(oh, ow),
                     mode='bilinear', align_corners=False
-                ).squeeze(0)                               # [3, oh, ow]
-                adv_crop  = ctrl_crop.detach() + 0.1 * p_small   # synthetic overlay
-                # _preprocess is differentiable (F.interpolate + permute/scale)
-                ctrl_inp  = backend._preprocess(ctrl_crop.unsqueeze(0)).detach()
-                adv_inp   = backend._preprocess(adv_crop.unsqueeze(0))
+                )                                          # [1, 3, oh, ow]
+                adv_crop  = ctrl_crop.detach() + 0.1 * p_batch   # [1, 3, oh, ow]
+                # Pass [1, 3, H, W] directly — _preprocess already expects batched input
+                ctrl_inp  = backend._preprocess(ctrl_crop).detach()
+                adv_inp   = backend._preprocess(adv_crop)
 
             ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True,  device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
@@ -592,9 +619,13 @@ def run_qscore_basin_profile(
     for pi, (det, ocr) in enumerate(pipeline_backends):
         nn_det = getattr(det, '_model', None)
         if nn_det is not None:
+            # OWLViT: full forward requires text tokens — use vision backbone only
+            if hasattr(nn_det, 'owlvit') and hasattr(nn_det.owlvit, 'vision_model'):
+                nn_det = _VisionOnlyWrapper(nn_det.owlvit.vision_model)
             registry.append((det.name, nn_det, False, det, pi))
         nn_ocr = getattr(ocr, '_model', None)
         if nn_ocr is not None:
+            # TrOCR: encoder-decoder model — use encoder only
             if hasattr(nn_ocr, 'encoder') and hasattr(nn_ocr, 'decoder'):
                 nn_ocr = _EncoderOnlyWrapper(nn_ocr.encoder)
             registry.append((ocr.name, nn_ocr, True, ocr, pi))
@@ -621,10 +652,11 @@ def run_qscore_basin_profile(
                     if not is_ocr:
                         ctrl_inputs.append(ci["patched_prep"].unsqueeze(0).to(device))
                     else:
+                        # ocr_crop is already [1, 3, H, W] from _prepare_batch
                         cc = ci.get("ocr_crop")
                         if cc is not None:
                             ctrl_inputs.append(
-                                backend._preprocess(cc.unsqueeze(0).to(device))
+                                backend._preprocess(cc.to(device))
                             )
                 except Exception:
                     continue
