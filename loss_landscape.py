@@ -393,6 +393,18 @@ def _qs_capture(model, inp, neurons, no_grad, device):
         for h in hooks: h.remove()
 
 
+def _qs_ocr_preprocess(backend, crop_tensor):
+    """
+    Apply backend-specific preprocessing to an OCR crop tensor [1, 3, H, W].
+    Falls back to bilinear resize to ocr_crop_size when _preprocess is absent
+    (e.g. TrOCR uses a HuggingFace PIL-based processor, not a tensor method).
+    """
+    if hasattr(backend, '_preprocess'):
+        return backend._preprocess(crop_tensor)
+    oh, ow = backend.ocr_crop_size
+    return F.interpolate(crop_tensor, size=(oh, ow), mode='bilinear', align_corners=False)
+
+
 def _qs_loss(adv_acts, ctrl_acts, neuron_stds):
     """
     L_q = -log(rms(delta / std) + ε),  delta = adv - ctrl (ctrl detached).
@@ -551,9 +563,10 @@ def _qs_compute_one(
                     mode='bilinear', align_corners=False
                 )                                          # [1, 3, oh, ow]
                 adv_crop  = ctrl_crop.detach() + 0.1 * p_batch   # [1, 3, oh, ow]
-                # Pass [1, 3, H, W] directly — _preprocess already expects batched input
-                ctrl_inp  = backend._preprocess(ctrl_crop).detach()
-                adv_inp   = backend._preprocess(adv_crop)
+                # Pass [1, 3, H, W] directly; _qs_ocr_preprocess falls back to
+                # F.interpolate for backends without a tensor _preprocess (e.g. TrOCR)
+                ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
+                adv_inp   = _qs_ocr_preprocess(backend, adv_crop)
 
             ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True,  device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
@@ -661,7 +674,7 @@ def run_qscore_basin_profile(
                         cc = ci.get("ocr_crop")
                         if cc is not None:
                             ctrl_inputs.append(
-                                backend._preprocess(cc.to(device))
+                                _qs_ocr_preprocess(backend, cc.to(device))
                             )
                 except Exception:
                     continue
