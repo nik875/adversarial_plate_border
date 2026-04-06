@@ -149,7 +149,7 @@ def main():
     parser.add_argument("--finetuned-models", default="finetuned_models", metavar="DIR",
                         help="Directory containing finetuned model weights")
     parser.add_argument("--csv", default="finetuned_models/train_split.csv",
-                        help="Training CSV used by the data loader")
+                        help="CCPD training CSV (same as --ccpd-train-csv in train_segmented.py)")
     parser.add_argument("--n-batches", type=int, default=10,
                         help="Number of data items to evaluate per alpha step "
                              "(same items reused for every pipeline and alpha)")
@@ -212,7 +212,7 @@ def main():
     trainer = AdversarialPatchTrainer(
         detector             = det0,
         ocr                  = ocr0,
-        csv_path             = args.csv,
+        ccpd_csv             = args.csv,
         seed_channels        = seed_channels,
         impersonation_target = args.impersonation_target,
         tv_weight            = args.tv_weight,
