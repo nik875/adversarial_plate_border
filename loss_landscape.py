@@ -662,6 +662,165 @@ def _qs_compute_one(
     return (total_ql / n_valid).item(), _collect_grad(trainer)
 
 
+def _qs_build_model_data(trainer, pipeline_backends, raw_items, device):
+    """
+    Build the model registry and collect ctrl_inputs for every model.
+    Returns model_data dict: label → (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi).
+    Shared by run_qscore_basin_profile and run_qscore_overlap_calibration.
+    """
+    registry = []
+    for pi, (det, ocr) in enumerate(pipeline_backends):
+        nn_det = getattr(det, '_model', None)
+        if nn_det is not None:
+            if hasattr(nn_det, 'owlvit') and hasattr(nn_det.owlvit, 'vision_model'):
+                nn_det = _VisionOnlyWrapper(nn_det.owlvit.vision_model)
+            registry.append((det.name, nn_det, False, det, pi))
+        nn_ocr = getattr(ocr, '_model', None)
+        if nn_ocr is not None:
+            if hasattr(nn_ocr, 'encoder') and hasattr(nn_ocr, 'decoder'):
+                nn_ocr = _EncoderOnlyWrapper(nn_ocr.encoder)
+            registry.append((ocr.name, nn_ocr, True, ocr, pi))
+
+    model_data = {}
+    print("Discovering layers and collecting ctrl inputs:")
+    for label, nn_model, is_ocr, backend, pi in registry:
+        det_b, ocr_b = pipeline_backends[pi]
+        trainer._activate_pipeline(det_b, ocr_b)
+        try:
+            with torch.no_grad():
+                gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
+            ctrl_inputs = []
+            for raw in raw_items:
+                try:
+                    ci = trainer._prepare_one(raw, gray, augment=False)
+                    if not is_ocr:
+                        ctrl_inputs.append(ci["patched_prep"].unsqueeze(0).to(device))
+                    else:
+                        cc = ci.get("ocr_crop")
+                        if cc is not None:
+                            ctrl_inputs.append(_qs_ocr_preprocess(backend, cc.to(device)))
+                except Exception:
+                    continue
+            if not ctrl_inputs:
+                raise ValueError("no ctrl inputs prepared")
+            shapes = _qs_discover_leaf_shapes(nn_model, ctrl_inputs[0], device)
+            if not shapes:
+                raise ValueError("no leaf shapes discovered")
+            model_data[label] = (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)
+            print(f"  ✓  {label:20s}  {len(shapes):4d} layers  {len(ctrl_inputs)} ctrl inputs")
+        except Exception as e:
+            print(f"  ✗  {label}: skip — {e}")
+    return model_data
+
+
+def _qs_run_precompute(model_data, all_neuron_sets, needed_per_model,
+                        raw_items, pipeline_backends, trainer, device):
+    """
+    Build per-model activation matrices and per-neuron-set position tensors.
+
+    Returns:
+      act_matrices     : {label: float32 CPU Tensor[n_unique, N_valid]}
+      neuron_to_pos    : {label: {(name, idx): int}}
+      pos_tensors      : {(label, step_idx, si): LongTensor[k]}
+      item_ctrl_inputs : {label: List[None | (ctrl_inp, ctrl_crop, valid_item_idx)]}
+
+    Shared by run_qscore_basin_profile and run_qscore_overlap_calibration.
+    """
+    print("\nPrecomputing ctrl activation matrices (once per model) …")
+    act_matrices     = {}
+    neuron_to_pos    = {}
+    item_ctrl_inputs = {}
+    n_models = len(model_data)
+
+    for m_idx, (label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)) in \
+            enumerate(model_data.items()):
+        det_b, ocr_b = pipeline_backends[pi]
+        trainer._activate_pipeline(det_b, ocr_b)
+
+        with torch.no_grad():
+            gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
+
+        item_cache   = []
+        valid_inputs = []
+        for raw in raw_items:
+            try:
+                ctrl_item = trainer._prepare_one(raw, gray, augment=False)
+                if not is_ocr:
+                    ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
+                    ctrl_crop = None
+                else:
+                    ctrl_crop_t = ctrl_item.get("ocr_crop")
+                    if ctrl_crop_t is None:
+                        item_cache.append(None)
+                        continue
+                    ctrl_crop = ctrl_crop_t.to(device)
+                    ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
+                valid_item_idx = len(valid_inputs)
+                valid_inputs.append(ctrl_inp)
+                item_cache.append((ctrl_inp, ctrl_crop, valid_item_idx))
+            except Exception:
+                item_cache.append(None)
+        item_ctrl_inputs[label] = item_cache
+
+        n_needed = len(needed_per_model[label])
+        print(f"  [{m_idx+1}/{n_models}] {label}  ({n_needed:,} neurons × {len(valid_inputs)} inputs) …")
+        name_to_mod   = {n: m for n, m in nn_model.named_modules()}
+        layer_indices = {}
+        for name, idx in needed_per_model[label]:
+            layer_indices.setdefault(name, set()).add(idx)
+        results = {key: [] for key in needed_per_model[label]}
+
+        with tqdm(total=len(valid_inputs), unit="inp", ncols=72, leave=False) as inner:
+            for inp in valid_inputs:
+                captured = {}
+                hooks    = []
+
+                def _make(name):
+                    def hook(mod, _inp, out):
+                        if isinstance(out, torch.Tensor) and out.dim() >= 1:
+                            captured[name] = out.detach().float().cpu().flatten()
+                    return hook
+
+                for name in layer_indices:
+                    if name in name_to_mod:
+                        hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
+                try:
+                    with torch.no_grad():
+                        try:   nn_model(inp)
+                        except Exception: pass
+                finally:
+                    for h in hooks: h.remove()
+
+                for name, idxs in layer_indices.items():
+                    flat = captured.get(name)
+                    L    = len(flat) if flat is not None else 0
+                    for idx in idxs:
+                        results[(name, idx)].append(
+                            flat[idx % L].item() if L > 0 else float('nan')
+                        )
+                inner.update(1)
+
+        lookup = {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
+        neuron_order = list(needed_per_model[label])
+        neuron_to_pos[label] = {key: i for i, key in enumerate(neuron_order)}
+        act_matrices[label]  = _qs_build_act_matrix(lookup, neuron_order)
+
+        n_valid = sum(1 for x in item_cache if x is not None)
+        n_bytes = act_matrices[label].numel() * 4
+        print(f"  ✓  {label:20s}  {n_valid}/{len(raw_items)} items  "
+              f"matrix={act_matrices[label].shape}  {n_bytes / 1e6:.1f} MB")
+
+    print("\nBuilding position-index tensors …")
+    pos_tensors = {}
+    for (label, step_idx, si), neurons in all_neuron_sets.items():
+        ntp = neuron_to_pos[label]
+        pos_tensors[(label, step_idx, si)] = torch.tensor(
+            [ntp[key] for key in neurons], dtype=torch.long
+        )
+    print(f"  built {len(pos_tensors):,} position tensors")
+    return act_matrices, neuron_to_pos, pos_tensors, item_ctrl_inputs
+
+
 def run_qscore_basin_profile(
     trainer, seed_orig, sd_orig, pipeline_backends,
     raw_items, batch_size, direction_seed, k_values, beta,
@@ -712,74 +871,18 @@ def run_qscore_basin_profile(
         print(f"  {i}. {line}")
     print()
 
-    # ── Restore base weights ──────────────────────────────────────────────────
     apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
-
-    # ── Build model registry ──────────────────────────────────────────────────
-    registry = []
-    for pi, (det, ocr) in enumerate(pipeline_backends):
-        nn_det = getattr(det, '_model', None)
-        if nn_det is not None:
-            if hasattr(nn_det, 'owlvit') and hasattr(nn_det.owlvit, 'vision_model'):
-                nn_det = _VisionOnlyWrapper(nn_det.owlvit.vision_model)
-            registry.append((det.name, nn_det, False, det, pi))
-        nn_ocr = getattr(ocr, '_model', None)
-        if nn_ocr is not None:
-            if hasattr(nn_ocr, 'encoder') and hasattr(nn_ocr, 'decoder'):
-                nn_ocr = _EncoderOnlyWrapper(nn_ocr.encoder)
-            registry.append((ocr.name, nn_ocr, True, ocr, pi))
-
-    # ── Setup: discover shapes + collect ctrl_inputs (reused at every k) ─────
-    # label → (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)
-    model_data = {}
-
-    print("Discovering layers and collecting ctrl inputs:")
-    for label, nn_model, is_ocr, backend, pi in registry:
-        det_b, ocr_b = pipeline_backends[pi]
-        trainer._activate_pipeline(det_b, ocr_b)
-        try:
-            with torch.no_grad():
-                gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
-
-            ctrl_inputs = []
-            for raw in raw_items:
-                try:
-                    ci = trainer._prepare_one(raw, gray, augment=False)
-                    if not is_ocr:
-                        ctrl_inputs.append(ci["patched_prep"].unsqueeze(0).to(device))
-                    else:
-                        cc = ci.get("ocr_crop")
-                        if cc is not None:
-                            ctrl_inputs.append(_qs_ocr_preprocess(backend, cc.to(device)))
-                except Exception:
-                    continue
-
-            if not ctrl_inputs:
-                raise ValueError("no ctrl inputs prepared")
-
-            shapes = _qs_discover_leaf_shapes(nn_model, ctrl_inputs[0], device)
-            if not shapes:
-                raise ValueError("no leaf shapes discovered")
-
-            model_data[label] = (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)
-            print(f"  ✓  {label:20s}  {len(shapes):4d} layers  "
-                  f"{len(ctrl_inputs)} ctrl inputs")
-        except Exception as e:
-            print(f"  ✗  {label}: skip — {e}")
-
+    model_data = _qs_build_model_data(trainer, pipeline_backends, raw_items, device)
     if not model_data:
         print("[qscore] No usable models.")
         return
-
     labels = list(model_data.keys())
 
     # ── Pre-generate all neuron sets (deterministic, seeds fully known) ─────────
-    # Mirrors the sweep loop order exactly so rng state advances identically.
     n_k = len(k_values)
     print("\nPre-generating neuron sets for all k-steps …")
-    all_neuron_sets   = {}   # (label, k_idx, si) → list of (name, idx)
-    needed_per_model  = {}   # label → set of (name, idx)
-
+    all_neuron_sets  = {}
+    needed_per_model = {}
     for k_idx, k in enumerate(k_values):
         rng_s0 = _stdlib_random.Random(direction_seed + k_idx)
         rng_s1 = _stdlib_random.Random(direction_seed + k_idx + n_k)
@@ -788,120 +891,13 @@ def run_qscore_basin_profile(
                 neurons = _qs_sample_neurons(shapes, k, rng)
                 all_neuron_sets[(label, k_idx, si)] = neurons
                 needed_per_model.setdefault(label, set()).update(neurons)
-
     for label, needed in needed_per_model.items():
         print(f"  {label:20s}  {len(needed):>7,} unique (layer, idx) pairs needed")
 
-    # ── Precompute ctrl activation matrices (once per model, reused at every k) ─
-    # act_matrices[label]    : float32 CPU Tensor[n_unique, N_valid]
-    #   dense 2-D matrix built from the compact lookup; enables vectorised
-    #   stds and ctrl_acts via act_matrices[label][pos_tensor] — no Python loops.
-    # neuron_to_pos[label]   : {(name, idx): int} — row index in act_matrices
-    # pos_tensors[(l,k,si)]  : LongTensor[k] — precomputed row indices per neuron set
-    # item_ctrl_inputs[label]: List[None | (ctrl_inp, ctrl_crop_or_None, valid_item_idx)]
-    #   ctrl tensors are kept on device so no CPU→GPU transfer occurs in the sweep.
-    print("\nPrecomputing ctrl activation matrices (once per model) …")
-    act_matrices     = {}
-    neuron_to_pos    = {}
-    item_ctrl_inputs = {}
-
-    n_models = len(model_data)
-    for m_idx, (label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)) in \
-            enumerate(model_data.items()):
-        det_b, ocr_b = pipeline_backends[pi]
-        trainer._activate_pipeline(det_b, ocr_b)
-
-        with torch.no_grad():
-            gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
-
-        # Prepare ctrl tensors for every raw_item; keep on device to avoid
-        # repeated CPU→GPU transfers during the sweep.
-        item_cache   = []
-        valid_inputs = []   # model-ready tensors in lookup-index order
-        for raw in raw_items:
-            try:
-                ctrl_item = trainer._prepare_one(raw, gray, augment=False)
-                if not is_ocr:
-                    ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
-                    ctrl_crop = None
-                else:
-                    ctrl_crop_t = ctrl_item.get("ocr_crop")
-                    if ctrl_crop_t is None:
-                        item_cache.append(None)
-                        continue
-                    ctrl_crop = ctrl_crop_t.to(device)
-                    ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
-                valid_item_idx = len(valid_inputs)
-                valid_inputs.append(ctrl_inp)
-                item_cache.append((ctrl_inp, ctrl_crop, valid_item_idx))
-            except Exception:
-                item_cache.append(None)
-
-        item_ctrl_inputs[label] = item_cache
-
-        # Build compact scalar lookup, then convert to dense 2-D matrix
-        n_needed = len(needed_per_model[label])
-        print(f"  [{m_idx+1}/{n_models}] {label}  ({n_needed:,} neurons × {len(valid_inputs)} inputs) …")
-        with tqdm(total=len(valid_inputs), unit="inp", ncols=72, leave=False) as inner:
-            lookup = {}
-            # Run one pass per valid input, capturing only needed neurons
-            name_to_mod  = {n: m for n, m in nn_model.named_modules()}
-            layer_indices = {}
-            for name, idx in needed_per_model[label]:
-                layer_indices.setdefault(name, set()).add(idx)
-            results = {key: [] for key in needed_per_model[label]}
-
-            for inp in valid_inputs:
-                captured = {}
-                hooks    = []
-
-                def _make(name):
-                    def hook(mod, _inp, out):
-                        if isinstance(out, torch.Tensor) and out.dim() >= 1:
-                            captured[name] = out.detach().float().cpu().flatten()
-                    return hook
-
-                for name in layer_indices:
-                    if name in name_to_mod:
-                        hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
-                try:
-                    with torch.no_grad():
-                        try:   nn_model(inp)
-                        except Exception: pass
-                finally:
-                    for h in hooks: h.remove()
-
-                for name, idxs in layer_indices.items():
-                    flat = captured.get(name)
-                    L    = len(flat) if flat is not None else 0
-                    for idx in idxs:
-                        val = flat[idx % L].item() if L > 0 else float('nan')
-                        results[(name, idx)].append(val)
-                inner.update(1)
-
-            lookup = {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
-
-        # Build ordered neuron list and dense matrix
-        neuron_order = list(needed_per_model[label])
-        neuron_to_pos[label] = {key: i for i, key in enumerate(neuron_order)}
-        act_matrices[label]  = _qs_build_act_matrix(lookup, neuron_order)
-
-        n_valid = sum(1 for x in item_cache if x is not None)
-        n_bytes = act_matrices[label].numel() * 4
-        print(f"  ✓  {label:20s}  {n_valid}/{len(raw_items)} items  "
-              f"matrix={act_matrices[label].shape}  {n_bytes / 1e6:.1f} MB")
-
-    # ── Precompute position-index tensors for every neuron set ────────────────
-    # Converts per-neuron-set (name, idx) lists into LongTensor row indices into
-    # act_matrices — eliminates all Python-level loops from the k-sweep hot path.
-    print("\nBuilding position-index tensors for all neuron sets …")
-    pos_tensors = {}   # (label, k_idx, si) → LongTensor[k]
-    for (label, k_idx, si), neurons in all_neuron_sets.items():
-        ntp = neuron_to_pos[label]
-        pos_tensors[(label, k_idx, si)] = torch.tensor(
-            [ntp[key] for key in neurons], dtype=torch.long
-        )
-    print(f"  built {len(pos_tensors):,} position tensors")
+    act_matrices, neuron_to_pos, pos_tensors, item_ctrl_inputs = _qs_run_precompute(
+        model_data, all_neuron_sets, needed_per_model, raw_items,
+        pipeline_backends, trainer, device,
+    )
 
     # ── Training gradient — computed once at base ─────────────────────────────
     print("\nComputing training gradient (base checkpoint) …")
@@ -1072,6 +1068,196 @@ def run_qscore_basin_profile(
     print(f"\nCSV saved → {csv_path}")
 
 
+def run_qscore_overlap_calibration(
+    trainer, seed_orig, sd_orig, pipeline_backends,
+    raw_items, batch_size, direction_seed,
+    k, target_cos, n_steps,
+):
+    """
+    For each model, find the neuron-set overlap fraction that achieves
+    cos(s0, s1) ≈ target_cos with a fixed k neurons per set.
+
+    overlap_frac controls what fraction of the k neurons are shared between s0
+    and s1: overlap=0 → fully independent sets (noisiest signal), overlap=1 →
+    identical sets (cos=1, zero variance).  The function sweeps n_steps
+    evenly-spaced fractions from 0 to 1, measures the resulting cos(s0,s1) per
+    model, then linearly interpolates to find the fraction that hits target_cos.
+
+    Results are printed and saved to qscore_overlap_cal.csv.
+    """
+    import csv as _csv
+    device = trainer.device
+
+    print("\n" + "═" * 72)
+    print(f"Q-score overlap calibration  (k={k}, target_cos={target_cos}, steps={n_steps})")
+    print("═" * 72)
+    print("  overlap_frac=0 → fully independent neuron sets")
+    print("  overlap_frac=1 → identical neuron sets  (cos=1)")
+    print(f"  Goal: find overlap_frac per model s.t. cos(s0,s1) ≈ {target_cos}")
+    print()
+
+    apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
+    model_data = _qs_build_model_data(trainer, pipeline_backends, raw_items, device)
+    if not model_data:
+        print("[qscore] No usable models.")
+        return
+    labels = list(model_data.keys())
+
+    # ── Pre-generate all neuron set pairs (deterministic) ────────────────────
+    # For each (step_idx, model):
+    #   s0 = shared_neurons + uniq_s0_neurons
+    #   s1 = shared_neurons + uniq_s1_neurons
+    # Three separate rngs per step so shared/uniq_s0/uniq_s1 are independent.
+    overlap_fracs = np.linspace(0.0, 1.0, n_steps)
+    print(f"Overlap fracs: {[f'{f:.2f}' for f in overlap_fracs]}")
+    print("\nPre-generating neuron set pairs …")
+
+    all_neuron_sets  = {}   # (label, step_idx, si∈{0,1}) → neuron list
+    needed_per_model = {}
+
+    for step_idx, frac in enumerate(overlap_fracs):
+        n_shared = int(round(frac * k))
+        n_unique = k - n_shared
+        rng_shared  = _stdlib_random.Random(direction_seed + step_idx)
+        rng_uniq_s0 = _stdlib_random.Random(direction_seed + step_idx + n_steps)
+        rng_uniq_s1 = _stdlib_random.Random(direction_seed + step_idx + 2 * n_steps)
+
+        for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+            shared   = _qs_sample_neurons(shapes, n_shared, rng_shared)
+            uniq_s0  = _qs_sample_neurons(shapes, n_unique, rng_uniq_s0)
+            uniq_s1  = _qs_sample_neurons(shapes, n_unique, rng_uniq_s1)
+            s0 = shared + uniq_s0
+            s1 = shared + uniq_s1
+            all_neuron_sets[(label, step_idx, 0)] = s0
+            all_neuron_sets[(label, step_idx, 1)] = s1
+            needed_per_model.setdefault(label, set()).update(s0)
+            needed_per_model.setdefault(label, set()).update(s1)
+
+    for label, needed in needed_per_model.items():
+        print(f"  {label:20s}  {len(needed):>7,} unique (layer, idx) pairs needed")
+
+    act_matrices, neuron_to_pos, pos_tensors, item_ctrl_inputs = _qs_run_precompute(
+        model_data, all_neuron_sets, needed_per_model, raw_items,
+        pipeline_backends, trainer, device,
+    )
+
+    # ── Sweep ─────────────────────────────────────────────────────────────────
+    grad_store = {}   # (label, step_idx, si) → grad_flat
+    n_total = n_steps * len(labels) * 2
+    print(f"\nSweeping {n_steps} overlap fracs × {len(labels)} models × 2 sets = {n_total} passes")
+
+    with tqdm(total=n_total, unit="bwd", ncols=80) as pbar:
+        for step_idx, frac in enumerate(overlap_fracs):
+            for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+                mat = act_matrices[label]
+                valid_idxs = [c[2] for c in item_ctrl_inputs[label] if c is not None]
+                for si in range(2):
+                    pbar.set_description(f"ov={frac:.2f} {label[:12]} s{si}")
+                    pos = pos_tensors[(label, step_idx, si)]
+                    rows = mat[pos]
+                    stds = rows.std(dim=1).clamp(min=1e-6)
+                    stds = torch.where(torch.isnan(stds), torch.ones_like(stds), stds)
+                    ctrl_acts_gpu = mat[pos][:, valid_idxs].t().to(device) if valid_idxs else None
+                    neurons = all_neuron_sets[(label, step_idx, si)]
+                    _, gv = _qs_compute_one(
+                        trainer, nn_model, neurons, stds, is_ocr, backend,
+                        pipeline_backends, pi, raw_items, device,
+                        item_ctrl_inputs=item_ctrl_inputs[label],
+                        ctrl_acts_gpu=ctrl_acts_gpu,
+                    )
+                    grad_store[(label, step_idx, si)] = gv
+                    pbar.update(1)
+
+    # ── Compute cos(s0,s1) per model per step ─────────────────────────────────
+    rows_out = []
+    cos_by_model = {label: [] for label in labels}   # label → [cos per step]
+
+    for step_idx, frac in enumerate(overlap_fracs):
+        n_shared = int(round(frac * k))
+        for label in labels:
+            g0 = grad_store.get((label, step_idx, 0))
+            g1 = grad_store.get((label, step_idx, 1))
+            cs = _cosim(g0, g1) if (g0 is not None and g1 is not None) else float('nan')
+            cos_by_model[label].append(cs)
+            rows_out.append(dict(
+                overlap_frac=round(frac, 6),
+                n_shared=n_shared,
+                model=label,
+                is_ocr=int(model_data[label][3]),
+                cos_s0s1=cs,
+            ))
+
+    # ── Interpolate target overlap per model ──────────────────────────────────
+    cw = 10
+    print(f"\n{'═'*72}")
+    print(f"Overlap calibration results  (target cos(s0,s1) = {target_cos})")
+    print(f"{'═'*72}")
+
+    h = (f"{'model':>20}  {'baseline':>{cw}}  {'@overlap=1':>{cw}}  "
+         f"{'target_frac':>{cw}}  {'achievable'}")
+    print(h)
+    print("─" * len(h))
+
+    target_fracs = {}   # label → recommended overlap_frac
+    for label in labels:
+        cos_vals = cos_by_model[label]
+        valid = [(f, c) for f, c in zip(overlap_fracs, cos_vals) if not np.isnan(c)]
+        if not valid:
+            print(f"  {label:>20}  {'nan':>{cw}}  {'nan':>{cw}}  {'nan':>{cw}}  no valid data")
+            target_fracs[label] = float('nan')
+            continue
+
+        fracs_v, cos_v = zip(*valid)
+        baseline = cos_v[0]   # cos at overlap=0
+        at_one   = cos_v[-1]  # cos at overlap=1
+
+        # cos(s0,s1) should increase monotonically with overlap_frac.
+        # Interpolate to find the frac where cos ≈ target_cos.
+        if target_cos <= baseline:
+            tf = 0.0
+            note = f"already ≥ target at overlap=0 (baseline={baseline:.3f})"
+        elif target_cos >= at_one:
+            tf = float('nan')
+            note = f"unachievable (max={at_one:.3f})"
+        else:
+            tf = float(np.interp(target_cos, cos_v, fracs_v))
+            note = "✓"
+
+        target_fracs[label] = tf
+        tf_str = f"{tf:.4f}" if not np.isnan(tf) else "nan"
+        print(f"  {label:>20}  {baseline:>{cw}.4f}  {at_one:>{cw}.4f}  {tf_str:>{cw}}  {note}")
+
+    # ── Per-step summary table ─────────────────────────────────────────────────
+    print(f"\n{'─'*72}")
+    print("cos(s0,s1) per overlap step:")
+    header_parts = [f"{'overlap':>8}"] + [f"{lb[:10]:>11}" for lb in labels]
+    print("  " + "  ".join(header_parts))
+    for step_idx, frac in enumerate(overlap_fracs):
+        vals = [cos_by_model[lb][step_idx] for lb in labels]
+        row_parts = [f"{frac:>8.2f}"] + [
+            f"{v:>11.4f}" if not np.isnan(v) else f"{'nan':>11}" for v in vals
+        ]
+        print("  " + "  ".join(row_parts))
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+    csv_path = "qscore_overlap_cal.csv"
+    fieldnames = ["overlap_frac", "n_shared", "model", "is_ocr", "cos_s0s1"]
+    with open(csv_path, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows_out)
+
+    # Append per-model target fracs as a summary section
+    with open(csv_path, "a", newline="") as f:
+        f.write("\n# target_cos per model\n")
+        f.write("model,target_overlap_frac\n")
+        for label, tf in target_fracs.items():
+            f.write(f"{label},{tf:.6f}\n" if not np.isnan(tf) else f"{label},nan\n")
+    print(f"\nCSV saved → {csv_path}")
+
+    return target_fracs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -1105,8 +1291,17 @@ def main():
                         help="Single run dir only: sweep neuron counts from 100 to 100k "
                              "(log-spaced, --k-steps points) to measure how gradient "
                              "stability and training alignment evolve with k.")
+    parser.add_argument("--overlap-cal", action="store_true",
+                        help="Single run dir only: sweep neuron-set overlap fractions "
+                             "(0→1, --overlap-steps points) at fixed --k-neurons to find "
+                             "the fraction that achieves --target-cos for each model.")
     parser.add_argument("--k-neurons", type=int, default=1000,
-                        help="(unused in --qscore k-sweep; kept for compatibility)")
+                        help="Fixed neuron count used by --overlap-cal (default 1000).")
+    parser.add_argument("--target-cos", type=float, default=0.25,
+                        help="Target cos(s0,s1) for --overlap-cal (default 0.25).")
+    parser.add_argument("--overlap-steps", type=int, default=11,
+                        help="Number of overlap fractions swept by --overlap-cal "
+                             "(default 11, linearly spaced 0→1).")
     parser.add_argument("--beta", type=float, default=0.1,
                         help="Weight of quality loss in combined gradient for --qscore "
                              "(default 0.1; quality loss is in log-space so this makes "
@@ -1197,6 +1392,14 @@ def main():
     print(f"Collected {len(raw_items)} items.\n")
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
+    if basin_mode and args.overlap_cal:
+        run_qscore_overlap_calibration(
+            trainer, seed_a, sd_a, pipeline_backends,
+            raw_items, args.batch_size, args.direction_seed,
+            k=args.k_neurons, target_cos=args.target_cos, n_steps=args.overlap_steps,
+        )
+        return
+
     if basin_mode and args.qscore:
         k_vals_raw = np.geomspace(100, 100_000, args.k_steps).round().astype(int).tolist()
         # deduplicate while preserving order
