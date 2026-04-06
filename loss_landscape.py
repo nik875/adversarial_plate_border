@@ -447,6 +447,86 @@ def _qs_profile_stds(nn_model, neurons, ctrl_inputs, device):
     return stacked.std(dim=0).clamp(min=1e-6)
 
 
+@torch.no_grad()
+def _qs_precompute_all_acts(nn_model, inputs, device):
+    """
+    Run one no-grad forward pass per input, capturing all leaf-layer outputs
+    as flat float32 CPU tensors.
+
+    Returns a list of dicts {layer_name: flat_cpu_tensor} — one per input.
+    Inputs that raise during the forward pass produce an empty dict.
+    """
+    name_to_mod = {n: m for n, m in nn_model.named_modules()}
+    leaf_names  = [n for n, m in nn_model.named_modules() if not list(m.children())]
+
+    result = []
+    for inp in inputs:
+        captured = {}
+        hooks    = []
+
+        def _make(name):
+            def hook(mod, _inp, out):
+                if isinstance(out, torch.Tensor) and out.dim() >= 1:
+                    captured[name] = out.detach().float().cpu().flatten()
+            return hook
+
+        for name in leaf_names:
+            if name in name_to_mod:
+                hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
+        try:
+            try:   nn_model(inp)
+            except Exception: pass
+        finally:
+            for h in hooks: h.remove()
+        result.append(captured)
+    return result
+
+
+def _qs_stds_from_cache(ctrl_act_cache, neurons):
+    """
+    Compute per-neuron activation stds from a precomputed activation cache —
+    no forward passes needed.
+
+    ctrl_act_cache: list of {layer_name: flat_cpu_tensor} — one per ctrl_input.
+    neurons: list of (layer_name, flat_idx).
+    Returns [k] float32 CPU tensor, clamped to ≥ 1e-6.
+    Falls back to 1.0 for neurons whose layer has fewer than 2 cached entries.
+    """
+    k   = len(neurons)
+    out = torch.ones(k, dtype=torch.float32)
+    if len(ctrl_act_cache) < 2:
+        return out
+
+    layer_neurons = {}
+    for pos, (name, idx) in enumerate(neurons):
+        layer_neurons.setdefault(name, []).append((pos, idx))
+
+    for name, nlist in layer_neurons.items():
+        cols = [entry[name] for entry in ctrl_act_cache if name in entry]
+        if len(cols) < 2:
+            continue
+        stacked = torch.stack(cols, dim=0)   # [N_ctrl, numel]
+        L = stacked.shape[1]
+        for pos, idx in nlist:
+            out[pos] = stacked[:, idx % L].std().clamp(min=1e-6)
+    return out
+
+
+def _qs_ctrl_acts_from_cache(act_entry, neurons, device):
+    """
+    Extract ctrl activations for a single input from a precomputed cache entry.
+    Returns [k] float32 tensor on device (detached).
+    Falls back to 0 for neurons whose layer is absent from the cache entry.
+    """
+    k     = len(neurons)
+    elems = torch.zeros(k, dtype=torch.float32)
+    for pos, (name, idx) in enumerate(neurons):
+        flat = act_entry.get(name)
+        if flat is not None:
+            elems[pos] = flat[idx % len(flat)]
+    return elems.to(device)
+
+
 def _collect_grad(trainer):
     """Flatten seed + decoder gradients into a single CPU float32 vector."""
     parts = []
@@ -526,12 +606,22 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
 def _qs_compute_one(
     trainer, nn_model, neurons, neuron_stds, is_ocr, backend,
     pipeline_backends, pi, raw_items, device,
+    item_ctrl_cache=None,
 ):
     """
     Compute quality loss and its gradient w.r.t. decoder+seed params for one
     (model, neuron_set) pair.
 
     neuron_stds: [k] CPU tensor from _qs_profile_stds — used to normalise delta.
+
+    item_ctrl_cache: optional list (one entry per raw_item) of either
+        None  — item failed preparation; skip it
+        (ctrl_inp_cpu, ctrl_crop_cpu_or_None, act_entry)
+            ctrl_inp_cpu  : preprocessed ctrl tensor [1, C, H, W] on CPU
+            ctrl_crop_cpu : original OCR crop [1, 3, H, W] on CPU, or None for det
+            act_entry     : {layer_name: flat_cpu_tensor} of ctrl activations
+        When provided, _prepare_one and the no-grad ctrl forward pass are skipped.
+
     Returns (ql_value: float, grad_flat: Tensor[N]).
     """
     det_b, ocr_b = pipeline_backends[pi]
@@ -557,8 +647,10 @@ def _qs_compute_one(
     total_ql = torch.tensor(0.0, device=device)
     n_valid  = 0
 
-    for raw_item in raw_items:
+    for item_idx, raw_item in enumerate(raw_items):
         try:
+            cached = item_ctrl_cache[item_idx] if item_ctrl_cache is not None else None
+
             if not is_ocr:
                 # ── Detector: additive patch overlay on ctrl background ─────
                 # _prepare_one brightness-normalises patch_batch inside
@@ -566,8 +658,13 @@ def _qs_compute_one(
                 # to patched_prep.  Instead: get the gray-patch background once
                 # (ctrl), then add the learned patch as a scaled additive
                 # perturbation so gradients always flow from patch_norm.
-                ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
-                ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
+                if cached is not None:
+                    ctrl_inp_cpu, _ctrl_crop_cpu, act_entry = cached
+                    ctrl_inp = ctrl_inp_cpu.to(device)
+                else:
+                    ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
+                    ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
+                    act_entry = None
                 h, w      = ctrl_inp.shape[-2], ctrl_inp.shape[-1]
                 p_scaled  = F.interpolate(
                     patch_norm.unsqueeze(0), size=(h, w),
@@ -576,12 +673,21 @@ def _qs_compute_one(
                 adv_inp   = ctrl_inp + 0.1 * p_scaled         # gradient flows here
             else:
                 # ── OCR: GT plate crop + additive patch overlay ─────────────
-                ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
-                ctrl_crop = ctrl_item.get("ocr_crop")
-                if ctrl_crop is None:
-                    continue
-                # ocr_crop is [1, 3, H, W] (already batched by _prepare_batch)
-                ctrl_crop = ctrl_crop.to(device)           # [1, 3, H, W]
+                if cached is not None:
+                    ctrl_inp_cpu, ctrl_crop_cpu, act_entry = cached
+                    if ctrl_crop_cpu is None:
+                        continue
+                    ctrl_inp  = ctrl_inp_cpu.to(device)
+                    ctrl_crop = ctrl_crop_cpu.to(device)
+                else:
+                    ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
+                    ctrl_crop = ctrl_item.get("ocr_crop")
+                    if ctrl_crop is None:
+                        continue
+                    # ocr_crop is [1, 3, H, W] (already batched by _prepare_batch)
+                    ctrl_crop = ctrl_crop.to(device)           # [1, 3, H, W]
+                    ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
+                    act_entry = None
                 oh, ow    = backend.ocr_crop_size
                 # Keep batch dim: [1, 3, oh, ow]; gradient flows through interpolate
                 p_batch   = F.interpolate(
@@ -591,10 +697,12 @@ def _qs_compute_one(
                 adv_crop  = ctrl_crop.detach() + 0.1 * p_batch   # [1, 3, oh, ow]
                 # Pass [1, 3, H, W] directly; _qs_ocr_preprocess falls back to
                 # F.interpolate for backends without a tensor _preprocess (e.g. TrOCR)
-                ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
                 adv_inp   = _qs_ocr_preprocess(backend, adv_crop)
 
-            ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True,  device=device)
+            if act_entry is not None:
+                ctrl_acts = _qs_ctrl_acts_from_cache(act_entry, neurons, device)
+            else:
+                ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True, device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
             total_ql  = total_ql + _qs_loss(adv_acts, ctrl_acts, neuron_stds)
             n_valid  += 1
@@ -722,6 +830,52 @@ def run_qscore_basin_profile(
 
     labels = list(model_data.keys())
 
+    # ── Precompute ctrl activation caches (once per model, reused at every k) ─
+    # ctrl_std_caches[label]  : List[{layer: flat_cpu_tensor}] — one per ctrl_input
+    #   → used by _qs_stds_from_cache to compute per-neuron stds without forward passes
+    # item_ctrl_caches[label] : List[None | (ctrl_inp_cpu, ctrl_crop_cpu, act_entry)]
+    #   → used by _qs_compute_one to skip _prepare_one + ctrl forward pass per item
+    print("\nPrecomputing ctrl activation caches (once per model) …")
+    ctrl_std_caches  = {}
+    item_ctrl_caches = {}
+
+    for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+        det_b, ocr_b = pipeline_backends[pi]
+        trainer._activate_pipeline(det_b, ocr_b)
+
+        # std cache: reuse the already-collected ctrl_inputs
+        ctrl_std_caches[label] = _qs_precompute_all_acts(nn_model, ctrl_inputs, device)
+
+        # item cache: prepare ctrl inputs for every raw_item, run one forward pass each
+        with torch.no_grad():
+            gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
+        item_cache = []
+        for raw in raw_items:
+            try:
+                ctrl_item = trainer._prepare_one(raw, gray, augment=False)
+                if not is_ocr:
+                    ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
+                    ctrl_crop = None
+                else:
+                    ctrl_crop_t = ctrl_item.get("ocr_crop")
+                    if ctrl_crop_t is None:
+                        item_cache.append(None)
+                        continue
+                    ctrl_crop = ctrl_crop_t.to(device)
+                    ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
+                acts = _qs_precompute_all_acts(nn_model, [ctrl_inp], device)[0]
+                item_cache.append((
+                    ctrl_inp.cpu(),
+                    ctrl_crop.cpu() if ctrl_crop is not None else None,
+                    acts,
+                ))
+            except Exception:
+                item_cache.append(None)
+        item_ctrl_caches[label] = item_cache
+        n_valid_items = sum(1 for x in item_cache if x is not None)
+        print(f"  ✓  {label:20s}  std_cache={len(ctrl_std_caches[label])}  "
+              f"item_cache={n_valid_items}/{len(raw_items)}")
+
     # ── Training gradient — computed once at base ─────────────────────────────
     print("\nComputing training gradient (base checkpoint) …")
     train_loss, train_grad = _compute_training_grad(
@@ -748,10 +902,11 @@ def run_qscore_basin_profile(
                 for si, rng in enumerate([rng_s0, rng_s1]):
                     pbar.set_description(f"k={k:>6d} {label[:12]} s{si}")
                     neurons = _qs_sample_neurons(shapes, k, rng)
-                    stds    = _qs_profile_stds(nn_model, neurons, ctrl_inputs, device)
+                    stds    = _qs_stds_from_cache(ctrl_std_caches[label], neurons)
                     ql, gv  = _qs_compute_one(
                         trainer, nn_model, neurons, stds, is_ocr, backend,
                         pipeline_backends, pi, raw_items, device,
+                        item_ctrl_cache=item_ctrl_caches[label],
                     )
                     ql_store[(label, si, k_idx)]   = ql
                     grad_store[(label, si, k_idx)]  = gv
