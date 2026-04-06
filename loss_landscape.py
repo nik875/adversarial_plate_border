@@ -22,6 +22,8 @@ import random as _stdlib_random
 import sys
 from pathlib import Path
 
+from tqdm import tqdm
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -750,38 +752,37 @@ def run_qscore_basin_profile(
 
     n_qs    = len(epsilons) * len(labels) * 2
     n_train = len(epsilons) * len(pipeline_backends)
+    n_total = n_train + n_qs
     print(f"\nSweeping {len(epsilons)} epsilons: "
-          f"{n_train} training backward passes + {n_qs} qscore backward passes …")
+          f"{n_train} training + {n_qs} qscore = {n_total} backward passes")
 
-    for eps_i, eps in enumerate(epsilons):
-        if eps == 0.0:
-            apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
-        else:
-            pv     = base_vec + eps * direction
-            ps, pd = _vec_to_params(pv, seed_orig, sd_orig)
-            apply_interpolated_weights(trainer, ps, ps, pd, pd, 0.0)
+    with tqdm(total=n_total, unit="bwd", ncols=80) as pbar:
+        for eps_i, eps in enumerate(epsilons):
+            if eps == 0.0:
+                apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
+            else:
+                pv     = base_vec + eps * direction
+                ps, pd = _vec_to_params(pv, seed_orig, sd_orig)
+                apply_interpolated_weights(trainer, ps, ps, pd, pd, 0.0)
 
-        # Training gradient (aggregate over all pipelines)
-        tl, tg = _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, device)
-        # Store once per eps_i (same grad for all pipelines — it's the aggregate)
-        for pi in range(len(pipeline_backends)):
-            train_loss_store[(pi, eps_i)] = tl
-            train_grad_store[(pi, eps_i)] = tg
+            eps_s = "base" if eps == 0.0 else f"{eps:.1e}"
+            pbar.set_description(f"eps={eps_s} train")
+            tl, tg = _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, device)
+            for pi in range(len(pipeline_backends)):
+                train_loss_store[(pi, eps_i)] = tl
+                train_grad_store[(pi, eps_i)] = tg
+            pbar.update(len(pipeline_backends))
 
-        # Qscore gradients
-        for label, (ns0, ns1, stds0, stds1, nn_model, is_ocr, backend, pi) in model_data.items():
-            for si, (neurons, stds) in enumerate([(ns0, stds0), (ns1, stds1)]):
-                ql, gv = _qs_compute_one(
-                    trainer, nn_model, neurons, stds, is_ocr, backend,
-                    pipeline_backends, pi, raw_items, device,
-                )
-                ql_store[(label, si, eps_i)]  = ql
-                grad_store[(label, si, eps_i)] = gv
-
-        done = (eps_i + 1) * (len(labels) * 2 + 1)
-        print(f"  eps {eps_i+1}/{len(epsilons)} done", end="\r", flush=True)
-
-    print(f"  All {len(epsilons)} epsilons done.          ")
+            for label, (ns0, ns1, stds0, stds1, nn_model, is_ocr, backend, pi) in model_data.items():
+                for si, (neurons, stds) in enumerate([(ns0, stds0), (ns1, stds1)]):
+                    pbar.set_description(f"eps={eps_s} {label[:12]} s{si}")
+                    ql, gv = _qs_compute_one(
+                        trainer, nn_model, neurons, stds, is_ocr, backend,
+                        pipeline_backends, pi, raw_items, device,
+                    )
+                    ql_store[(label, si, eps_i)]  = ql
+                    grad_store[(label, si, eps_i)] = gv
+                    pbar.update(1)
 
     # ── Helper: combined gradient for a pipeline at a given eps ──────────────
     def combined_grad(pi, eps_i):
