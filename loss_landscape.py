@@ -448,18 +448,29 @@ def _qs_profile_stds(nn_model, neurons, ctrl_inputs, device):
 
 
 @torch.no_grad()
-def _qs_precompute_all_acts(nn_model, inputs, device):
+def _qs_precompute_neuron_acts(nn_model, inputs, needed_neurons, device):
     """
-    Run one no-grad forward pass per input, capturing all leaf-layer outputs
-    as flat float32 CPU tensors.
+    Run one no-grad forward pass per input, recording only the specific
+    (layer_name, flat_idx) pairs in needed_neurons.
 
-    Returns a list of dicts {layer_name: flat_cpu_tensor} — one per input.
-    Inputs that raise during the forward pass produce an empty dict.
+    needed_neurons: iterable of (layer_name, flat_idx) pairs
+    inputs:         list of preprocessed model-input tensors
+
+    Returns dict[(layer_name, flat_idx)] -> float32 Tensor[N_inputs].
+    Entries are NaN for inputs whose forward pass raised or whose layer was absent.
+
+    Memory cost: O(|needed_neurons| × N_inputs × 4 bytes) — typically a few MB
+    rather than storing full activation tensors for every leaf layer.
     """
+    layer_indices = {}
+    for name, idx in needed_neurons:
+        layer_indices.setdefault(name, set()).add(idx)
+
     name_to_mod = {n: m for n, m in nn_model.named_modules()}
-    leaf_names  = [n for n, m in nn_model.named_modules() if not list(m.children())]
 
-    result = []
+    # accumulate scalar values: results[(name, idx)] = [float, ...]
+    results = {(name, idx): [] for name, idxs in layer_indices.items() for idx in idxs}
+
     for inp in inputs:
         captured = {}
         hooks    = []
@@ -470,7 +481,7 @@ def _qs_precompute_all_acts(nn_model, inputs, device):
                     captured[name] = out.detach().float().cpu().flatten()
             return hook
 
-        for name in leaf_names:
+        for name in layer_indices:
             if name in name_to_mod:
                 hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
         try:
@@ -478,52 +489,50 @@ def _qs_precompute_all_acts(nn_model, inputs, device):
             except Exception: pass
         finally:
             for h in hooks: h.remove()
-        result.append(captured)
-    return result
+
+        for name, idxs in layer_indices.items():
+            flat = captured.get(name)
+            L    = len(flat) if flat is not None else 0
+            for idx in idxs:
+                val = flat[idx % L].item() if L > 0 else float('nan')
+                results[(name, idx)].append(val)
+
+    return {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
 
 
-def _qs_stds_from_cache(ctrl_act_cache, neurons):
+def _qs_stds_from_lookup(lookup, neurons):
     """
-    Compute per-neuron activation stds from a precomputed activation cache —
-    no forward passes needed.
+    Compute per-neuron activation stds from a compact lookup — no forward passes.
 
-    ctrl_act_cache: list of {layer_name: flat_cpu_tensor} — one per ctrl_input.
-    neurons: list of (layer_name, flat_idx).
+    lookup:  {(layer_name, flat_idx): Tensor[N_inputs]} from _qs_precompute_neuron_acts
+    neurons: list of (layer_name, flat_idx)
     Returns [k] float32 CPU tensor, clamped to ≥ 1e-6.
-    Falls back to 1.0 for neurons whose layer has fewer than 2 cached entries.
+    Falls back to 1.0 for neurons absent from the lookup or with < 2 valid values.
     """
     k   = len(neurons)
     out = torch.ones(k, dtype=torch.float32)
-    if len(ctrl_act_cache) < 2:
-        return out
-
-    layer_neurons = {}
-    for pos, (name, idx) in enumerate(neurons):
-        layer_neurons.setdefault(name, []).append((pos, idx))
-
-    for name, nlist in layer_neurons.items():
-        cols = [entry[name] for entry in ctrl_act_cache if name in entry]
-        if len(cols) < 2:
-            continue
-        stacked = torch.stack(cols, dim=0)   # [N_ctrl, numel]
-        L = stacked.shape[1]
-        for pos, idx in nlist:
-            out[pos] = stacked[:, idx % L].std().clamp(min=1e-6)
+    for pos, key in enumerate(neurons):
+        vals = lookup.get(key)
+        if vals is not None:
+            valid = vals[~torch.isnan(vals)]
+            if len(valid) >= 2:
+                out[pos] = valid.std().clamp(min=1e-6)
     return out
 
 
-def _qs_ctrl_acts_from_cache(act_entry, neurons, device):
+def _qs_ctrl_acts_from_lookup(lookup, neurons, lookup_idx, device):
     """
-    Extract ctrl activations for a single input from a precomputed cache entry.
-    Returns [k] float32 tensor on device (detached).
-    Falls back to 0 for neurons whose layer is absent from the cache entry.
+    Extract ctrl activations for one input from a compact lookup.
+
+    lookup_idx: which column of each lookup tensor corresponds to this input.
+    Returns [k] float32 tensor on device (detached). Falls back to 0.
     """
     k     = len(neurons)
     elems = torch.zeros(k, dtype=torch.float32)
-    for pos, (name, idx) in enumerate(neurons):
-        flat = act_entry.get(name)
-        if flat is not None:
-            elems[pos] = flat[idx % len(flat)]
+    for pos, key in enumerate(neurons):
+        vals = lookup.get(key)
+        if vals is not None and lookup_idx < len(vals):
+            elems[pos] = vals[lookup_idx]
     return elems.to(device)
 
 
@@ -606,7 +615,8 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
 def _qs_compute_one(
     trainer, nn_model, neurons, neuron_stds, is_ocr, backend,
     pipeline_backends, pi, raw_items, device,
-    item_ctrl_cache=None,
+    item_ctrl_inputs=None,
+    ctrl_lookup=None,
 ):
     """
     Compute quality loss and its gradient w.r.t. decoder+seed params for one
@@ -614,13 +624,17 @@ def _qs_compute_one(
 
     neuron_stds: [k] CPU tensor from _qs_profile_stds — used to normalise delta.
 
-    item_ctrl_cache: optional list (one entry per raw_item) of either
+    item_ctrl_inputs: optional list (one entry per raw_item) of either
         None  — item failed preparation; skip it
-        (ctrl_inp_cpu, ctrl_crop_cpu_or_None, act_entry)
+        (ctrl_inp_cpu, ctrl_crop_cpu_or_None, lookup_idx)
             ctrl_inp_cpu  : preprocessed ctrl tensor [1, C, H, W] on CPU
             ctrl_crop_cpu : original OCR crop [1, 3, H, W] on CPU, or None for det
-            act_entry     : {layer_name: flat_cpu_tensor} of ctrl activations
-        When provided, _prepare_one and the no-grad ctrl forward pass are skipped.
+            lookup_idx    : int index into ctrl_lookup for this item's activations
+        When provided, _prepare_one is skipped.
+
+    ctrl_lookup: optional {(layer_name, flat_idx): Tensor[N]} from
+        _qs_precompute_neuron_acts — when provided, the no-grad ctrl forward
+        pass is replaced by a lookup into this table.
 
     Returns (ql_value: float, grad_flat: Tensor[N]).
     """
@@ -649,7 +663,7 @@ def _qs_compute_one(
 
     for item_idx, raw_item in enumerate(raw_items):
         try:
-            cached = item_ctrl_cache[item_idx] if item_ctrl_cache is not None else None
+            cached = item_ctrl_inputs[item_idx] if item_ctrl_inputs is not None else None
 
             if not is_ocr:
                 # ── Detector: additive patch overlay on ctrl background ─────
@@ -659,12 +673,12 @@ def _qs_compute_one(
                 # (ctrl), then add the learned patch as a scaled additive
                 # perturbation so gradients always flow from patch_norm.
                 if cached is not None:
-                    ctrl_inp_cpu, _ctrl_crop_cpu, act_entry = cached
+                    ctrl_inp_cpu, _ctrl_crop_cpu, lookup_idx = cached
                     ctrl_inp = ctrl_inp_cpu.to(device)
                 else:
                     ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
                     ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
-                    act_entry = None
+                    lookup_idx = None
                 h, w      = ctrl_inp.shape[-2], ctrl_inp.shape[-1]
                 p_scaled  = F.interpolate(
                     patch_norm.unsqueeze(0), size=(h, w),
@@ -674,7 +688,7 @@ def _qs_compute_one(
             else:
                 # ── OCR: GT plate crop + additive patch overlay ─────────────
                 if cached is not None:
-                    ctrl_inp_cpu, ctrl_crop_cpu, act_entry = cached
+                    ctrl_inp_cpu, ctrl_crop_cpu, lookup_idx = cached
                     if ctrl_crop_cpu is None:
                         continue
                     ctrl_inp  = ctrl_inp_cpu.to(device)
@@ -687,7 +701,7 @@ def _qs_compute_one(
                     # ocr_crop is [1, 3, H, W] (already batched by _prepare_batch)
                     ctrl_crop = ctrl_crop.to(device)           # [1, 3, H, W]
                     ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
-                    act_entry = None
+                    lookup_idx = None
                 oh, ow    = backend.ocr_crop_size
                 # Keep batch dim: [1, 3, oh, ow]; gradient flows through interpolate
                 p_batch   = F.interpolate(
@@ -699,8 +713,8 @@ def _qs_compute_one(
                 # F.interpolate for backends without a tensor _preprocess (e.g. TrOCR)
                 adv_inp   = _qs_ocr_preprocess(backend, adv_crop)
 
-            if act_entry is not None:
-                ctrl_acts = _qs_ctrl_acts_from_cache(act_entry, neurons, device)
+            if ctrl_lookup is not None and lookup_idx is not None:
+                ctrl_acts = _qs_ctrl_acts_from_lookup(ctrl_lookup, neurons, lookup_idx, device)
             else:
                 ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True, device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
@@ -830,26 +844,45 @@ def run_qscore_basin_profile(
 
     labels = list(model_data.keys())
 
-    # ── Precompute ctrl activation caches (once per model, reused at every k) ─
-    # ctrl_std_caches[label]  : List[{layer: flat_cpu_tensor}] — one per ctrl_input
-    #   → used by _qs_stds_from_cache to compute per-neuron stds without forward passes
-    # item_ctrl_caches[label] : List[None | (ctrl_inp_cpu, ctrl_crop_cpu, act_entry)]
-    #   → used by _qs_compute_one to skip _prepare_one + ctrl forward pass per item
-    print("\nPrecomputing ctrl activation caches (once per model) …")
-    ctrl_std_caches  = {}
-    item_ctrl_caches = {}
+    # ── Pre-generate all neuron sets (deterministic, seeds fully known) ─────────
+    # Mirrors the sweep loop order exactly so rng state advances identically.
+    n_k = len(k_values)
+    print("\nPre-generating neuron sets for all k-steps …")
+    all_neuron_sets   = {}   # (label, k_idx, si) → list of (name, idx)
+    needed_per_model  = {}   # label → set of (name, idx)
+
+    for k_idx, k in enumerate(k_values):
+        rng_s0 = _stdlib_random.Random(direction_seed + k_idx)
+        rng_s1 = _stdlib_random.Random(direction_seed + k_idx + n_k)
+        for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+            for si, rng in enumerate([rng_s0, rng_s1]):
+                neurons = _qs_sample_neurons(shapes, k, rng)
+                all_neuron_sets[(label, k_idx, si)] = neurons
+                needed_per_model.setdefault(label, set()).update(neurons)
+
+    for label, needed in needed_per_model.items():
+        print(f"  {label:20s}  {len(needed):>7,} unique (layer, idx) pairs needed")
+
+    # ── Precompute ctrl activation lookups (once per model, reused at every k) ─
+    # ctrl_lookups[label]      : {(layer, idx): Tensor[N_valid]} — scalar activations
+    #   only the specific neurons actually used across all k-steps are stored,
+    #   so memory is O(unique_neurons × N_inputs × 4 bytes) instead of O(all_leaf_outputs)
+    # item_ctrl_inputs[label]  : List[None | (ctrl_inp_cpu, ctrl_crop_cpu, lookup_idx)]
+    #   lookup_idx maps each raw_item to its column in ctrl_lookups[label]
+    print("\nPrecomputing ctrl activation lookups (once per model) …")
+    ctrl_lookups      = {}
+    item_ctrl_inputs  = {}
 
     for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
         det_b, ocr_b = pipeline_backends[pi]
         trainer._activate_pipeline(det_b, ocr_b)
 
-        # std cache: reuse the already-collected ctrl_inputs
-        ctrl_std_caches[label] = _qs_precompute_all_acts(nn_model, ctrl_inputs, device)
-
-        # item cache: prepare ctrl inputs for every raw_item, run one forward pass each
         with torch.no_grad():
             gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
-        item_cache = []
+
+        # Prepare ctrl tensors for every raw_item; valid ones are passed to precompute
+        item_cache   = []
+        valid_inputs = []   # model-ready tensors in lookup-index order
         for raw in raw_items:
             try:
                 ctrl_item = trainer._prepare_one(raw, gray, augment=False)
@@ -863,18 +896,25 @@ def run_qscore_basin_profile(
                         continue
                     ctrl_crop = ctrl_crop_t.to(device)
                     ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
-                acts = _qs_precompute_all_acts(nn_model, [ctrl_inp], device)[0]
+                lookup_idx = len(valid_inputs)
+                valid_inputs.append(ctrl_inp)
                 item_cache.append((
                     ctrl_inp.cpu(),
                     ctrl_crop.cpu() if ctrl_crop is not None else None,
-                    acts,
+                    lookup_idx,
                 ))
             except Exception:
                 item_cache.append(None)
-        item_ctrl_caches[label] = item_cache
-        n_valid_items = sum(1 for x in item_cache if x is not None)
-        print(f"  ✓  {label:20s}  std_cache={len(ctrl_std_caches[label])}  "
-              f"item_cache={n_valid_items}/{len(raw_items)}")
+
+        item_ctrl_inputs[label] = item_cache
+        ctrl_lookups[label] = _qs_precompute_neuron_acts(
+            nn_model, valid_inputs, needed_per_model[label], device
+        )
+        n_valid = sum(1 for x in item_cache if x is not None)
+        n_bytes = sum(v.numel() * 4 for v in ctrl_lookups[label].values())
+        print(f"  ✓  {label:20s}  {n_valid}/{len(raw_items)} items  "
+              f"lookup={len(ctrl_lookups[label]):,} entries  "
+              f"{n_bytes / 1e6:.1f} MB")
 
     # ── Training gradient — computed once at base ─────────────────────────────
     print("\nComputing training gradient (base checkpoint) …")
@@ -888,25 +928,21 @@ def run_qscore_basin_profile(
     ql_store   = {}
     grad_store = {}
 
-    n_k  = len(k_values)
     n_total = n_k * len(labels) * 2
     print(f"\nSweeping {n_k} k values × {len(labels)} models × 2 sets = {n_total} backward passes")
 
     with tqdm(total=n_total, unit="bwd", ncols=80) as pbar:
         for k_idx, k in enumerate(k_values):
-            # Fresh independent neuron sets at each k; seeds shift by k_idx
-            rng_s0 = _stdlib_random.Random(direction_seed + k_idx)
-            rng_s1 = _stdlib_random.Random(direction_seed + k_idx + n_k)
-
             for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
-                for si, rng in enumerate([rng_s0, rng_s1]):
+                for si in range(2):
                     pbar.set_description(f"k={k:>6d} {label[:12]} s{si}")
-                    neurons = _qs_sample_neurons(shapes, k, rng)
-                    stds    = _qs_stds_from_cache(ctrl_std_caches[label], neurons)
+                    neurons = all_neuron_sets[(label, k_idx, si)]
+                    stds    = _qs_stds_from_lookup(ctrl_lookups[label], neurons)
                     ql, gv  = _qs_compute_one(
                         trainer, nn_model, neurons, stds, is_ocr, backend,
                         pipeline_backends, pi, raw_items, device,
-                        item_ctrl_cache=item_ctrl_caches[label],
+                        item_ctrl_inputs=item_ctrl_inputs[label],
+                        ctrl_lookup=ctrl_lookups[label],
                     )
                     ql_store[(label, si, k_idx)]   = ql
                     grad_store[(label, si, k_idx)]  = gv
