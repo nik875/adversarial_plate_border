@@ -396,13 +396,20 @@ def _qs_capture(model, inp, neurons, no_grad, device):
 def _qs_ocr_preprocess(backend, crop_tensor):
     """
     Apply backend-specific preprocessing to an OCR crop tensor [1, 3, H, W].
-    Falls back to bilinear resize to ocr_crop_size when _preprocess is absent
-    (e.g. TrOCR uses a HuggingFace PIL-based processor, not a tensor method).
+
+    For backends with a tensor _preprocess (LPRNet, CCT, DoctrViTSTR):
+        delegates to backend._preprocess — matches trainer.py exactly.
+
+    For TrOCR (no tensor _preprocess):
+        trainer.py's differentiable_loss does: pixel_values = (crop - 0.5) / 0.5
+        The crop is already [1, 3, 384, 384] from _bbox_ocr_crop (ocr_crop_size).
+        We apply the same normalisation: resize to ocr_crop_size then (x-0.5)/0.5.
     """
     if hasattr(backend, '_preprocess'):
         return backend._preprocess(crop_tensor)
     oh, ow = backend.ocr_crop_size
-    return F.interpolate(crop_tensor, size=(oh, ow), mode='bilinear', align_corners=False)
+    x = F.interpolate(crop_tensor, size=(oh, ow), mode='bilinear', align_corners=False)
+    return (x - 0.5) / 0.5   # [0,1] → [-1,1], matches TrOCR differentiable_loss
 
 
 def _qs_loss(adv_acts, ctrl_acts, neuron_stds):
