@@ -178,12 +178,13 @@ def main():
     ckpt_b = torch.load(ckpt_path_b, map_location="cpu")
 
     seed_channels = int(ckpt_a.get("seed_channels", 128))
-    seed_a = ckpt_a["seed"]   # [1, C, 4, 8]  cpu
+    seed_a = ckpt_a["seed"]   # [1, C, seed_h, 8]  cpu
     seed_b = ckpt_b["seed"]
     sd_a   = ckpt_a["decoder"]
     sd_b   = ckpt_b["decoder"]
+    top_extend = seed_a.shape[2] == 8   # seed_h=8 → top_extend, seed_h=4 → normal
 
-    print(f"Seed channels : {seed_channels}")
+    print(f"Seed channels : {seed_channels}  top_extend={top_extend}")
     print(f"  A global_update = {ckpt_a.get('global_update', '?'):>8}   "
           f"backend = {ckpt_a.get('backend', '?')}")
     print(f"  B global_update = {ckpt_b.get('global_update', '?'):>8}   "
@@ -221,6 +222,7 @@ def main():
         skip_sanity          = True,
         training             = False,
         augment              = False,
+        top_extend           = top_extend,
         run_name             = "_landscape_survey",
     )
 
