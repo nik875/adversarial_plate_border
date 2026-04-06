@@ -463,6 +463,14 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
 
     for det, ocr in pipeline_backends:
         trainer._activate_pipeline(det, ocr)
+
+        # CuDNN LSTM (e.g. LPRNet) saves the training-mode flag during the
+        # forward pass; backward fails if that flag was eval.  Switch before
+        # the forward, restore after backward.
+        ocr_nn = getattr(ocr, '_model', None)
+        if ocr_nn is not None:
+            ocr_nn.train()
+
         with torch.enable_grad():
             patch_norm = trainer.generate_patch(training_aug=False)
 
@@ -476,6 +484,8 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
                 continue
 
         if not items:
+            if ocr_nn is not None:
+                ocr_nn.eval()
             continue
 
         pipe_loss = torch.tensor(0.0, device=device)
@@ -484,11 +494,6 @@ def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, de
             loss, *_ = trainer.compute_loss_batch(chunk)
             pipe_loss = pipe_loss + loss / len(pipeline_backends)
 
-        # CuDNN LSTM (e.g. LPRNet) requires training mode for backward even
-        # when weights are frozen.  Switch, backprop, then restore eval.
-        ocr_nn = getattr(ocr, '_model', None)
-        if ocr_nn is not None:
-            ocr_nn.train()
         pipe_loss.backward()   # accumulates into .grad; graph freed immediately
         if ocr_nn is not None:
             ocr_nn.eval()
