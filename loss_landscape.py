@@ -20,6 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
@@ -139,13 +140,122 @@ def make_patch_grid(
     return canvas
 
 
+def _params_to_vec(seed: torch.Tensor, sd: dict) -> torch.Tensor:
+    """Flatten seed + all decoder tensors into a single float32 CPU vector."""
+    parts = [seed.float().cpu().flatten()]
+    for v in sd.values():
+        parts.append(v.float().cpu().flatten())
+    return torch.cat(parts)
+
+
+def _vec_to_params(vec: torch.Tensor, seed_ref: torch.Tensor, sd_ref: dict):
+    """Split a flat vector back into (seed, state_dict) matching the reference shapes."""
+    offset = 0
+    seed_n = seed_ref.numel()
+    seed = vec[offset : offset + seed_n].reshape(seed_ref.shape)
+    offset += seed_n
+    sd = {}
+    for k, v in sd_ref.items():
+        n = v.numel()
+        sd[k] = vec[offset : offset + n].reshape(v.shape)
+        offset += n
+    return seed, sd
+
+
+def run_basin_profile(
+    trainer: AdversarialPatchTrainer,
+    seed_orig: torch.Tensor,
+    sd_orig: dict,
+    pipeline_backends: list,
+    raw_items: list,
+    batch_size: int,
+    n_epsilons: int = 11,
+    seed: int = 0,
+) -> None:
+    """
+    Pick a random unit-norm direction in weight space and perturb the
+    checkpoint weights by exponentially increasing magnitudes.  Prints a
+    table of per-pipeline and mean losses at each perturbation size, giving
+    an estimate of basin sharpness / flatness.
+    """
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+
+    # Build base vector and a unit-norm random direction
+    base_vec = _params_to_vec(seed_orig, sd_orig)
+    direction = torch.randn(base_vec.numel(), generator=rng)
+    direction /= direction.norm()
+
+    epsilons = np.geomspace(1e-8, 1e-3, n_epsilons).tolist()
+
+    pipeline_names = [f"{d}/{o}" for d, o in PIPELINE_PAIRINGS]
+    col_w = 20
+    header = (
+        f"{'epsilon':>10}  "
+        + "  ".join(f"{n:>{col_w}}" for n in pipeline_names)
+        + f"  {'mean':>{col_w}}"
+    )
+    sep = "-" * len(header)
+
+    print(f"\nBasin sharpness profile  (random direction, seed={seed})")
+    print(f"Total parameters in direction vector: {base_vec.numel():,}")
+    print(header)
+    print(sep)
+
+    # Baseline at epsilon=0
+    apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
+    base_losses = []
+    for det, ocr in pipeline_backends:
+        trainer._activate_pipeline(det, ocr)
+        base_losses.append(eval_pipeline_loss(trainer, raw_items, batch_size))
+    base_mean = sum(base_losses) / len(base_losses)
+    print(
+        f"{'0 (base)':>10}  "
+        + "  ".join(f"{l:>{col_w}.4f}" for l in base_losses)
+        + f"  {base_mean:>{col_w}.4f}"
+    )
+
+    all_rows = []
+    for eps in epsilons:
+        perturbed_vec = base_vec + eps * direction
+        p_seed, p_sd = _vec_to_params(perturbed_vec, seed_orig, sd_orig)
+        apply_interpolated_weights(trainer, p_seed, p_seed, p_sd, p_sd, 0.0)
+
+        row_losses = []
+        for det, ocr in pipeline_backends:
+            trainer._activate_pipeline(det, ocr)
+            row_losses.append(eval_pipeline_loss(trainer, raw_items, batch_size))
+        mean_loss = sum(row_losses) / len(row_losses)
+        all_rows.append((eps, row_losses, mean_loss))
+
+        print(
+            f"{eps:>10.2e}  "
+            + "  ".join(f"{l:>{col_w}.4f}" for l in row_losses)
+            + f"  {mean_loss:>{col_w}.4f}"
+        )
+
+    print(sep)
+
+    # Find first epsilon where mean loss exceeds base by >1%
+    threshold = base_mean * 1.01
+    first_broken = next(
+        (eps for eps, _, m in all_rows if m > threshold), None
+    )
+    if first_broken:
+        print(f"\nLoss rises >1% above baseline at epsilon ≈ {first_broken:.2e}  "
+              f"(basin radius estimate)")
+    else:
+        print(f"\nLoss stays within 1% of baseline across all epsilons — very flat basin.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("run_dir_a", help="Run directory A  (alpha = 0)")
-    parser.add_argument("run_dir_b", help="Run directory B  (alpha = 1)")
+    parser.add_argument("run_dir_a", help="Run directory A  (alpha = 0, or single dir for basin mode)")
+    parser.add_argument("run_dir_b", nargs="?", default=None,
+                        help="Run directory B  (alpha = 1); omit to run basin sharpness profile")
     parser.add_argument("--finetuned-models", default="finetuned_models", metavar="DIR",
                         help="Directory containing finetuned model weights")
     parser.add_argument("--csv", default="finetuned_models/train_split.csv",
@@ -156,6 +266,11 @@ def main():
     parser.add_argument("--n-steps", type=int, default=11,
                         help="Number of interpolation points  "
                              "(default 11 → alpha = 0.0, 0.1, …, 1.0)")
+    parser.add_argument("--n-epsilons", type=int, default=11,
+                        help="Number of epsilon values in basin profile  "
+                             "(default 11, log-spaced from 1e-8 to 1e-3)")
+    parser.add_argument("--direction-seed", type=int, default=0,
+                        help="RNG seed for the random perturbation direction")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Sub-batch size passed to compute_loss_batch")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -164,18 +279,22 @@ def main():
     parser.add_argument("--det-loss-weight", type=float, default=3.0)
     args = parser.parse_args()
 
+    basin_mode = args.run_dir_b is None
     run_a = Path(args.run_dir_a)
-    run_b = Path(args.run_dir_b)
+    run_b = Path(args.run_dir_b) if not basin_mode else None
     fdir  = Path(args.finetuned_models)
 
     # ── Checkpoints ───────────────────────────────────────────────────────────
     ckpt_path_a = latest_checkpoint(run_a)
-    ckpt_path_b = latest_checkpoint(run_b)
     print(f"Checkpoint A : {ckpt_path_a}")
-    print(f"Checkpoint B : {ckpt_path_b}")
-
     ckpt_a = torch.load(ckpt_path_a, map_location="cpu")
-    ckpt_b = torch.load(ckpt_path_b, map_location="cpu")
+
+    if not basin_mode:
+        ckpt_path_b = latest_checkpoint(run_b)
+        print(f"Checkpoint B : {ckpt_path_b}")
+        ckpt_b = torch.load(ckpt_path_b, map_location="cpu")
+    else:
+        ckpt_b = ckpt_a   # unused in basin mode
 
     seed_channels = int(ckpt_a.get("seed_channels", 128))
     seed_a = ckpt_a["seed"]   # [1, C, seed_h, 8]  cpu
@@ -187,8 +306,9 @@ def main():
     print(f"Seed channels : {seed_channels}  top_extend={top_extend}")
     print(f"  A global_update = {ckpt_a.get('global_update', '?'):>8}   "
           f"backend = {ckpt_a.get('backend', '?')}")
-    print(f"  B global_update = {ckpt_b.get('global_update', '?'):>8}   "
-          f"backend = {ckpt_b.get('backend', '?')}")
+    if not basin_mode:
+        print(f"  B global_update = {ckpt_b.get('global_update', '?'):>8}   "
+              f"backend = {ckpt_b.get('backend', '?')}")
     print()
 
     # ── Load all four pipeline backends ───────────────────────────────────────
@@ -235,6 +355,14 @@ def main():
         if len(raw_items) >= args.n_batches:
             break
     print(f"Collected {len(raw_items)} items.\n")
+
+    # ── Dispatch ─────────────────────────────────────────────────────────────
+    if basin_mode:
+        run_basin_profile(
+            trainer, seed_a, sd_a, pipeline_backends, raw_items,
+            args.batch_size, args.n_epsilons, args.direction_seed,
+        )
+        return
 
     # ── Interpolation sweep ───────────────────────────────────────────────────
     alphas = [i / (args.n_steps - 1) for i in range(args.n_steps)]
