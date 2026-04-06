@@ -374,10 +374,37 @@ def _qs_capture(model, inp, neurons, no_grad, device):
         for h in hooks: h.remove()
 
 
-def _qs_loss(adv_acts, ctrl_acts):
-    """L_q = -log(rms(delta) + ε),  delta = adv - ctrl (ctrl detached)."""
+def _qs_loss(adv_acts, ctrl_acts, neuron_stds):
+    """
+    L_q = -log(rms(delta / std) + ε),  delta = adv - ctrl (ctrl detached).
+    neuron_stds: [k] CPU tensor of per-neuron activation std (from ctrl profiling).
+    Normalising by std prevents high-variance neurons from dominating the gradient.
+    """
     delta = adv_acts - ctrl_acts.detach()
-    return -torch.log(delta.pow(2).mean().sqrt() + 1e-8)
+    norm_delta = delta / neuron_stds.to(delta.device).clamp(min=1e-6)
+    return -torch.log(norm_delta.pow(2).mean().sqrt() + 1e-8)
+
+
+@torch.no_grad()
+def _qs_profile_stds(nn_model, neurons, ctrl_inputs, device):
+    """
+    Estimate per-neuron activation std from a list of ctrl inputs.
+
+    ctrl_inputs: list of model-ready tensors (already preprocessed, on device).
+    Returns [k] float32 CPU tensor; clamped to ≥ 1e-6 so no neuron is silenced.
+    Falls back to ones if fewer than 2 valid captures.
+    """
+    all_acts = []
+    for inp in ctrl_inputs:
+        try:
+            acts = _qs_capture(nn_model, inp, neurons, no_grad=True, device=device)
+            all_acts.append(acts.cpu())
+        except Exception:
+            continue
+    if len(all_acts) < 2:
+        return torch.ones(len(neurons), dtype=torch.float32)
+    stacked = torch.stack(all_acts, dim=0)   # [N, k]
+    return stacked.std(dim=0).clamp(min=1e-6)
 
 
 def _collect_grad(trainer):
@@ -399,13 +426,60 @@ def _cosim(a, b):
     return (a.dot(b) / (na * nb)).item()
 
 
+def _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, device):
+    """
+    Compute the average training-loss gradient across all pipelines.
+
+    One backward pass per pipeline (avoids holding all 4 graphs simultaneously).
+    Gradients are accumulated into decoder+seed .grad attributes, then collected.
+
+    Returns (mean_loss: float, grad_flat: Tensor[N]).
+    """
+    trainer.decoder.zero_grad()
+    if trainer.seed.grad is not None:
+        trainer.seed.grad.zero_()
+
+    total_loss = 0.0
+    n_pipes    = len(pipeline_backends)
+
+    for det, ocr in pipeline_backends:
+        trainer._activate_pipeline(det, ocr)
+        with torch.enable_grad():
+            patch_norm = trainer.generate_patch(training_aug=False)
+
+        items = []
+        for raw in raw_items:
+            try:
+                item = trainer._prepare_one(raw, patch_norm, augment=False)
+                item["_patch_norm"] = patch_norm
+                items.append(item)
+            except Exception:
+                continue
+
+        if not items:
+            continue
+
+        pipe_loss = torch.tensor(0.0, device=device)
+        for start in range(0, len(items), batch_size):
+            chunk = items[start : start + batch_size]
+            loss, *_ = trainer.compute_loss_batch(chunk)
+            pipe_loss = pipe_loss + loss / len(pipeline_backends)
+
+        pipe_loss.backward()   # accumulates into .grad; graph freed immediately
+        total_loss += pipe_loss.item()
+
+    return total_loss, _collect_grad(trainer)
+
+
 def _qs_compute_one(
-    trainer, nn_model, neurons, is_ocr, backend, pipeline_backends, pi, raw_items, device
+    trainer, nn_model, neurons, neuron_stds, is_ocr, backend,
+    pipeline_backends, pi, raw_items, device,
 ):
     """
     Compute quality loss and its gradient w.r.t. decoder+seed params for one
     (model, neuron_set) pair.
 
+    neuron_stds: [k] CPU tensor from _qs_profile_stds — used to normalise delta.
     Returns (ql_value: float, grad_flat: Tensor[N]).
     """
     det_b, ocr_b = pipeline_backends[pi]
@@ -451,7 +525,7 @@ def _qs_compute_one(
 
             ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True,  device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
-            total_ql  = total_ql + _qs_loss(adv_acts, ctrl_acts)
+            total_ql  = total_ql + _qs_loss(adv_acts, ctrl_acts, neuron_stds)
             n_valid  += 1
         except Exception:
             continue
@@ -466,48 +540,46 @@ def _qs_compute_one(
 
 def run_qscore_basin_profile(
     trainer, seed_orig, sd_orig, pipeline_backends,
-    raw_items, batch_size, n_epsilons, direction_seed, k_neurons,
+    raw_items, batch_size, n_epsilons, direction_seed, k_neurons, beta,
 ):
     """
-    Basin sharpness profile augmented with quality-loss gradients.
+    Basin sharpness profile with combined (training + beta*quality) gradients.
 
-    Design decisions (printed at runtime):
-      1. Quality loss: L_q = -log(rms(adv_acts - ctrl_acts) + ε), unnormalised
-         — no per-neuron std calibration pass required.
-      2. Ctrl (detectors): full preprocessed image with constant gray (0.5) patch
-         at plate boundary, same _prepare_one pipeline as training.
-      3. Adv  (detectors): full preprocessed image with learned patch (standard).
-      4. Ctrl (OCR): GT plate crop (item['ocr_crop']), backend._preprocess applied,
-         detached. GT crop is pipeline-independent.
-      5. Adv  (OCR): ctrl_crop + 0.1 × F.interpolate(patch, ocr_size), then
-         _preprocess. Scale 0.1 injects a differentiable signal; the plate crop
-         doesn't naturally contain the border patch.
-      6. TrOCR: encoder-only forward via _EncoderOnlyWrapper — decoder requires
-         autoregressive input tokens incompatible with a plain forward pass.
-      7. Neuron sampling: uniform-layer-first (layer chosen uniformly, then neuron
-         within it uniformly). Two sets/model, seeded at direction_seed and +1.
-      8. Gradient: ∂L_q/∂(seed ‖ decoder_params), one independent backward per
-         (model, set) pair.  Same layout as _params_to_vec.
-      9. cos(grad, -direction): positive means quality gradient points back toward
-         the trained checkpoint; negative means it diverges.
-     10. Cross-model test uses set_0 gradients at the base checkpoint only.
-     11. Cross-model pairs split into: within-pipeline (det↔ocr same pipeline),
-         cross-pipeline det↔det, cross-pipeline ocr↔ocr, cross-pipeline det↔ocr.
+    Design decisions:
+      1. Quality loss: L_q = -log(rms(delta/std) + ε).  Per-neuron std estimated
+         from ctrl activations over raw_items before the sweep (no separate pass).
+      2. Ctrl (detectors): full image with constant gray (0.5) patch, same prep.
+      3. Adv  (detectors): full image with learned patch, standard _prepare_one.
+      4. Ctrl (OCR): GT plate crop (item['ocr_crop']), backend._preprocess, detached.
+      5. Adv  (OCR): ctrl_crop + 0.1 × resized_patch → _preprocess.
+      6. TrOCR: _EncoderOnlyWrapper (encoder only, no autoregressive decoder).
+      7. Neurons: uniform-layer-first, 2 sets/model, seeds direction_seed & +1.
+      8. Training gradient: average over all 4 pipeline training losses, one
+         backward per pipeline (memory-safe; graphs freed immediately).
+      9. Combined gradient: train_grad + beta * qs_grad, where qs_grad is the
+         mean of both neuron-set gradients for that pipeline's models.
+     10. Output table 1 — per pipeline per epsilon:
+           train_loss | cos(train,-d) | mean_ql | cos(qs,-d) | cos(qs,train)
+           cos(comb,-d) | magnitude_ratio (beta*|qs|/|train|)
+     11. Output table 2 — per model per epsilon (set_0 and set_1):
+           ql_s0 | ql_s1 | cos(s0,train) | cos(s1,train) | cos(s0,s1)
+     12. Cross-model: pairwise cos of qscore set_0 grads at base, same grouping.
     """
     device = trainer.device
 
     print("\n" + "═" * 72)
-    print("Q-score basin profile")
+    print(f"Q-score basin profile  (beta={beta})")
     print("═" * 72)
     for i, line in enumerate([
-        "Quality loss: -log(rms(adv-ctrl) + ε), unnormalised",
-        "Ctrl detectors: gray-patch full image  Adv: learned-patch full image",
-        "Ctrl OCR: GT plate crop via _preprocess (detached)",
-        "Adv  OCR: ctrl_crop + 0.1 × resized_patch → _preprocess (grad flows)",
-        "TrOCR: encoder-only wrapper used",
-        f"Neurons: {k_neurons}/set, 2 sets/model, seeds={direction_seed}&{direction_seed+1}",
-        "Gradient: ∂L_q/∂(seed ‖ decoder_params), independent backward/pair",
-        "cos(g, -dir): +1 = quality grad aligns with 'return to checkpoint'",
+        "L_q = -log(rms(delta/neuron_std) + ε)  [normalised by ctrl-activation std]",
+        "Ctrl det: gray-patch image  |  Adv det: learned-patch image",
+        "Ctrl OCR: GT plate crop → _preprocess (detached)",
+        "Adv  OCR: ctrl_crop + 0.1×patch_resized → _preprocess (grad flows)",
+        "TrOCR: encoder-only wrapper",
+        f"Neurons: {k_neurons}/set × 2 sets/model, seeds {direction_seed} & {direction_seed+1}",
+        "Train grad: mean over 4 pipeline losses, per-pipeline backward",
+        f"Combined: train_grad + {beta} × qs_grad (mean of 2 sets per pipeline models)",
+        "cos(g,-d): +1 = gradient points back toward trained checkpoint",
     ], 1):
         print(f"  {i}. {line}")
     print()
@@ -516,7 +588,6 @@ def run_qscore_basin_profile(
     apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
 
     # ── Build model registry ──────────────────────────────────────────────────
-    # (label, nn_module, is_ocr, backend, pipeline_idx)
     registry = []
     for pi, (det, ocr) in enumerate(pipeline_backends):
         nn_det = getattr(det, '_model', None)
@@ -524,36 +595,56 @@ def run_qscore_basin_profile(
             registry.append((det.name, nn_det, False, det, pi))
         nn_ocr = getattr(ocr, '_model', None)
         if nn_ocr is not None:
-            # TrOCR: VisionEncoderDecoderModel → wrap encoder only
             if hasattr(nn_ocr, 'encoder') and hasattr(nn_ocr, 'decoder'):
                 nn_ocr = _EncoderOnlyWrapper(nn_ocr.encoder)
             registry.append((ocr.name, nn_ocr, True, ocr, pi))
 
-    # ── Discover leaf shapes + sample 2 neuron sets per model ────────────────
-    rng_s0 = _stdlib_random.Random(direction_seed)
-    rng_s1 = _stdlib_random.Random(direction_seed + 1)
-    model_data = {}   # label → (ns0, ns1, nn_model, is_ocr, backend, pi)
+    # ── Discover shapes, sample neurons, profile per-neuron stds ─────────────
+    rng_s0    = _stdlib_random.Random(direction_seed)
+    rng_s1    = _stdlib_random.Random(direction_seed + 1)
+    # label → (ns0, ns1, stds0, stds1, nn_model, is_ocr, backend, pi)
+    model_data = {}
 
-    print("Discovering layers and sampling neurons:")
+    print("Discovering layers, sampling neurons, profiling ctrl stds:")
     for label, nn_model, is_ocr, backend, pi in registry:
         det_b, ocr_b = pipeline_backends[pi]
         trainer._activate_pipeline(det_b, ocr_b)
         try:
             with torch.no_grad():
-                gray        = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
-            sample_item = trainer._prepare_one(raw_items[0], gray, augment=False)
-            if not is_ocr:
-                sample_inp = sample_item["patched_prep"].unsqueeze(0).to(device)
-            else:
-                cc = sample_item.get("ocr_crop")
-                if cc is None: raise ValueError("no ocr_crop in item")
-                sample_inp = backend._preprocess(cc.unsqueeze(0).to(device))
-            shapes = _qs_discover_leaf_shapes(nn_model, sample_inp, device)
-            if not shapes: raise ValueError("no leaf shapes discovered")
+                gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
+
+            # Build ctrl inputs for all raw_items (used for both sample_inp and std profiling)
+            ctrl_inputs = []
+            for raw in raw_items:
+                try:
+                    ci = trainer._prepare_one(raw, gray, augment=False)
+                    if not is_ocr:
+                        ctrl_inputs.append(ci["patched_prep"].unsqueeze(0).to(device))
+                    else:
+                        cc = ci.get("ocr_crop")
+                        if cc is not None:
+                            ctrl_inputs.append(
+                                backend._preprocess(cc.unsqueeze(0).to(device))
+                            )
+                except Exception:
+                    continue
+
+            if not ctrl_inputs:
+                raise ValueError("no ctrl inputs prepared")
+
+            shapes = _qs_discover_leaf_shapes(nn_model, ctrl_inputs[0], device)
+            if not shapes:
+                raise ValueError("no leaf shapes discovered")
+
             ns0 = _qs_sample_neurons(shapes, k_neurons, rng_s0)
             ns1 = _qs_sample_neurons(shapes, k_neurons, rng_s1)
-            model_data[label] = (ns0, ns1, nn_model, is_ocr, backend, pi)
-            print(f"  ✓  {label:20s}  {len(shapes):4d} layers")
+
+            stds0 = _qs_profile_stds(nn_model, ns0, ctrl_inputs, device)
+            stds1 = _qs_profile_stds(nn_model, ns1, ctrl_inputs, device)
+
+            model_data[label] = (ns0, ns1, stds0, stds1, nn_model, is_ocr, backend, pi)
+            print(f"  ✓  {label:20s}  {len(shapes):4d} layers  "
+                  f"std_median={stds0.median():.3e}")
         except Exception as e:
             print(f"  ✗  {label}: skip — {e}")
 
@@ -563,7 +654,7 @@ def run_qscore_basin_profile(
 
     labels = list(model_data.keys())
 
-    # ── Build perturbation direction (random, same seed as basin profile) ─────
+    # ── Perturbation direction ────────────────────────────────────────────────
     base_vec  = _params_to_vec(seed_orig, sd_orig)
     trng      = torch.Generator()
     trng.manual_seed(direction_seed)
@@ -573,66 +664,164 @@ def run_qscore_basin_profile(
     epsilons = [0.0] + np.geomspace(1e-8, 1e-3, n_epsilons).tolist()
 
     # ── Sweep ─────────────────────────────────────────────────────────────────
-    ql_store   = {}   # (label, set_idx, eps_i) → float
-    grad_store = {}   # (label, set_idx, eps_i) → Tensor[N]
+    # per-pipeline training gradient
+    train_loss_store = {}   # (pi, eps_i) → float
+    train_grad_store = {}   # (pi, eps_i) → Tensor[N]
+    # per-(model, set) qscore gradient
+    ql_store   = {}         # (label, si, eps_i) → float
+    grad_store = {}         # (label, si, eps_i) → Tensor[N]
 
-    n_total = len(epsilons) * len(labels) * 2
-    done    = 0
-    print(f"\nSweeping {len(epsilons)} epsilon values × {len(labels)} models × 2 sets "
-          f"= {n_total} backward passes …")
+    n_qs    = len(epsilons) * len(labels) * 2
+    n_train = len(epsilons) * len(pipeline_backends)
+    print(f"\nSweeping {len(epsilons)} epsilons: "
+          f"{n_train} training backward passes + {n_qs} qscore backward passes …")
 
     for eps_i, eps in enumerate(epsilons):
         if eps == 0.0:
             apply_interpolated_weights(trainer, seed_orig, seed_orig, sd_orig, sd_orig, 0.0)
         else:
-            pv      = base_vec + eps * direction
-            ps, pd  = _vec_to_params(pv, seed_orig, sd_orig)
+            pv     = base_vec + eps * direction
+            ps, pd = _vec_to_params(pv, seed_orig, sd_orig)
             apply_interpolated_weights(trainer, ps, ps, pd, pd, 0.0)
 
-        for label, (ns0, ns1, nn_model, is_ocr, backend, pi) in model_data.items():
-            for si, neurons in enumerate([ns0, ns1]):
+        # Training gradient (aggregate over all pipelines)
+        tl, tg = _compute_training_grad(trainer, pipeline_backends, raw_items, batch_size, device)
+        # Store once per eps_i (same grad for all pipelines — it's the aggregate)
+        for pi in range(len(pipeline_backends)):
+            train_loss_store[(pi, eps_i)] = tl
+            train_grad_store[(pi, eps_i)] = tg
+
+        # Qscore gradients
+        for label, (ns0, ns1, stds0, stds1, nn_model, is_ocr, backend, pi) in model_data.items():
+            for si, (neurons, stds) in enumerate([(ns0, stds0), (ns1, stds1)]):
                 ql, gv = _qs_compute_one(
-                    trainer, nn_model, neurons, is_ocr, backend,
+                    trainer, nn_model, neurons, stds, is_ocr, backend,
                     pipeline_backends, pi, raw_items, device,
                 )
                 ql_store[(label, si, eps_i)]  = ql
                 grad_store[(label, si, eps_i)] = gv
-                done += 1
-                if done % 8 == 0:
-                    print(f"  {done}/{n_total}", end="\r", flush=True)
 
-    print(f"  {n_total}/{n_total}  done.         ")
+        done = (eps_i + 1) * (len(labels) * 2 + 1)
+        print(f"  eps {eps_i+1}/{len(epsilons)} done", end="\r", flush=True)
 
-    # ── Print basin profile table ─────────────────────────────────────────────
-    cw = 8
-    hdr = (f"{'epsilon':>10}  {'model':>20}  {'ql_s0':>{cw}}  {'ql_s1':>{cw}}"
-           f"  {'cos(-d)_s0':>11}  {'cos(-d)_s1':>11}  {'cos(s0,s1)':>11}")
-    sep = "─" * len(hdr)
-    print(f"\n{hdr}")
-    print(sep)
+    print(f"  All {len(epsilons)} epsilons done.          ")
+
+    # ── Helper: combined gradient for a pipeline at a given eps ──────────────
+    def combined_grad(pi, eps_i):
+        tg = train_grad_store.get((pi, eps_i))
+        if tg is None:
+            return None
+        # Mean qscore grad over all models in this pipeline (both sets)
+        qs_grads = []
+        for label, (_, _, _, _, _, _, _, lpi) in model_data.items():
+            if lpi != pi:
+                continue
+            for si in range(2):
+                gv = grad_store.get((label, si, eps_i))
+                if gv is not None:
+                    qs_grads.append(gv)
+        if not qs_grads:
+            return tg
+        mean_qs = torch.stack(qs_grads).mean(dim=0)
+        return tg + beta * mean_qs
+
+    # ── Table 1: per-pipeline summary ────────────────────────────────────────
+    pipe_names = [f"{d.name}/{o.name}" for d, o in pipeline_backends]
+    cw = 9
+    h1 = (f"{'epsilon':>10}  {'pipeline':>26}"
+          f"  {'train_l':>{cw}}  {'cos(t,-d)':>{cw}}"
+          f"  {'mean_ql':>{cw}}  {'cos(qs,-d)':>{cw}}"
+          f"  {'cos(qs,t)':>{cw}}  {'cos(cb,-d)':>{cw}}"
+          f"  {'β|qs|/|t|':>{cw}}")
+    sep1 = "─" * len(h1)
+    print(f"\n{'━'*len(h1)}")
+    print("Table 1 — Pipeline-level combined gradient summary")
+    print(f"{'━'*len(h1)}")
+    print(h1)
+    print(sep1)
+
+    for eps_i, eps in enumerate(epsilons):
+        eps_s = "0 (base)" if eps == 0.0 else f"{eps:.2e}"
+        for pi, pname in enumerate(pipe_names):
+            tl  = train_loss_store.get((pi, eps_i), float('nan'))
+            tg  = train_grad_store.get((pi, eps_i))
+            cg  = combined_grad(pi, eps_i)
+
+            # Mean qs grad + loss for models in this pipeline
+            qs_grads, qls = [], []
+            for label, (_, _, _, _, _, _, _, lpi) in model_data.items():
+                if lpi != pi: continue
+                for si in range(2):
+                    gv = grad_store.get((label, si, eps_i))
+                    if gv is not None: qs_grads.append(gv)
+                    ql = ql_store.get((label, si, eps_i))
+                    if ql is not None and not (isinstance(ql, float) and ql != ql):
+                        qls.append(ql)
+            mean_qs  = torch.stack(qs_grads).mean(dim=0) if qs_grads else None
+            mean_ql  = float(np.mean(qls)) if qls else float('nan')
+
+            ct_d  = _cosim(tg, -direction)           if tg  is not None else float('nan')
+            cqs_d = _cosim(mean_qs, -direction)      if mean_qs is not None else float('nan')
+            cqs_t = _cosim(mean_qs, tg)              if (mean_qs is not None and tg is not None) else float('nan')
+            ccb_d = _cosim(cg, -direction)           if cg  is not None else float('nan')
+
+            mag_ratio = float('nan')
+            if tg is not None and mean_qs is not None:
+                tn, qn = tg.norm().item(), mean_qs.norm().item()
+                if tn > 1e-12:
+                    mag_ratio = beta * qn / tn
+
+            print(f"{eps_s:>10}  {pname:>26}"
+                  f"  {tl:>{cw}.4f}  {ct_d:>{cw}.4f}"
+                  f"  {mean_ql:>{cw}.4f}  {cqs_d:>{cw}.4f}"
+                  f"  {cqs_t:>{cw}.4f}  {ccb_d:>{cw}.4f}"
+                  f"  {mag_ratio:>{cw}.4f}")
+        print()
+
+    # ── Table 2: per-model per-set detail ────────────────────────────────────
+    cw2 = 8
+    h2 = (f"{'epsilon':>10}  {'model':>20}"
+          f"  {'ql_s0':>{cw2}}  {'ql_s1':>{cw2}}"
+          f"  {'cos(s0,t)':>10}  {'cos(s1,t)':>10}"
+          f"  {'cos(s0,-d)':>11}  {'cos(s1,-d)':>11}"
+          f"  {'cos(s0,s1)':>11}")
+    sep2 = "─" * len(h2)
+    print(f"\n{'━'*len(h2)}")
+    print("Table 2 — Per-model per-neuron-set detail")
+    print(f"{'━'*len(h2)}")
+    print(h2)
+    print(sep2)
 
     for eps_i, eps in enumerate(epsilons):
         eps_s = "0 (base)" if eps == 0.0 else f"{eps:.2e}"
         for label in labels:
+            pi = model_data[label][7]
+            tg = train_grad_store.get((pi, eps_i))
             g0 = grad_store.get((label, 0, eps_i))
             g1 = grad_store.get((label, 1, eps_i))
             q0 = ql_store.get((label, 0, eps_i), float('nan'))
             q1 = ql_store.get((label, 1, eps_i), float('nan'))
-            cd0 = _cosim(g0, -direction) if g0 is not None else float('nan')
-            cd1 = _cosim(g1, -direction) if g1 is not None else float('nan')
-            ci  = _cosim(g0, g1) if g0 is not None and g1 is not None else float('nan')
-            print(f"{eps_s:>10}  {label:>20}  {q0:>{cw}.4f}  {q1:>{cw}.4f}"
-                  f"  {cd0:>11.4f}  {cd1:>11.4f}  {ci:>11.4f}")
+
+            cs0t = _cosim(g0, tg) if (g0 is not None and tg is not None) else float('nan')
+            cs1t = _cosim(g1, tg) if (g1 is not None and tg is not None) else float('nan')
+            cs0d = _cosim(g0, -direction) if g0 is not None else float('nan')
+            cs1d = _cosim(g1, -direction) if g1 is not None else float('nan')
+            cs01 = _cosim(g0, g1) if (g0 is not None and g1 is not None) else float('nan')
+
+            print(f"{eps_s:>10}  {label:>20}"
+                  f"  {q0:>{cw2}.4f}  {q1:>{cw2}.4f}"
+                  f"  {cs0t:>10.4f}  {cs1t:>10.4f}"
+                  f"  {cs0d:>11.4f}  {cs1d:>11.4f}"
+                  f"  {cs01:>11.4f}")
         print()
 
-    # ── Cross-model gradient similarity (base checkpoint, set_0) ─────────────
-    print("═" * 72)
-    print("Cross-model gradient cosine similarities  (base, set_0)")
-    print("═" * 72)
+    # ── Cross-model qscore gradient similarity (base checkpoint, set_0) ──────
+    print(f"\n{'═'*72}")
+    print("Cross-model qscore gradient cosine similarities  (base, set_0)")
+    print(f"{'═'*72}")
 
-    # Full pairwise matrix
     lw = max(len(l) for l in labels)
-    print(f"\n{' ' * lw}", end="")
+    print(f"\n{' '*lw}", end="")
     for lb in labels:
         print(f"  {lb[:10]:>10}", end="")
     print()
@@ -641,29 +830,19 @@ def run_qscore_basin_profile(
         print(f"{la:{lw}}", end="")
         for lb in labels:
             gb = grad_store.get((lb, 0, 0))
-            if ga is not None and gb is not None:
-                print(f"  {_cosim(ga, gb):>10.4f}", end="")
-            else:
-                print(f"  {'---':>10}", end="")
+            print(f"  {_cosim(ga, gb):>10.4f}" if (ga is not None and gb is not None)
+                  else f"  {'---':>10}", end="")
         print()
 
-    # Categorised pair summaries
-    pipe_map  = {lbl: model_data[lbl][5] for lbl in labels}
-    is_ocr_map = {lbl: model_data[lbl][3] for lbl in labels}
-
-    same_pipe  = []
-    cross_det  = []
-    cross_ocr  = []
-    cross_mix  = []
+    pipe_map   = {lbl: model_data[lbl][7] for lbl in labels}
+    is_ocr_map = {lbl: model_data[lbl][5] for lbl in labels}
+    same_pipe, cross_det, cross_ocr, cross_mix = [], [], [], []
 
     for i, la in enumerate(labels):
         for j, lb in enumerate(labels):
-            if j <= i:
-                continue
-            ga = grad_store.get((la, 0, 0))
-            gb = grad_store.get((lb, 0, 0))
-            if ga is None or gb is None:
-                continue
+            if j <= i: continue
+            ga, gb = grad_store.get((la, 0, 0)), grad_store.get((lb, 0, 0))
+            if ga is None or gb is None: continue
             cs = _cosim(ga, gb)
             oa, ob = is_ocr_map[la], is_ocr_map[lb]
             if pipe_map[la] == pipe_map[lb]:
@@ -676,8 +855,7 @@ def run_qscore_basin_profile(
                 cross_mix.append((la, lb, cs))
 
     def _print_group(pairs, title):
-        if not pairs:
-            return
+        if not pairs: return
         vals = [cs for _, _, cs in pairs]
         print(f"\n{title}  (n={len(pairs)}, mean={np.mean(vals):.4f}, std={np.std(vals):.4f})")
         for la, lb, cs in sorted(pairs, key=lambda x: -x[2]):
@@ -722,6 +900,10 @@ def main():
                              "intra-model set cosine sim, and cross-model gradient similarity.")
     parser.add_argument("--k-neurons", type=int, default=1000,
                         help="Neurons per set per model for --qscore (default 1000)")
+    parser.add_argument("--beta", type=float, default=0.1,
+                        help="Weight of quality loss in combined gradient for --qscore "
+                             "(default 0.1; quality loss is in log-space so this makes "
+                             "it ~10%% of typical training loss magnitude)")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Sub-batch size passed to compute_loss_batch")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -812,7 +994,7 @@ def main():
         run_qscore_basin_profile(
             trainer, seed_a, sd_a, pipeline_backends,
             raw_items, args.batch_size, args.n_epsilons,
-            args.direction_seed, args.k_neurons,
+            args.direction_seed, args.k_neurons, args.beta,
         )
         return
 
