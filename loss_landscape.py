@@ -270,8 +270,8 @@ class _EncoderOnlyWrapper(torch.nn.Module):
         super().__init__()
         self.enc = encoder
 
-    def named_modules(self):
-        return self.enc.named_modules()
+    def named_modules(self, **kwargs):
+        return self.enc.named_modules(**kwargs)
 
     def forward(self, x):
         return self.enc(pixel_values=x).last_hidden_state
@@ -287,8 +287,8 @@ class _VisionOnlyWrapper(torch.nn.Module):
         super().__init__()
         self.vm = vision_model
 
-    def named_modules(self):
-        return self.vm.named_modules()
+    def named_modules(self, **kwargs):
+        return self.vm.named_modules(**kwargs)
 
     def forward(self, x):
         out = self.vm(pixel_values=x)
