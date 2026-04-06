@@ -171,20 +171,25 @@ def run_basin_profile(
     batch_size: int,
     n_epsilons: int = 11,
     seed: int = 0,
+    direction: torch.Tensor = None,   # pre-computed unit-norm direction, or None for random
 ) -> None:
     """
-    Pick a random unit-norm direction in weight space and perturb the
-    checkpoint weights by exponentially increasing magnitudes.  Prints a
-    table of per-pipeline and mean losses at each perturbation size, giving
-    an estimate of basin sharpness / flatness.
-    """
-    rng = torch.Generator()
-    rng.manual_seed(seed)
+    Perturb checkpoint weights along a unit-norm direction by exponentially
+    increasing magnitudes (1e-8 → 1e-3) and evaluate loss at each step.
 
-    # Build base vector and a unit-norm random direction
+    direction: if None, a random unit-norm vector is sampled (reproducible via seed).
+               If provided (e.g. normalised A→B vector), it is used as-is.
+    """
     base_vec = _params_to_vec(seed_orig, sd_orig)
-    direction = torch.randn(base_vec.numel(), generator=rng)
-    direction /= direction.norm()
+
+    if direction is None:
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+        direction = torch.randn(base_vec.numel(), generator=rng)
+        direction /= direction.norm()
+        dir_label = f"random direction, seed={seed}"
+    else:
+        dir_label = "direction A→B (normalised)"
 
     epsilons = np.geomspace(1e-8, 1e-3, n_epsilons).tolist()
 
@@ -197,7 +202,7 @@ def run_basin_profile(
     )
     sep = "-" * len(header)
 
-    print(f"\nBasin sharpness profile  (random direction, seed={seed})")
+    print(f"\nBasin sharpness profile  ({dir_label})")
     print(f"Total parameters in direction vector: {base_vec.numel():,}")
     print(header)
     print(sep)
@@ -271,6 +276,9 @@ def main():
                              "(default 11, log-spaced from 1e-8 to 1e-3)")
     parser.add_argument("--direction-seed", type=int, default=0,
                         help="RNG seed for the random perturbation direction")
+    parser.add_argument("--local-direction", action="store_true",
+                        help="With two run dirs: profile basin sharpness in the A→B direction "
+                             "instead of running the interpolation sweep")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Sub-batch size passed to compute_loss_batch")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -357,10 +365,19 @@ def main():
     print(f"Collected {len(raw_items)} items.\n")
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
-    if basin_mode:
+    if basin_mode or args.local_direction:
+        if args.local_direction:
+            vec_a = _params_to_vec(seed_a, sd_a)
+            vec_b = _params_to_vec(seed_b, sd_b)
+            diff  = vec_b - vec_a
+            local_dir = diff / diff.norm()
+            print(f"A→B distance (L2): {diff.norm().item():.4e}")
+        else:
+            local_dir = None
         run_basin_profile(
             trainer, seed_a, sd_a, pipeline_backends, raw_items,
             args.batch_size, args.n_epsilons, args.direction_seed,
+            direction=local_dir,
         )
         return
 
