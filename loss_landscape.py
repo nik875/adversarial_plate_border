@@ -447,93 +447,25 @@ def _qs_profile_stds(nn_model, neurons, ctrl_inputs, device):
     return stacked.std(dim=0).clamp(min=1e-6)
 
 
-@torch.no_grad()
-def _qs_precompute_neuron_acts(nn_model, inputs, needed_neurons, device):
+
+def _qs_build_act_matrix(lookup, neuron_order):
     """
-    Run one no-grad forward pass per input, recording only the specific
-    (layer_name, flat_idx) pairs in needed_neurons.
+    Convert a {(name, idx): Tensor[N]} lookup into a dense 2-D matrix.
 
-    needed_neurons: iterable of (layer_name, flat_idx) pairs
-    inputs:         list of preprocessed model-input tensors
-
-    Returns dict[(layer_name, flat_idx)] -> float32 Tensor[N_inputs].
-    Entries are NaN for inputs whose forward pass raised or whose layer was absent.
-
-    Memory cost: O(|needed_neurons| × N_inputs × 4 bytes) — typically a few MB
-    rather than storing full activation tensors for every leaf layer.
+    neuron_order: ordered list of (name, idx) keys that defines the row order.
+    Returns float32 CPU Tensor[n_unique, N_inputs].
+    Rows for keys absent from lookup are zero; NaN values are preserved.
     """
-    layer_indices = {}
-    for name, idx in needed_neurons:
-        layer_indices.setdefault(name, set()).add(idx)
-
-    name_to_mod = {n: m for n, m in nn_model.named_modules()}
-
-    # accumulate scalar values: results[(name, idx)] = [float, ...]
-    results = {(name, idx): [] for name, idxs in layer_indices.items() for idx in idxs}
-
-    for inp in inputs:
-        captured = {}
-        hooks    = []
-
-        def _make(name):
-            def hook(mod, _inp, out):
-                if isinstance(out, torch.Tensor) and out.dim() >= 1:
-                    captured[name] = out.detach().float().cpu().flatten()
-            return hook
-
-        for name in layer_indices:
-            if name in name_to_mod:
-                hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
-        try:
-            try:   nn_model(inp)
-            except Exception: pass
-        finally:
-            for h in hooks: h.remove()
-
-        for name, idxs in layer_indices.items():
-            flat = captured.get(name)
-            L    = len(flat) if flat is not None else 0
-            for idx in idxs:
-                val = flat[idx % L].item() if L > 0 else float('nan')
-                results[(name, idx)].append(val)
-
-    return {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
-
-
-def _qs_stds_from_lookup(lookup, neurons):
-    """
-    Compute per-neuron activation stds from a compact lookup — no forward passes.
-
-    lookup:  {(layer_name, flat_idx): Tensor[N_inputs]} from _qs_precompute_neuron_acts
-    neurons: list of (layer_name, flat_idx)
-    Returns [k] float32 CPU tensor, clamped to ≥ 1e-6.
-    Falls back to 1.0 for neurons absent from the lookup or with < 2 valid values.
-    """
-    k   = len(neurons)
-    out = torch.ones(k, dtype=torch.float32)
-    for pos, key in enumerate(neurons):
-        vals = lookup.get(key)
-        if vals is not None:
-            valid = vals[~torch.isnan(vals)]
-            if len(valid) >= 2:
-                out[pos] = valid.std().clamp(min=1e-6)
-    return out
-
-
-def _qs_ctrl_acts_from_lookup(lookup, neurons, lookup_idx, device):
-    """
-    Extract ctrl activations for one input from a compact lookup.
-
-    lookup_idx: which column of each lookup tensor corresponds to this input.
-    Returns [k] float32 tensor on device (detached). Falls back to 0.
-    """
-    k     = len(neurons)
-    elems = torch.zeros(k, dtype=torch.float32)
-    for pos, key in enumerate(neurons):
-        vals = lookup.get(key)
-        if vals is not None and lookup_idx < len(vals):
-            elems[pos] = vals[lookup_idx]
-    return elems.to(device)
+    n_unique = len(neuron_order)
+    if not lookup:
+        return torch.zeros(n_unique, 0, dtype=torch.float32)
+    N = next(iter(lookup.values())).shape[0]
+    mat = torch.zeros(n_unique, N, dtype=torch.float32)
+    for row, key in enumerate(neuron_order):
+        v = lookup.get(key)
+        if v is not None:
+            mat[row] = v
+    return mat
 
 
 def _collect_grad(trainer):
@@ -616,25 +548,25 @@ def _qs_compute_one(
     trainer, nn_model, neurons, neuron_stds, is_ocr, backend,
     pipeline_backends, pi, raw_items, device,
     item_ctrl_inputs=None,
-    ctrl_lookup=None,
+    ctrl_acts_gpu=None,
 ):
     """
     Compute quality loss and its gradient w.r.t. decoder+seed params for one
     (model, neuron_set) pair.
 
-    neuron_stds: [k] CPU tensor from _qs_profile_stds — used to normalise delta.
+    neuron_stds: [k] CPU tensor — used to normalise delta.
 
     item_ctrl_inputs: optional list (one entry per raw_item) of either
         None  — item failed preparation; skip it
-        (ctrl_inp_cpu, ctrl_crop_cpu_or_None, lookup_idx)
-            ctrl_inp_cpu  : preprocessed ctrl tensor [1, C, H, W] on CPU
-            ctrl_crop_cpu : original OCR crop [1, 3, H, W] on CPU, or None for det
-            lookup_idx    : int index into ctrl_lookup for this item's activations
+        (ctrl_inp, ctrl_crop_or_None, valid_item_idx)
+            ctrl_inp       : preprocessed ctrl tensor [1, C, H, W] already on device
+            ctrl_crop      : original OCR crop [1, 3, H, W] on device, or None for det
+            valid_item_idx : row index into ctrl_acts_gpu for this item
         When provided, _prepare_one is skipped.
 
-    ctrl_lookup: optional {(layer_name, flat_idx): Tensor[N]} from
-        _qs_precompute_neuron_acts — when provided, the no-grad ctrl forward
-        pass is replaced by a lookup into this table.
+    ctrl_acts_gpu: optional Tensor[N_valid_items, k] already on device — precomputed
+        ctrl activations for all valid items.  When provided, the no-grad ctrl
+        forward pass is eliminated; ctrl_acts = ctrl_acts_gpu[valid_item_idx].
 
     Returns (ql_value: float, grad_flat: Tensor[N]).
     """
@@ -673,12 +605,11 @@ def _qs_compute_one(
                 # (ctrl), then add the learned patch as a scaled additive
                 # perturbation so gradients always flow from patch_norm.
                 if cached is not None:
-                    ctrl_inp_cpu, _ctrl_crop_cpu, lookup_idx = cached
-                    ctrl_inp = ctrl_inp_cpu.to(device)
+                    ctrl_inp, _ctrl_crop, valid_item_idx = cached
                 else:
                     ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
                     ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
-                    lookup_idx = None
+                    valid_item_idx = None
                 h, w      = ctrl_inp.shape[-2], ctrl_inp.shape[-1]
                 p_scaled  = F.interpolate(
                     patch_norm.unsqueeze(0), size=(h, w),
@@ -688,11 +619,9 @@ def _qs_compute_one(
             else:
                 # ── OCR: GT plate crop + additive patch overlay ─────────────
                 if cached is not None:
-                    ctrl_inp_cpu, ctrl_crop_cpu, lookup_idx = cached
-                    if ctrl_crop_cpu is None:
+                    ctrl_inp, ctrl_crop, valid_item_idx = cached
+                    if ctrl_crop is None:
                         continue
-                    ctrl_inp  = ctrl_inp_cpu.to(device)
-                    ctrl_crop = ctrl_crop_cpu.to(device)
                 else:
                     ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
                     ctrl_crop = ctrl_item.get("ocr_crop")
@@ -701,7 +630,7 @@ def _qs_compute_one(
                     # ocr_crop is [1, 3, H, W] (already batched by _prepare_batch)
                     ctrl_crop = ctrl_crop.to(device)           # [1, 3, H, W]
                     ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
-                    lookup_idx = None
+                    valid_item_idx = None
                 oh, ow    = backend.ocr_crop_size
                 # Keep batch dim: [1, 3, oh, ow]; gradient flows through interpolate
                 p_batch   = F.interpolate(
@@ -713,8 +642,8 @@ def _qs_compute_one(
                 # F.interpolate for backends without a tensor _preprocess (e.g. TrOCR)
                 adv_inp   = _qs_ocr_preprocess(backend, adv_crop)
 
-            if ctrl_lookup is not None and lookup_idx is not None:
-                ctrl_acts = _qs_ctrl_acts_from_lookup(ctrl_lookup, neurons, lookup_idx, device)
+            if ctrl_acts_gpu is not None and valid_item_idx is not None:
+                ctrl_acts = ctrl_acts_gpu[valid_item_idx]      # already on device, [k]
             else:
                 ctrl_acts = _qs_capture(nn_model, ctrl_inp, neurons, no_grad=True, device=device)
             adv_acts  = _qs_capture(nn_model, adv_inp,  neurons, no_grad=False, device=device)
@@ -863,24 +792,30 @@ def run_qscore_basin_profile(
     for label, needed in needed_per_model.items():
         print(f"  {label:20s}  {len(needed):>7,} unique (layer, idx) pairs needed")
 
-    # ── Precompute ctrl activation lookups (once per model, reused at every k) ─
-    # ctrl_lookups[label]      : {(layer, idx): Tensor[N_valid]} — scalar activations
-    #   only the specific neurons actually used across all k-steps are stored,
-    #   so memory is O(unique_neurons × N_inputs × 4 bytes) instead of O(all_leaf_outputs)
-    # item_ctrl_inputs[label]  : List[None | (ctrl_inp_cpu, ctrl_crop_cpu, lookup_idx)]
-    #   lookup_idx maps each raw_item to its column in ctrl_lookups[label]
-    print("\nPrecomputing ctrl activation lookups (once per model) …")
-    ctrl_lookups      = {}
-    item_ctrl_inputs  = {}
+    # ── Precompute ctrl activation matrices (once per model, reused at every k) ─
+    # act_matrices[label]    : float32 CPU Tensor[n_unique, N_valid]
+    #   dense 2-D matrix built from the compact lookup; enables vectorised
+    #   stds and ctrl_acts via act_matrices[label][pos_tensor] — no Python loops.
+    # neuron_to_pos[label]   : {(name, idx): int} — row index in act_matrices
+    # pos_tensors[(l,k,si)]  : LongTensor[k] — precomputed row indices per neuron set
+    # item_ctrl_inputs[label]: List[None | (ctrl_inp, ctrl_crop_or_None, valid_item_idx)]
+    #   ctrl tensors are kept on device so no CPU→GPU transfer occurs in the sweep.
+    print("\nPrecomputing ctrl activation matrices (once per model) …")
+    act_matrices     = {}
+    neuron_to_pos    = {}
+    item_ctrl_inputs = {}
 
-    for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+    n_models = len(model_data)
+    for m_idx, (label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi)) in \
+            enumerate(model_data.items()):
         det_b, ocr_b = pipeline_backends[pi]
         trainer._activate_pipeline(det_b, ocr_b)
 
         with torch.no_grad():
             gray = torch.full_like(trainer.generate_patch(training_aug=False), 0.5)
 
-        # Prepare ctrl tensors for every raw_item; valid ones are passed to precompute
+        # Prepare ctrl tensors for every raw_item; keep on device to avoid
+        # repeated CPU→GPU transfers during the sweep.
         item_cache   = []
         valid_inputs = []   # model-ready tensors in lookup-index order
         for raw in raw_items:
@@ -896,25 +831,77 @@ def run_qscore_basin_profile(
                         continue
                     ctrl_crop = ctrl_crop_t.to(device)
                     ctrl_inp  = _qs_ocr_preprocess(backend, ctrl_crop).detach()
-                lookup_idx = len(valid_inputs)
+                valid_item_idx = len(valid_inputs)
                 valid_inputs.append(ctrl_inp)
-                item_cache.append((
-                    ctrl_inp.cpu(),
-                    ctrl_crop.cpu() if ctrl_crop is not None else None,
-                    lookup_idx,
-                ))
+                item_cache.append((ctrl_inp, ctrl_crop, valid_item_idx))
             except Exception:
                 item_cache.append(None)
 
         item_ctrl_inputs[label] = item_cache
-        ctrl_lookups[label] = _qs_precompute_neuron_acts(
-            nn_model, valid_inputs, needed_per_model[label], device
-        )
+
+        # Build compact scalar lookup, then convert to dense 2-D matrix
+        n_needed = len(needed_per_model[label])
+        print(f"  [{m_idx+1}/{n_models}] {label}  ({n_needed:,} neurons × {len(valid_inputs)} inputs) …")
+        with tqdm(total=len(valid_inputs), unit="inp", ncols=72, leave=False) as inner:
+            lookup = {}
+            # Run one pass per valid input, capturing only needed neurons
+            name_to_mod  = {n: m for n, m in nn_model.named_modules()}
+            layer_indices = {}
+            for name, idx in needed_per_model[label]:
+                layer_indices.setdefault(name, set()).add(idx)
+            results = {key: [] for key in needed_per_model[label]}
+
+            for inp in valid_inputs:
+                captured = {}
+                hooks    = []
+
+                def _make(name):
+                    def hook(mod, _inp, out):
+                        if isinstance(out, torch.Tensor) and out.dim() >= 1:
+                            captured[name] = out.detach().float().cpu().flatten()
+                    return hook
+
+                for name in layer_indices:
+                    if name in name_to_mod:
+                        hooks.append(name_to_mod[name].register_forward_hook(_make(name)))
+                try:
+                    with torch.no_grad():
+                        try:   nn_model(inp)
+                        except Exception: pass
+                finally:
+                    for h in hooks: h.remove()
+
+                for name, idxs in layer_indices.items():
+                    flat = captured.get(name)
+                    L    = len(flat) if flat is not None else 0
+                    for idx in idxs:
+                        val = flat[idx % L].item() if L > 0 else float('nan')
+                        results[(name, idx)].append(val)
+                inner.update(1)
+
+            lookup = {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
+
+        # Build ordered neuron list and dense matrix
+        neuron_order = list(needed_per_model[label])
+        neuron_to_pos[label] = {key: i for i, key in enumerate(neuron_order)}
+        act_matrices[label]  = _qs_build_act_matrix(lookup, neuron_order)
+
         n_valid = sum(1 for x in item_cache if x is not None)
-        n_bytes = sum(v.numel() * 4 for v in ctrl_lookups[label].values())
+        n_bytes = act_matrices[label].numel() * 4
         print(f"  ✓  {label:20s}  {n_valid}/{len(raw_items)} items  "
-              f"lookup={len(ctrl_lookups[label]):,} entries  "
-              f"{n_bytes / 1e6:.1f} MB")
+              f"matrix={act_matrices[label].shape}  {n_bytes / 1e6:.1f} MB")
+
+    # ── Precompute position-index tensors for every neuron set ────────────────
+    # Converts per-neuron-set (name, idx) lists into LongTensor row indices into
+    # act_matrices — eliminates all Python-level loops from the k-sweep hot path.
+    print("\nBuilding position-index tensors for all neuron sets …")
+    pos_tensors = {}   # (label, k_idx, si) → LongTensor[k]
+    for (label, k_idx, si), neurons in all_neuron_sets.items():
+        ntp = neuron_to_pos[label]
+        pos_tensors[(label, k_idx, si)] = torch.tensor(
+            [ntp[key] for key in neurons], dtype=torch.long
+        )
+    print(f"  built {len(pos_tensors):,} position tensors")
 
     # ── Training gradient — computed once at base ─────────────────────────────
     print("\nComputing training gradient (base checkpoint) …")
@@ -934,15 +921,30 @@ def run_qscore_basin_profile(
     with tqdm(total=n_total, unit="bwd", ncols=80) as pbar:
         for k_idx, k in enumerate(k_values):
             for label, (ctrl_inputs, shapes, nn_model, is_ocr, backend, pi) in model_data.items():
+                mat = act_matrices[label]   # [n_unique, N_valid], CPU
                 for si in range(2):
                     pbar.set_description(f"k={k:>6d} {label[:12]} s{si}")
+                    pos = pos_tensors[(label, k_idx, si)]   # LongTensor[k]
+
+                    # Stds: vectorised slice of act_matrix — no Python loop
+                    rows = mat[pos]                          # [k, N_valid]
+                    stds = rows.std(dim=1).clamp(min=1e-6)  # [k]
+                    # Replace NaN stds (all-NaN rows) with 1.0
+                    stds = torch.where(torch.isnan(stds), torch.ones_like(stds), stds)
+
+                    # Ctrl acts for all valid items — one slice + one GPU transfer
+                    valid_idxs = [c[2] for c in item_ctrl_inputs[label] if c is not None]
+                    if valid_idxs:
+                        ctrl_acts_gpu = mat[pos][:, valid_idxs].t().to(device)  # [N_valid, k]
+                    else:
+                        ctrl_acts_gpu = None
+
                     neurons = all_neuron_sets[(label, k_idx, si)]
-                    stds    = _qs_stds_from_lookup(ctrl_lookups[label], neurons)
                     ql, gv  = _qs_compute_one(
                         trainer, nn_model, neurons, stds, is_ocr, backend,
                         pipeline_backends, pi, raw_items, device,
                         item_ctrl_inputs=item_ctrl_inputs[label],
-                        ctrl_lookup=ctrl_lookups[label],
+                        ctrl_acts_gpu=ctrl_acts_gpu,
                     )
                     ql_store[(label, si, k_idx)]   = ql
                     grad_store[(label, si, k_idx)]  = gv
