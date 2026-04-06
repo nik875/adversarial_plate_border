@@ -558,11 +558,20 @@ def _qs_compute_one(
     for raw_item in raw_items:
         try:
             if not is_ocr:
-                # ── Detector: full preprocessed image ──────────────────────
-                adv_item  = trainer._prepare_one(raw_item, patch_norm, augment=False)
-                ctrl_item = trainer._prepare_one(raw_item, gray,       augment=False)
-                adv_inp   = adv_item["patched_prep"].unsqueeze(0).to(device)
+                # ── Detector: additive patch overlay on ctrl background ─────
+                # _prepare_one brightness-normalises patch_batch inside
+                # torch.no_grad(), severing the gradient chain from patch_norm
+                # to patched_prep.  Instead: get the gray-patch background once
+                # (ctrl), then add the learned patch as a scaled additive
+                # perturbation so gradients always flow from patch_norm.
+                ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
                 ctrl_inp  = ctrl_item["patched_prep"].unsqueeze(0).to(device).detach()
+                h, w      = ctrl_inp.shape[-2], ctrl_inp.shape[-1]
+                p_scaled  = F.interpolate(
+                    patch_norm.unsqueeze(0), size=(h, w),
+                    mode='bilinear', align_corners=False,
+                )                                              # [1, 3, h, w]
+                adv_inp   = ctrl_inp + 0.1 * p_scaled         # gradient flows here
             else:
                 # ── OCR: GT plate crop + additive patch overlay ─────────────
                 ctrl_item = trainer._prepare_one(raw_item, gray, augment=False)
@@ -634,7 +643,8 @@ def run_qscore_basin_profile(
     print("═" * 72)
     for i, line in enumerate([
         "L_q = -log(rms(delta/neuron_std) + ε)  [normalised by ctrl-activation std]",
-        "Ctrl det: gray-patch image  |  Adv det: learned-patch image",
+        "Ctrl det: gray-patch image (detached)  Adv det: ctrl + 0.1×patch_resized",
+        "  (brightness_norm in _prepare_one runs inside no_grad, severing grad chain)",
         "Ctrl OCR: GT plate crop → _preprocess (detached)",
         "Adv  OCR: ctrl_crop + 0.1×patch_resized → _preprocess (grad flows)",
         "TrOCR: encoder-only wrapper",
