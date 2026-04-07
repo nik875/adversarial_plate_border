@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_segmented.py — run a long holdout training in restartable segments.
+train_segmented.py — run a long holdout/trainon training in restartable segments.
 
 Splits the full training run into N segments.  After each segment the trainer
 process exits (freeing all GPU/CPU memory), then this script relaunches it
@@ -10,6 +10,7 @@ Usage:
     python train_segmented.py --holdout owlvit
     python train_segmented.py --holdout owlvit --epochs 5 --segments 10
     python train_segmented.py --holdout owlvit --continue   # resume latest run
+    python train_segmented.py --trainon fasterrcnn           # single-pipeline mode
 """
 
 import argparse
@@ -48,9 +49,10 @@ def global_update_from_ckpt(ckpt: Path) -> int:
     return int(m.group(1)) if m else 0
 
 
-def find_latest_run(holdout: str, holdout_ocr: str) -> Path | None:
+def find_latest_run(mode: str, det: str, ocr: str) -> Path | None:
+    """mode is 'holdout' or 'trainon'."""
     runs_dir = Path("runs")
-    prefix = f"holdout_{holdout}_{holdout_ocr}_"
+    prefix = f"{mode}_{det}_{ocr}_"
     matches = sorted(
         (p for p in runs_dir.glob(f"{prefix}*") if p.is_dir()),
         key=lambda p: p.stat().st_mtime,
@@ -61,9 +63,13 @@ def find_latest_run(holdout: str, holdout_ocr: str) -> Path | None:
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--holdout", required=True,
-                        choices=[d for d, _ in PIPELINE_PAIRINGS],
-                        help="Detector name to hold out")
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--holdout",
+                            choices=[d for d, _ in PIPELINE_PAIRINGS],
+                            help="Detector name to hold out (train against all others)")
+    mode_group.add_argument("--trainon",
+                            choices=[d for d, _ in PIPELINE_PAIRINGS],
+                            help="Train against ONLY this detector pipeline")
     parser.add_argument("--continue", dest="resume", action="store_true",
                         help="Resume the most recent matching run from its "
                              "last checkpoint, preserving LR and dataloader state")
@@ -85,8 +91,14 @@ def main():
     parser.add_argument("--no-augment",       dest="augment", action="store_false")
     args = parser.parse_args()
 
-    holdout     = args.holdout
-    holdout_ocr = next(o for d, o in PIPELINE_PAIRINGS if d == holdout)
+    if args.holdout:
+        run_mode    = "holdout"
+        run_det     = args.holdout
+        run_ocr     = next(o for d, o in PIPELINE_PAIRINGS if d == run_det)
+    else:
+        run_mode    = "trainon"
+        run_det     = args.trainon
+        run_ocr     = next(o for d, o in PIPELINE_PAIRINGS if d == run_det)
 
     n_images        = count_csv_data_rows(args.ccpd_train_csv)
     steps_per_epoch = n_images // args.eval_batch_size
@@ -107,10 +119,10 @@ def main():
     start_seg     = 1
 
     if args.resume:
-        existing_run = find_latest_run(holdout, holdout_ocr)
+        existing_run = find_latest_run(run_mode, run_det, run_ocr)
         if existing_run is None:
             print(f"[segmented] --continue: no existing run found for "
-                  f"holdout={holdout}/{holdout_ocr} in runs/")
+                  f"{run_mode}={run_det}/{run_ocr} in runs/")
             sys.exit(1)
 
         patches_dir = existing_run / "patches"
@@ -119,7 +131,7 @@ def main():
             print(f"[segmented] --continue: no checkpoint found in {patches_dir}")
             sys.exit(1)
 
-        prefix   = f"holdout_{holdout}_{holdout_ocr}_"
+        prefix   = f"{run_mode}_{run_det}_{run_ocr}_"
         run_name = existing_run.name[len(prefix):]
         run_dir  = existing_run
         global_update = global_update_from_ckpt(ckpt)
@@ -135,9 +147,9 @@ def main():
               f"(starting at segment {start_seg})")
     else:
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir  = Path("runs") / f"holdout_{holdout}_{holdout_ocr}_{run_name}"
+        run_dir  = Path("runs") / f"{run_mode}_{run_det}_{run_ocr}_{run_name}"
 
-    print(f"[segmented] holdout        : {holdout} / {holdout_ocr}")
+    print(f"[segmented] {run_mode:<14}: {run_det} / {run_ocr}")
     print(f"[segmented] run_dir        : {run_dir}")
     print(f"[segmented] n_images       : {n_images}")
     print(f"[segmented] steps/epoch    : {steps_per_epoch}")
@@ -150,7 +162,7 @@ def main():
     base_cmd = [
         sys.executable, "trainer.py",
         "--finetuned-models",     args.finetuned_models,
-        "--holdout",              holdout,
+        f"--{run_mode}",          run_det,
         "--ccpd-train-csv",       args.ccpd_train_csv,
         "--impersonation-target", args.impersonation_target,
         "--epochs",               str(args.epochs),

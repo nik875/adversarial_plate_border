@@ -3062,6 +3062,11 @@ def main():
                              "matches DETECTOR (e.g. 'fasterrcnn') and train against the "
                              "remaining 3 pipelines in round-robin.  Requires --finetuned-models.  "
                              f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}")
+    parser.add_argument("--trainon", default=None, metavar="DETECTOR",
+                        help="Single-pipeline ensemble mode: train against ONLY the pipeline "
+                             "whose detector matches DETECTOR.  Mutually exclusive with "
+                             "--holdout.  Requires --finetuned-models.  "
+                             f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}")
     parser.add_argument("--profile", default=None,
                         choices=["timing", "mem"],
                         help="Enable profiling.  'timing' reports per-stage wall-clock time "
@@ -3078,7 +3083,12 @@ def main():
     args = parser.parse_args()
 
     # ── Holdout / ensemble mode ───────────────────────────────────────────────
+    if args.holdout and args.trainon:
+        parser.error("--holdout and --trainon are mutually exclusive")
+
     _holdout_pair: Optional[Tuple[str, str]] = None
+    _trainon_pair: Optional[Tuple[str, str]] = None
+
     if args.holdout:
         _holdout_pair = next(
             ((d, o) for d, o in PIPELINE_PAIRINGS if d == args.holdout), None
@@ -3097,6 +3107,21 @@ def main():
         args.backend     = _primary_det
         args.ocr_backend = _primary_ocr
 
+    if args.trainon:
+        _trainon_pair = next(
+            ((d, o) for d, o in PIPELINE_PAIRINGS if d == args.trainon), None
+        )
+        if _trainon_pair is None:
+            parser.error(
+                f"--trainon {args.trainon!r} does not match any pipeline detector.  "
+                f"Valid values: {[d for d, _ in PIPELINE_PAIRINGS]}"
+            )
+        if not args.finetuned_models:
+            parser.error("--trainon requires --finetuned-models")
+        # Use the trainon pipeline as the primary backend
+        args.backend     = _trainon_pair[0]
+        args.ocr_backend = _trainon_pair[1]
+
     # ── run_dir override for ensemble mode ───────────────────────────────────
     _run_dir_override = None
     if _holdout_pair:
@@ -3104,6 +3129,12 @@ def main():
         _suffix = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
         _run_dir_override = str(
             Path("runs") / f"holdout_{holdout_det}_{holdout_ocr}_{_suffix}"
+        )
+    elif _trainon_pair:
+        trainon_det, trainon_ocr = _trainon_pair
+        _suffix = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        _run_dir_override = str(
+            Path("runs") / f"trainon_{trainon_det}_{trainon_ocr}_{_suffix}"
         )
 
     # ── Resolve model paths (mirrors evaluate_finetuned.py checkpoint_map) ──
@@ -3193,6 +3224,18 @@ def main():
             active_pipeline_backends.append((_det, _ocr_b))
         print(f"  [ensemble] Loaded {len(active_pipeline_backends)} active pipelines "
               f"(holdout: {_holdout_pair[0]}/{_holdout_pair[1]})")
+    elif _trainon_pair and args.finetuned_models:
+        _fdir_ens = Path(args.finetuned_models)
+        _det_name, _ocr_name = _trainon_pair
+        _dp = str(_fdir_ens / _FINETUNED_CHECKPOINT_MAP[_det_name])
+        _op = str(_fdir_ens / _FINETUNED_CHECKPOINT_MAP[_ocr_name])
+        _det = build_backend(_det_name, _dp, device=args.device)
+        _det.load(); _det.eval(); _det.freeze()
+        _ocr_b = build_ocr_backend(_ocr_name, _op, device=args.device)
+        _ocr_b.load(); _ocr_b.eval()
+        active_pipeline_backends.append((_det, _ocr_b))
+        print(f"  [ensemble] Loaded 1 active pipeline "
+              f"(trainon: {_trainon_pair[0]}/{_trainon_pair[1]})")
 
     # If resuming, reuse the original run directory (two levels up from the .pt file).
     # (Ignored when run_dir_override is set — ensemble mode computes its own path.)
@@ -3238,7 +3281,7 @@ def main():
         trainer.profiling = "mem"
         trainer._mem_prof_steps = args.profile_steps
 
-    if _holdout_pair:
+    if _holdout_pair or _trainon_pair:
         trainer.train_ensemble(
             active_pipelines = active_pipeline_backends,
             num_epochs       = args.epochs,
