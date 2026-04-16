@@ -640,7 +640,7 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                 ocr_result = batch_ocr[local_idx]
                 gt_text = batch_gts[global_idx]
 
-                pred_text = ocr_result.text.strip().upper()
+                pred_text = (ocr_result.text or "").strip().upper()
 
                 # LPRR: exact match
                 lprr = 1.0 if pred_text == gt_text else 0.0
@@ -863,7 +863,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
 
                 # Process OCR results
                 for ocr_idx, (ocr_result, gt_text) in enumerate(zip(batch_ocr, ocr_batch_gts)):
-                    pred_text = ocr_result.text.strip().upper()
+                    pred_text = (ocr_result.text or "").strip().upper()
                     result_idx = ocr_indices[ocr_idx]
 
                     if pred_text == gt_text:
