@@ -200,7 +200,7 @@ def _bbox_ocr_crop(
     th, tw = target_size
     if x2 <= x1 or y2 <= y1:
         return torch.zeros(img.shape[0], img.shape[1], th, tw or 128, device=img.device)
-    crop = img[..., y1:y2, x1:x2]
+    crop = img[..., y1:y2, x1:x2]  # Non-differentiable
     if tw is None:
         crop_h, crop_w = crop.shape[-2], crop.shape[-1]
         tw = max(1, int(crop_w * th / max(crop_h, 1)))
@@ -286,7 +286,7 @@ class SAM(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 e_w = p.grad * scale
-                p.add_(e_w)
+                p.add_(e_w)  # Add the perturbation to the parameter group (weights)
                 self.state[p]["e_w"] = e_w
         if zero_grad:
             self.zero_grad()
@@ -297,7 +297,7 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             for p in group["params"]:
                 if "e_w" in self.state[p]:
-                    p.sub_(self.state[p]["e_w"])
+                    p.sub_(self.state[p]["e_w"])  # Subtract the perturbation, restore weights
         self.base_optimizer.step()
         if zero_grad:
             self.zero_grad()
@@ -1083,6 +1083,7 @@ class AdversarialPatchTrainer:
         # ── Pass 2: batch OCR — one model call for all crops ──────────────
         image_losses = []
         det_real_l_list, det_top_l_list, ocr_real_l_list, ocr_top_l_list = [], [], [], []
+        # TODO: all OCR models should support batching! This restricts to only those who can encode_batch
         use_encode = hasattr(self.ocr, 'encode_batch')
 
         if use_encode:
@@ -1100,16 +1101,16 @@ class AdversarialPatchTrainer:
             if use_encode:
                 ri, ti = crop_idx_per_item[i]
                 ocr_real_i = (self.ocr.loss_from_raw(raw_all[ri], self.impersonation_target,
-                                                      True, None)                              if ri is not None else None)
+                                                      True, None) if ri is not None else None)
                 ocr_top_i  = (self.ocr.loss_from_raw(raw_all[ti], self.impersonation_target,
-                                                      True, None)                              if ti is not None else None)
+                                                      True, None) if ti is not None else None)
             else:
                 ocr_real_i = (self.ocr.differentiable_loss_batch(
                                   [real_crop], self.impersonation_target,
-                                  impersonation=True)[0]                              if real_crop is not None else None)
+                                  impersonation=True)[0] if real_crop is not None else None)
                 ocr_top_i  = (self.ocr.differentiable_loss_batch(
                                   [top_crop], self.impersonation_target,
-                                  impersonation=True)[0]                              if top_crop is not None else None)
+                                  impersonation=True)[0] if top_crop is not None else None)
 
             # Weights: proportional to each detection term's magnitude.
             # Not detached: gradients flow through the weights so that reducing
@@ -2268,7 +2269,7 @@ class AdversarialPatchTrainer:
         continue_lr:   bool  = False,
         max_steps:     Optional[int] = None,
     ) -> dict:
-        """Ensemble training: EMA-weighted sampling over active_pipelines, one batch per step.
+        """Ensemble training over active_pipelines, one batch per step.
 
         active_pipelines : pre-loaded (DetectorBackend, OCRBackend) pairs for the
                            3 non-holdout pipelines (already eval()+freeze()'d).
@@ -2277,10 +2278,7 @@ class AdversarialPatchTrainer:
         For m-SAM, one step = eval_batch_size * grad_accumulate images through
         the chosen pipeline (reuses _msam_step() unchanged).
 
-        Pipeline selection: at each step the next pipeline is sampled with
-        probability ∝ softmax(ema_loss / τ).  Pipelines where the attack is
-        still struggling (high EMA loss) are visited more often; well-attacked
-        pipelines naturally receive fewer steps as their loss drops.
+        Pipeline selection: at each step a pipeline is chosen uniformly at random.
         """
         # ── Checkpoint load ───────────────────────────────────────────
         ckpt_global_update  = 0
@@ -2422,7 +2420,7 @@ class AdversarialPatchTrainer:
         print(f"  Patch gen : ConvTranspose decoder  "
               f"(seed {self.seed_channels}ch×4×8 → 3×256×512)")
         print(f"  Trainable : {n_params:,} params")
-        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (EMA-weighted sampling across {n} pipelines)")
+        print(f"  Dataset   : {_imgs_per_epoch} images/epoch (uniform sampling across {n} pipelines)")
         print(f"  Epochs    : {num_epochs}  |  Updates: {total_updates}  |  "
               f"Save every: {save_every} updates (~10%)")
         print(f"  Batch/pipeline: {B}  |  update_every: {update_every}")
@@ -2481,15 +2479,6 @@ class AdversarialPatchTrainer:
         except Exception:
             _trim_each_step = False
 
-        # ── EMA loss per pipeline (persists across epochs) ────────────
-        # ema_loss[i] = None until pipeline i has been seen at least once.
-        # Unseen pipelines are visited first (round-robin warm-up) to get a
-        # realistic loss estimate before weighted sampling begins.
-        # After the warm-up, pipeline selection probability ∝ ema_loss[i]:
-        # pipelines where the attack is still struggling get more steps.
-        _ema_alpha = 0.1   # smoothing factor
-        ema_loss: list = [None] * n   # None = not yet observed
-
         # ── Epoch loop ────────────────────────────────────────────────
         for epoch in range(ckpt_resume_epoch, num_epochs):
             epoch_start  = time.time()
@@ -2525,17 +2514,8 @@ class AdversarialPatchTrainer:
                         desc=f"Epoch {epoch+1}", unit="upd", leave=False)
 
             while True:
-                # ── Choose pipeline via EMA-weighted softmax ──────────
-                # Warm-up: visit any pipeline not yet observed, in order.
-                # This ensures every pipeline gets a real loss estimate before
-                # weighted sampling begins (avoids init-value collapse).
-                _unseen = [i for i in range(n) if ema_loss[i] is None]
-                if _unseen:
-                    pi = _unseen[0]
-                else:
-                    pi = random.choices(range(n), weights=[
-                        (l + self.det_loss_weight + 1e-6) ** 2 for l in ema_loss
-                    ])[0]
+                # ── Choose pipeline uniformly at random ───────────────
+                pi = random.randrange(n)
 
                 # ── Grab items_needed items from the shared loader ────
                 items_raw = []
@@ -2555,6 +2535,7 @@ class AdversarialPatchTrainer:
                 self.ocr.train()
 
                 # TV warmup
+                # linear warmup from 0 to 1 over tv warmup epochs, * _saved_tv_weight
                 global_upd_for_step = global_updates + global_steps + 1
                 if tv_warmup_updates > 0 and global_upd_for_step <= tv_warmup_updates:
                     self.tv_weight = _saved_tv_weight * min(
@@ -2797,12 +2778,6 @@ class AdversarialPatchTrainer:
                     _libc.malloc_trim(0)
 
                 scheduler.step()
-
-                # ── Update EMA ────────────────────────────────────────
-                if ema_loss[pi] is None:
-                    ema_loss[pi] = lv          # cold start: set directly
-                else:
-                    ema_loss[pi] = (1 - _ema_alpha) * ema_loss[pi] + _ema_alpha * lv
 
                 # Metrics tracking
                 pipe_loss_sum[pi] += lv; pipe_steps[pi] += 1
