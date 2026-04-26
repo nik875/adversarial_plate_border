@@ -576,13 +576,24 @@ class AdversarialPatchTrainer:
         # Re-apply patch to clean images — keeps grad chain intact
         clean_imgs   = torch.stack([item["clean_orig"] for item in items])
         corners_b    = torch.stack([item["orig_corners"] for item in items])
+
+        # Debug: verify patch_norm is a grad-carrying leaf
+        print(f"[feat-debug] patch_norm: requires_grad={patch_norm.requires_grad}, "
+              f"grad_fn={patch_norm.grad_fn}, shape={tuple(patch_norm.shape)}")
+
         patched_imgs = self.apply_patch_to_image(
             clean_imgs, corners_b, patch_norm=patch_norm, augment=False,
         )[0]                                            # [B, C, H, W] with grad
 
+        print(f"[feat-debug] patched_imgs: requires_grad={patched_imgs.requires_grad}, "
+              f"grad_fn={type(patched_imgs.grad_fn).__name__ if patched_imgs.grad_fn else None}")
+
         # Preprocess for RT-DETR
         clean_px      = torch.cat([preprocess(clean_imgs[i]) for i in range(len(items))])
         patched_px_g  = torch.cat([preprocess(patched_imgs[i]) for i in range(len(items))])
+
+        print(f"[feat-debug] patched_px_g: requires_grad={patched_px_g.requires_grad}, "
+              f"grad_fn={type(patched_px_g.grad_fn).__name__ if patched_px_g.grad_fn else None}")
 
         # Detach patched into a leaf with requires_grad so the frozen backbone
         # tracks autograd.  After loss.backward() we chain the gradient back
@@ -596,6 +607,11 @@ class AdversarialPatchTrainer:
             clean_feat = backbone(clean_px, pmask)[-1][0]      # [B, C, h, w]
 
         patch_feat = backbone(patched_px, pmask)[-1][0]        # [B, C, h, w]
+
+        print(f"[feat-debug] patched_px: requires_grad={patched_px.requires_grad}, "
+              f"grad_fn={type(patched_px.grad_fn).__name__ if patched_px.grad_fn else None}")
+        print(f"[feat-debug] patch_feat: requires_grad={patch_feat.requires_grad}, "
+              f"grad_fn={type(patch_feat.grad_fn).__name__ if patch_feat.grad_fn else None}")
 
         _, _, fh, fw = clean_feat.shape
 
@@ -638,6 +654,10 @@ class AdversarialPatchTrainer:
                                               p_region.unsqueeze(0)))
 
         cos_loss = torch.cat(losses).mean()
+
+        print(f"[feat-debug] cos_loss: val={cos_loss.item():.4f}, "
+              f"requires_grad={cos_loss.requires_grad}, "
+              f"grad_fn={type(cos_loss.grad_fn).__name__ if cos_loss.grad_fn else None}")
 
         # Chain gradient: cos_loss → patched_px → patched_px_g → patch_norm
         (cos_loss * grad_scale).backward(retain_graph=False)
