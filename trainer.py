@@ -144,6 +144,7 @@ def _corners_resize(corners: np.ndarray, sx: float, sy: float) -> np.ndarray:
 
 PATCH_WIDTH  = 512
 PATCH_HEIGHT = 256
+DEFAULT_RTDETR_MODEL_ID = "justjuu/rtdetr-v2-license-plate-detection"
 
 
 def _bbox_ocr_crop_diff(
@@ -344,6 +345,9 @@ class AdversarialPatchTrainer:
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
         det_loss_weight:      float          = 0.0,
+        backbone_feature_weight: float       = 0.0,
+        backbone_source:      str            = "auto",
+        backbone_model_path:  str            = "none",
         disable_disruption:   bool           = False,
         eval_batch_size:      Optional[int]  = None,
         sam_m:                Optional[int]  = None,
@@ -359,6 +363,10 @@ class AdversarialPatchTrainer:
         self.training             = training
         self.tv_weight            = tv_weight
         self.det_loss_weight      = det_loss_weight
+        self.backbone_feature_weight = backbone_feature_weight
+        self.backbone_source      = backbone_source
+        self.backbone_model_path  = backbone_model_path
+        self.backbone_feature_enabled = backbone_feature_weight > 0.0
         self.disable_disruption   = disable_disruption
         self._eval_batch_size_fixed = eval_batch_size is not None
         self.eval_batch_size        = eval_batch_size if eval_batch_size is not None else 1
@@ -399,6 +407,9 @@ class AdversarialPatchTrainer:
             self.ocr.freeze()
         else:
             self.ocr.eval()
+
+        if self.backbone_feature_enabled:
+            self._load_backbone_feature_model()
 
         # ── Run output directory ───────────────────────────────────────
         if run_dir_override:
@@ -544,6 +555,80 @@ class AdversarialPatchTrainer:
                 img, r, dw, dh = _diff_letterbox(img_chw, 384)
                 return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
+
+    def _load_backbone_feature_model(self) -> None:
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+
+        source = self.backbone_model_path
+        if source in {"", "none"}:
+            source = DEFAULT_RTDETR_MODEL_ID
+
+        print(f"  Backbone feature model : {source} (source={self.backbone_source})")
+        self._backbone_processor = AutoImageProcessor.from_pretrained(source)
+        self._backbone_model = AutoModelForObjectDetection.from_pretrained(source)
+        self._backbone_model.to(self.device)
+        self._backbone_model.eval()
+        for p in self._backbone_model.parameters():
+            p.requires_grad = False
+
+    def _backbone_diff_preprocess_batch(self, images: torch.Tensor) -> torch.Tensor:
+        size = self._backbone_processor.size
+        target_h = size.get("height", size.get("shortest_edge", 640))
+        target_w = size.get("width", size.get("shortest_edge", 640))
+        x = F.interpolate(images, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        mean = torch.tensor(
+            self._backbone_processor.image_mean,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(1, 3, 1, 1)
+        std = torch.tensor(
+            self._backbone_processor.image_std,
+            dtype=torch.float32,
+            device=self.device,
+        ).view(1, 3, 1, 1)
+        return (x - mean) / std
+
+    def _extract_backbone_feature_tensor(self, outputs) -> torch.Tensor:
+        if self.backbone_source == "encoder":
+            if hasattr(outputs, "encoder_last_hidden_state") and outputs.encoder_last_hidden_state is not None:
+                return outputs.encoder_last_hidden_state
+            if hasattr(outputs, "encoder_hidden_states") and outputs.encoder_hidden_states:
+                return outputs.encoder_hidden_states[-1]
+
+        if self.backbone_source == "decoder":
+            if hasattr(outputs, "decoder_hidden_states") and outputs.decoder_hidden_states:
+                return outputs.decoder_hidden_states[-1]
+
+        if hasattr(outputs, "encoder_last_hidden_state") and outputs.encoder_last_hidden_state is not None:
+            return outputs.encoder_last_hidden_state
+        if hasattr(outputs, "encoder_hidden_states") and outputs.encoder_hidden_states:
+            return outputs.encoder_hidden_states[-1]
+        if hasattr(outputs, "decoder_hidden_states") and outputs.decoder_hidden_states:
+            return outputs.decoder_hidden_states[-1]
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            return outputs.last_hidden_state
+        raise RuntimeError("Could not locate hidden states in RT-DETR outputs for backbone feature loss.")
+
+    def _compute_backbone_feature_loss(self, items: list) -> torch.Tensor:
+        losses = []
+        for item in items:
+            clean = item["clean_orig"].unsqueeze(0)
+            patched = item["patched_orig"].unsqueeze(0)
+
+            clean_px = self._backbone_diff_preprocess_batch(clean)
+            patched_px = self._backbone_diff_preprocess_batch(patched)
+
+            with torch.no_grad():
+                out_clean = self._backbone_model(pixel_values=clean_px, output_hidden_states=True)
+            out_patch = self._backbone_model(pixel_values=patched_px, output_hidden_states=True)
+
+            clean_feat = self._extract_backbone_feature_tensor(out_clean).detach()
+            patch_feat = self._extract_backbone_feature_tensor(out_patch)
+            clean_vec = clean_feat.flatten(start_dim=1)
+            patch_vec = patch_feat.flatten(start_dim=1)
+            losses.append(F.cosine_similarity(patch_vec, clean_vec, dim=1).mean())
+
+        return torch.stack(losses).mean()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
@@ -897,6 +982,7 @@ class AdversarialPatchTrainer:
         single batched warp call per size group (kornia requires uniform HxW).
         diff_prep runs as a single batched F.interpolate call per size group.
         """
+        _pt = time.perf_counter
         _prof = (self.profiling is True)  # only True (timing), not "mem"
         if _prof: _t_batch0 = _t0 = _pt()
 
@@ -991,6 +1077,8 @@ class AdversarialPatchTrainer:
                 "top_region_box": top_region_box,      # [4] or None
                 "top_ocr_crop":   top_ocr_crop,        # [1, 3, H_c, W_c] or None
                 "label":          label,
+                "clean_orig":     orig_tensor,         # [C, H, W] in [0,1]
+                "patched_orig":   po.squeeze(0),       # [C, H, W] in [0,1]
             })
 
         if _prof:
@@ -1138,9 +1226,14 @@ class AdversarialPatchTrainer:
             ocr_top_l_list.append(ocr_top_i.detach()  if ocr_top_i  is not None else _zero)
 
         det_top_l_for_loss = torch.stack([d for _, d in det_losses]).mean()
+        if self.backbone_feature_enabled:
+            feat_l = self._compute_backbone_feature_loss(items)
+        else:
+            feat_l = torch.tensor(0.0, device=self.device)
         total      = (torch.stack(image_losses).mean()
                       + self.tv_weight * tv_l
-                      + self.det_loss_weight * det_top_l_for_loss)
+                      + self.det_loss_weight * det_top_l_for_loss
+                      + self.backbone_feature_weight * feat_l)
         det_real_l = torch.stack(det_real_l_list).mean()
         det_top_l  = torch.stack(det_top_l_list).mean()
         ocr_real_l = torch.stack(ocr_real_l_list).mean()
@@ -2163,6 +2256,8 @@ class AdversarialPatchTrainer:
               f"Save every: {save_every} updates (~10%)")
         print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        print(f"  Backbone feature loss : w={self.backbone_feature_weight:.3g}  "
+              f"source={self.backbone_source}")
         if tv_warmup_updates > 0:
             print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
         else:
@@ -2426,6 +2521,8 @@ class AdversarialPatchTrainer:
         print(f"  Batch/pipeline: {B}  |  update_every: {update_every}")
         print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
+        print(f"  Backbone feature loss : w={self.backbone_feature_weight:.3g}  "
+              f"source={self.backbone_source}")
         if tv_warmup_updates > 0:
             print(f"  TV warmup : {tv_warmup:.0%} of updates = {tv_warmup_updates} updates")
         else:
@@ -2995,6 +3092,12 @@ def main():
     parser.add_argument("--det-loss-weight", type=float, default=0.0,
                         help="Weight for the impersonation-zone detection loss added directly "
                              "to the total loss (default: 0.0, disabled).")
+    parser.add_argument("--backbone-feature-weight", type=float, default=0.0,
+                        help="Weight for optional RT-DETR backbone feature loss added to total loss.")
+    parser.add_argument("--backbone-source", choices=["auto", "encoder", "decoder"], default="auto",
+                        help="Which RT-DETR hidden-state source to use for backbone feature loss.")
+    parser.add_argument("--backbone-model-path", default="none",
+                        help="RT-DETR model path or HF model ID for backbone feature loss model.")
     parser.add_argument("--tv-warmup", type=float, default=0.1,
                         help="Fraction of total gradient updates to suppress TV loss "
                              "so the patch can move freely early on (default: 0.1). "
@@ -3237,6 +3340,9 @@ def main():
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
         det_loss_weight      = args.det_loss_weight,
+        backbone_feature_weight = args.backbone_feature_weight,
+        backbone_source      = args.backbone_source,
+        backbone_model_path  = args.backbone_model_path,
         disable_disruption   = args.no_disruption,
         eval_batch_size      = args.eval_batch_size,
         sam_m                = args.sam_m,
