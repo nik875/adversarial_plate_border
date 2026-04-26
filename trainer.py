@@ -588,25 +588,32 @@ class AdversarialPatchTrainer:
         ).view(1, 3, 1, 1)
         return (x - mean) / std
 
+    @staticmethod
+    def _unwrap_feature(val):
+        """If val is a list/tuple of tensors (multi-scale features), return the last one."""
+        if isinstance(val, (list, tuple)):
+            return val[-1]
+        return val
+
     def _extract_backbone_feature_tensor(self, outputs) -> torch.Tensor:
         if self.backbone_source == "encoder":
             if hasattr(outputs, "encoder_last_hidden_state") and outputs.encoder_last_hidden_state is not None:
-                return outputs.encoder_last_hidden_state
+                return self._unwrap_feature(outputs.encoder_last_hidden_state)
             if hasattr(outputs, "encoder_hidden_states") and outputs.encoder_hidden_states:
-                return outputs.encoder_hidden_states[-1]
+                return self._unwrap_feature(outputs.encoder_hidden_states[-1])
 
         if self.backbone_source == "decoder":
             if hasattr(outputs, "decoder_hidden_states") and outputs.decoder_hidden_states:
-                return outputs.decoder_hidden_states[-1]
+                return self._unwrap_feature(outputs.decoder_hidden_states[-1])
 
         if hasattr(outputs, "encoder_last_hidden_state") and outputs.encoder_last_hidden_state is not None:
-            return outputs.encoder_last_hidden_state
+            return self._unwrap_feature(outputs.encoder_last_hidden_state)
         if hasattr(outputs, "encoder_hidden_states") and outputs.encoder_hidden_states:
-            return outputs.encoder_hidden_states[-1]
+            return self._unwrap_feature(outputs.encoder_hidden_states[-1])
         if hasattr(outputs, "decoder_hidden_states") and outputs.decoder_hidden_states:
-            return outputs.decoder_hidden_states[-1]
+            return self._unwrap_feature(outputs.decoder_hidden_states[-1])
         if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-            return outputs.last_hidden_state
+            return self._unwrap_feature(outputs.last_hidden_state)
         raise RuntimeError("Could not locate hidden states in RT-DETR outputs for backbone feature loss.")
 
     def _compute_backbone_feature_loss(self, items: list) -> torch.Tensor:
