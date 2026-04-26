@@ -561,48 +561,56 @@ class AdversarialPatchTrainer:
         Runs full clean/patched images through only the ResNet vision backbone
         (no encoder/decoder), then filters the spatial feature maps to positions
         overlapping the border region and computes cosine similarity there.
+
+        Uses a detach-and-chain pattern for the patched batch: the preprocessed
+        tensor is detached into a leaf with requires_grad=True so the frozen
+        backbone still tracks gradients through the input.  The caller
+        (_accumulate) must call ``self._feature_grad_chain()`` after
+        ``loss.backward()`` to propagate the gradient back to patch_leaf.
         """
         backbone = self.detector._model.model.backbone
         preprocess = self.detector._diff_preprocess
 
-        clean_batch = torch.cat([preprocess(item["clean_orig"]) for item in items])
-        patched_batch = torch.cat([preprocess(item["patched_orig"]) for item in items])
+        clean_px = torch.cat([preprocess(item["clean_orig"]) for item in items])
+        patched_px_graph = torch.cat([preprocess(item["patched_orig"]) for item in items])
 
-        pmask = torch.ones(clean_batch.shape[0], clean_batch.shape[2],
-                           clean_batch.shape[3],
-                           dtype=torch.float32, device=self.device)
+        # Detach into an explicit leaf so the frozen backbone tracks grad
+        patched_px = patched_px_graph.detach().requires_grad_(True)
+
+        B, _, inH, inW = clean_px.shape
+        pmask = torch.ones(B, inH, inW, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            clean_feat = backbone(clean_batch, pmask)[-1][0]   # [B, C, h, w]
+            clean_feat = backbone(clean_px, pmask)[-1][0]      # [B, C, h, w]
 
-        patch_feat = backbone(patched_batch, pmask)[-1][0]     # [B, C, h, w]
+        patch_feat = backbone(patched_px, pmask)[-1][0]        # [B, C, h, w]
 
         _, _, fh, fw = clean_feat.shape
-        _, _, inH, inW = clean_batch.shape
 
-        # Build per-image spatial mask: which feature-map cells overlap the border
+        # Build per-image spatial mask: which feature-map cells overlap the border.
+        # Uses the same border geometry as apply_patch_to_image (scale corners
+        # by 1.4 from center; top_extend adds 1.4× column vector on top).
         losses = []
         for i, item in enumerate(items):
-            corners = item["orig_corners"]              # [4, 2] original image space
+            corners = item["orig_corners"]                     # [4, 2] original space
             _, origH, origW = item["clean_orig"].shape
 
             # Scale corners to preprocessed (640×640) space
-            sx = inW / origW
-            sy = inH / origH
+            sx, sy = inW / origW, inH / origH
             scaled = corners.clone()
             scaled[:, 0] *= sx
             scaled[:, 1] *= sy
 
-            # Compute border quad in preprocessed space
+            # Border quad — mirrors apply_patch_to_image logic
             center = scaled.mean(dim=0)
             border = center + (scaled - center) * 1.4
             if self.top_extend:
-                col_left  = scaled[0] - scaled[3]
-                col_right = scaled[1] - scaled[2]
+                col_left  = scaled[0] - scaled[3]              # TL - BL
+                col_right = scaled[1] - scaled[2]              # TR - BR
                 border[0] = border[0] + 1.4 * col_left
                 border[1] = border[1] + 1.4 * col_right
 
-            # AABB of the border region in feature-map coordinates
+            # AABB of border region in feature-map coordinates
             fx1 = (border[:, 0].min() / inW * fw).clamp(min=0).long()
             fy1 = (border[:, 1].min() / inH * fh).clamp(min=0).long()
             fx2 = (border[:, 0].max() / inW * fw).clamp(max=fw).long()
@@ -617,7 +625,17 @@ class AdversarialPatchTrainer:
             losses.append(F.cosine_similarity(c_region.unsqueeze(0),
                                               p_region.unsqueeze(0)))
 
-        return torch.cat(losses).mean()
+        cos_loss = torch.cat(losses).mean()
+
+        # Store link for gradient chaining (caller must invoke _feature_grad_chain)
+        self._feature_grad_link = (patched_px, patched_px_graph)
+        return cos_loss
+
+    def _feature_grad_chain(self) -> None:
+        """Propagate backbone feature gradient back through the patch graph."""
+        patched_px, patched_px_graph = self._feature_grad_link
+        patched_px_graph.backward(patched_px.grad)
+        del self._feature_grad_link
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
@@ -1734,6 +1752,8 @@ class AdversarialPatchTrainer:
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(items)
                 # loss is mean over len(chunk); scale back to sum for grad equivalence
                 (loss * weight * len(chunk)).backward()
+                if backbone_only:
+                    self._feature_grad_chain()
                 total_loss    += loss.item()       * len(chunk)
                 det_real_sum  += det_real_l.item() * len(chunk)
                 det_top_sum   += det_top_l.item()  * len(chunk)
@@ -2734,6 +2754,8 @@ class AdversarialPatchTrainer:
                         loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
                     if _mem_prof: _mp_checkpoints.append(("cp_forward",  _rss_mb()))
                     loss.backward()
+                    if _is_backbone_step:
+                        self._feature_grad_chain()
                     patch_with_graph.backward(patch_leaf.grad)
                     if _mem_prof: _mp_checkpoints.append(("cp_backward", _rss_mb()))
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
