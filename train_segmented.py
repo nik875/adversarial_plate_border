@@ -84,6 +84,7 @@ def main():
     parser.add_argument("--lr-min",           type=float, default=1e-6)
     parser.add_argument("--tv-weight",        type=float, default=100.0)
     parser.add_argument("--det-loss-weight",  type=float, default=3.0)
+    parser.add_argument("--feature-weight",   type=float, default=0.0)
     parser.add_argument("--eval-batch-size",  type=int,   default=16)
     parser.add_argument("--skip-sanity",      action="store_true", default=True)
     parser.add_argument("--no-skip-sanity",   dest="skip_sanity", action="store_false")
@@ -170,6 +171,7 @@ def main():
         "--lr-min",               str(args.lr_min),
         "--tv-weight",            str(args.tv_weight),
         "--det-loss-weight",      str(args.det_loss_weight),
+        "--backbone-feature-weight", str(args.feature_weight),
         "--eval-batch-size",      str(args.eval_batch_size),
         "--run-name",             run_name,
         "--max-steps",            str(segment_steps),
