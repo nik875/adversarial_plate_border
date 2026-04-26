@@ -555,27 +555,39 @@ class AdversarialPatchTrainer:
                 return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
 
-    def _compute_rtdetr_feature_loss(self, items: list) -> torch.Tensor:
+    def _compute_rtdetr_feature_loss(self, items: list,
+                                     grad_scale: float = 1.0) -> torch.Tensor:
         """Backbone-only feature loss using the active RT-DETR detector.
 
-        Runs full clean/patched images through only the ResNet vision backbone
-        (no encoder/decoder), then filters the spatial feature maps to positions
-        overlapping the border region and computes cosine similarity there.
+        Re-applies the patch to clean images (with a fresh, grad-tracked graph)
+        then runs full clean/patched images through only the ResNet vision
+        backbone (no encoder/decoder).  Filters the spatial feature maps to
+        positions overlapping the border region and computes cosine similarity.
 
-        Uses a detach-and-chain pattern for the patched batch: the preprocessed
-        tensor is detached into a leaf with requires_grad=True so the frozen
-        backbone still tracks gradients through the input.  The caller
-        (_accumulate) must call ``self._feature_grad_chain()`` after
-        ``loss.backward()`` to propagate the gradient back to patch_leaf.
+        NOTE: apply_patch_to_image's brightness correction runs inside
+        torch.no_grad(), which severs the grad chain through patched_orig.
+        We therefore re-apply the patch here to guarantee gradient flow from
+        the backbone loss back to patch_leaf.
         """
         backbone = self.detector._model.model.backbone
         preprocess = self.detector._diff_preprocess
+        patch_norm = items[0]["_patch_norm"]            # patch_leaf (has grad)
 
-        clean_px = torch.cat([preprocess(item["clean_orig"]) for item in items])
-        patched_px_graph = torch.cat([preprocess(item["patched_orig"]) for item in items])
+        # Re-apply patch to clean images — keeps grad chain intact
+        clean_imgs   = torch.stack([item["clean_orig"] for item in items])
+        corners_b    = torch.stack([item["orig_corners"] for item in items])
+        patched_imgs = self.apply_patch_to_image(
+            clean_imgs, corners_b, patch_norm=patch_norm, augment=False,
+        )[0]                                            # [B, C, H, W] with grad
 
-        # Detach into an explicit leaf so the frozen backbone tracks grad
-        patched_px = patched_px_graph.detach().requires_grad_(True)
+        # Preprocess for RT-DETR
+        clean_px      = torch.cat([preprocess(clean_imgs[i]) for i in range(len(items))])
+        patched_px_g  = torch.cat([preprocess(patched_imgs[i]) for i in range(len(items))])
+
+        # Detach patched into a leaf with requires_grad so the frozen backbone
+        # tracks autograd.  After loss.backward() we chain the gradient back
+        # through the original graph (patched_px_g → patched_imgs → patch_norm).
+        patched_px = patched_px_g.detach().requires_grad_(True)
 
         B, _, inH, inW = clean_px.shape
         pmask = torch.ones(B, inH, inW, dtype=torch.float32, device=self.device)
@@ -627,15 +639,12 @@ class AdversarialPatchTrainer:
 
         cos_loss = torch.cat(losses).mean()
 
-        # Store link for gradient chaining (caller must invoke _feature_grad_chain)
-        self._feature_grad_link = (patched_px, patched_px_graph)
-        return cos_loss
+        # Chain gradient: cos_loss → patched_px → patched_px_g → patch_norm
+        (cos_loss * grad_scale).backward(retain_graph=False)
+        if patched_px.grad is not None:
+            patched_px_g.backward(patched_px.grad)
 
-    def _feature_grad_chain(self) -> None:
-        """Propagate backbone feature gradient back through the patch graph."""
-        patched_px, patched_px_graph = self._feature_grad_link
-        patched_px_graph.backward(patched_px.grad)
-        del self._feature_grad_link
+        return cos_loss.detach()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
@@ -1744,17 +1753,20 @@ class AdversarialPatchTrainer:
                     item["_patch_norm"] = patch_leaf
                     items.append(item)
                 if backbone_only:
-                    cos_sim = self._compute_rtdetr_feature_loss(items)
-                    loss = self.backbone_feature_weight * cos_sim
+                    # _compute_rtdetr_feature_loss does its own backward
+                    # (detach-and-chain through the frozen backbone).
+                    # Pass the full scaling so gradients are correct.
+                    grad_scale = self.backbone_feature_weight * weight * len(chunk)
+                    cos_sim = self._compute_rtdetr_feature_loss(items, grad_scale)
+                    loss_val = self.backbone_feature_weight * cos_sim.item()
                     det_real_l = det_top_l = ocr_real_l = ocr_top_l = tv_l = \
                         torch.tensor(0.0, device=self.device)
                 else:
                     loss, det_real_l, det_top_l, ocr_real_l, ocr_top_l, tv_l = self.compute_loss_batch(items)
-                # loss is mean over len(chunk); scale back to sum for grad equivalence
-                (loss * weight * len(chunk)).backward()
-                if backbone_only:
-                    self._feature_grad_chain()
-                total_loss    += loss.item()       * len(chunk)
+                    # loss is mean over len(chunk); scale back to sum for grad equivalence
+                    (loss * weight * len(chunk)).backward()
+                    loss_val = loss.item()
+                total_loss    += loss_val          * len(chunk)
                 det_real_sum  += det_real_l.item() * len(chunk)
                 det_top_sum   += det_top_l.item()  * len(chunk)
                 ocr_real_sum  += ocr_real_l.item() * len(chunk)
@@ -2747,21 +2759,22 @@ class AdversarialPatchTrainer:
                     for it in items: it["_patch_norm"] = patch_leaf
                     if _mem_prof: _mp_checkpoints.append(("cp_prep",     _rss_mb()))
                     if _is_backbone_step:
-                        cos_sim = self._compute_rtdetr_feature_loss(items)
-                        loss = self.backbone_feature_weight * cos_sim
+                        # _compute_rtdetr_feature_loss does its own backward
+                        cos_sim = self._compute_rtdetr_feature_loss(
+                            items, grad_scale=self.backbone_feature_weight)
+                        lv = self.backbone_feature_weight * cos_sim.item()
                         dr = dt = or_ = ot = tv_l = torch.tensor(0.0, device=self.device)
                     else:
                         loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
+                        lv = loss.item()
                     if _mem_prof: _mp_checkpoints.append(("cp_forward",  _rss_mb()))
-                    loss.backward()
-                    if _is_backbone_step:
-                        self._feature_grad_chain()
+                    if not _is_backbone_step:
+                        loss.backward()
                     patch_with_graph.backward(patch_leaf.grad)
                     if _mem_prof: _mp_checkpoints.append(("cp_backward", _rss_mb()))
                     torch.nn.utils.clip_grad_norm_(self._trainable_params(), max_norm=1.0)
                     optimizer.step(); optimizer.zero_grad()
                     if _mem_prof: _mp_checkpoints.append(("cp_optim",    _rss_mb()))
-                    lv = loss.item()
 
                 if _is_backbone_step:
                     cos_sim_sum += lv / max(self.backbone_feature_weight, 1e-8)
