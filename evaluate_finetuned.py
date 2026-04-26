@@ -359,7 +359,8 @@ def compute_ap(confidences: List[float], ious: List[float],
 def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
                              device: str = "cpu",
                              patch_tensor: Optional[torch.Tensor] = None,
-                             top_extend: bool = True) -> dict:
+                             top_extend: bool = True,
+                             batch_size_override: Optional[int] = None) -> dict:
     """
     Evaluate detector: compute AP@0.5, AP@0.75, mAP@0.5:0.95, etc.
     Processes records in batches with auto-detected batch size and running metrics.
@@ -367,7 +368,7 @@ def compute_detector_metrics(backend: DetectorBackend, records: List[dict],
     transform = T.ToTensor()
 
     # Auto-detect batch size
-    batch_size = find_optimal_batch_size(backend, device, max_bs=64)
+    batch_size = batch_size_override if batch_size_override is not None else find_optimal_batch_size(backend, device, max_bs=64)
 
     confidences_list = []
     ious_list = []
@@ -569,7 +570,8 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
                         device: str = "cpu",
                         patch_tensor: Optional[torch.Tensor] = None,
                         top_extend: bool = True,
-                        impersonation_target: Optional[str] = None) -> dict:
+                        impersonation_target: Optional[str] = None,
+                        batch_size_override: Optional[int] = None) -> dict:
     """
     Evaluate OCR: compute CRR, LPRR, edit distance.
     Processes records in batches with auto-detected batch size and running metrics.
@@ -577,7 +579,7 @@ def compute_ocr_metrics(backend: OCRBackend, records: List[dict],
     transform = T.ToTensor()
 
     # Auto-detect batch size (for OCR, smaller batches usually needed)
-    batch_size = max(1, min(32, find_optimal_batch_size(backend, device, max_bs=64)))
+    batch_size = batch_size_override if batch_size_override is not None else max(1, min(32, find_optimal_batch_size(backend, device, max_bs=64)))
 
     latencies = []
     crr_values = []
@@ -713,7 +715,8 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
                              records: List[dict], device: str = "cpu",
                              patch_tensor: Optional[torch.Tensor] = None,
                              top_extend: bool = True,
-                             impersonation_target: Optional[str] = None) -> dict:
+                             impersonation_target: Optional[str] = None,
+                             batch_size_override: Optional[int] = None) -> dict:
     """
     Evaluate detector + OCR pipeline end-to-end (batched).
 
@@ -723,7 +726,7 @@ def compute_pipeline_metrics(detector: DetectorBackend, ocr_backend: OCRBackend,
     3. Track: detection failures, OCR failures (given good detection), full successes
     """
     transform = T.ToTensor()
-    batch_size = find_optimal_batch_size(detector, device, max_bs=64)
+    batch_size = batch_size_override if batch_size_override is not None else find_optimal_batch_size(detector, device, max_bs=64)
 
     n_det_failures = 0
     n_ocr_failures = 0  # given good detection
@@ -1352,6 +1355,10 @@ def main():
     parser.add_argument("--impersonation-target", default=None,
                         help="Fixed target string to evaluate impersonation performance against "
                              "(e.g. --impersonation-target ABC123). Only meaningful with --patch.")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override auto-detected batch size (default: auto)")
+    parser.add_argument("--preview-samples", type=int, default=256,
+                        help="Number of images for preview evaluation (default: 256)")
     args = parser.parse_args()
 
     finetuned_dir = Path(args.finetuned_models)
@@ -1445,7 +1452,8 @@ def main():
                 print(f"\n  {name}")
                 try:
                     metrics = compute_detector_metrics(backend, eval_records, device=args.device,
-                                                       patch_tensor=patch_tensor, top_extend=args.top_extend)
+                                                       patch_tensor=patch_tensor, top_extend=args.top_extend,
+                                                       batch_size_override=args.batch_size)
                     res.append(EvalResults(name, "detector", metrics))
                     det_line = f"    AP@0.5={metrics['ap_50']:.4f}, F1@0.5={metrics['f1_50']:.4f}, mAP={metrics['map_50_95']:.4f}"
                     if "top_zone_ap_50" in metrics:
@@ -1462,7 +1470,8 @@ def main():
                 try:
                     metrics = compute_ocr_metrics(backend, eval_records, device=args.device,
                                                   patch_tensor=patch_tensor, top_extend=args.top_extend,
-                                                  impersonation_target=imp_target)
+                                                  impersonation_target=imp_target,
+                                                  batch_size_override=args.batch_size)
                     res.append(EvalResults(name, "ocr", metrics))
                     ocr_line = f"    CRR={metrics['crr']:.4f}, LPRR={metrics['lprr']:.4f}"
                     if "imp_lprr" in metrics:
@@ -1484,6 +1493,7 @@ def main():
                         eval_records, device=args.device,
                         patch_tensor=patch_tensor, top_extend=args.top_extend,
                         impersonation_target=imp_target,
+                        batch_size_override=args.batch_size,
                     )
                     res.append(EvalResults(f"{det_name}+{ocr_name}", "pipeline", metrics))
                     pipe_line = f"    Success={metrics['pipeline_success']:.4f}, Det Fail={metrics['det_failure_rate']:.4f}, OCR Fail|Det={metrics['ocr_failure_given_det']:.4f}"
@@ -1496,9 +1506,9 @@ def main():
 
         return res
 
-    # 256-image preview
+    # Preview
     if not args.skip_preview:
-        n_preview = min(256, len(records))
+        n_preview = min(args.preview_samples, len(records))
         preview_records = random.sample(records, n_preview)
         if patch_tensor is not None:
             print(f"[preview] Running pipelines only (--patch given) on {n_preview} randomly sampled images...")
