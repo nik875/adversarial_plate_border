@@ -617,25 +617,21 @@ class AdversarialPatchTrainer:
         raise RuntimeError("Could not locate hidden states in RT-DETR outputs for backbone feature loss.")
 
     def _compute_backbone_feature_loss(self, items: list) -> torch.Tensor:
-        losses = []
-        for item in items:
-            clean = item["clean_orig"].unsqueeze(0)
-            patched = item["patched_orig"].unsqueeze(0)
+        clean_batch = torch.stack([item["clean_orig"] for item in items])
+        patched_batch = torch.stack([item["patched_orig"] for item in items])
 
-            clean_px = self._backbone_diff_preprocess_batch(clean)
-            patched_px = self._backbone_diff_preprocess_batch(patched)
+        clean_px = self._backbone_diff_preprocess_batch(clean_batch)
+        patched_px = self._backbone_diff_preprocess_batch(patched_batch)
 
-            with torch.no_grad():
-                out_clean = self._backbone_model(pixel_values=clean_px, output_hidden_states=True)
-            out_patch = self._backbone_model(pixel_values=patched_px, output_hidden_states=True)
+        with torch.no_grad():
+            out_clean = self._backbone_model(pixel_values=clean_px, output_hidden_states=True)
+            clean_feat = self._extract_backbone_feature_tensor(out_clean)
+        out_patch = self._backbone_model(pixel_values=patched_px, output_hidden_states=True)
+        patch_feat = self._extract_backbone_feature_tensor(out_patch)
 
-            clean_feat = self._extract_backbone_feature_tensor(out_clean).detach()
-            patch_feat = self._extract_backbone_feature_tensor(out_patch)
-            clean_vec = clean_feat.flatten(start_dim=1)
-            patch_vec = patch_feat.flatten(start_dim=1)
-            losses.append(F.cosine_similarity(patch_vec, clean_vec, dim=1).mean())
-
-        return torch.stack(losses).mean()
+        clean_vec = clean_feat.flatten(start_dim=1)
+        patch_vec = patch_feat.flatten(start_dim=1)
+        return F.cosine_similarity(patch_vec, clean_vec, dim=1).mean()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
