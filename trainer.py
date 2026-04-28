@@ -346,7 +346,9 @@ class AdversarialPatchTrainer:
         tv_weight:            float          = 10.0,
         det_loss_weight:      float          = 0.0,
         backbone_feature_weight: float       = 0.0,
+        feature_delta_weight: float          = 0.0,
         feature_prob:         float          = 0.25,
+        feature_profile_n:    int            = 200,
         backbone_source:      str            = "auto",
         backbone_model_path:  str            = "none",
         disable_disruption:   bool           = False,
@@ -365,6 +367,8 @@ class AdversarialPatchTrainer:
         self.tv_weight            = tv_weight
         self.det_loss_weight      = det_loss_weight
         self.backbone_feature_weight = backbone_feature_weight
+        self.feature_delta_weight = feature_delta_weight
+        self._feature_profile_n   = feature_profile_n
         self.backbone_source      = backbone_source
         self.backbone_model_path  = backbone_model_path
         self.disable_disruption   = disable_disruption
@@ -408,7 +412,12 @@ class AdversarialPatchTrainer:
         else:
             self.ocr.eval()
 
-        self.feature_prob = feature_prob if backbone_feature_weight > 0.0 else 0.0
+        _feat_enabled = backbone_feature_weight > 0.0 or feature_delta_weight > 0.0
+        self.feature_prob = feature_prob if _feat_enabled else 0.0
+
+        # Per-channel std for normalized delta loss (populated by profiling)
+        self._feat_channel_std: Optional[torch.Tensor] = None
+        self._feat_beta: float = 1e-8
 
         # ── Run output directory ───────────────────────────────────────
         if run_dir_override:
@@ -555,19 +564,143 @@ class AdversarialPatchTrainer:
                 return img, _corners_letterbox(corners_np, r, dw, dh)
         return fn
 
+    def _border_feat_aabb(self, corners: torch.Tensor,
+                         origH: int, origW: int,
+                         inH: int, inW: int,
+                         fh: int, fw: int,
+                         ) -> Tuple[int, int, int, int]:
+        """Border region AABB in feature-map coordinates.
+
+        corners: [4, 2] plate corners in original image space.
+        Returns (fx1, fy1, fx2, fy2) clamped to [0, fw) × [0, fh).
+        """
+        sx, sy = inW / origW, inH / origH
+        scaled = corners.clone()
+        scaled[:, 0] *= sx
+        scaled[:, 1] *= sy
+        center = scaled.mean(dim=0)
+        border = center + (scaled - center) * 1.4
+        if self.top_extend:
+            col_left  = scaled[0] - scaled[3]
+            col_right = scaled[1] - scaled[2]
+            border[0] = border[0] + 1.4 * col_left
+            border[1] = border[1] + 1.4 * col_right
+        fx1 = (border[:, 0].min() / inW * fw).clamp(min=0).long().item()
+        fy1 = (border[:, 1].min() / inH * fh).clamp(min=0).long().item()
+        fx2 = (border[:, 0].max() / inW * fw).clamp(max=fw).long().item()
+        fy2 = (border[:, 1].max() / inH * fh).clamp(max=fh).long().item()
+        if fx2 <= fx1: fx2 = fx1 + 1
+        if fy2 <= fy1: fy2 = fy1 + 1
+        return fx1, fy1, fx2, fy2
+
+    def _profile_backbone_feature_stds(self, n_images: int = 200) -> None:
+        """Profile per-channel std of backbone feature deltas.
+
+        Runs n_images through the RT-DETR backbone with random patches,
+        computing (patched_feat - clean_feat) at border-region positions.
+        Uses Welford's algorithm for numerically stable per-channel
+        variance estimation.
+
+        Stores self._feat_channel_std [C] and self._feat_beta (scalar floor).
+        """
+        print(f"  [profile] Profiling backbone feature stds ({n_images} images)...")
+        backbone  = self.detector._model.model.backbone
+        preprocess = self.detector._diff_preprocess
+        loader    = self._make_pipeline_loader(seed=9999)
+
+        # Welford accumulators (initialised after first batch reveals C)
+        count = 0
+        mean_acc  = None   # [C]
+        m2_acc    = None   # [C]
+
+        with torch.no_grad():
+            for idx, batch_raw in enumerate(loader):
+                if idx >= n_images:
+                    break
+                raw = {k: v[0] for k, v in batch_raw.items()}
+                t = raw["orig_image"].to(self.device)
+                if t.dtype == torch.uint8:
+                    t = t.float().div_(255.0)
+                c = raw["orig_corners"].to(self.device)
+                _, H, W = t.shape
+
+                # Random patch
+                rand_patch = torch.rand(3, self.patch_height, self.patch_width,
+                                        device=self.device)
+                clean_img  = t.unsqueeze(0)                  # [1, C, H, W]
+                patched_img = self.apply_patch_to_image(
+                    clean_img, c.unsqueeze(0),
+                    patch_norm=rand_patch, augment=False,
+                )[0]
+
+                clean_px   = preprocess(clean_img[0])        # [1, 3, 640, 640]
+                patched_px = preprocess(patched_img[0])
+
+                pmask = torch.ones(1, clean_px.shape[2], clean_px.shape[3],
+                                   dtype=torch.float32, device=self.device)
+                clean_feat  = backbone(clean_px, pmask)[-1][0]   # [1, C, h, w]
+                patch_feat  = backbone(patched_px, pmask)[-1][0]
+
+                _, C, fh, fw = clean_feat.shape
+                if mean_acc is None:
+                    mean_acc = torch.zeros(C, device=self.device)
+                    m2_acc   = torch.zeros(C, device=self.device)
+
+                fx1, fy1, fx2, fy2 = self._border_feat_aabb(
+                    c, H, W, clean_px.shape[2], clean_px.shape[3], fh, fw)
+
+                # delta: [C, h_region, w_region] → per-channel values
+                delta = (patch_feat[0, :, fy1:fy2, fx1:fx2]
+                         - clean_feat[0, :, fy1:fy2, fx1:fx2])  # [C, h_r, w_r]
+                # Flatten spatial dims → each spatial position is a sample
+                delta_flat = delta.reshape(C, -1)               # [C, N]
+                n_pos = delta_flat.shape[1]
+
+                # Welford batch update (Chan's parallel algorithm)
+                for j in range(n_pos):
+                    x = delta_flat[:, j]                        # [C]
+                    count += 1
+                    d = x - mean_acc
+                    mean_acc += d / count
+                    d2 = x - mean_acc
+                    m2_acc += d * d2
+
+        if count < 2:
+            print("  [profile] WARNING: insufficient samples, using unit std")
+            self._feat_channel_std = torch.ones(1, device=self.device)
+            self._feat_beta = 1e-8
+            return
+
+        variance = m2_acc / (count - 1)
+        std = variance.sqrt().clamp(min=1e-8)
+        self._feat_channel_std = std                            # [C]
+
+        # β floor: 10% of median live-neuron std (following framework branch)
+        live = std[std > 1e-7]
+        if live.numel() > 0:
+            self._feat_beta = live.median().item() * 0.1
+        else:
+            self._feat_beta = 1e-8
+
+        print(f"  [profile] Done. channels={std.numel()}, "
+              f"median_std={std.median().item():.4f}, "
+              f"β={self._feat_beta:.4f}, samples={count}")
+
     def _compute_rtdetr_feature_loss(self, items: list,
-                                     grad_scale: float = 1.0) -> torch.Tensor:
+                                     grad_scale: float = 1.0,
+                                     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Backbone-only feature loss using the active RT-DETR detector.
 
         Re-applies the patch to clean images (with a fresh, grad-tracked graph)
         then runs full clean/patched images through only the ResNet vision
         backbone (no encoder/decoder).  Filters the spatial feature maps to
-        positions overlapping the border region and computes cosine similarity.
+        positions overlapping the border region and computes:
+          1. cosine similarity  (direction — want to minimize)
+          2. -log(quality) where quality = RMS of per-channel-normalised deltas
+             (magnitude — want to maximize divergence)
 
-        NOTE: apply_patch_to_image's brightness correction runs inside
-        torch.no_grad(), which severs the grad chain through patched_orig.
-        We therefore re-apply the patch here to guarantee gradient flow from
-        the backbone loss back to patch_leaf.
+        Returns (cos_sim, quality) as detached scalars.  Handles its own
+        backward internally (detach-and-chain through the frozen backbone).
         """
         backbone = self.detector._model.model.backbone
         preprocess = self.detector._diff_preprocess
@@ -598,54 +731,59 @@ class AdversarialPatchTrainer:
 
         patch_feat = backbone(patched_px, pmask)[-1][0]        # [B, C, h, w]
 
-        _, _, fh, fw = clean_feat.shape
+        _, C, fh, fw = clean_feat.shape
 
-        # Build per-image spatial mask: which feature-map cells overlap the border.
-        # Uses the same border geometry as apply_patch_to_image (scale corners
-        # by 1.4 from center; top_extend adds 1.4× column vector on top).
-        losses = []
+        cos_losses = []
+        delta_qualities = []
+        has_std = (self._feat_channel_std is not None
+                   and self.feature_delta_weight > 0)
+        if has_std:
+            eff_std = self._feat_channel_std.clamp(min=self._feat_beta)  # [C]
+
         for i, item in enumerate(items):
-            corners = item["orig_corners"]                     # [4, 2] original space
+            corners = item["orig_corners"]
             _, origH, origW = item["clean_orig"].shape
 
-            # Scale corners to preprocessed (640×640) space
-            sx, sy = inW / origW, inH / origH
-            scaled = corners.clone()
-            scaled[:, 0] *= sx
-            scaled[:, 1] *= sy
+            fx1, fy1, fx2, fy2 = self._border_feat_aabb(
+                corners, origH, origW, inH, inW, fh, fw)
 
-            # Border quad — mirrors apply_patch_to_image logic
-            center = scaled.mean(dim=0)
-            border = center + (scaled - center) * 1.4
-            if self.top_extend:
-                col_left  = scaled[0] - scaled[3]              # TL - BL
-                col_right = scaled[1] - scaled[2]              # TR - BR
-                border[0] = border[0] + 1.4 * col_left
-                border[1] = border[1] + 1.4 * col_right
+            c_region = clean_feat[i, :, fy1:fy2, fx1:fx2]     # [C, h_r, w_r]
+            p_region = patch_feat[i, :, fy1:fy2, fx1:fx2]
 
-            # AABB of border region in feature-map coordinates
-            fx1 = (border[:, 0].min() / inW * fw).clamp(min=0).long()
-            fy1 = (border[:, 1].min() / inH * fh).clamp(min=0).long()
-            fx2 = (border[:, 0].max() / inW * fw).clamp(max=fw).long()
-            fy2 = (border[:, 1].max() / inH * fh).clamp(max=fh).long()
+            # Cosine similarity (flatten all dims)
+            cos_losses.append(F.cosine_similarity(
+                c_region.flatten().unsqueeze(0),
+                p_region.flatten().unsqueeze(0)))
 
-            # Ensure at least one cell
-            if fx2 <= fx1: fx2 = fx1 + 1
-            if fy2 <= fy1: fy2 = fy1 + 1
+            # Normalised delta magnitude
+            if has_std:
+                delta = p_region - c_region                    # [C, h_r, w_r]
+                # Normalise per-channel: delta[c] / eff_std[c]
+                norm_delta = delta / eff_std.view(C, 1, 1)
+                # RMS across all elements
+                quality = norm_delta.pow(2).mean().sqrt() + 1e-8
+                delta_qualities.append(quality)
 
-            c_region = clean_feat[i, :, fy1:fy2, fx1:fx2].flatten()
-            p_region = patch_feat[i, :, fy1:fy2, fx1:fx2].flatten()
-            losses.append(F.cosine_similarity(c_region.unsqueeze(0),
-                                              p_region.unsqueeze(0)))
+        cos_loss = torch.cat(cos_losses).mean()
 
-        cos_loss = torch.cat(losses).mean()
+        # Combined loss for backward
+        total = self.backbone_feature_weight * cos_loss
+        if has_std and delta_qualities:
+            quality = torch.stack(delta_qualities).mean()
+            # -log(quality): larger quality → lower loss
+            total = total - self.feature_delta_weight * torch.log(quality)
+        else:
+            quality = torch.tensor(0.0, device=self.device)
 
-        # Chain gradient: cos_loss → patched_px → patched_px_g → patch_norm
-        (cos_loss * grad_scale).backward(retain_graph=False)
+        # Chain gradient: total → patched_px → patched_px_g → patch_norm
+        (total * grad_scale).backward(retain_graph=False)
         if patched_px.grad is not None:
             patched_px_g.backward(patched_px.grad)
 
-        return cos_loss.detach()
+        # Stash for progress bar tracking
+        self._last_cos_sim = cos_loss.item()
+        self._last_quality = quality.item()
+        return cos_loss.detach(), quality.detach()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
@@ -1759,10 +1897,11 @@ class AdversarialPatchTrainer:
                 if backbone_only:
                     # _compute_rtdetr_feature_loss does its own backward
                     # (detach-and-chain through the frozen backbone).
-                    # Pass the full scaling so gradients are correct.
-                    grad_scale = self.backbone_feature_weight * weight * len(chunk)
-                    cos_sim = self._compute_rtdetr_feature_loss(items, grad_scale)
-                    loss_val = self.backbone_feature_weight * cos_sim.item()
+                    # Weights are applied internally; pass only accum scaling.
+                    cos_sim, qual = self._compute_rtdetr_feature_loss(
+                        items, grad_scale=weight * len(chunk))
+                    loss_val = (self.backbone_feature_weight * cos_sim.item()
+                                - self.feature_delta_weight * max(qual.item(), 1e-8))
                     det_real_l = det_top_l = ocr_real_l = ocr_top_l = tv_l = \
                         torch.tensor(0.0, device=self.device)
                 else:
@@ -2556,8 +2695,12 @@ class AdversarialPatchTrainer:
         print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         if self.feature_prob > 0:
-            print(f"  Feature loss   : w={self.backbone_feature_weight:.3g}  "
-                  f"prob={self.feature_prob:.0%}  (backbone-only on RT-DETR steps)")
+            _feat_parts = [f"cos_w={self.backbone_feature_weight:.3g}"]
+            if self.feature_delta_weight > 0:
+                _feat_parts.append(f"delta_w={self.feature_delta_weight:.3g}")
+            _feat_parts.append(f"prob={self.feature_prob:.0%}")
+            print(f"  Feature loss   : {', '.join(_feat_parts)}  "
+                  f"(backbone-only on RT-DETR steps)")
         else:
             print(f"  Feature loss   : disabled")
         if tv_warmup_updates > 0:
@@ -2572,6 +2715,15 @@ class AdversarialPatchTrainer:
         print(f"  Mode      : {_mode}")
         print(f"  Run dir   : {self.run_dir}")
         print(f"{'='*60}\n")
+
+        # ── Feature delta profiling (requires RT-DETR to be loaded) ───
+        if (self.feature_delta_weight > 0
+            and self._feat_channel_std is None):
+            for det, ocr in active_pipelines:
+                if det.name == "rtdetr":
+                    self._activate_pipeline(det, ocr)
+                    self._profile_backbone_feature_stds(self._feature_profile_n)
+                    break
 
         # ── Logging ───────────────────────────────────────────────────
         _resuming = continue_path is not None
@@ -2640,6 +2792,7 @@ class AdversarialPatchTrainer:
             global_loss_sum = 0.0
             global_steps    = 0
             cos_sim_sum     = 0.0
+            qual_sum        = 0.0
             cos_sim_steps   = 0
 
             # tqdm total: approximate updates this epoch
@@ -2764,9 +2917,9 @@ class AdversarialPatchTrainer:
                     if _mem_prof: _mp_checkpoints.append(("cp_prep",     _rss_mb()))
                     if _is_backbone_step:
                         # _compute_rtdetr_feature_loss does its own backward
-                        cos_sim = self._compute_rtdetr_feature_loss(
-                            items, grad_scale=self.backbone_feature_weight)
-                        lv = self.backbone_feature_weight * cos_sim.item()
+                        cos_sim, qual = self._compute_rtdetr_feature_loss(items)
+                        lv = (self.backbone_feature_weight * cos_sim.item()
+                              - self.feature_delta_weight * max(qual.item(), 1e-8))
                         dr = dt = or_ = ot = tv_l = torch.tensor(0.0, device=self.device)
                     else:
                         loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
@@ -2781,7 +2934,8 @@ class AdversarialPatchTrainer:
                     if _mem_prof: _mp_checkpoints.append(("cp_optim",    _rss_mb()))
 
                 if _is_backbone_step:
-                    cos_sim_sum += lv / max(self.backbone_feature_weight, 1e-8)
+                    cos_sim_sum += self._last_cos_sim
+                    qual_sum    += self._last_quality
                     cos_sim_steps += 1
 
                 # ── Mem profiling: post-step measurement & logging ────────
@@ -2992,6 +3146,8 @@ class AdversarialPatchTrainer:
                 }
                 if cos_sim_steps > 0:
                     _postfix["cos"] = f"{cos_sim_sum / cos_sim_steps:.4f}"
+                    if qual_sum > 0:
+                        _postfix["qual"] = f"{qual_sum / cos_sim_steps:.2f}"
                 pbar.set_postfix(_postfix)
 
                 if len(items_raw) < items_needed:
@@ -3158,10 +3314,19 @@ def main():
                         help="Weight for RT-DETR backbone feature loss.  When >0, a fraction "
                              "of RT-DETR steps run only the vision backbone (no decoder/OCR) "
                              "and optimise cosine-similarity of border-region features.")
+    parser.add_argument("--feature-delta-weight", type=float, default=0.0,
+                        help="Weight for normalised-delta magnitude loss (-log(quality)). "
+                             "Encourages the patch to increase the magnitude of backbone "
+                             "feature deltas, not just change their direction.  Requires "
+                             "a profiling run at startup to compute per-channel std.")
     parser.add_argument("--feature-prob", type=float, default=0.25,
                         help="Probability of running a backbone-only feature step instead of "
                              "the full pipeline when RT-DETR is active (default: 0.25). "
-                             "Only effective when --backbone-feature-weight > 0.")
+                             "Only effective when --backbone-feature-weight > 0 or "
+                             "--feature-delta-weight > 0.")
+    parser.add_argument("--feature-profile-n", type=int, default=200,
+                        help="Number of images for backbone feature std profiling "
+                             "(default: 200). Only used when --feature-delta-weight > 0.")
     parser.add_argument("--backbone-source", choices=["auto", "encoder", "decoder"], default="auto",
                         help="Which RT-DETR hidden-state source to use for backbone feature loss.")
     parser.add_argument("--backbone-model-path", default="none",
@@ -3409,7 +3574,9 @@ def main():
         tv_weight            = args.tv_weight,
         det_loss_weight      = args.det_loss_weight,
         backbone_feature_weight = args.backbone_feature_weight,
+        feature_delta_weight = args.feature_delta_weight,
         feature_prob         = args.feature_prob,
+        feature_profile_n    = args.feature_profile_n,
         backbone_source      = args.backbone_source,
         backbone_model_path  = args.backbone_model_path,
         disable_disruption   = args.no_disruption,
