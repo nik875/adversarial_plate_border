@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import csv
 import gc
+import math
 import os
 import random
 import re
@@ -735,11 +736,12 @@ class AdversarialPatchTrainer:
                    if has_std else None)
 
         per_image_quality = []
+        cos_means = []
         for i in range(len(items)):
             # Per-position cosine similarity along the channel dim → [fh, fw]
-            # F.cosine_similarity with dim=0 over [C, fh, fw] tensors
             cos_map = F.cosine_similarity(
                 clean_feat[i], patch_feat[i], dim=0)           # [fh, fw] ∈ [-1,1]
+            cos_means.append(cos_map.mean())
 
             # Per-position normalised delta norm → [fh, fw]
             delta = patch_feat[i] - clean_feat[i]              # [C, fh, fw]
@@ -758,7 +760,8 @@ class AdversarialPatchTrainer:
             hm = per_pos.numel() / (1.0 / (per_pos + eps)).sum()
             per_image_quality.append(hm)
 
-        quality = torch.stack(per_image_quality).mean()
+        quality  = torch.stack(per_image_quality).mean()
+        cos_mean = torch.stack(cos_means).mean()
 
         # -log(quality): minimised when quality is maximised
         total = -torch.log(quality)
@@ -768,10 +771,10 @@ class AdversarialPatchTrainer:
         if patched_px.grad is not None:
             patched_px_g.backward(patched_px.grad)
 
-        # Stash for progress bar tracking (cos_sim approximated from quality)
-        self._last_cos_sim = quality.item()
+        # Stash for progress bar: cos = mean cosine sim, qual = HM quality
+        self._last_cos_sim = cos_mean.item()
         self._last_quality = quality.item()
-        return quality.detach(), quality.detach()
+        return cos_mean.detach(), quality.detach()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
@@ -1888,7 +1891,7 @@ class AdversarialPatchTrainer:
                     # Weights are applied internally; pass only accum scaling.
                     cos_sim, qual = self._compute_rtdetr_feature_loss(
                         items, grad_scale=weight * len(chunk))
-                    loss_val = -qual.item()
+                    loss_val = -math.log(max(qual.item(), 1e-8))
                     det_real_l = det_top_l = ocr_real_l = ocr_top_l = tv_l = \
                         torch.tensor(0.0, device=self.device)
                 else:
@@ -2899,7 +2902,7 @@ class AdversarialPatchTrainer:
                     if _is_backbone_step:
                         # _compute_rtdetr_feature_loss does its own backward
                         cos_sim, qual = self._compute_rtdetr_feature_loss(items)
-                        lv = -qual.item()
+                        lv = -math.log(max(qual.item(), 1e-8))
                         dr = dt = or_ = ot = tv_l = torch.tensor(0.0, device=self.device)
                     else:
                         loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
