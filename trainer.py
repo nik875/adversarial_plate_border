@@ -345,9 +345,7 @@ class AdversarialPatchTrainer:
         run_name:             Optional[str]  = None,
         tv_weight:            float          = 10.0,
         det_loss_weight:      float          = 0.0,
-        backbone_feature_weight: float       = 0.0,
-        feature_delta_weight: float          = 0.0,
-        feature_prob:         float          = 0.25,
+        feature_prob:         float          = 0.0,
         feature_profile_n:    int            = 200,
         backbone_source:      str            = "auto",
         backbone_model_path:  str            = "none",
@@ -366,8 +364,6 @@ class AdversarialPatchTrainer:
         self.training             = training
         self.tv_weight            = tv_weight
         self.det_loss_weight      = det_loss_weight
-        self.backbone_feature_weight = backbone_feature_weight
-        self.feature_delta_weight = feature_delta_weight
         self._feature_profile_n   = feature_profile_n
         self.backbone_source      = backbone_source
         self.backbone_model_path  = backbone_model_path
@@ -412,8 +408,7 @@ class AdversarialPatchTrainer:
         else:
             self.ocr.eval()
 
-        _feat_enabled = backbone_feature_weight > 0.0 or feature_delta_weight > 0.0
-        self.feature_prob = feature_prob if _feat_enabled else 0.0
+        self.feature_prob = feature_prob
 
         # Per-channel std for normalized delta loss (populated by profiling)
         self._feat_channel_std: Optional[torch.Tensor] = None
@@ -693,14 +688,13 @@ class AdversarialPatchTrainer:
         backbone (no encoder/decoder).  Computes two complementary losses:
 
         For each spatial position (i,j) a combined divergence score is
-        computed from two terms weighted by backbone_feature_weight and
-        feature_delta_weight respectively:
-          - (1 - cos_sim[i,j]) / 2  ∈ [0,1]: directional divergence
-          - ||normalised_delta[i,j]||₂      : magnitude divergence
-        The harmonic mean of these per-position scores across the full
-        feature map is maximised via -log(HM).  The HM is dominated by
-        the smallest values, forcing the patch to perturb every spatial
-        position broadly rather than concentrating on a few rim cells.
+        For each spatial position (i,j) a combined divergence score is
+        computed as:
+          (1 - cos_sim[i,j]) × ||normalised_delta[i,j]||₂
+        Direction and magnitude must both be large at the same position —
+        neither alone is rewarded.  The harmonic mean across the full
+        feature map is maximised via -log(HM), forcing broad perturbation
+        rather than concentration on a few rim cells.
 
         Returns (cos_sim, quality) as detached scalars.  Handles its own
         backward internally (detach-and-chain through the frozen backbone).
@@ -753,14 +747,11 @@ class AdversarialPatchTrainer:
                 delta = delta / eff_std.view(C, 1, 1)
             pos_norm = delta.norm(dim=0)                        # [fh, fw]
 
-            # Combined per-position divergence score.
-            # (1 - cos_map)/2 ∈ [0,1]: 0 = same direction, 1 = opposite.
-            # pos_norm ∈ [0,∞): larger = bigger normalised perturbation.
-            # Both terms reward broad feature-space divergence; weights let
-            # the user tune their relative importance.
+            # Per-position score: product of directional and magnitude divergence.
+            # (1 - cos_map) ∈ [0,2]: 0 = same direction, 2 = opposite.
+            # Both must be large at the same position — neither is rewarded alone.
             eps = 1e-4
-            per_pos = (self.backbone_feature_weight * (1.0 - cos_map) / 2.0
-                       + self.feature_delta_weight * pos_norm)  # [fh, fw]
+            per_pos = (1.0 - cos_map) * pos_norm                # [fh, fw]
 
             # Harmonic mean across all positions: dominated by the smallest
             # values, so the patch must perturb every position broadly.
@@ -1897,8 +1888,7 @@ class AdversarialPatchTrainer:
                     # Weights are applied internally; pass only accum scaling.
                     cos_sim, qual = self._compute_rtdetr_feature_loss(
                         items, grad_scale=weight * len(chunk))
-                    loss_val = (self.backbone_feature_weight * cos_sim.item()
-                                - self.feature_delta_weight * max(qual.item(), 1e-8))
+                    loss_val = -qual.item()
                     det_real_l = det_top_l = ocr_real_l = ocr_top_l = tv_l = \
                         torch.tensor(0.0, device=self.device)
                 else:
@@ -2424,8 +2414,7 @@ class AdversarialPatchTrainer:
         print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         if self.feature_prob > 0:
-            print(f"  Feature loss   : w={self.backbone_feature_weight:.3g}  "
-                  f"prob={self.feature_prob:.0%}  (backbone-only on RT-DETR steps)")
+            print(f"  Feature loss   : prob={self.feature_prob:.0%}  (backbone-only on RT-DETR steps)")
         else:
             print(f"  Feature loss   : disabled")
         if tv_warmup_updates > 0:
@@ -2692,12 +2681,7 @@ class AdversarialPatchTrainer:
         print(f"  LR warmup : {warmup_updates} updates  |  "
               f"LR: {eta_min:.0e} → {learning_rate:.0e} → {eta_min:.0e}")
         if self.feature_prob > 0:
-            _feat_parts = [f"cos_w={self.backbone_feature_weight:.3g}"]
-            if self.feature_delta_weight > 0:
-                _feat_parts.append(f"delta_w={self.feature_delta_weight:.3g}")
-            _feat_parts.append(f"prob={self.feature_prob:.0%}")
-            print(f"  Feature loss   : {', '.join(_feat_parts)}  "
-                  f"(backbone-only on RT-DETR steps)")
+            print(f"  Feature loss   : prob={self.feature_prob:.0%}  (backbone-only on RT-DETR steps)")
         else:
             print(f"  Feature loss   : disabled")
         if tv_warmup_updates > 0:
@@ -2714,7 +2698,7 @@ class AdversarialPatchTrainer:
         print(f"{'='*60}\n")
 
         # ── Feature delta profiling (requires RT-DETR to be loaded) ───
-        if (self.feature_delta_weight > 0
+        if (self.feature_prob > 0
             and self._feat_channel_std is None):
             for det, ocr in active_pipelines:
                 if det.name == "rtdetr":
@@ -2915,8 +2899,7 @@ class AdversarialPatchTrainer:
                     if _is_backbone_step:
                         # _compute_rtdetr_feature_loss does its own backward
                         cos_sim, qual = self._compute_rtdetr_feature_loss(items)
-                        lv = (self.backbone_feature_weight * cos_sim.item()
-                              - self.feature_delta_weight * max(qual.item(), 1e-8))
+                        lv = -qual.item()
                         dr = dt = or_ = ot = tv_l = torch.tensor(0.0, device=self.device)
                     else:
                         loss, dr, dt, or_, ot, tv_l = self.compute_loss_batch(items)
@@ -3307,23 +3290,13 @@ def main():
     parser.add_argument("--det-loss-weight", type=float, default=0.0,
                         help="Weight for the impersonation-zone detection loss added directly "
                              "to the total loss (default: 0.0, disabled).")
-    parser.add_argument("--backbone-feature-weight", type=float, default=0.0,
-                        help="Weight for RT-DETR backbone feature loss.  When >0, a fraction "
-                             "of RT-DETR steps run only the vision backbone (no decoder/OCR) "
-                             "and optimise cosine-similarity of border-region features.")
-    parser.add_argument("--feature-delta-weight", type=float, default=0.0,
-                        help="Weight for normalised-delta magnitude loss (-log(quality)). "
-                             "Encourages the patch to increase the magnitude of backbone "
-                             "feature deltas, not just change their direction.  Requires "
-                             "a profiling run at startup to compute per-channel std.")
-    parser.add_argument("--feature-prob", type=float, default=0.25,
+    parser.add_argument("--feature-prob", type=float, default=0.0,
                         help="Probability of running a backbone-only feature step instead of "
-                             "the full pipeline when RT-DETR is active (default: 0.25). "
-                             "Only effective when --backbone-feature-weight > 0 or "
-                             "--feature-delta-weight > 0.")
+                             "the full pipeline when RT-DETR is active (default: 0.0 = disabled). "
+                             "Loss = -log(HM over positions of (1-cos_sim) × norm_delta).")
     parser.add_argument("--feature-profile-n", type=int, default=200,
-                        help="Number of images for backbone feature std profiling "
-                             "(default: 200). Only used when --feature-delta-weight > 0.")
+                        help="Number of images for backbone feature std profiling at startup "
+                             "(default: 200). Only used when --feature-prob > 0.")
     parser.add_argument("--backbone-source", choices=["auto", "encoder", "decoder"], default="auto",
                         help="Which RT-DETR hidden-state source to use for backbone feature loss.")
     parser.add_argument("--backbone-model-path", default="none",
@@ -3570,8 +3543,6 @@ def main():
         run_name             = args.run_name,
         tv_weight            = args.tv_weight,
         det_loss_weight      = args.det_loss_weight,
-        backbone_feature_weight = args.backbone_feature_weight,
-        feature_delta_weight = args.feature_delta_weight,
         feature_prob         = args.feature_prob,
         feature_profile_n    = args.feature_profile_n,
         backbone_source      = args.backbone_source,

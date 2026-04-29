@@ -84,9 +84,7 @@ def main():
     parser.add_argument("--lr-min",           type=float, default=1e-6)
     parser.add_argument("--tv-weight",        type=float, default=100.0)
     parser.add_argument("--det-loss-weight",  type=float, default=3.0)
-    parser.add_argument("--feature-weight",   type=float, default=0.0)
-    parser.add_argument("--feature-delta-weight", type=float, default=0.0)
-    parser.add_argument("--feature-prob",    type=float, default=0.25)
+    parser.add_argument("--feature-prob",    type=float, default=0.0)
     parser.add_argument("--feature-profile-n", type=int, default=200)
     parser.add_argument("--eval-batch-size",  type=int,   default=16)
     parser.add_argument("--skip-sanity",      action="store_true", default=True)
@@ -174,8 +172,6 @@ def main():
         "--lr-min",               str(args.lr_min),
         "--tv-weight",            str(args.tv_weight),
         "--det-loss-weight",      str(args.det_loss_weight),
-        "--backbone-feature-weight", str(args.feature_weight),
-        "--feature-delta-weight", str(args.feature_delta_weight),
         "--feature-prob",         str(args.feature_prob),
         "--feature-profile-n",   str(args.feature_profile_n),
         "--eval-batch-size",      str(args.eval_batch_size),
