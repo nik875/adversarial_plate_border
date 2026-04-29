@@ -692,13 +692,15 @@ class AdversarialPatchTrainer:
         then runs full clean/patched images through only the ResNet vision
         backbone (no encoder/decoder).  Computes two complementary losses:
 
-          1. Cosine similarity on rim-region positions (direction signal —
-             want features to diverge in direction, not just magnitude).
-          2. Harmonic-mean of per-channel-normalised delta norms over the
-             FULL feature map.  The harmonic mean is dominated by the
-             smallest per-position delta, so maximising it forces the patch
-             to perturb every spatial position broadly rather than
-             concentrating on a few rim cells.
+        For each spatial position (i,j) a combined divergence score is
+        computed from two terms weighted by backbone_feature_weight and
+        feature_delta_weight respectively:
+          - (1 - cos_sim[i,j]) / 2  ∈ [0,1]: directional divergence
+          - ||normalised_delta[i,j]||₂      : magnitude divergence
+        The harmonic mean of these per-position scores across the full
+        feature map is maximised via -log(HM).  The HM is dominated by
+        the smallest values, forcing the patch to perturb every spatial
+        position broadly rather than concentrating on a few rim cells.
 
         Returns (cos_sim, quality) as detached scalars.  Handles its own
         backward internally (detach-and-chain through the frozen backbone).
@@ -734,62 +736,51 @@ class AdversarialPatchTrainer:
 
         _, C, fh, fw = clean_feat.shape
 
-        cos_losses = []
-        delta_qualities = []
-        has_std = (self._feat_channel_std is not None
-                   and self.feature_delta_weight > 0)
-        if has_std:
-            eff_std = self._feat_channel_std.clamp(min=self._feat_beta)  # [C]
+        has_std = self._feat_channel_std is not None
+        eff_std = (self._feat_channel_std.clamp(min=self._feat_beta)
+                   if has_std else None)
 
-        for i, item in enumerate(items):
-            corners = item["orig_corners"]
-            _, origH, origW = item["clean_orig"].shape
+        per_image_quality = []
+        for i in range(len(items)):
+            # Per-position cosine similarity along the channel dim → [fh, fw]
+            # F.cosine_similarity with dim=0 over [C, fh, fw] tensors
+            cos_map = F.cosine_similarity(
+                clean_feat[i], patch_feat[i], dim=0)           # [fh, fw] ∈ [-1,1]
 
-            fx1, fy1, fx2, fy2 = self._border_feat_aabb(
-                corners, origH, origW, inH, inW, fh, fw)
+            # Per-position normalised delta norm → [fh, fw]
+            delta = patch_feat[i] - clean_feat[i]              # [C, fh, fw]
+            if eff_std is not None:
+                delta = delta / eff_std.view(C, 1, 1)
+            pos_norm = delta.norm(dim=0)                        # [fh, fw]
 
-            c_region = clean_feat[i, :, fy1:fy2, fx1:fx2]     # [C, h_r, w_r]
-            p_region = patch_feat[i, :, fy1:fy2, fx1:fx2]
+            # Combined per-position divergence score.
+            # (1 - cos_map)/2 ∈ [0,1]: 0 = same direction, 1 = opposite.
+            # pos_norm ∈ [0,∞): larger = bigger normalised perturbation.
+            # Both terms reward broad feature-space divergence; weights let
+            # the user tune their relative importance.
+            eps = 1e-4
+            per_pos = (self.backbone_feature_weight * (1.0 - cos_map) / 2.0
+                       + self.feature_delta_weight * pos_norm)  # [fh, fw]
 
-            # Cosine similarity on rim region only (direction signal)
-            cos_losses.append(F.cosine_similarity(
-                c_region.flatten().unsqueeze(0),
-                p_region.flatten().unsqueeze(0)))
+            # Harmonic mean across all positions: dominated by the smallest
+            # values, so the patch must perturb every position broadly.
+            hm = per_pos.numel() / (1.0 / (per_pos + eps)).sum()
+            per_image_quality.append(hm)
 
-            # Harmonic-mean delta magnitude over the FULL feature map.
-            # HM is dominated by the smallest per-position delta — to
-            # maximise it the patch must perturb broadly across the whole
-            # feature map, not just concentrate on a few rim cells.
-            if has_std:
-                delta_full = patch_feat[i] - clean_feat[i]     # [C, fh, fw]
-                norm_delta = delta_full / eff_std.view(C, 1, 1)  # [C, fh, fw]
-                pos_norm   = norm_delta.norm(dim=0)              # [fh, fw]
+        quality = torch.stack(per_image_quality).mean()
 
-                # Harmonic mean: N / sum(1 / (xᵢ + ε))
-                eps = 1e-4
-                quality = pos_norm.numel() / (1.0 / (pos_norm + eps)).sum()
-                delta_qualities.append(quality)
-
-        cos_loss = torch.cat(cos_losses).mean()
-
-        # Combined loss for backward
-        total = self.backbone_feature_weight * cos_loss
-        if has_std and delta_qualities:
-            quality = torch.stack(delta_qualities).mean()
-            # -log(quality): larger quality → lower loss
-            total = total - self.feature_delta_weight * torch.log(quality)
-        else:
-            quality = torch.tensor(0.0, device=self.device)
+        # -log(quality): minimised when quality is maximised
+        total = -torch.log(quality)
 
         # Chain gradient: total → patched_px → patched_px_g → patch_norm
         (total * grad_scale).backward(retain_graph=False)
         if patched_px.grad is not None:
             patched_px_g.backward(patched_px.grad)
 
-        # Stash for progress bar tracking
-        self._last_cos_sim = cos_loss.item()
+        # Stash for progress bar tracking (cos_sim approximated from quality)
+        self._last_cos_sim = quality.item()
         self._last_quality = quality.item()
-        return cos_loss.detach(), quality.detach()
+        return quality.detach(), quality.detach()
 
     def _diff_prep_batch(
         self, imgs_bchw: torch.Tensor, corners_batch: torch.Tensor
