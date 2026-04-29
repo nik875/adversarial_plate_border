@@ -1359,6 +1359,8 @@ def main():
                         help="Override auto-detected batch size (default: auto)")
     parser.add_argument("--preview-samples", type=int, default=256,
                         help="Number of images for preview evaluation (default: 256)")
+    parser.add_argument("--preview-only", action="store_true",
+                        help="Run only the preview evaluation and exit (no files saved)")
     args = parser.parse_args()
 
     finetuned_dir = Path(args.finetuned_models)
@@ -1518,6 +1520,8 @@ def main():
         if preview_results:
             print(f"\n[preview] Results on {n_preview} images (no files saved):")
             print(_build_summary_table(preview_results))
+        if args.preview_only:
+            return 0
         print(f"\n{'─' * 60}")
         print(f"[eval] Starting full evaluation on {len(records)} images...")
         print(f"{'─' * 60}\n")
