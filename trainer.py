@@ -593,6 +593,60 @@ class AdversarialPatchTrainer:
         if fy2 <= fy1: fy2 = fy1 + 1
         return fx1, fy1, fx2, fy2
 
+    def _feat_distance_weight_map(self, corners: torch.Tensor,
+                                  origH: int, origW: int,
+                                  inH: int, inW: int,
+                                  fh: int, fw: int,
+                                  ) -> torch.Tensor:
+        """Distance-from-rim weight map on the feature grid [fh, fw].
+
+        Each cell's weight = (Euclidean distance from the rim polygon in
+        feature-grid units), then softmax-normalized so weights sum to 1.
+        Cells inside the rim polygon get distance 0 (weight ≈ 0 after
+        normalization), so loss pressure is concentrated on distant cells.
+
+        Returns a [fh, fw] float32 tensor on self.device.
+        """
+        import numpy as np
+        sx, sy = inW / origW, inH / origH
+
+        # Scale corners to the preprocessed input space
+        scaled = corners.detach().cpu().clone().float()
+        scaled[:, 0] *= sx
+        scaled[:, 1] *= sy
+
+        # Expand to border polygon (same as _border_feat_aabb)
+        center = scaled.mean(dim=0)
+        border_pts = center + (scaled - center) * 1.4
+        if self.top_extend:
+            col_left  = scaled[0] - scaled[3]
+            col_right = scaled[1] - scaled[2]
+            border_pts[0] = border_pts[0] + 1.4 * col_left
+            border_pts[1] = border_pts[1] + 1.4 * col_right
+
+        # Map border polygon to feature-grid coordinates
+        feat_pts = border_pts.numpy().copy()
+        feat_pts[:, 0] = feat_pts[:, 0] / inW * fw
+        feat_pts[:, 1] = feat_pts[:, 1] / inH * fh
+
+        # Rasterize the border polygon as a filled mask on [fh, fw]
+        import cv2
+        rim_mask = np.zeros((fh, fw), dtype=np.uint8)
+        poly = feat_pts.astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(rim_mask, [poly], 1)
+
+        # Distance transform: each cell = distance to nearest rim pixel
+        dist = cv2.distanceTransform(
+            (1 - rim_mask).astype(np.uint8), cv2.DIST_L2, 3
+        ).astype(np.float32)  # [fh, fw], 0 inside rim
+
+        dist_t = torch.from_numpy(dist).to(self.device)
+
+        # Softmax-normalize so weights sum to 1
+        flat = dist_t.flatten()
+        weights = torch.softmax(flat, dim=0).reshape(fh, fw)
+        return weights
+
     def _profile_backbone_feature_stds(self, n_images: int = 200) -> None:
         """Profile per-channel std of backbone feature deltas.
 
@@ -646,12 +700,8 @@ class AdversarialPatchTrainer:
                     mean_acc = torch.zeros(C, device=self.device)
                     m2_acc   = torch.zeros(C, device=self.device)
 
-                fx1, fy1, fx2, fy2 = self._border_feat_aabb(
-                    c, H, W, clean_px.shape[2], clean_px.shape[3], fh, fw)
-
-                # delta: [C, h_region, w_region] → per-channel values
-                delta = (patch_feat[0, :, fy1:fy2, fx1:fx2]
-                         - clean_feat[0, :, fy1:fy2, fx1:fx2])  # [C, h_r, w_r]
+                # delta over full feature map — std must match normalization scope
+                delta = (patch_feat[0] - clean_feat[0])         # [C, fh, fw]
                 # Flatten spatial dims → each spatial position is a sample
                 delta_flat = delta.reshape(C, -1)               # [C, N]
                 n_pos = delta_flat.shape[1]
@@ -693,11 +743,17 @@ class AdversarialPatchTrainer:
 
         Re-applies the patch to clean images (with a fresh, grad-tracked graph)
         then runs full clean/patched images through only the ResNet vision
-        backbone (no encoder/decoder).  Filters the spatial feature maps to
-        positions overlapping the border region and computes:
-          1. cosine similarity  (direction — want to minimize)
-          2. -log(quality) where quality = RMS of per-channel-normalised deltas
-             (magnitude — want to maximize divergence)
+        backbone (no encoder/decoder).  Computes two complementary losses:
+
+          1. Cosine similarity on rim-region positions (direction signal —
+             want features to diverge in direction, not just magnitude).
+          2. Distance-weighted delta magnitude over the FULL feature map.
+             Each spatial position is weighted by its softmax-normalised
+             Euclidean distance from the rim polygon on the feature grid,
+             so distant positions contribute more.  This pressures the patch
+             to exploit ResNet's large receptive field and propagate the
+             perturbation far beyond the physical rim — corrupting the entire
+             plate region before the transformer encoder ever runs.
 
         Returns (cos_sim, quality) as detached scalars.  Handles its own
         backward internally (detach-and-chain through the frozen backbone).
@@ -750,18 +806,26 @@ class AdversarialPatchTrainer:
             c_region = clean_feat[i, :, fy1:fy2, fx1:fx2]     # [C, h_r, w_r]
             p_region = patch_feat[i, :, fy1:fy2, fx1:fx2]
 
-            # Cosine similarity (flatten all dims)
+            # Cosine similarity on rim region only (direction signal)
             cos_losses.append(F.cosine_similarity(
                 c_region.flatten().unsqueeze(0),
                 p_region.flatten().unsqueeze(0)))
 
-            # Normalised delta magnitude
+            # Distance-weighted delta magnitude over the FULL feature map.
+            # Weight[i,j] = softmax(dist_from_rim[i,j]) so distant positions
+            # contribute more — the patch must exploit ResNet's receptive field
+            # to propagate perturbation beyond the local rim region.
             if has_std:
-                delta = p_region - c_region                    # [C, h_r, w_r]
-                # Normalise per-channel: delta[c] / eff_std[c]
-                norm_delta = delta / eff_std.view(C, 1, 1)
-                # RMS across all elements
-                quality = norm_delta.pow(2).mean().sqrt() + 1e-8
+                w_map = self._feat_distance_weight_map(
+                    corners, origH, origW, inH, inW, fh, fw)  # [fh, fw]
+
+                delta_full = patch_feat[i] - clean_feat[i]     # [C, fh, fw]
+                # Per-channel normalisation, then per-position L2 norm
+                norm_delta = delta_full / eff_std.view(C, 1, 1)  # [C, fh, fw]
+                pos_norm   = norm_delta.norm(dim=0)              # [fh, fw]
+
+                # Weighted mean: focus on far-from-rim positions
+                quality = (w_map * pos_norm).sum() + 1e-8
                 delta_qualities.append(quality)
 
         cos_loss = torch.cat(cos_losses).mean()
