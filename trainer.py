@@ -314,8 +314,8 @@ class SAM(torch.optim.Optimizer):
 
 PIPELINE_PAIRINGS: List[Tuple[str, str]] = [
     ("fasterrcnn",  "lprnet"),
-    ("rtdetr",      "doctr-vitstr"),
-    ("owlvit",      "trocr"),
+    ("rtdetr",      "trocr"),
+    ("owlvit",      "doctr-vitstr"),
     ("yolo-v9-608", "cct"),
 ]
 

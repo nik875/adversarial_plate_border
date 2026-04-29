@@ -25,8 +25,8 @@ from pathlib import Path
 # PIPELINE_PAIRINGS mirrors trainer.py — needed to predict the run_dir name.
 PIPELINE_PAIRINGS = [
     ("fasterrcnn",  "lprnet"),
-    ("rtdetr",      "doctr-vitstr"),
-    ("owlvit",      "trocr"),
+    ("rtdetr",      "trocr"),
+    ("owlvit",      "doctr-vitstr"),
     ("yolo-v9-608", "cct"),
 ]
 
