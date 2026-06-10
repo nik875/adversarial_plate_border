@@ -1,6 +1,7 @@
 # SPAR: Street-Legal Physical Adversarial Attacks on Automatic License Plate Recognition Systems
 
 Official repository for the paper **"SPAR: Street-Legal Physical Adversarial Attacks on Automatic License Plate Recognition Systems"**, accepted at the SiMLA 2026 Workshop.
+
 Paper Link: https://arxiv.org/abs/2604.02457v1
 
 ## Overview
