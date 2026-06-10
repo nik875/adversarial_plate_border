@@ -1,23 +1,35 @@
-```python
-def patch_reg_loss(self):
-    patch = self.patch  # shape (C, 256, 128)
-    C, H, W = patch.shape
-    
-    tv_h = torch.pow(patch[:, :, 1:] - patch[:, :, :-1], 2).sum()
-    tv_v = torch.pow(patch[:, 1:, :] - patch[:, :-1, :], 2).sum()
-    
-    # Number of comparisons: C × (256×127 + 255×128) = C × 65152
-    num_comparisons = C * (H * (W - 1) + (H - 1) * W)
-    
-    loss = (tv_h + tv_v) / num_comparisons
-    
-    # For [-1, 1] range, mean squared diff is typically 0.01-0.04 for natural images
-    # Scale by 2-3x to get 0-0.1 range
-    loss = loss * 2.5
-    
-    return loss
-```
+# SPAR: Street-Legal Physical Adversarial Attacks on Automatic License Plate Recognition Systems
 
-https://claude.ai/chat/17d19287-27cf-4053-9e7b-8249d67188de
+Official repository for the paper **"SPAR: Street-Legal Physical Adversarial Attacks on Automatic License Plate Recognition Systems"**, accepted at the SiMLA 2026 Workshop.
+Paper Link: https://arxiv.org/abs/2604.02457v1
 
-Patch regularization loss, missing from currently committed file. Ranges 0-0.1, directly added to loss term.
+## Overview
+
+Automatic License Plate Recognition (ALPR) systems are widely deployed in law enforcement, tolling, and traffic monitoring. While previous research has demonstrated vulnerabilities to adversarial examples, most attacks assume unrealistic threat models, require direct modification of license plate characters, or fail to transfer reliably to the physical world.
+
+We introduce **SPAR (Street-Legal Physical Adversarial Rim)**, a physically realizable adversarial attack that modifies only the border region surrounding a license plate while leaving the plate characters unchanged. SPAR is designed under realistic attacker constraints, including limited resources and legal restrictions on license plate modifications.
+
+## Key Contributions
+
+* Introduce **SPAR**, a border-based adversarial attack that preserves license plate legibility.
+* Demonstrate effective attacks against ALPR systems under a realistic white-box threat model.
+* Incorporate homography-based transformations during optimization to improve robustness to viewpoint and distance changes.
+* Show that Total Variation (TV) regularization produces structured perturbations that transfer more effectively to physical environments.
+* Evaluate attacks in both digital and real-world settings.
+* Investigate the role of large language models (LLMs) in assisting attack design and iteration.
+
+## Results
+
+SPAR successfully transfers from digital optimization to physical deployment and significantly degrades ALPR performance while maintaining a visually unobtrusive appearance.
+
+Key findings include:
+
+* Significant reduction in ALPR recognition accuracy.
+* Successful targeted impersonation attacks in both digital and physical evaluations.
+* Improved robustness through structured, low-frequency perturbations.
+* Evidence that LLM assistance lowers the barrier to developing effective physical attacks.
+
+## Disclaimer
+
+This work is intended solely for academic research, security evaluation, and the development of more robust machine learning systems. The techniques described should only be used in authorized and ethical research settings.
+
